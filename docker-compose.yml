@@ -1,0 +1,50 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - .:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 300s
+      timeout: 300s
+      retries: 10
+      start_period: 120s
+    ports:
+      - "5432:5432"
+    command: >
+      bash -c "
+        # Install dependencies
+        apt-get update &&
+        apt-get install -y flex bison git build-essential postgresql-server-dev-16 cmake pkg-config libxml2-dev postgresql-contrib &&
+        
+        # Setup bison
+        which bison &&
+        ln -s /usr/bin/bison /usr/local/bin/bison &&
+        
+        # Install AGE
+        cd /tmp &&
+        rm -rf age &&
+        git clone https://github.com/apache/age.git &&
+        cd age &&
+        git checkout PG16 &&
+        USE_PGXS=1 PG_CONFIG=/usr/lib/postgresql/16/bin/pg_config make clean &&
+        USE_PGXS=1 PG_CONFIG=/usr/lib/postgresql/16/bin/pg_config make &&
+        USE_PGXS=1 PG_CONFIG=/usr/lib/postgresql/16/bin/pg_config make install &&
+        
+        # Copy ALL SQL files
+        cp /tmp/age/sql/*.sql /usr/share/postgresql/16/extension/ &&
+        cp /tmp/age/*.sql /usr/share/postgresql/16/extension/ &&
+        cp /tmp/age/age.control /usr/share/postgresql/16/extension/ &&
+        
+        # Start PostgreSQL
+        docker-entrypoint.sh postgres"
+
+volumes:
+  postgres_data:

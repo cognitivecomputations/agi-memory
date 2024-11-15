@@ -1,0 +1,33 @@
+# Core dependencies
+fastapi>=0.104.0
+uvicorn>=0.24.0
+pydantic>=2.4.2
+asyncio>=3.4.3
+
+# Database
+asyncpg>=0.29.0
+psycopg2-binary>=2.9.9
+
+# AI/ML
+openai>=1.3.0
+numpy>=1.24.0
+tiktoken>=0.5.1
+
+# Vector operations
+pgvector>=0.2.0
+
+# Testing
+pytest>=7.4.3
+pytest-asyncio>=0.21.1
+httpx>=0.25.0
+
+# Development
+python-dotenv>=1.0.0
+black>=23.11.0
+isort>=5.12.0
+mypy>=1.7.0
+
+# Async fixtures
+pytest-asyncio>=0.21.1
+pytest-mock>=3.11.1
+pytest-cov>=4.1.0
