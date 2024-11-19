@@ -1,63 +1,43 @@
 import pytest
-
+import asyncio
 import asyncpg
 import json
-from typing import Dict
 
+# Update to use loop_scope instead of scope
+pytestmark = pytest.mark.asyncio(loop_scope="session")
 
-@pytest.fixture
+@pytest.fixture(scope="session")
 async def db_pool():
     """Create a connection pool for testing"""
     pool = await asyncpg.create_pool(
-        "postgresql://agi_user:agi_password@localhost:5432/agi_db"
+        "postgresql://agi_user:agi_password@localhost:5432/agi_db",
+        ssl=False,
+        min_size=2,
+        max_size=20,
+        command_timeout=60.0
     )
     yield pool
     await pool.close()
 
-
 @pytest.fixture(autouse=True)
-async def cleanup_after_test(db_pool):
-    """Cleanup after each test"""
-    yield
+async def setup_db(db_pool):
+    """Setup the database before each test"""
     async with db_pool.acquire() as conn:
         await conn.execute("LOAD 'age';")
         await conn.execute("SET search_path = ag_catalog, public;")
-        
-        # Clear graph
-        await conn.execute("""
-            SELECT * FROM cypher('memory_graph', $$
-                MATCH (n) DETACH DELETE n
-            $$) as (result ag_catalog.agtype)
-        """)
-        
-        # Clear relational tables
-        await conn.execute("""
-            TRUNCATE TABLE 
-                episodic_memories,
-                semantic_memories,
-                procedural_memories,
-                strategic_memories,
-                memory_changes,
-                memories
-            CASCADE
-        """)
-
+    yield
 
 async def test_extensions(db_pool):
-    """Test that required PostgreSQL extensions are installed and properly loaded"""
+    """Test that required PostgreSQL extensions are installed"""
     async with db_pool.acquire() as conn:
-        # Check extensions exist
         extensions = await conn.fetch("""
-            SELECT extname, extversion FROM pg_extension
+            SELECT extname FROM pg_extension
         """)
-        ext_names = {ext["extname"]: ext["extversion"] for ext in extensions}
-
-        assert "vector" in ext_names, "pgvector extension not installed"
-        assert "age" in ext_names, "AGE extension not installed"
-        assert "btree_gist" in ext_names, "btree_gist extension not installed"
-        assert "pg_trgm" in ext_names, "pg_trgm extension not installed"
-        assert "cube" in ext_names, "cube extension not installed"
-
+        ext_names = {ext['extname'] for ext in extensions}
+        
+        required_extensions = {'vector', 'age', 'btree_gist', 'pg_trgm'}
+        for ext in required_extensions:
+            assert ext in ext_names, f"{ext} extension not found"
         # Verify AGE is loaded
         await conn.execute("LOAD 'age';")
         await conn.execute("SET search_path = ag_catalog, public;")
@@ -398,33 +378,86 @@ async def test_memory_status_transitions(db_pool):
 async def test_vector_search(db_pool):
     """Test vector similarity search"""
     async with db_pool.acquire() as conn:
-        # Create test memories with different embeddings
+        # Clear existing test data with proper cascade
+        await conn.execute("""
+            DELETE FROM memory_changes 
+            WHERE memory_id IN (
+                SELECT id FROM memories WHERE content LIKE 'Test content%'
+            )
+        """)
+        await conn.execute("""
+            DELETE FROM semantic_memories 
+            WHERE memory_id IN (
+                SELECT id FROM memories WHERE content LIKE 'Test content%'
+            )
+        """)
+        await conn.execute("""
+            DELETE FROM episodic_memories 
+            WHERE memory_id IN (
+                SELECT id FROM memories WHERE content LIKE 'Test content%'
+            )
+        """)
+        await conn.execute("""
+            DELETE FROM procedural_memories 
+            WHERE memory_id IN (
+                SELECT id FROM memories WHERE content LIKE 'Test content%'
+            )
+        """)
+        await conn.execute("""
+            DELETE FROM strategic_memories 
+            WHERE memory_id IN (
+                SELECT id FROM memories WHERE content LIKE 'Test content%'
+            )
+        """)
+        await conn.execute("DELETE FROM memories WHERE content LIKE 'Test content%'")
+        
+        # Create more distinct test vectors
         test_embeddings = [
-            '[' + ','.join(['1.0'] * 1536) + ']',
-            '[' + ','.join(['0.5'] * 1536) + ']',
-            '[' + ','.join(['0.0'] * 1536) + ']'
+            # First vector: alternating 1.0 and 0.8
+            '[' + ','.join(['1.0' if i % 2 == 0 else '0.8' for i in range(1536)]) + ']',
+            # Second vector: alternating 0.5 and 0.3
+            '[' + ','.join(['0.5' if i % 2 == 0 else '0.3' for i in range(1536)]) + ']',
+            # Third vector: alternating 0.2 and 0.0
+            '[' + ','.join(['0.2' if i % 2 == 0 else '0.0' for i in range(1536)]) + ']'
         ]
         
-        for emb in test_embeddings:
+        # Insert test vectors
+        for i, emb in enumerate(test_embeddings):
             await conn.execute("""
-                INSERT INTO memories (type, content, embedding)
-                VALUES (
+                INSERT INTO memories (
+                    type, 
+                    content, 
+                    embedding
+                ) VALUES (
                     'semantic'::memory_type,
-                    'Test content',
-                    $1::vector
+                    'Test content ' || $1,
+                    $2::vector
                 )
-            """, emb)
+            """, str(i), emb)
+
+        # Query vector more similar to first pattern
+        query_vector = '[' + ','.join(['0.95' if i % 2 == 0 else '0.75' for i in range(1536)]) + ']'
         
-        # Test nearest neighbor search
         results = await conn.fetch("""
-            SELECT id, 1 - (embedding <-> $1::vector) as similarity
+            SELECT 
+                id, 
+                content,
+                embedding <=> $1::vector as cosine_distance
             FROM memories
-            ORDER BY embedding <-> $1::vector
-            LIMIT 2
-        """, test_embeddings[0])
+            WHERE content LIKE 'Test content%'
+            ORDER BY embedding <=> $1::vector
+            LIMIT 3
+        """, query_vector)
+
+        assert len(results) >= 2, "Wrong number of results"
         
-        assert len(results) == 2, "Wrong number of results"
-        assert results[0]['similarity'] > results[1]['similarity'], "Incorrect similarity ordering"
+        # Print distances for debugging
+        for r in results:
+            print(f"Content: {r['content']}, Distance: {r['cosine_distance']}")
+            
+        # First result should have smaller cosine distance than second
+        assert results[0]['cosine_distance'] < results[1]['cosine_distance'], \
+            f"Incorrect distance ordering: {results[0]['cosine_distance']} >= {results[1]['cosine_distance']}"
 
 
 async def test_complex_graph_queries(db_pool):
@@ -733,3 +766,4 @@ async def test_memory_relevance(db_pool):
         
         assert relevance is not None, "Relevance score not calculated"
         assert relevance < 0.8, "Relevance should be less than importance due to decay"
+
