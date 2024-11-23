@@ -557,14 +557,16 @@ async def test_memory_storage_episodic(db_pool):
             json.dumps({"result": "success"})
         )
 
-        # Verify storage
-        count = await conn.fetchval("""
-            SELECT COUNT(*) 
+        # Verify storage including new fields
+        result = await conn.fetchrow("""
+            SELECT e.verification_status, e.event_time
             FROM memories m 
             JOIN episodic_memories e ON m.id = e.memory_id
-            WHERE m.type = 'episodic'
-        """)
-        assert count > 0, "No episodic memories stored"
+            WHERE m.type = 'episodic' AND m.id = $1
+        """, memory_id)
+        
+        assert result['verification_status'] is True, "Verification status not set"
+        assert result['event_time'] is not None, "Event time not set"
 
 
 async def test_memory_storage_semantic(db_pool):
@@ -595,8 +597,9 @@ async def test_memory_storage_semantic(db_pool):
                 source_references,
                 contradictions,
                 category,
-                related_concepts
-            ) VALUES ($1, 0.8, $2, $3, $4, $5)
+                related_concepts,
+                last_validated
+            ) VALUES ($1, 0.8, $2, $3, $4, $5, CURRENT_TIMESTAMP)
         """,
             memory_id,
             json.dumps({"source": "test"}),
@@ -605,13 +608,15 @@ async def test_memory_storage_semantic(db_pool):
             ["test_concept"]
         )
 
-        count = await conn.fetchval("""
-            SELECT COUNT(*) 
+        # Verify including new field
+        result = await conn.fetchrow("""
+            SELECT s.last_validated
             FROM memories m 
             JOIN semantic_memories s ON m.id = s.memory_id
-            WHERE m.type = 'semantic'
-        """)
-        assert count > 0, "No semantic memories stored"
+            WHERE m.type = 'semantic' AND m.id = $1
+        """, memory_id)
+        
+        assert result['last_validated'] is not None, "Last validated timestamp not set"
 
 
 async def test_memory_storage_strategic(db_pool):
@@ -766,4 +771,242 @@ async def test_memory_relevance(db_pool):
         
         assert relevance is not None, "Relevance score not calculated"
         assert relevance < 0.8, "Relevance should be less than importance due to decay"
+
+async def test_worldview_primitives(db_pool):
+    """Test worldview primitives and their influence on memories"""
+    async with db_pool.acquire() as conn:
+        # Create worldview primitive
+        worldview_id = await conn.fetchval("""
+            INSERT INTO worldview_primitives (
+                id,
+                category,
+                belief,
+                confidence,
+                emotional_valence,
+                stability_score,
+                activation_patterns,
+                memory_filter_rules,
+                influence_patterns
+            ) VALUES (
+                gen_random_uuid(),
+                'values',
+                'Test belief',
+                0.8,
+                0.5,
+                0.7,
+                '{"patterns": ["test"]}',
+                '{"filters": ["test"]}',
+                '{"influences": ["test"]}'
+            ) RETURNING id
+        """)
+        
+        # Create memory
+        memory_id = await conn.fetchval("""
+            INSERT INTO memories (
+                type,
+                content,
+                embedding
+            ) VALUES (
+                'episodic'::memory_type,
+                'Test memory for worldview',
+                array_fill(0, ARRAY[1536])::vector
+            ) RETURNING id
+        """)
+        
+        # Create influence relationship
+        await conn.execute("""
+            INSERT INTO worldview_memory_influences (
+                id,
+                worldview_id,
+                memory_id,
+                influence_type,
+                strength
+            ) VALUES (
+                gen_random_uuid(),
+                $1,
+                $2,
+                'filter',
+                0.7
+            )
+        """, worldview_id, memory_id)
+        
+        # Verify relationship
+        influence = await conn.fetchrow("""
+            SELECT * 
+            FROM worldview_memory_influences
+            WHERE worldview_id = $1 AND memory_id = $2
+        """, worldview_id, memory_id)
+        
+        assert influence is not None, "Worldview influence not created"
+        assert influence['strength'] == 0.7, "Incorrect influence strength"
+
+async def test_identity_model(db_pool):
+    """Test identity model and memory resonance"""
+    async with db_pool.acquire() as conn:
+        # Create identity aspect
+        identity_id = await conn.fetchval("""
+            INSERT INTO identity_model (
+                id,
+                self_concept,
+                agency_beliefs,
+                purpose_framework,
+                group_identifications,
+                boundary_definitions,
+                emotional_baseline,
+                threat_sensitivity,
+                change_resistance
+            ) VALUES (
+                gen_random_uuid(),
+                '{"concept": "test"}',
+                '{"agency": "high"}',
+                '{"purpose": "test"}',
+                '{"groups": ["test"]}',
+                '{"boundaries": ["test"]}',
+                '{"baseline": "neutral"}',
+                0.5,
+                0.3
+            ) RETURNING id
+        """)
+        
+        # Create memory
+        memory_id = await conn.fetchval("""
+            INSERT INTO memories (
+                type,
+                content,
+                embedding
+            ) VALUES (
+                'episodic'::memory_type,
+                'Test memory for identity',
+                array_fill(0, ARRAY[1536])::vector
+            ) RETURNING id
+        """)
+        
+        # Create resonance
+        await conn.execute("""
+            INSERT INTO identity_memory_resonance (
+                id,
+                memory_id,
+                identity_aspect,
+                resonance_strength,
+                integration_status
+            ) VALUES (
+                gen_random_uuid(),
+                $1,
+                $2,
+                0.8,
+                'integrated'
+            )
+        """, memory_id, identity_id)
+        
+        # Verify resonance
+        resonance = await conn.fetchrow("""
+            SELECT * 
+            FROM identity_memory_resonance
+            WHERE memory_id = $1 AND identity_aspect = $2
+        """, memory_id, identity_id)
+        
+        assert resonance is not None, "Identity resonance not created"
+        assert resonance['resonance_strength'] == 0.8, "Incorrect resonance strength"
+
+async def test_memory_changes_tracking(db_pool):
+    """Test comprehensive memory changes tracking"""
+    async with db_pool.acquire() as conn:
+        # Create test memory
+        memory_id = await conn.fetchval("""
+            INSERT INTO memories (
+                type,
+                content,
+                embedding,
+                importance
+            ) VALUES (
+                'semantic'::memory_type,
+                'Test tracking memory',
+                array_fill(0, ARRAY[1536])::vector,
+                0.5
+            ) RETURNING id
+        """)
+        
+        # Make various changes
+        changes = [
+            ('importance_update', 0.5, 0.7),
+            ('status_change', 'active', 'archived'),
+            ('content_update', 'Test tracking memory', 'Updated test memory')
+        ]
+        
+        for change_type, old_val, new_val in changes:
+            await conn.execute("""
+                INSERT INTO memory_changes (
+                    memory_id,
+                    change_type,
+                    old_value,
+                    new_value
+                ) VALUES (
+                    $1,
+                    $2,
+                    $3::jsonb,
+                    $4::jsonb
+                )
+            """, memory_id, change_type, 
+                json.dumps({change_type: old_val}),
+                json.dumps({change_type: new_val}))
+        
+        # Verify change history
+        history = await conn.fetch("""
+            SELECT change_type, old_value, new_value
+            FROM memory_changes
+            WHERE memory_id = $1
+            ORDER BY changed_at DESC
+        """, memory_id)
+        
+        assert len(history) == len(changes), "Not all changes were tracked"
+        assert history[0]['change_type'] == changes[-1][0], "Changes not tracked in correct order"
+
+async def test_enhanced_relevance_scoring(db_pool):
+    """Test the enhanced relevance scoring system"""
+    async with db_pool.acquire() as conn:
+        # Create test memory with specific parameters
+        memory_id = await conn.fetchval("""
+            INSERT INTO memories (
+                type,
+                content,
+                embedding,
+                importance,
+                decay_rate,
+                created_at,
+                access_count
+            ) VALUES (
+                'semantic'::memory_type,
+                'Test relevance scoring',
+                array_fill(0, ARRAY[1536])::vector,
+                0.8,
+                0.01,
+                CURRENT_TIMESTAMP - interval '1 day',
+                5
+            ) RETURNING id
+        """)
+        
+        # Get initial relevance score
+        initial_score = await conn.fetchval("""
+            SELECT relevance_score
+            FROM memories
+            WHERE id = $1
+        """, memory_id)
+        
+        # Update access count to trigger importance change
+        await conn.execute("""
+            UPDATE memories 
+            SET access_count = access_count + 1
+            WHERE id = $1
+        """, memory_id)
+        
+        # Get updated relevance score
+        updated_score = await conn.fetchval("""
+            SELECT relevance_score
+            FROM memories
+            WHERE id = $1
+        """, memory_id)
+        
+        assert initial_score is not None, "Initial relevance score not calculated"
+        assert updated_score is not None, "Updated relevance score not calculated"
+        assert updated_score != initial_score, "Relevance score should change with importance"
 

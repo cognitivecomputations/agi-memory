@@ -108,14 +108,53 @@ CREATE TABLE strategic_memories (
     CONSTRAINT valid_confidence CHECK (confidence_score >= 0 AND confidence_score <= 1)
 );
 
--- Indexes for performance (same as yours, with potential addition for working memory)
-CREATE INDEX ON memories USING ivfflat (embedding vector_cosine_ops);
-CREATE INDEX ON memories (type);
-CREATE INDEX ON memories (status);
-CREATE INDEX ON memories (importance);
-CREATE INDEX ON memories USING GIN (content gin_trgm_ops);
+-- Worldview primitives with enhanced memory interaction
+CREATE TABLE worldview_primitives (
+    id UUID PRIMARY KEY,
+    category TEXT NOT NULL, -- e.g. 'causality', 'agency', 'values', 'metaphysics'
+    belief TEXT NOT NULL,
+    confidence FLOAT,
+    emotional_valence FLOAT,
+    stability_score FLOAT, -- resistance to change
+    connected_beliefs UUID[], -- hierarchical structure
+    activation_patterns JSONB, -- what triggers this belief
+    memory_filter_rules JSONB, -- How this belief filters/colors incoming memories
+    influence_patterns JSONB -- How it affects memory formation/recall
+);
 
--- Temporal tracking (same as yours)
+-- Track how worldview affects memory interpretation
+CREATE TABLE worldview_memory_influences (
+    id UUID PRIMARY KEY,
+    worldview_id UUID REFERENCES worldview_primitives(id),
+    memory_id UUID REFERENCES memories(id),
+    influence_type TEXT, -- e.g. 'filter', 'enhance', 'suppress'
+    strength FLOAT,
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Enhanced identity model with emotional groundings
+CREATE TABLE identity_model (
+    id UUID PRIMARY KEY,
+    self_concept JSONB,
+    agency_beliefs JSONB,
+    purpose_framework JSONB,
+    group_identifications JSONB,
+    boundary_definitions JSONB,
+    emotional_baseline JSONB, -- Default emotional states
+    threat_sensitivity FLOAT, -- How easily threatened is identity
+    change_resistance FLOAT -- How strongly it maintains consistency
+);
+
+-- Bridge between memories and identity
+CREATE TABLE identity_memory_resonance (
+    id UUID PRIMARY KEY,
+    memory_id UUID REFERENCES memories(id),
+    identity_aspect UUID REFERENCES identity_model(id),
+    resonance_strength FLOAT, -- How strongly memory affects identity
+    integration_status TEXT -- How well integrated into self-concept
+);
+
+-- Temporal tracking
 CREATE TABLE memory_changes (
     change_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     memory_id UUID REFERENCES memories(id),
@@ -124,6 +163,14 @@ CREATE TABLE memory_changes (
     old_value JSONB,
     new_value JSONB
 );
+
+-- Indexes for performance (same as yours, with potential addition for working memory)
+CREATE INDEX ON memories USING ivfflat (embedding vector_cosine_ops);
+CREATE INDEX ON memories (status);
+CREATE INDEX ON memories USING GIN (content gin_trgm_ops);
+CREATE INDEX ON memories (relevance_score DESC) WHERE status = 'active';  -- Filtered relevance queries
+CREATE INDEX ON worldview_memory_influences (memory_id, strength DESC);  -- Memory formation filtering
+CREATE INDEX ON identity_memory_resonance (memory_id, resonance_strength DESC);  -- Identity influence
 
 -- Functions for memory management
 
@@ -202,6 +249,8 @@ WHERE m.status = 'active'
 ORDER BY 
     p.success_rate DESC,
     m.importance DESC;
+
+
 
 -- Scheduled tasks (conceptual, not SQL)
 
