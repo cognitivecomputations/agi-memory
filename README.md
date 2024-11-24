@@ -14,6 +14,8 @@ This system provides a comprehensive memory management solution for AGI applicat
 - Working memory system
 - Memory consolidation mechanisms
 
+https://notebooklm.google.com/notebook/528f67f0-f1c2-4829-bdd3-128168a3aaca/audio
+
 ## Architecture
 
 ### Memory Types
