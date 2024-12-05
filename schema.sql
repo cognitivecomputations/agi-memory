@@ -193,21 +193,35 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- Function to create memory relationship in graph (same as yours)
+-- Function to create memory relationship in graph
 CREATE OR REPLACE FUNCTION create_memory_relationship(
     from_id UUID,
     to_id UUID,
     relationship_type TEXT,
     properties JSONB DEFAULT '{}'
 ) RETURNS VOID AS $func$
+DECLARE
+    cypher_query TEXT;
 BEGIN
-    PERFORM * FROM cypher('memory_graph', $cypher$
-        MATCH (a:MemoryNode {memory_id: $1}), (b:MemoryNode {memory_id: $2})
-        CREATE (a)-[r:$3]->(b)
-        SET r = $4
-    $cypher$, 
-        ARRAY[from_id::text, to_id::text, relationship_type, properties::text]
-    ) as (result agtype);
+    -- Build the cypher query with proper escaping and casting
+    cypher_query := format(
+        $q$SELECT * FROM cypher('memory_graph', $$
+            MATCH (a:MemoryNode), (b:MemoryNode)
+            WHERE a.memory_id = '%s' AND b.memory_id = '%s'
+            CREATE (a)-[r:%s {%s}]->(b)
+            RETURN r
+        $$) as (result agtype)$q$,
+        from_id,
+        to_id,
+        relationship_type,
+        (
+            SELECT string_agg(format('%I: %s', key, value), ', ')
+            FROM jsonb_each(properties)
+        )
+    );
+
+    -- Execute the cypher query
+    EXECUTE cypher_query;
 END;
 $func$ LANGUAGE plpgsql;
 

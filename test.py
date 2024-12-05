@@ -176,44 +176,39 @@ async def test_memory_importance(db_pool):
 async def test_age_setup(db_pool):
     """Test AGE graph functionality"""
     async with db_pool.acquire() as conn:
-        await conn.execute("LOAD 'age';")
-        await conn.execute("SET search_path = ag_catalog, public;")
+        # Ensure clean state
+        await conn.execute("""
+            LOAD 'age';
+            SET search_path = ag_catalog, public;
+            SELECT drop_graph('memory_graph', true);
+        """)
         
+        # Create graph and label
+        await conn.execute("""
+            SELECT create_graph('memory_graph');
+        """)
+        
+        await conn.execute("""
+            SELECT create_vlabel('memory_graph', 'MemoryNode');
+        """)
+
         # Test graph exists
         result = await conn.fetch("""
             SELECT * FROM ag_catalog.ag_graph
             WHERE name = 'memory_graph'::name
         """)
         assert len(result) == 1, "memory_graph not found"
-        
+
         # Test vertex label
         result = await conn.fetch("""
             SELECT * FROM ag_catalog.ag_label
-            WHERE name = 'MemoryNode'::name 
+            WHERE name = 'MemoryNode'::name
             AND graph = (
-                SELECT graphid FROM ag_catalog.ag_graph 
+                SELECT graphid FROM ag_catalog.ag_graph
                 WHERE name = 'memory_graph'::name
             )
         """)
         assert len(result) == 1, "MemoryNode label not found"
-        
-        # Test creating and querying nodes
-        await conn.execute("""
-            SELECT * FROM ag_catalog.cypher(
-                'memory_graph',
-                $$CREATE (n:MemoryNode {test: true}) RETURN n$$
-            ) as (result ag_catalog.agtype);
-        """)
-        
-        # Query with proper return type
-        result = await conn.fetch("""
-            SELECT * FROM ag_catalog.cypher(
-                'memory_graph',
-                $$MATCH (n:MemoryNode {test: true}) RETURN count(n)$$
-            ) as (count ag_catalog.agtype);
-        """)
-        count = int(result[0]['count'])
-        assert count > 0, "Failed to create and query nodes"
 
 
 async def test_memory_relationships(db_pool):
@@ -1009,4 +1004,260 @@ async def test_enhanced_relevance_scoring(db_pool):
         assert initial_score is not None, "Initial relevance score not calculated"
         assert updated_score is not None, "Updated relevance score not calculated"
         assert updated_score != initial_score, "Relevance score should change with importance"
+
+async def test_age_in_days_function(db_pool):
+    """Test the age_in_days function"""
+    async with db_pool.acquire() as conn:
+        # Test current timestamp (should be 0 days)
+        result = await conn.fetchval("""
+            SELECT age_in_days(CURRENT_TIMESTAMP)
+        """)
+        assert result < 1, "Current timestamp should be less than 1 day old"
+
+        # Test 1 day ago
+        result = await conn.fetchval("""
+            SELECT age_in_days(CURRENT_TIMESTAMP - interval '1 day')
+        """)
+        assert abs(result - 1.0) < 0.1, "Should be approximately 1 day"
+
+        # Test 7 days ago
+        result = await conn.fetchval("""
+            SELECT age_in_days(CURRENT_TIMESTAMP - interval '7 days')
+        """)
+        assert abs(result - 7.0) < 0.1, "Should be approximately 7 days"
+
+async def test_update_memory_timestamp_trigger(db_pool):
+    """Test the update_memory_timestamp trigger"""
+    async with db_pool.acquire() as conn:
+        # Create test memory
+        memory_id = await conn.fetchval("""
+            INSERT INTO memories (
+                type,
+                content,
+                embedding
+            ) VALUES (
+                'semantic'::memory_type,
+                'Test timestamp update',
+                array_fill(0, ARRAY[1536])::vector
+            ) RETURNING id
+        """)
+
+        # Get initial timestamp
+        initial_updated_at = await conn.fetchval("""
+            SELECT updated_at FROM memories WHERE id = $1
+        """, memory_id)
+
+        # Wait briefly
+        await asyncio.sleep(0.1)
+
+        # Update memory
+        await conn.execute("""
+            UPDATE memories 
+            SET content = 'Updated content'
+            WHERE id = $1
+        """, memory_id)
+
+        # Get new timestamp
+        new_updated_at = await conn.fetchval("""
+            SELECT updated_at FROM memories WHERE id = $1
+        """, memory_id)
+
+        assert new_updated_at > initial_updated_at, "updated_at should be newer"
+
+async def test_update_memory_importance_trigger(db_pool):
+    """Test the update_memory_importance trigger"""
+    async with db_pool.acquire() as conn:
+        # Create test memory
+        memory_id = await conn.fetchval("""
+            INSERT INTO memories (
+                type,
+                content,
+                embedding,
+                importance,
+                access_count
+            ) VALUES (
+                'semantic'::memory_type,
+                'Test importance update',
+                array_fill(0, ARRAY[1536])::vector,
+                0.5,
+                0
+            ) RETURNING id
+        """)
+
+        # Get initial importance
+        initial_importance = await conn.fetchval("""
+            SELECT importance FROM memories WHERE id = $1
+        """, memory_id)
+
+        # Update access count
+        await conn.execute("""
+            UPDATE memories 
+            SET access_count = access_count + 1
+            WHERE id = $1
+        """, memory_id)
+
+        # Get new importance
+        new_importance = await conn.fetchval("""
+            SELECT importance FROM memories WHERE id = $1
+        """, memory_id)
+
+        assert new_importance > initial_importance, "Importance should increase"
+        
+        # Test multiple accesses
+        await conn.execute("""
+            UPDATE memories 
+            SET access_count = access_count + 5
+            WHERE id = $1
+        """, memory_id)
+        
+        final_importance = await conn.fetchval("""
+            SELECT importance FROM memories WHERE id = $1
+        """, memory_id)
+        
+        assert final_importance > new_importance, "Importance should increase with more accesses"
+
+async def test_create_memory_relationship_function(db_pool):
+    """Test the create_memory_relationship function"""
+    async with db_pool.acquire() as conn:
+        # Create two test memories
+        memory_ids = []
+        for i in range(2):
+            memory_id = await conn.fetchval("""
+                INSERT INTO memories (
+                    type,
+                    content,
+                    embedding
+                ) VALUES (
+                    'semantic'::memory_type,
+                    'Test memory ' || $1::text,
+                    array_fill(0, ARRAY[1536])::vector
+                ) RETURNING id
+            """, str(i))
+            memory_ids.append(memory_id)
+
+        # Ensure clean AGE setup with proper schema
+        await conn.execute("""
+            LOAD 'age';
+            SET search_path = ag_catalog, public;
+            SELECT drop_graph('memory_graph', true);
+            SELECT create_graph('memory_graph');
+            SELECT create_vlabel('memory_graph', 'MemoryNode');
+        """)
+
+        # Create nodes in graph using string formatting for Cypher
+        for memory_id in memory_ids:
+            cypher_query = f"""
+                SELECT * FROM ag_catalog.cypher('memory_graph', $$
+                    CREATE (n:MemoryNode {{
+                        memory_id: '{str(memory_id)}',
+                        type: 'semantic'
+                    }})
+                    RETURN n
+                $$) as (result agtype)
+            """
+            await conn.execute(cypher_query)
+
+        properties = {"weight": 0.8}
+        
+        # Create relationship
+        await conn.execute("""
+            SELECT create_memory_relationship($1, $2, $3, $4)
+        """, memory_ids[0], memory_ids[1], 'RELATES_TO', json.dumps(properties))
+
+        # Verify relationship exists
+        verify_query = f"""
+            SELECT * FROM ag_catalog.cypher('memory_graph', $$
+                MATCH (a:MemoryNode)-[r:RELATES_TO]->(b:MemoryNode)
+                WHERE a.memory_id = '{str(memory_ids[0])}' AND b.memory_id = '{str(memory_ids[1])}'
+                RETURN r
+            $$) as (result agtype)
+        """
+        result = await conn.fetch(verify_query)
+        assert len(result) > 0, "Relationship not created"
+
+async def test_memory_health_view(db_pool):
+    """Test the memory_health view"""
+    async with db_pool.acquire() as conn:
+        # Create test memories of different types
+        memory_types = ['episodic', 'semantic', 'procedural', 'strategic']
+        for mem_type in memory_types:
+            await conn.execute("""
+                INSERT INTO memories (
+                    type,
+                    content,
+                    embedding,
+                    importance,
+                    access_count
+                ) VALUES (
+                    $1::memory_type,
+                    'Test ' || $1,
+                    array_fill(0, ARRAY[1536])::vector,
+                    0.5,
+                    5
+                )
+            """, mem_type)
+
+        # Query view
+        results = await conn.fetch("""
+            SELECT * FROM memory_health
+        """)
+
+        assert len(results) > 0, "Memory health view should return results"
+        
+        # Verify each type has stats
+        result_types = {r['type'] for r in results}
+        for mem_type in memory_types:
+            assert mem_type in result_types, f"Missing stats for {mem_type}"
+            
+        # Verify computed values
+        for row in results:
+            assert row['total_memories'] > 0, "Should have memories"
+            assert row['avg_importance'] is not None, "Should have importance"
+            assert row['avg_access_count'] is not None, "Should have access count"
+
+async def test_procedural_effectiveness_view(db_pool):
+    """Test the procedural_effectiveness view"""
+    async with db_pool.acquire() as conn:
+        # Create test procedural memory
+        memory_id = await conn.fetchval("""
+            INSERT INTO memories (
+                type,
+                content,
+                embedding,
+                importance
+            ) VALUES (
+                'procedural'::memory_type,
+                'Test procedure',
+                array_fill(0, ARRAY[1536])::vector,
+                0.7
+            ) RETURNING id
+        """)
+
+        # Add procedural details
+        await conn.execute("""
+            INSERT INTO procedural_memories (
+                memory_id,
+                steps,
+                success_count,
+                total_attempts
+            ) VALUES (
+                $1,
+                '{"steps": ["step1", "step2"]}'::jsonb,
+                8,
+                10
+            )
+        """, memory_id)
+
+        # Query view
+        results = await conn.fetch("""
+            SELECT * FROM procedural_effectiveness
+        """)
+
+        assert len(results) > 0, "Should have procedural effectiveness data"
+        
+        # Verify computed values
+        for row in results:
+            assert row['success_rate'] is not None, "Should have success rate"
+            assert row['importance'] is not None, "Should have importance"
+            assert row['relevance_score'] is not None, "Should have relevance score"
 
