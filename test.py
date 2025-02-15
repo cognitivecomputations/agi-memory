@@ -10,7 +10,7 @@ pytestmark = pytest.mark.asyncio(loop_scope="session")
 async def db_pool():
     """Create a connection pool for testing"""
     pool = await asyncpg.create_pool(
-        "postgresql://agi_user:agi_password@localhost:5432/agi_db",
+        "postgresql://agi_user:agi_password!QAZ@localhost:5432/agi_db",
         ssl=False,
         min_size=2,
         max_size=20,

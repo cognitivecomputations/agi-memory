@@ -57,3 +57,5 @@ logs/
 # Misc
 .cache/
 .tmp/
+.env
+.venv
