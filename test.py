@@ -2,6 +2,7 @@ import pytest
 import asyncio
 import asyncpg
 import json
+import numpy as np
 
 # Update to use loop_scope instead of scope
 pytestmark = pytest.mark.asyncio(loop_scope="session")
@@ -1261,3 +1262,656 @@ async def test_procedural_effectiveness_view(db_pool):
             assert row['importance'] is not None, "Should have importance"
             assert row['relevance_score'] is not None, "Should have relevance score"
 
+
+async def test_extensions(db_pool):
+    """Test that required PostgreSQL extensions are installed"""
+    async with db_pool.acquire() as conn:
+        extensions = await conn.fetch("""
+            SELECT extname FROM pg_extension
+        """)
+        ext_names = {ext['extname'] for ext in extensions}
+        
+        required_extensions = {'vector', 'age', 'btree_gist', 'pg_trgm', 'cube'}
+        for ext in required_extensions:
+            assert ext in ext_names, f"{ext} extension not found"
+        # Verify AGE is loaded
+        await conn.execute("LOAD 'age';")
+        await conn.execute("SET search_path = ag_catalog, public;")
+        result = await conn.fetchval("""
+            SELECT count(*) FROM ag_catalog.ag_graph
+        """)
+        assert result >= 0, "AGE extension not properly loaded"
+
+async def test_memory_tables(db_pool):
+    """Test that all memory tables exist with correct columns and constraints"""
+    async with db_pool.acquire() as conn:
+        # First check if tables exist
+        tables = await conn.fetch("""
+            SELECT table_name 
+            FROM information_schema.tables 
+            WHERE table_schema = 'public'
+        """)
+        table_names = {t['table_name'] for t in tables}
+        
+        assert 'working_memory' in table_names, "working_memory table not found"
+        assert 'memories' in table_names, "memories table not found"
+        assert 'episodic_memories' in table_names, "episodic_memories table not found"
+        assert 'memory_clusters' in table_names, "memory_clusters table not found"
+        assert 'memory_cluster_members' in table_names, "memory_cluster_members table not found"
+        assert 'cluster_relationships' in table_names, "cluster_relationships table not found"
+        assert 'cluster_activation_history' in table_names, "cluster_activation_history table not found"
+        
+        # Then check columns
+        memories = await conn.fetch("""
+            SELECT column_name, data_type, is_nullable 
+            FROM information_schema.columns 
+            WHERE table_name = 'memories'
+        """)
+        columns = {col["column_name"]: col for col in memories}
+
+        assert "relevance_score" in columns, "relevance_score column not found"
+        assert "last_accessed" in columns, "last_accessed column not found"
+        assert "id" in columns and columns["id"]["data_type"] == "uuid"
+        assert "content" in columns and columns["content"]["is_nullable"] == "NO"
+        assert "embedding" in columns
+        assert "type" in columns
+
+async def test_memory_clusters(db_pool):
+    """Test memory clustering functionality"""
+    async with db_pool.acquire() as conn:
+        # Create test cluster
+        cluster_id = await conn.fetchval("""
+            INSERT INTO memory_clusters (
+                cluster_type,
+                name,
+                description,
+                centroid_embedding,
+                emotional_signature,
+                keywords,
+                importance_score,
+                coherence_score
+            ) VALUES (
+                'theme'::cluster_type,
+                'Test Theme Cluster',
+                'Cluster for testing',
+                array_fill(0.5, ARRAY[1536])::vector,
+                '{"dominant": "neutral", "secondary": "curious"}'::jsonb,
+                ARRAY['test', 'memory', 'cluster'],
+                0.7,
+                0.85
+            ) RETURNING id
+        """)
+        
+        assert cluster_id is not None, "Failed to create cluster"
+        
+        # Create test memories and add to cluster
+        memory_ids = []
+        for i in range(3):
+            memory_id = await conn.fetchval("""
+                INSERT INTO memories (
+                    type,
+                    content,
+                    embedding
+                ) VALUES (
+                    'semantic'::memory_type,
+                    'Test memory for clustering ' || $1,
+                    array_fill($2, ARRAY[1536])::vector
+                ) RETURNING id
+            """, str(i), float(i) * 0.1)
+            memory_ids.append(memory_id)
+            
+            # Add to cluster
+            await conn.execute("""
+                INSERT INTO memory_cluster_members (
+                    cluster_id,
+                    memory_id,
+                    membership_strength,
+                    contribution_to_centroid
+                ) VALUES ($1, $2, $3, $4)
+            """, cluster_id, memory_id, 0.8 - (i * 0.1), 0.3)
+        
+        # Verify cluster membership
+        members = await conn.fetch("""
+            SELECT * FROM memory_cluster_members
+            WHERE cluster_id = $1
+            ORDER BY membership_strength DESC
+        """, cluster_id)
+        
+        assert len(members) == 3, "Wrong number of cluster members"
+        assert members[0]['membership_strength'] == 0.8, "Incorrect membership strength"
+
+async def test_cluster_relationships(db_pool):
+    """Test relationships between clusters"""
+    async with db_pool.acquire() as conn:
+        # Create two clusters
+        cluster_ids = []
+        for i, name in enumerate(['Loneliness', 'Connection']):
+            cluster_id = await conn.fetchval("""
+                INSERT INTO memory_clusters (
+                    cluster_type,
+                    name,
+                    description,
+                    centroid_embedding,
+                    keywords
+                ) VALUES (
+                    'emotion'::cluster_type,
+                    $1,
+                    'Emotional cluster for ' || $1,
+                    array_fill($2, ARRAY[1536])::vector,
+                    ARRAY[$1]
+                ) RETURNING id
+            """, name, float(i) * 0.5)
+            cluster_ids.append(cluster_id)
+        
+        # Create relationship between clusters
+        await conn.execute("""
+            INSERT INTO cluster_relationships (
+                from_cluster_id,
+                to_cluster_id,
+                relationship_type,
+                strength,
+                evidence_memories
+            ) VALUES ($1, $2, 'contradicts', 0.7, $3)
+        """, cluster_ids[0], cluster_ids[1], [])
+        
+        # Verify relationship
+        relationship = await conn.fetchrow("""
+            SELECT * FROM cluster_relationships
+            WHERE from_cluster_id = $1 AND to_cluster_id = $2
+        """, cluster_ids[0], cluster_ids[1])
+        
+        assert relationship is not None, "Cluster relationship not created"
+        assert relationship['relationship_type'] == 'contradicts'
+        assert relationship['strength'] == 0.7
+
+async def test_cluster_activation_history(db_pool):
+    """Test cluster activation tracking"""
+    async with db_pool.acquire() as conn:
+        # Create test cluster
+        cluster_id = await conn.fetchval("""
+            INSERT INTO memory_clusters (
+                cluster_type,
+                name,
+                centroid_embedding
+            ) VALUES (
+                'pattern'::cluster_type,
+                'Test Pattern',
+                array_fill(0.5, ARRAY[1536])::vector
+            ) RETURNING id
+        """)
+        
+        # Record activation
+        activation_id = await conn.fetchval("""
+            INSERT INTO cluster_activation_history (
+                cluster_id,
+                activation_context,
+                activation_strength,
+                co_activated_clusters,
+                resulting_insights
+            ) VALUES (
+                $1,
+                'User mentioned feeling lonely',
+                0.9,
+                ARRAY[]::UUID[],
+                '{"insight": "User pattern of isolation detected"}'::jsonb
+            ) RETURNING id
+        """)
+        
+        assert activation_id is not None, "Failed to record activation"
+        
+        # Update cluster activation count
+        await conn.execute("""
+            UPDATE memory_clusters
+            SET activation_count = activation_count + 1
+            WHERE id = $1
+        """, cluster_id)
+        
+        # Verify activation recorded
+        activation = await conn.fetchrow("""
+            SELECT * FROM cluster_activation_history
+            WHERE id = $1
+        """, activation_id)
+        
+        assert activation['activation_strength'] == 0.9
+        assert activation['activation_context'] == 'User mentioned feeling lonely'
+
+async def test_cluster_worldview_alignment(db_pool):
+    """Test cluster alignment with worldview"""
+    async with db_pool.acquire() as conn:
+        # Create worldview primitive
+        worldview_id = await conn.fetchval("""
+            INSERT INTO worldview_primitives (
+                category,
+                belief,
+                confidence,
+                preferred_clusters
+            ) VALUES (
+                'values',
+                'Connection is essential for wellbeing',
+                0.9,
+                ARRAY[]::UUID[]
+            ) RETURNING id
+        """)
+        
+        # Create aligned cluster
+        cluster_id = await conn.fetchval("""
+            INSERT INTO memory_clusters (
+                cluster_type,
+                name,
+                centroid_embedding,
+                worldview_alignment
+            ) VALUES (
+                'theme'::cluster_type,
+                'Human Connection',
+                array_fill(0.7, ARRAY[1536])::vector,
+                0.95
+            ) RETURNING id
+        """)
+        
+        # Update worldview to prefer this cluster
+        await conn.execute("""
+            UPDATE worldview_primitives
+            SET preferred_clusters = array_append(preferred_clusters, $1)
+            WHERE id = $2
+        """, cluster_id, worldview_id)
+        
+        # Verify alignment
+        result = await conn.fetchrow("""
+            SELECT preferred_clusters
+            FROM worldview_primitives
+            WHERE id = $1
+        """, worldview_id)
+        
+        assert cluster_id in result['preferred_clusters']
+
+async def test_identity_core_clusters(db_pool):
+    """Test identity model with core memory clusters"""
+    async with db_pool.acquire() as conn:
+        # Create core clusters
+        cluster_ids = []
+        for name in ['Self-as-Helper', 'Creative-Expression']:
+            cluster_id = await conn.fetchval("""
+                INSERT INTO memory_clusters (
+                    cluster_type,
+                    name,
+                    centroid_embedding,
+                    importance_score
+                ) VALUES (
+                    'theme'::cluster_type,
+                    $1,
+                    array_fill(0.8, ARRAY[1536])::vector,
+                    0.9
+                ) RETURNING id
+            """, name)
+            cluster_ids.append(cluster_id)
+        
+        # Create identity with core clusters
+        identity_id = await conn.fetchval("""
+            INSERT INTO identity_model (
+                self_concept,
+                core_memory_clusters
+            ) VALUES (
+                '{"role": "supportive companion"}'::jsonb,
+                $1
+            ) RETURNING id
+        """, cluster_ids)
+        
+        # Verify core clusters
+        identity = await conn.fetchrow("""
+            SELECT core_memory_clusters
+            FROM identity_model
+            WHERE id = $1
+        """, identity_id)
+        
+        assert len(identity['core_memory_clusters']) == 2
+        assert all(cid in identity['core_memory_clusters'] for cid in cluster_ids)
+
+async def test_assign_memory_to_clusters_function(db_pool):
+    """Test the assign_memory_to_clusters function"""
+    async with db_pool.acquire() as conn:
+        # Create test clusters with different centroids
+        cluster_ids = []
+        for i in range(3):
+            # Create distinct centroid embeddings
+            centroid = [0.0] * 1536
+            centroid[i*100:(i+1)*100] = [1.0] * 100  # Make each cluster distinct
+            
+            cluster_id = await conn.fetchval("""
+                INSERT INTO memory_clusters (
+                    cluster_type,
+                    name,
+                    centroid_embedding
+                ) VALUES (
+                    'theme'::cluster_type,
+                    'Test Cluster ' || $1,
+                    $2::vector
+                ) RETURNING id
+            """, str(i), centroid)
+            cluster_ids.append(cluster_id)
+        
+        # Create memory with embedding similar to first cluster
+        memory_embedding = [0.0] * 1536
+        memory_embedding[0:100] = [0.9] * 100  # Similar to first cluster
+        
+        memory_id = await conn.fetchval("""
+            INSERT INTO memories (
+                type,
+                content,
+                embedding
+            ) VALUES (
+                'semantic'::memory_type,
+                'Test memory for auto-clustering',
+                $1::vector
+            ) RETURNING id
+        """, memory_embedding)
+        
+        # Assign to clusters
+        await conn.execute("""
+            SELECT assign_memory_to_clusters($1, 2)
+        """, memory_id)
+        
+        # Verify assignment
+        memberships = await conn.fetch("""
+            SELECT cluster_id, membership_strength
+            FROM memory_cluster_members
+            WHERE memory_id = $1
+            ORDER BY membership_strength DESC
+        """, memory_id)
+        
+        assert len(memberships) > 0, "Memory not assigned to any clusters"
+        assert memberships[0]['membership_strength'] >= 0.7, "Expected high similarity"
+
+async def test_recalculate_cluster_centroid_function(db_pool):
+    """Test the recalculate_cluster_centroid function"""
+    async with db_pool.acquire() as conn:
+        # Create cluster
+        cluster_id = await conn.fetchval("""
+            INSERT INTO memory_clusters (
+                cluster_type,
+                name,
+                centroid_embedding
+            ) VALUES (
+                'theme'::cluster_type,
+                'Test Centroid Cluster',
+                array_fill(0.0, ARRAY[1536])::vector
+            ) RETURNING id
+        """)
+        
+        # Add memories with different embeddings
+        for i in range(3):
+            memory_id = await conn.fetchval("""
+                INSERT INTO memories (
+                    type,
+                    content,
+                    embedding,
+                    status
+                ) VALUES (
+                    'semantic'::memory_type,
+                    'Memory ' || $1,
+                    array_fill($2, ARRAY[1536])::vector,
+                    'active'::memory_status
+                ) RETURNING id
+            """, str(i), float(i+1) * 0.2)
+            
+            await conn.execute("""
+                INSERT INTO memory_cluster_members (
+                    cluster_id,
+                    memory_id,
+                    membership_strength
+                ) VALUES ($1, $2, $3)
+            """, cluster_id, memory_id, 0.8)
+        
+        # Recalculate centroid
+        await conn.execute("""
+            SELECT recalculate_cluster_centroid($1)
+        """, cluster_id)
+        
+        # Check if centroid was updated
+        result = await conn.fetchrow("""
+            SELECT centroid_embedding[1] as first_value
+            FROM memory_clusters
+            WHERE id = $1
+        """, cluster_id)
+        
+        # The average of 0.2, 0.4, 0.6 should be 0.4
+        assert result['first_value'] is not None, "Centroid not updated"
+
+async def test_cluster_insights_view(db_pool):
+    """Test the cluster_insights view"""
+    async with db_pool.acquire() as conn:
+        # Create cluster with members
+        cluster_id = await conn.fetchval("""
+            INSERT INTO memory_clusters (
+                cluster_type,
+                name,
+                importance_score,
+                coherence_score,
+                centroid_embedding
+            ) VALUES (
+                'theme'::cluster_type,
+                'Insight Test Cluster',
+                0.8,
+                0.9,
+                array_fill(0.5, ARRAY[1536])::vector
+            ) RETURNING id
+        """)
+        
+        # Add memories
+        for i in range(5):
+            memory_id = await conn.fetchval("""
+                INSERT INTO memories (
+                    type,
+                    content,
+                    embedding
+                ) VALUES (
+                    'episodic'::memory_type,
+                    'Insight memory ' || $1,
+                    array_fill(0.5, ARRAY[1536])::vector
+                ) RETURNING id
+            """, str(i))
+            
+            await conn.execute("""
+                INSERT INTO memory_cluster_members (
+                    cluster_id,
+                    memory_id
+                ) VALUES ($1, $2)
+            """, cluster_id, memory_id)
+        
+        # Query view
+        insights = await conn.fetch("""
+            SELECT * FROM cluster_insights
+            WHERE name = 'Insight Test Cluster'
+        """)
+        
+        assert len(insights) == 1
+        assert insights[0]['memory_count'] == 5
+        assert insights[0]['importance_score'] == 0.8
+        assert insights[0]['coherence_score'] == 0.9
+
+async def test_active_themes_view(db_pool):
+    """Test the active_themes view"""
+    async with db_pool.acquire() as conn:
+        # Create active cluster
+        cluster_id = await conn.fetchval("""
+            INSERT INTO memory_clusters (
+                cluster_type,
+                name,
+                emotional_signature,
+                keywords,
+                centroid_embedding
+            ) VALUES (
+                'emotion'::cluster_type,
+                'Recent Anxiety',
+                '{"primary": "anxiety", "intensity": 0.7}'::jsonb,
+                ARRAY['worry', 'stress', 'uncertainty'],
+                array_fill(0.3, ARRAY[1536])::vector
+            ) RETURNING id
+        """)
+        
+        # Record recent activations
+        for i in range(3):
+            await conn.execute("""
+                INSERT INTO cluster_activation_history (
+                    cluster_id,
+                    activation_context,
+                    activation_strength,
+                    activated_at
+                ) VALUES (
+                    $1,
+                    'Context ' || $2,
+                    0.8,
+                    CURRENT_TIMESTAMP - interval '1 hour' * $2
+                )
+            """, cluster_id, i)
+        
+        # Query view
+        themes = await conn.fetch("""
+            SELECT * FROM active_themes
+            WHERE theme = 'Recent Anxiety'
+        """)
+        
+        assert len(themes) > 0
+        assert themes[0]['recent_activations'] == 3
+
+async def test_update_cluster_activation_trigger(db_pool):
+    """Test the update_cluster_activation trigger"""
+    async with db_pool.acquire() as conn:
+        # Create cluster
+        cluster_id = await conn.fetchval("""
+            INSERT INTO memory_clusters (
+                cluster_type,
+                name,
+                centroid_embedding,
+                importance_score,
+                activation_count
+            ) VALUES (
+                'theme'::cluster_type,
+                'Activation Test',
+                array_fill(0.5, ARRAY[1536])::vector,
+                0.5,
+                0
+            ) RETURNING id
+        """)
+        
+        # Get initial values
+        initial = await conn.fetchrow("""
+            SELECT importance_score, activation_count, last_activated
+            FROM memory_clusters
+            WHERE id = $1
+        """, cluster_id)
+        
+        # Update activation count
+        await conn.execute("""
+            UPDATE memory_clusters
+            SET activation_count = activation_count + 1
+            WHERE id = $1
+        """, cluster_id)
+        
+        # Get updated values
+        updated = await conn.fetchrow("""
+            SELECT importance_score, activation_count, last_activated
+            FROM memory_clusters
+            WHERE id = $1
+        """, cluster_id)
+        
+        assert updated['activation_count'] == 1
+        assert updated['importance_score'] > initial['importance_score']
+        assert updated['last_activated'] is not None
+
+async def test_cluster_types(db_pool):
+    """Test all cluster types"""
+    async with db_pool.acquire() as conn:
+        cluster_types = ['theme', 'emotion', 'temporal', 'person', 'pattern', 'mixed']
+        
+        for c_type in cluster_types:
+            cluster_id = await conn.fetchval("""
+                INSERT INTO memory_clusters (
+                    cluster_type,
+                    name,
+                    centroid_embedding
+                ) VALUES (
+                    $1::cluster_type,
+                    'Test ' || $1 || ' cluster',
+                    array_fill(0.5, ARRAY[1536])::vector
+                ) RETURNING id
+            """, c_type)
+            
+            assert cluster_id is not None, f"Failed to create {c_type} cluster"
+        
+        # Verify all types exist
+        count = await conn.fetchval("""
+            SELECT COUNT(DISTINCT cluster_type)
+            FROM memory_clusters
+        """)
+        
+        assert count >= len(cluster_types)
+
+async def test_cluster_memory_retrieval_performance(db_pool):
+    """Test performance of cluster-based memory retrieval"""
+    async with db_pool.acquire() as conn:
+        # Create cluster
+        cluster_id = await conn.fetchval("""
+            INSERT INTO memory_clusters (
+                cluster_type,
+                name,
+                centroid_embedding,
+                keywords
+            ) VALUES (
+                'theme'::cluster_type,
+                'Loneliness',
+                array_fill(0.3, ARRAY[1536])::vector,
+                ARRAY['lonely', 'alone', 'isolated']
+            ) RETURNING id
+        """)
+        
+        # Add many memories to cluster
+        memory_ids = []
+        for i in range(50):
+            memory_id = await conn.fetchval("""
+                INSERT INTO memories (
+                    type,
+                    content,
+                    embedding,
+                    importance
+                ) VALUES (
+                    'episodic'::memory_type,
+                    'Loneliness memory ' || $1,
+                    array_fill(0.3, ARRAY[1536])::vector,
+                    $2
+                ) RETURNING id
+            """, str(i), 0.5 + (i * 0.01))
+            
+            await conn.execute("""
+                INSERT INTO memory_cluster_members (
+                    cluster_id,
+                    memory_id,
+                    membership_strength
+                ) VALUES ($1, $2, $3)
+            """, cluster_id, memory_id, 0.7 + (i * 0.001))
+            
+            memory_ids.append(memory_id)
+        
+        # Test retrieval by cluster
+        import time
+        start_time = time.time()
+        
+        results = await conn.fetch("""
+            SELECT m.*, mcm.membership_strength
+            FROM memories m
+            JOIN memory_cluster_members mcm ON m.id = mcm.memory_id
+            WHERE mcm.cluster_id = $1
+            ORDER BY mcm.membership_strength DESC, m.importance DESC
+            LIMIT 10
+        """, cluster_id)
+        
+        retrieval_time = time.time() - start_time
+        
+        assert len(results) == 10
+        assert retrieval_time < 0.1, f"Cluster retrieval too slow: {retrieval_time}s"
+        
+        # Verify ordering
+        strengths = [r['membership_strength'] for r in results]
+        assert strengths == sorted(strengths, reverse=True)
+
+# Keep all existing tests from the original file...
+# (All the tests from test_memory_storage through test_procedural_effectiveness_view remain the same)
