@@ -304,7 +304,7 @@ BEGIN
     FOR cluster_record IN 
         SELECT id, 1 - (centroid_embedding <=> memory_embedding) as similarity
         FROM memory_clusters
-        WHERE status = 'active'
+        WHERE centroid_embedding IS NOT NULL
         ORDER BY centroid_embedding <=> memory_embedding
         LIMIT 10
     LOOP
@@ -404,7 +404,7 @@ SELECT
     mc.emotional_signature,
     mc.keywords,
     count(DISTINCT mch.id) as recent_activations,
-    array_agg(DISTINCT mch.co_activated_clusters) as associated_themes
+    array_agg(DISTINCT mch.co_activated_clusters) FILTER (WHERE mch.co_activated_clusters IS NOT NULL) as associated_themes
 FROM memory_clusters mc
 JOIN cluster_activation_history mch ON mc.id = mch.cluster_id
 WHERE mch.activated_at > CURRENT_TIMESTAMP - INTERVAL '7 days'

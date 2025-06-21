@@ -12,10 +12,10 @@ services:
       - .:/docker-entrypoint-initdb.d
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
-      interval: 300s
-      timeout: 300s
-      retries: 10
-      start_period: 120s
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     ports:
       - "5432:5432"
     command: >
