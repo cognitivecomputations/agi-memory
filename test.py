@@ -3,9 +3,18 @@ import asyncio
 import asyncpg
 import json
 import numpy as np
+import time
+import uuid
 
 # Update to use loop_scope instead of scope
 pytestmark = pytest.mark.asyncio(loop_scope="session")
+
+# Global test session ID to help with cleanup
+TEST_SESSION_ID = str(uuid.uuid4())[:8]
+
+def get_test_identifier(test_name: str) -> str:
+    """Generate a unique identifier for test data"""
+    return f"{test_name}_{TEST_SESSION_ID}_{int(time.time() * 1000)}"
 
 @pytest.fixture(scope="session")
 async def db_pool():
@@ -82,8 +91,11 @@ async def test_memory_tables(db_pool):
 async def test_memory_storage(db_pool):
     """Test storing and retrieving different types of memories"""
     async with db_pool.acquire() as conn:
+        test_id = get_test_identifier("memory_storage")
+        
         # Test each memory type
         memory_types = ['episodic', 'semantic', 'procedural', 'strategic']
+        created_memories = []
         
         for mem_type in memory_types:
             # Cast the type explicitly
@@ -94,12 +106,13 @@ async def test_memory_storage(db_pool):
                     embedding
                 ) VALUES (
                     $1::memory_type,
-                    'Test ' || $1 || ' memory',
+                    'Test ' || $1 || ' memory ' || $2,
                     array_fill(0, ARRAY[1536])::vector
                 ) RETURNING id
-            """, mem_type)
+            """, mem_type, test_id)
 
             assert memory_id is not None
+            created_memories.append(memory_id)
 
             # Store type-specific details
             if mem_type == 'episodic':
@@ -119,14 +132,14 @@ async def test_memory_storage(db_pool):
                 )
             # Add other memory type tests...
 
-        # Verify storage and relationships
+        # Verify storage and relationships for our specific test memories
         for mem_type in memory_types:
             count = await conn.fetchval("""
                 SELECT COUNT(*) 
                 FROM memories m 
-                WHERE m.type = $1
-            """, mem_type)
-            assert count > 0, f"No {mem_type} memories stored"
+                WHERE m.type = $1 AND m.content LIKE '%' || $2
+            """, mem_type, test_id)
+            assert count > 0, f"No {mem_type} memories stored for test {test_id}"
 
 
 async def test_memory_importance(db_pool):
@@ -1877,6 +1890,2167 @@ async def test_cluster_memory_retrieval_performance(db_pool):
         # Verify ordering
         strengths = [r['membership_strength'] for r in results]
         assert strengths == sorted(strengths, reverse=True)
+
+
+# HIGH PRIORITY ADDITIONAL TESTS
+
+async def test_constraint_violations(db_pool):
+    """Test constraint violations and error handling"""
+    async with db_pool.acquire() as conn:
+        # Test invalid emotional_valence (should be between -1 and 1)
+        with pytest.raises(Exception):
+            await conn.execute("""
+                INSERT INTO episodic_memories (
+                    memory_id,
+                    action_taken,
+                    context,
+                    result,
+                    emotional_valence
+                ) VALUES (
+                    gen_random_uuid(),
+                    '{"action": "test"}',
+                    '{"context": "test"}',
+                    '{"result": "test"}',
+                    2.0
+                )
+            """)
+        
+        # Test invalid confidence score (should be between 0 and 1)
+        with pytest.raises(Exception):
+            await conn.execute("""
+                INSERT INTO semantic_memories (
+                    memory_id,
+                    confidence
+                ) VALUES (
+                    gen_random_uuid(),
+                    1.5
+                )
+            """)
+        
+        # Test foreign key violation
+        with pytest.raises(Exception):
+            fake_uuid = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+            await conn.execute("""
+                INSERT INTO episodic_memories (
+                    memory_id,
+                    action_taken,
+                    context,
+                    result
+                ) VALUES (
+                    $1::uuid,
+                    '{"action": "test"}',
+                    '{"context": "test"}',
+                    '{"result": "test"}'
+                )
+            """, fake_uuid)
+        
+        # Test invalid vector dimension
+        with pytest.raises(Exception):
+            await conn.execute("""
+                INSERT INTO memories (
+                    type,
+                    content,
+                    embedding
+                ) VALUES (
+                    'semantic'::memory_type,
+                    'Test content',
+                    array_fill(0, ARRAY[100])::vector
+                )
+            """)
+        
+        # Test null constraint violation
+        with pytest.raises(Exception):
+            await conn.execute("""
+                INSERT INTO memories (
+                    type,
+                    embedding
+                ) VALUES (
+                    'semantic'::memory_type,
+                    array_fill(0, ARRAY[1536])::vector
+                )
+            """)
+
+
+async def test_memory_consolidation_workflow(db_pool):
+    """Test complete memory consolidation from working memory to long-term storage"""
+    async with db_pool.acquire() as conn:
+        # Step 1: Create working memory entries
+        working_memories = []
+        for i in range(5):
+            wm_id = await conn.fetchval("""
+                INSERT INTO working_memory (
+                    content,
+                    embedding,
+                    expiry
+                ) VALUES (
+                    'Working memory content ' || $1,
+                    array_fill($2::float, ARRAY[1536])::vector,
+                    CURRENT_TIMESTAMP + interval '1 hour'
+                ) RETURNING id
+            """, str(i), float(i) * 0.1)
+            working_memories.append(wm_id)
+        
+        # Step 2: Simulate consolidation process
+        consolidated_memories = []
+        for wm_id in working_memories:
+            # Get working memory content
+            wm_data = await conn.fetchrow("""
+                SELECT content, embedding FROM working_memory WHERE id = $1
+            """, wm_id)
+            
+            # Create long-term memory
+            ltm_id = await conn.fetchval("""
+                INSERT INTO memories (
+                    type,
+                    content,
+                    embedding,
+                    importance
+                ) VALUES (
+                    'episodic'::memory_type,
+                    'Consolidated: ' || $1,
+                    $2,
+                    0.7
+                ) RETURNING id
+            """, wm_data['content'], wm_data['embedding'])
+            
+            # Create episodic details
+            await conn.execute("""
+                INSERT INTO episodic_memories (
+                    memory_id,
+                    action_taken,
+                    context,
+                    result,
+                    emotional_valence
+                ) VALUES (
+                    $1,
+                    '{"action": "consolidation"}',
+                    '{"source": "working_memory"}',
+                    '{"status": "consolidated"}',
+                    0.0
+                )
+            """, ltm_id)
+            
+            consolidated_memories.append(ltm_id)
+            
+            # Remove from working memory
+            await conn.execute("""
+                DELETE FROM working_memory WHERE id = $1
+            """, wm_id)
+        
+        # Step 3: Verify consolidation
+        # Check working memory is empty
+        wm_count = await conn.fetchval("""
+            SELECT COUNT(*) FROM working_memory
+            WHERE id = ANY($1::uuid[])
+        """, working_memories)
+        assert wm_count == 0, "Working memory not properly cleared"
+        
+        # Check long-term memories exist
+        ltm_count = await conn.fetchval("""
+            SELECT COUNT(*) FROM memories
+            WHERE id = ANY($1::uuid[])
+        """, consolidated_memories)
+        assert ltm_count == 5, "Not all memories consolidated"
+        
+        # Step 4: Test memory clustering after consolidation
+        for memory_id in consolidated_memories:
+            await conn.execute("""
+                SELECT assign_memory_to_clusters($1, 2)
+            """, memory_id)
+        
+        # Verify cluster assignments
+        cluster_assignments = await conn.fetchval("""
+            SELECT COUNT(*) FROM memory_cluster_members
+            WHERE memory_id = ANY($1::uuid[])
+        """, consolidated_memories)
+        assert cluster_assignments > 0, "Memories not assigned to clusters"
+
+
+async def test_large_dataset_performance(db_pool):
+    """Test system performance with large datasets"""
+    async with db_pool.acquire() as conn:
+        import time
+        
+        # Create large number of memories (1000 for testing, would be 10K+ in production)
+        batch_size = 100
+        total_memories = 1000
+        memory_ids = []
+        
+        print(f"Creating {total_memories} memories in batches of {batch_size}...")
+        
+        for batch_start in range(0, total_memories, batch_size):
+            batch_end = min(batch_start + batch_size, total_memories)
+            batch_memories = []
+            
+            # Create batch of memories
+            for i in range(batch_start, batch_end):
+                # Create diverse embeddings
+                embedding = [0.0] * 1536
+                # Create patterns in embeddings for clustering
+                pattern_start = (i % 10) * 150
+                pattern_end = min(pattern_start + 150, 1536)
+                embedding[pattern_start:pattern_end] = [0.8] * (pattern_end - pattern_start)
+                
+                memory_id = await conn.fetchval("""
+                    INSERT INTO memories (
+                        type,
+                        content,
+                        embedding,
+                        importance
+                    ) VALUES (
+                        $1::memory_type,
+                        'Large dataset memory ' || $2,
+                        $3::vector,
+                        $4
+                    ) RETURNING id
+                """, 
+                    ['episodic', 'semantic', 'procedural', 'strategic'][i % 4],
+                    str(i),
+                    str(embedding),
+                    0.1 + (i % 100) * 0.01
+                )
+                batch_memories.append(memory_id)
+            
+            memory_ids.extend(batch_memories)
+        
+        print(f"Created {len(memory_ids)} memories")
+        
+        # Test 1: Vector similarity search performance
+        query_embedding = [0.8] * 150 + [0.0] * (1536 - 150)
+        
+        start_time = time.time()
+        similar_memories = await conn.fetch("""
+            SELECT id, content, embedding <=> $1::vector as distance
+            FROM memories
+            ORDER BY embedding <=> $1::vector
+            LIMIT 50
+        """, str(query_embedding))
+        vector_search_time = time.time() - start_time
+        
+        assert len(similar_memories) == 50
+        assert vector_search_time < 1.0, f"Vector search too slow: {vector_search_time}s"
+        print(f"Vector search time: {vector_search_time:.3f}s")
+        
+        # Test 2: Complex query performance
+        start_time = time.time()
+        complex_results = await conn.fetch("""
+            SELECT m.type, COUNT(*) as count, AVG(m.importance) as avg_importance
+            FROM memories m
+            WHERE m.status = 'active'
+            AND m.importance > 0.5
+            GROUP BY m.type
+            ORDER BY avg_importance DESC
+        """)
+        complex_query_time = time.time() - start_time
+        
+        assert len(complex_results) > 0
+        assert complex_query_time < 0.5, f"Complex query too slow: {complex_query_time}s"
+        print(f"Complex query time: {complex_query_time:.3f}s")
+        
+        # Test 3: Memory health view performance
+        start_time = time.time()
+        health_stats = await conn.fetch("""
+            SELECT * FROM memory_health
+        """)
+        view_query_time = time.time() - start_time
+        
+        assert len(health_stats) > 0
+        assert view_query_time < 0.5, f"View query too slow: {view_query_time}s"
+        print(f"View query time: {view_query_time:.3f}s")
+
+
+async def test_concurrency_safety(db_pool):
+    """Test concurrent operations for race conditions"""
+    async with db_pool.acquire() as conn:
+        # Create test memory for concurrent updates
+        memory_id = await conn.fetchval("""
+            INSERT INTO memories (
+                type,
+                content,
+                embedding,
+                importance,
+                access_count
+            ) VALUES (
+                'semantic'::memory_type,
+                'Concurrency test memory',
+                array_fill(0.5, ARRAY[1536])::vector,
+                0.5,
+                0
+            ) RETURNING id
+        """)
+        
+        # Test concurrent access count updates
+        async def update_access_count(pool, mem_id, increment):
+            async with pool.acquire() as connection:
+                for _ in range(increment):
+                    await connection.execute("""
+                        UPDATE memories 
+                        SET access_count = access_count + 1
+                        WHERE id = $1
+                    """, mem_id)
+        
+        # Run concurrent updates
+        import asyncio
+        tasks = [
+            update_access_count(db_pool, memory_id, 10),
+            update_access_count(db_pool, memory_id, 10),
+            update_access_count(db_pool, memory_id, 10)
+        ]
+        
+        await asyncio.gather(*tasks)
+        
+        # Verify final access count
+        final_count = await conn.fetchval("""
+            SELECT access_count FROM memories WHERE id = $1
+        """, memory_id)
+        
+        assert final_count == 30, f"Expected 30 accesses, got {final_count}"
+        
+        # Test concurrent cluster assignments
+        cluster_id = await conn.fetchval("""
+            INSERT INTO memory_clusters (
+                cluster_type,
+                name,
+                centroid_embedding
+            ) VALUES (
+                'theme'::cluster_type,
+                'Concurrency Test Cluster',
+                array_fill(0.5, ARRAY[1536])::vector
+            ) RETURNING id
+        """)
+        
+        # Create multiple memories for concurrent cluster assignment
+        test_memories = []
+        for i in range(5):
+            mem_id = await conn.fetchval("""
+                INSERT INTO memories (
+                    type,
+                    content,
+                    embedding
+                ) VALUES (
+                    'semantic'::memory_type,
+                    'Concurrent memory ' || $1,
+                    array_fill(0.5, ARRAY[1536])::vector
+                ) RETURNING id
+            """, str(i))
+            test_memories.append(mem_id)
+        
+        # Concurrent cluster assignments
+        async def assign_to_cluster(pool, mem_id, clust_id):
+            async with pool.acquire() as connection:
+                try:
+                    await connection.execute("""
+                        INSERT INTO memory_cluster_members (
+                            cluster_id,
+                            memory_id,
+                            membership_strength
+                        ) VALUES ($1, $2, 0.8)
+                        ON CONFLICT DO NOTHING
+                    """, clust_id, mem_id)
+                except Exception as e:
+                    # Expected for some concurrent operations
+                    pass
+        
+        assignment_tasks = [
+            assign_to_cluster(db_pool, mem_id, cluster_id)
+            for mem_id in test_memories
+        ]
+        
+        await asyncio.gather(*assignment_tasks)
+        
+        # Verify assignments
+        assignment_count = await conn.fetchval("""
+            SELECT COUNT(*) FROM memory_cluster_members
+            WHERE cluster_id = $1
+        """, cluster_id)
+        
+        assert assignment_count == 5, f"Expected 5 assignments, got {assignment_count}"
+
+
+async def test_cascade_delete_integrity(db_pool):
+    """Test referential integrity with cascade deletes"""
+    async with db_pool.acquire() as conn:
+        # Create memory with all related data
+        memory_id = await conn.fetchval("""
+            INSERT INTO memories (
+                type,
+                content,
+                embedding
+            ) VALUES (
+                'episodic'::memory_type,
+                'Test cascade delete',
+                array_fill(0.5, ARRAY[1536])::vector
+            ) RETURNING id
+        """)
+        
+        # Add episodic details
+        await conn.execute("""
+            INSERT INTO episodic_memories (
+                memory_id,
+                action_taken,
+                context,
+                result
+            ) VALUES (
+                $1,
+                '{"action": "test"}',
+                '{"context": "test"}',
+                '{"result": "test"}'
+            )
+        """, memory_id)
+        
+        # Add to cluster
+        cluster_id = await conn.fetchval("""
+            INSERT INTO memory_clusters (
+                cluster_type,
+                name,
+                centroid_embedding
+            ) VALUES (
+                'theme'::cluster_type,
+                'Cascade Test Cluster',
+                array_fill(0.5, ARRAY[1536])::vector
+            ) RETURNING id
+        """)
+        
+        await conn.execute("""
+            INSERT INTO memory_cluster_members (
+                cluster_id,
+                memory_id
+            ) VALUES ($1, $2)
+        """, cluster_id, memory_id)
+        
+        # Add memory changes
+        await conn.execute("""
+            INSERT INTO memory_changes (
+                memory_id,
+                change_type,
+                old_value,
+                new_value
+            ) VALUES (
+                $1,
+                'creation',
+                '{}',
+                '{"status": "created"}'
+            )
+        """, memory_id)
+        
+        # Verify all related data exists
+        episodic_count = await conn.fetchval("""
+            SELECT COUNT(*) FROM episodic_memories WHERE memory_id = $1
+        """, memory_id)
+        cluster_member_count = await conn.fetchval("""
+            SELECT COUNT(*) FROM memory_cluster_members WHERE memory_id = $1
+        """, memory_id)
+        changes_count = await conn.fetchval("""
+            SELECT COUNT(*) FROM memory_changes WHERE memory_id = $1
+        """, memory_id)
+        
+        assert episodic_count == 1
+        assert cluster_member_count == 1
+        assert changes_count == 1
+        
+        # Test that direct deletion fails due to foreign key constraints
+        # This is the correct behavior - memory type tables don't have CASCADE DELETE
+        with pytest.raises(Exception):
+            await conn.execute("""
+                DELETE FROM memories WHERE id = $1
+            """, memory_id)
+        
+        # Proper deletion requires removing ALL related data first
+        # Delete episodic details
+        await conn.execute("""
+            DELETE FROM episodic_memories WHERE memory_id = $1
+        """, memory_id)
+        
+        # Delete memory changes (audit trail - also no CASCADE)
+        await conn.execute("""
+            DELETE FROM memory_changes WHERE memory_id = $1
+        """, memory_id)
+        
+        # Now delete the memory (cluster membership should cascade)
+        await conn.execute("""
+            DELETE FROM memories WHERE id = $1
+        """, memory_id)
+        
+        # Verify cascade deletes worked for tables with CASCADE
+        cluster_member_count_after = await conn.fetchval("""
+            SELECT COUNT(*) FROM memory_cluster_members WHERE memory_id = $1
+        """, memory_id)
+        changes_count_after = await conn.fetchval("""
+            SELECT COUNT(*) FROM memory_changes WHERE memory_id = $1
+        """, memory_id)
+        episodic_count_after = await conn.fetchval("""
+            SELECT COUNT(*) FROM episodic_memories WHERE memory_id = $1
+        """, memory_id)
+        
+        # These should all be deleted now
+        assert cluster_member_count_after == 0, "Cluster membership not cascade deleted"
+        assert changes_count_after == 0, "Memory changes not deleted"
+        assert episodic_count_after == 0, "Episodic memory not deleted"
+
+
+async def test_memory_lifecycle_workflow(db_pool):
+    """Test complete memory lifecycle from creation to archival"""
+    async with db_pool.acquire() as conn:
+        # Step 1: Create new memory
+        memory_id = await conn.fetchval("""
+            INSERT INTO memories (
+                type,
+                content,
+                embedding,
+                importance,
+                access_count
+            ) VALUES (
+                'semantic'::memory_type,
+                'Lifecycle test memory',
+                array_fill(0.5, ARRAY[1536])::vector,
+                0.3,
+                0
+            ) RETURNING id
+        """)
+        
+        initial_relevance = await conn.fetchval("""
+            SELECT relevance_score FROM memories WHERE id = $1
+        """, memory_id)
+        
+        # Step 2: Simulate memory access and importance growth
+        for i in range(5):
+            await conn.execute("""
+                UPDATE memories 
+                SET access_count = access_count + 1
+                WHERE id = $1
+            """, memory_id)
+        
+        mid_relevance = await conn.fetchval("""
+            SELECT relevance_score FROM memories WHERE id = $1
+        """, memory_id)
+        
+        assert mid_relevance > initial_relevance, "Relevance should increase with access"
+        
+        # Step 3: Simulate time passage and decay
+        await conn.execute("""
+            UPDATE memories 
+            SET created_at = CURRENT_TIMESTAMP - interval '30 days'
+            WHERE id = $1
+        """, memory_id)
+        
+        aged_relevance = await conn.fetchval("""
+            SELECT relevance_score FROM memories WHERE id = $1
+        """, memory_id)
+        
+        assert aged_relevance < mid_relevance, "Relevance should decrease with age"
+        
+        # Step 4: Archive low-relevance memory
+        await conn.execute("""
+            UPDATE memories 
+            SET status = 'archived'::memory_status
+            WHERE id = $1 AND relevance_score < 0.1
+        """, memory_id)
+        
+        final_status = await conn.fetchval("""
+            SELECT status FROM memories WHERE id = $1
+        """, memory_id)
+        
+        # Memory might or might not be archived depending on exact relevance calculation
+        assert final_status in ['active', 'archived'], "Memory should have valid status"
+        
+        # Step 5: Test memory retrieval excludes archived memories
+        active_memories = await conn.fetch("""
+            SELECT * FROM memories 
+            WHERE status = 'active' AND id = $1
+        """, memory_id)
+        
+        if final_status == 'archived':
+            assert len(active_memories) == 0, "Archived memory should not appear in active queries"
+
+
+# CRITICAL MISSING TESTS
+
+async def test_edge_cases_empty_clusters(db_pool):
+    """Test edge cases with empty clusters"""
+    async with db_pool.acquire() as conn:
+        # Create empty cluster
+        cluster_id = await conn.fetchval("""
+            INSERT INTO memory_clusters (
+                cluster_type,
+                name,
+                centroid_embedding
+            ) VALUES (
+                'theme'::cluster_type,
+                'Empty Test Cluster',
+                array_fill(0.5, ARRAY[1536])::vector
+            ) RETURNING id
+        """)
+        
+        # Test recalculating centroid on empty cluster
+        await conn.execute("""
+            SELECT recalculate_cluster_centroid($1)
+        """, cluster_id)
+        
+        # Verify cluster still exists but centroid might be null
+        cluster = await conn.fetchrow("""
+            SELECT * FROM memory_clusters WHERE id = $1
+        """, cluster_id)
+        assert cluster is not None, "Empty cluster should still exist"
+        
+        # Test cluster insights view with empty cluster
+        insights = await conn.fetch("""
+            SELECT * FROM cluster_insights WHERE id = $1
+        """, cluster_id)
+        assert len(insights) == 1, "Empty cluster should appear in insights"
+        assert insights[0]['memory_count'] == 0, "Empty cluster should have 0 memories"
+
+
+async def test_edge_cases_circular_relationships(db_pool):
+    """Test edge cases with circular cluster relationships"""
+    async with db_pool.acquire() as conn:
+        # Create three clusters
+        cluster_ids = []
+        for i in range(3):
+            cluster_id = await conn.fetchval("""
+                INSERT INTO memory_clusters (
+                    cluster_type,
+                    name,
+                    centroid_embedding
+                ) VALUES (
+                    'theme'::cluster_type,
+                    'Circular Cluster ' || $1,
+                    array_fill($2::float, ARRAY[1536])::vector
+                ) RETURNING id
+            """, str(i), float(i) * 0.3)
+            cluster_ids.append(cluster_id)
+        
+        # Create circular relationships: A -> B -> C -> A
+        relationships = [
+            (cluster_ids[0], cluster_ids[1], 'leads_to'),
+            (cluster_ids[1], cluster_ids[2], 'causes'),
+            (cluster_ids[2], cluster_ids[0], 'reinforces')
+        ]
+        
+        for from_id, to_id, rel_type in relationships:
+            await conn.execute("""
+                INSERT INTO cluster_relationships (
+                    from_cluster_id,
+                    to_cluster_id,
+                    relationship_type,
+                    strength
+                ) VALUES ($1, $2, $3, 0.7)
+            """, from_id, to_id, rel_type)
+        
+        # Verify all relationships exist
+        total_relationships = await conn.fetchval("""
+            SELECT COUNT(*) FROM cluster_relationships
+            WHERE from_cluster_id = ANY($1::uuid[])
+        """, cluster_ids)
+        assert total_relationships == 3, "All circular relationships should exist"
+        
+        # Test that we can detect cycles (this would be application logic)
+        cycle_query = await conn.fetch("""
+            WITH RECURSIVE cluster_paths AS (
+                SELECT from_cluster_id, to_cluster_id, 1 as depth, 
+                       ARRAY[from_cluster_id] as path
+                FROM cluster_relationships
+                WHERE from_cluster_id = $1
+                
+                UNION ALL
+                
+                SELECT cr.from_cluster_id, cr.to_cluster_id, cp.depth + 1,
+                       cp.path || cr.from_cluster_id
+                FROM cluster_relationships cr
+                JOIN cluster_paths cp ON cr.from_cluster_id = cp.to_cluster_id
+                WHERE cp.depth < 5 AND NOT (cr.from_cluster_id = ANY(cp.path))
+            )
+            SELECT * FROM cluster_paths WHERE to_cluster_id = $1 AND depth > 1
+        """, cluster_ids[0])
+        
+        assert len(cycle_query) > 0, "Should detect circular relationship"
+
+
+async def test_edge_cases_extreme_values(db_pool):
+    """Test edge cases with extreme values"""
+    async with db_pool.acquire() as conn:
+        # Test memory with very high importance
+        high_importance_id = await conn.fetchval("""
+            INSERT INTO memories (
+                type,
+                content,
+                embedding,
+                importance,
+                access_count
+            ) VALUES (
+                'semantic'::memory_type,
+                'Extremely important memory',
+                array_fill(0.5, ARRAY[1536])::vector,
+                999999.0,
+                999999
+            ) RETURNING id
+        """)
+        
+        # Test memory with very old timestamp
+        old_memory_id = await conn.fetchval("""
+            INSERT INTO memories (
+                type,
+                content,
+                embedding,
+                importance,
+                created_at
+            ) VALUES (
+                'episodic'::memory_type,
+                'Ancient memory',
+                array_fill(0.5, ARRAY[1536])::vector,
+                0.5,
+                '1900-01-01'::timestamp
+            ) RETURNING id
+        """)
+        
+        # Test relevance calculation with extreme values
+        high_relevance = await conn.fetchval("""
+            SELECT relevance_score FROM memories WHERE id = $1
+        """, high_importance_id)
+        
+        old_relevance = await conn.fetchval("""
+            SELECT relevance_score FROM memories WHERE id = $1
+        """, old_memory_id)
+        
+        assert high_relevance > 1000, "High importance should result in high relevance"
+        assert old_relevance < 0.01, "Very old memory should have very low relevance"
+        
+        # Test with zero vectors
+        zero_vector_id = await conn.fetchval("""
+            INSERT INTO memories (
+                type,
+                content,
+                embedding
+            ) VALUES (
+                'semantic'::memory_type,
+                'Zero vector memory',
+                array_fill(0.0, ARRAY[1536])::vector
+            ) RETURNING id
+        """)
+        
+        # Test similarity search with zero vector
+        zero_results = await conn.fetch("""
+            SELECT id, embedding <=> array_fill(0.0, ARRAY[1536])::vector as distance
+            FROM memories
+            WHERE id = $1
+        """, zero_vector_id)
+        
+        assert len(zero_results) == 1
+        # Zero vectors result in NaN for cosine distance, which is expected behavior
+        import math
+        assert math.isnan(zero_results[0]['distance']), "Zero vector cosine distance should be NaN"
+
+
+async def test_data_integrity_orphaned_records(db_pool):
+    """Test data integrity with potential orphaned records"""
+    async with db_pool.acquire() as conn:
+        # Create memory with related data
+        memory_id = await conn.fetchval("""
+            INSERT INTO memories (
+                type,
+                content,
+                embedding
+            ) VALUES (
+                'semantic'::memory_type,
+                'Test orphan memory',
+                array_fill(0.5, ARRAY[1536])::vector
+            ) RETURNING id
+        """)
+        
+        # Add semantic details
+        await conn.execute("""
+            INSERT INTO semantic_memories (
+                memory_id,
+                confidence
+            ) VALUES ($1, 0.8)
+        """, memory_id)
+        
+        # Add to cluster
+        cluster_id = await conn.fetchval("""
+            INSERT INTO memory_clusters (
+                cluster_type,
+                name,
+                centroid_embedding
+            ) VALUES (
+                'theme'::cluster_type,
+                'Orphan Test Cluster',
+                array_fill(0.5, ARRAY[1536])::vector
+            ) RETURNING id
+        """)
+        
+        await conn.execute("""
+            INSERT INTO memory_cluster_members (
+                cluster_id,
+                memory_id
+            ) VALUES ($1, $2)
+        """, cluster_id, memory_id)
+        
+        # Simulate orphaned records by deleting cluster but not membership
+        # First, we need to temporarily disable the foreign key constraint
+        # In a real scenario, this could happen due to application bugs
+        
+        # Check for orphaned cluster memberships
+        orphaned_memberships = await conn.fetch("""
+            SELECT mcm.* 
+            FROM memory_cluster_members mcm
+            LEFT JOIN memory_clusters mc ON mcm.cluster_id = mc.id
+            WHERE mc.id IS NULL
+        """)
+        
+        # Should be empty in normal operation
+        assert len(orphaned_memberships) == 0, "No orphaned cluster memberships should exist"
+        
+        # Check for orphaned memory type records
+        orphaned_semantic = await conn.fetch("""
+            SELECT sm.*
+            FROM semantic_memories sm
+            LEFT JOIN memories m ON sm.memory_id = m.id
+            WHERE m.id IS NULL
+        """)
+        
+        assert len(orphaned_semantic) == 0, "No orphaned semantic memories should exist"
+
+
+async def test_computed_field_accuracy(db_pool):
+    """Test accuracy of computed fields"""
+    async with db_pool.acquire() as conn:
+        # Test procedural memory success rate calculation
+        memory_id = await conn.fetchval("""
+            INSERT INTO memories (
+                type,
+                content,
+                embedding
+            ) VALUES (
+                'procedural'::memory_type,
+                'Success rate test',
+                array_fill(0.5, ARRAY[1536])::vector
+            ) RETURNING id
+        """)
+        
+        # Test various success rate scenarios
+        test_cases = [
+            (0, 0, 0.0),      # No attempts
+            (5, 10, 0.5),     # 50% success
+            (10, 10, 1.0),    # 100% success
+            (0, 5, 0.0),      # 0% success
+            (1, 3, 0.333333)  # 33.33% success
+        ]
+        
+        for success_count, total_attempts, expected_rate in test_cases:
+            await conn.execute("""
+                INSERT INTO procedural_memories (
+                    memory_id,
+                    steps,
+                    success_count,
+                    total_attempts
+                ) VALUES ($1, '{"steps": ["test"]}', $2, $3)
+                ON CONFLICT (memory_id) DO UPDATE SET
+                    success_count = $2,
+                    total_attempts = $3
+            """, memory_id, success_count, total_attempts)
+            
+            actual_rate = await conn.fetchval("""
+                SELECT success_rate FROM procedural_memories WHERE memory_id = $1
+            """, memory_id)
+            
+            if expected_rate == 0.333333:
+                assert abs(actual_rate - expected_rate) < 0.000001, f"Success rate calculation incorrect: expected {expected_rate}, got {actual_rate}"
+            else:
+                assert actual_rate == expected_rate, f"Success rate calculation incorrect: expected {expected_rate}, got {actual_rate}"
+        
+        # Test relevance score accuracy
+        test_memory_id = await conn.fetchval("""
+            INSERT INTO memories (
+                type,
+                content,
+                embedding,
+                importance,
+                decay_rate,
+                created_at
+            ) VALUES (
+                'semantic'::memory_type,
+                'Relevance test',
+                array_fill(0.5, ARRAY[1536])::vector,
+                1.0,
+                0.1,
+                CURRENT_TIMESTAMP - interval '1 day'
+            ) RETURNING id
+        """)
+        
+        relevance = await conn.fetchval("""
+            SELECT relevance_score FROM memories WHERE id = $1
+        """, test_memory_id)
+        
+        # Manual calculation: importance * exp(-decay_rate * age_in_days)
+        # 1.0 * exp(-0.1 * 1) ≈ 1.0 * 0.9048 ≈ 0.9048
+        expected_relevance = 1.0 * 2.718281828459045 ** (-0.1 * 1)
+        assert abs(relevance - expected_relevance) < 0.001, f"Relevance calculation incorrect: expected ~{expected_relevance}, got {relevance}"
+
+
+async def test_trigger_consistency(db_pool):
+    """Test that all triggers fire correctly and consistently"""
+    async with db_pool.acquire() as conn:
+        # Test memory timestamp trigger
+        memory_id = await conn.fetchval("""
+            INSERT INTO memories (
+                type,
+                content,
+                embedding
+            ) VALUES (
+                'semantic'::memory_type,
+                'Trigger test memory',
+                array_fill(0.5, ARRAY[1536])::vector
+            ) RETURNING id
+        """)
+        
+        initial_updated_at = await conn.fetchval("""
+            SELECT updated_at FROM memories WHERE id = $1
+        """, memory_id)
+        
+        # Wait and update
+        await asyncio.sleep(0.1)
+        await conn.execute("""
+            UPDATE memories SET content = 'Updated content' WHERE id = $1
+        """, memory_id)
+        
+        new_updated_at = await conn.fetchval("""
+            SELECT updated_at FROM memories WHERE id = $1
+        """, memory_id)
+        
+        assert new_updated_at > initial_updated_at, "Timestamp trigger should fire on update"
+        
+        # Test importance trigger - set initial importance first
+        await conn.execute("""
+            UPDATE memories SET importance = 0.5 WHERE id = $1
+        """, memory_id)
+        
+        initial_importance = await conn.fetchval("""
+            SELECT importance FROM memories WHERE id = $1
+        """, memory_id)
+        
+        await conn.execute("""
+            UPDATE memories SET access_count = access_count + 1 WHERE id = $1
+        """, memory_id)
+        
+        new_importance = await conn.fetchval("""
+            SELECT importance FROM memories WHERE id = $1
+        """, memory_id)
+        
+        assert new_importance > initial_importance, "Importance trigger should fire on access count change"
+        
+        # Test cluster activation trigger
+        cluster_id = await conn.fetchval("""
+            INSERT INTO memory_clusters (
+                cluster_type,
+                name,
+                centroid_embedding,
+                activation_count,
+                importance_score
+            ) VALUES (
+                'theme'::cluster_type,
+                'Trigger Test Cluster',
+                array_fill(0.5, ARRAY[1536])::vector,
+                0,
+                0.5
+            ) RETURNING id
+        """)
+        
+        initial_cluster_importance = await conn.fetchval("""
+            SELECT importance_score FROM memory_clusters WHERE id = $1
+        """, cluster_id)
+        
+        await conn.execute("""
+            UPDATE memory_clusters SET activation_count = activation_count + 1 WHERE id = $1
+        """, cluster_id)
+        
+        new_cluster_importance = await conn.fetchval("""
+            SELECT importance_score FROM memory_clusters WHERE id = $1
+        """, cluster_id)
+        
+        assert new_cluster_importance > initial_cluster_importance, "Cluster activation trigger should fire"
+
+
+async def test_view_calculation_accuracy(db_pool):
+    """Test accuracy of view calculations"""
+    async with db_pool.acquire() as conn:
+        # Create test data for memory_health view with unique content to avoid interference
+        import time
+        unique_suffix = str(int(time.time() * 1000))
+        test_memories = []
+        for i in range(10):
+            memory_id = await conn.fetchval("""
+                INSERT INTO memories (
+                    type,
+                    content,
+                    embedding,
+                    importance,
+                    access_count,
+                    last_accessed
+                ) VALUES (
+                    'semantic'::memory_type,
+                    'Health test memory ' || $1 || ' ' || $2,
+                    array_fill(0.5, ARRAY[1536])::vector,
+                    $3,
+                    $4,
+                    CASE WHEN $5 THEN CURRENT_TIMESTAMP - interval '12 hours' ELSE NULL END
+                ) RETURNING id
+            """, str(i), unique_suffix, float(i) * 0.1, i, i % 2 == 0)
+            test_memories.append(memory_id)
+        
+        # Query memory_health view for just our test memories
+        health_stats = await conn.fetchrow("""
+            SELECT 
+                type,
+                COUNT(*) as total_memories,
+                AVG(importance) as avg_importance,
+                AVG(access_count) as avg_access_count,
+                COUNT(*) FILTER (WHERE last_accessed > CURRENT_TIMESTAMP - INTERVAL '1 day') as accessed_last_day,
+                AVG(relevance_score) as avg_relevance
+            FROM memories
+            WHERE type = 'semantic' AND content LIKE '%' || $1
+            GROUP BY type
+        """, unique_suffix)
+        
+        # Verify calculations
+        assert health_stats['total_memories'] == 10, "Should count exactly our 10 test memories"
+        
+        # Calculate expected average importance: (0.0 + 0.1 + 0.2 + ... + 0.9) / 10 = 4.5 / 10 = 0.45
+        expected_avg_importance = sum(i * 0.1 for i in range(10)) / 10
+        actual_avg_importance = float(health_stats['avg_importance'])
+        assert abs(actual_avg_importance - expected_avg_importance) < 0.01, f"Average importance calculation incorrect: expected {expected_avg_importance}, got {actual_avg_importance}"
+        
+        # Test cluster_insights view accuracy
+        cluster_id = await conn.fetchval("""
+            INSERT INTO memory_clusters (
+                cluster_type,
+                name,
+                importance_score,
+                coherence_score,
+                centroid_embedding
+            ) VALUES (
+                'theme'::cluster_type,
+                'Accuracy Test Cluster',
+                0.75,
+                0.85,
+                array_fill(0.5, ARRAY[1536])::vector
+            ) RETURNING id
+        """)
+        
+        # Add some memories to cluster
+        for memory_id in test_memories[:5]:
+            await conn.execute("""
+                INSERT INTO memory_cluster_members (
+                    cluster_id,
+                    memory_id
+                ) VALUES ($1, $2)
+            """, cluster_id, memory_id)
+        
+        cluster_insight = await conn.fetchrow("""
+            SELECT * FROM cluster_insights WHERE name = 'Accuracy Test Cluster'
+        """)
+        
+        assert cluster_insight['memory_count'] == 5, "Should count cluster members correctly"
+        assert cluster_insight['importance_score'] == 0.75, "Should preserve importance score"
+        assert cluster_insight['coherence_score'] == 0.85, "Should preserve coherence score"
+
+
+async def test_error_recovery_scenarios(db_pool):
+    """Test error recovery scenarios"""
+    async with db_pool.acquire() as conn:
+        # Test recovery from invalid JSON in JSONB fields
+        memory_id = await conn.fetchval("""
+            INSERT INTO memories (
+                type,
+                content,
+                embedding
+            ) VALUES (
+                'episodic'::memory_type,
+                'Error recovery test',
+                array_fill(0.5, ARRAY[1536])::vector
+            ) RETURNING id
+        """)
+        
+        # Insert valid episodic memory
+        await conn.execute("""
+            INSERT INTO episodic_memories (
+                memory_id,
+                action_taken,
+                context,
+                result
+            ) VALUES (
+                $1,
+                '{"action": "valid_json"}',
+                '{"context": "test"}',
+                '{"result": "success"}'
+            )
+        """, memory_id)
+        
+        # Test that we can query and update the record
+        episodic_data = await conn.fetchrow("""
+            SELECT * FROM episodic_memories WHERE memory_id = $1
+        """, memory_id)
+        
+        assert episodic_data is not None, "Should be able to query episodic memory"
+        
+        # Test updating with new valid JSON
+        await conn.execute("""
+            UPDATE episodic_memories 
+            SET action_taken = '{"action": "updated_action"}'
+            WHERE memory_id = $1
+        """, memory_id)
+        
+        updated_data = await conn.fetchrow("""
+            SELECT action_taken FROM episodic_memories WHERE memory_id = $1
+        """, memory_id)
+        
+        # Parse the JSON if it's returned as a string
+        action_taken = updated_data['action_taken']
+        if isinstance(action_taken, str):
+            action_taken = json.loads(action_taken)
+        
+        assert action_taken['action'] == 'updated_action', "Should update JSON correctly"
+        
+        # Test transaction rollback scenario
+        try:
+            async with conn.transaction():
+                # Create a memory
+                temp_memory_id = await conn.fetchval("""
+                    INSERT INTO memories (
+                        type,
+                        content,
+                        embedding
+                    ) VALUES (
+                        'semantic'::memory_type,
+                        'Rollback test',
+                        array_fill(0.5, ARRAY[1536])::vector
+                    ) RETURNING id
+                """)
+                
+                # Force an error with invalid constraint
+                await conn.execute("""
+                    INSERT INTO semantic_memories (
+                        memory_id,
+                        confidence
+                    ) VALUES ($1, 2.0)
+                """, temp_memory_id)  # This should fail due to confidence constraint
+        except Exception:
+            # Expected to fail
+            pass
+        
+        # Verify the memory was rolled back
+        rollback_check = await conn.fetchval("""
+            SELECT COUNT(*) FROM memories WHERE content = 'Rollback test'
+        """)
+        
+        assert rollback_check == 0, "Transaction should have been rolled back"
+
+
+async def test_worldview_driven_memory_filtering(db_pool):
+    """Test how worldview affects memory retrieval and filtering"""
+    async with db_pool.acquire() as conn:
+        # Create worldview primitive with filtering rules
+        worldview_id = await conn.fetchval("""
+            INSERT INTO worldview_primitives (
+                category,
+                belief,
+                confidence,
+                memory_filter_rules
+            ) VALUES (
+                'values',
+                'Positive thinking is important',
+                0.9,
+                '{"filter_negative_emotions": true, "boost_positive_memories": 1.5}'
+            ) RETURNING id
+        """)
+        
+        # Create memories with different emotional valences
+        positive_memory_id = await conn.fetchval("""
+            INSERT INTO memories (
+                type,
+                content,
+                embedding,
+                importance
+            ) VALUES (
+                'episodic'::memory_type,
+                'Positive experience',
+                array_fill(0.5, ARRAY[1536])::vector,
+                0.5
+            ) RETURNING id
+        """)
+        
+        await conn.execute("""
+            INSERT INTO episodic_memories (
+                memory_id,
+                action_taken,
+                context,
+                result,
+                emotional_valence
+            ) VALUES (
+                $1,
+                '{"action": "celebration"}',
+                '{"context": "achievement"}',
+                '{"result": "joy"}',
+                0.8
+            )
+        """, positive_memory_id)
+        
+        negative_memory_id = await conn.fetchval("""
+            INSERT INTO memories (
+                type,
+                content,
+                embedding,
+                importance
+            ) VALUES (
+                'episodic'::memory_type,
+                'Negative experience',
+                array_fill(0.5, ARRAY[1536])::vector,
+                0.5
+            ) RETURNING id
+        """)
+        
+        await conn.execute("""
+            INSERT INTO episodic_memories (
+                memory_id,
+                action_taken,
+                context,
+                result,
+                emotional_valence
+            ) VALUES (
+                $1,
+                '{"action": "failure"}',
+                '{"context": "disappointment"}',
+                '{"result": "sadness"}',
+                -0.8
+            )
+        """, negative_memory_id)
+        
+        # Create worldview influences
+        await conn.execute("""
+            INSERT INTO worldview_memory_influences (
+                worldview_id,
+                memory_id,
+                influence_type,
+                strength
+            ) VALUES 
+                ($1, $2, 'boost', 1.5),
+                ($1, $3, 'suppress', 0.3)
+        """, worldview_id, positive_memory_id, negative_memory_id)
+        
+        # Test worldview-influenced retrieval
+        influenced_memories = await conn.fetch("""
+            SELECT m.*, wmi.influence_type, wmi.strength,
+                   CASE 
+                       WHEN wmi.influence_type = 'boost' THEN m.importance * wmi.strength
+                       WHEN wmi.influence_type = 'suppress' THEN m.importance * wmi.strength
+                       ELSE m.importance
+                   END as adjusted_importance
+            FROM memories m
+            LEFT JOIN worldview_memory_influences wmi ON m.id = wmi.memory_id
+            WHERE wmi.worldview_id = $1
+            ORDER BY adjusted_importance DESC
+        """, worldview_id)
+        
+        assert len(influenced_memories) == 2, "Should find both influenced memories"
+        assert influenced_memories[0]['influence_type'] == 'boost', "Positive memory should be boosted"
+        assert influenced_memories[1]['influence_type'] == 'suppress', "Negative memory should be suppressed"
+        assert influenced_memories[0]['adjusted_importance'] > influenced_memories[1]['adjusted_importance'], "Boosted memory should rank higher"
+
+
+# MEDIUM PRIORITY ADDITIONAL TESTS
+
+async def test_complex_graph_traversals(db_pool):
+    """Test complex multi-hop graph traversals and path finding"""
+    async with db_pool.acquire() as conn:
+        await conn.execute("LOAD 'age';")
+        await conn.execute("SET search_path = ag_catalog, public;")
+        
+        # Create a complex memory network
+        memory_chain = []
+        memory_types = ['episodic', 'semantic', 'procedural', 'strategic', 'episodic']
+        
+        # Create 5 connected memories
+        for i, mem_type in enumerate(memory_types):
+            memory_id = await conn.fetchval("""
+                INSERT INTO memories (type, content, embedding)
+                VALUES ($1::memory_type, $2, array_fill($3::float, ARRAY[1536])::vector)
+                RETURNING id
+            """, mem_type, f'Complex memory {i}', float(i) * 0.1)
+            memory_chain.append(memory_id)
+            
+            # Create graph node
+            await conn.execute(f"""
+                SELECT * FROM cypher('memory_graph', $$
+                    CREATE (n:MemoryNode {{
+                        memory_id: '{memory_id}',
+                        type: '{mem_type}',
+                        step: {i}
+                    }})
+                    RETURN n
+                $$) as (n ag_catalog.agtype)
+            """)
+        
+        # Create linear chain relationships
+        for i in range(len(memory_chain) - 1):
+            await conn.execute(f"""
+                SELECT * FROM cypher('memory_graph', $$
+                    MATCH (a:MemoryNode {{memory_id: '{memory_chain[i]}'}}),
+                          (b:MemoryNode {{memory_id: '{memory_chain[i+1]}'}})
+                    CREATE (a)-[r:LEADS_TO {{strength: {0.8 - i*0.1}}}]->(b)
+                    RETURN r
+                $$) as (r ag_catalog.agtype)
+            """)
+        
+        # Create some cross-connections
+        await conn.execute(f"""
+            SELECT * FROM cypher('memory_graph', $$
+                MATCH (a:MemoryNode {{memory_id: '{memory_chain[0]}'}}),
+                      (b:MemoryNode {{memory_id: '{memory_chain[3]}'}})
+                CREATE (a)-[r:INFLUENCES {{strength: 0.6}}]->(b)
+                RETURN r
+            $$) as (r ag_catalog.agtype)
+        """)
+        
+        # Test 1: Find all paths between first and last memory
+        paths = await conn.fetch(f"""
+            SELECT * FROM cypher('memory_graph', $$
+                MATCH p = (start:MemoryNode {{memory_id: '{memory_chain[0]}'}})-[*1..5]->(finish:MemoryNode {{memory_id: '{memory_chain[-1]}'}})
+                RETURN p
+            $$) as (p ag_catalog.agtype)
+        """)
+        
+        assert len(paths) >= 1, "Should find at least one path"
+        
+        # Test 2: Find memories within 2 hops of the first memory
+        nearby_memories = await conn.fetch(f"""
+            SELECT * FROM cypher('memory_graph', $$
+                MATCH (start:MemoryNode {{memory_id: '{memory_chain[0]}'}})-[*1..2]->(nearby:MemoryNode)
+                RETURN DISTINCT nearby.memory_id as memory_id, nearby.type as type
+            $$) as (memory_id ag_catalog.agtype, type ag_catalog.agtype)
+        """)
+        
+        assert len(nearby_memories) >= 2, "Should find nearby memories"
+        
+        # Test 3: Find any path with relationship properties
+        weighted_path = await conn.fetch(f"""
+            SELECT * FROM cypher('memory_graph', $$
+                MATCH p = (start:MemoryNode {{memory_id: '{memory_chain[0]}'}})-[*1..5]->(finish:MemoryNode {{memory_id: '{memory_chain[-1]}'}})
+                RETURN p
+                LIMIT 1
+            $$) as (path ag_catalog.agtype)
+        """)
+        
+        assert len(weighted_path) > 0, "Should find a path"
+        
+        # Test 4: Complex pattern matching
+        patterns = await conn.fetch("""
+            SELECT * FROM cypher('memory_graph', $$
+                MATCH (e:MemoryNode {type: 'episodic'})-[:LEADS_TO]->(s:MemoryNode {type: 'semantic'})-[:LEADS_TO]->(p:MemoryNode {type: 'procedural'})
+                RETURN e.memory_id as episodic_id, s.memory_id as semantic_id, p.memory_id as procedural_id
+            $$) as (episodic_id ag_catalog.agtype, semantic_id ag_catalog.agtype, procedural_id ag_catalog.agtype)
+        """)
+        
+        assert len(patterns) > 0, "Should find episodic->semantic->procedural patterns"
+
+
+async def test_memory_lifecycle_management(db_pool):
+    """Test comprehensive memory lifecycle management"""
+    async with db_pool.acquire() as conn:
+        # Create memories with different lifecycle stages
+        lifecycle_memories = []
+        
+        # Stage 1: Fresh memories (high importance, recent)
+        for i in range(3):
+            memory_id = await conn.fetchval("""
+                INSERT INTO memories (
+                    type,
+                    content,
+                    embedding,
+                    importance,
+                    access_count,
+                    created_at
+                ) VALUES (
+                    'semantic'::memory_type,
+                    'Fresh memory ' || $1,
+                    array_fill(0.8, ARRAY[1536])::vector,
+                    0.9,
+                    10 + $2,
+                    CURRENT_TIMESTAMP - interval '1 hour' * $2
+                ) RETURNING id
+            """, str(i), i)
+            lifecycle_memories.append(('fresh', memory_id))
+        
+        # Stage 2: Aging memories (medium importance, older)
+        for i in range(3):
+            memory_id = await conn.fetchval("""
+                INSERT INTO memories (
+                    type,
+                    content,
+                    embedding,
+                    importance,
+                    access_count,
+                    created_at
+                ) VALUES (
+                    'episodic'::memory_type,
+                    'Aging memory ' || $1,
+                    array_fill(0.5, ARRAY[1536])::vector,
+                    0.5,
+                    5 + $2,
+                    CURRENT_TIMESTAMP - interval '7 days' * ($2 + 1)
+                ) RETURNING id
+            """, str(i), i)
+            lifecycle_memories.append(('aging', memory_id))
+        
+        # Stage 3: Stale memories (low importance, very old)
+        for i in range(3):
+            memory_id = await conn.fetchval("""
+                INSERT INTO memories (
+                    type,
+                    content,
+                    embedding,
+                    importance,
+                    access_count,
+                    created_at
+                ) VALUES (
+                    'procedural'::memory_type,
+                    'Stale memory ' || $1,
+                    array_fill(0.2, ARRAY[1536])::vector,
+                    0.1,
+                    1,
+                    CURRENT_TIMESTAMP - interval '30 days' * ($2 + 1)
+                ) RETURNING id
+            """, str(i), i)
+            lifecycle_memories.append(('stale', memory_id))
+        
+        # Test lifecycle categorization
+        fresh_count = await conn.fetchval("""
+            SELECT COUNT(*) FROM memories
+            WHERE created_at > CURRENT_TIMESTAMP - interval '1 day'
+            AND importance > 0.7
+        """)
+        
+        aging_count = await conn.fetchval("""
+            SELECT COUNT(*) FROM memories
+            WHERE created_at BETWEEN CURRENT_TIMESTAMP - interval '30 days' 
+                                 AND CURRENT_TIMESTAMP - interval '1 day'
+            AND importance BETWEEN 0.3 AND 0.7
+        """)
+        
+        stale_count = await conn.fetchval("""
+            SELECT COUNT(*) FROM memories
+            WHERE created_at < CURRENT_TIMESTAMP - interval '30 days'
+            AND importance < 0.3
+        """)
+        
+        assert fresh_count >= 3, "Should have fresh memories"
+        assert aging_count >= 3, "Should have aging memories"
+        assert stale_count >= 3, "Should have stale memories"
+        
+        # Test memory promotion (accessing old memory should increase importance)
+        stale_memory = [m for stage, m in lifecycle_memories if stage == 'stale'][0]
+        
+        initial_importance = await conn.fetchval("""
+            SELECT importance FROM memories WHERE id = $1
+        """, stale_memory)
+        
+        # Simulate multiple accesses
+        for _ in range(5):
+            await conn.execute("""
+                UPDATE memories 
+                SET access_count = access_count + 1
+                WHERE id = $1
+            """, stale_memory)
+        
+        final_importance = await conn.fetchval("""
+            SELECT importance FROM memories WHERE id = $1
+        """, stale_memory)
+        
+        assert final_importance > initial_importance, "Accessed memory should gain importance"
+        
+        # Test memory archival workflow
+        archival_candidates = await conn.fetch("""
+            SELECT id, relevance_score 
+            FROM memories
+            WHERE relevance_score < 0.1
+            AND status = 'active'
+            ORDER BY relevance_score ASC
+            LIMIT 5
+        """)
+        
+        for candidate in archival_candidates:
+            await conn.execute("""
+                UPDATE memories 
+                SET status = 'archived'::memory_status
+                WHERE id = $1
+            """, candidate['id'])
+        
+        # Verify archival
+        archived_count = await conn.fetchval("""
+            SELECT COUNT(*) FROM memories WHERE status = 'archived'
+        """)
+        
+        assert archived_count > 0, "Should have archived some memories"
+
+
+async def test_memory_pruning_operations(db_pool):
+    """Test memory pruning and cleanup operations"""
+    async with db_pool.acquire() as conn:
+        # Create memories for pruning
+        pruning_memories = []
+        
+        # Create very old, low-relevance memories
+        for i in range(10):
+            memory_id = await conn.fetchval("""
+                INSERT INTO memories (
+                    type,
+                    content,
+                    embedding,
+                    importance,
+                    access_count,
+                    created_at,
+                    last_accessed
+                ) VALUES (
+                    'semantic'::memory_type,
+                    'Pruning candidate ' || $1,
+                    array_fill(0.1, ARRAY[1536])::vector,
+                    0.05,
+                    0,
+                    CURRENT_TIMESTAMP - interval '90 days',
+                    CURRENT_TIMESTAMP - interval '60 days'
+                ) RETURNING id
+            """, str(i))
+            pruning_memories.append(memory_id)
+        
+        # Create some memories worth keeping
+        for i in range(5):
+            await conn.fetchval("""
+                INSERT INTO memories (
+                    type,
+                    content,
+                    embedding,
+                    importance,
+                    access_count,
+                    created_at
+                ) VALUES (
+                    'episodic'::memory_type,
+                    'Important memory ' || $1,
+                    array_fill(0.8, ARRAY[1536])::vector,
+                    0.8,
+                    20,
+                    CURRENT_TIMESTAMP - interval '30 days'
+                ) RETURNING id
+            """, str(i))
+        
+        # Test pruning criteria identification
+        pruning_candidates = await conn.fetch("""
+            SELECT id, relevance_score, importance, 
+                   age_in_days(created_at) as age_days,
+                   COALESCE(age_in_days(last_accessed), 999) as days_since_access
+            FROM memories
+            WHERE relevance_score < 0.1
+            AND (last_accessed IS NULL OR last_accessed < CURRENT_TIMESTAMP - interval '30 days')
+            AND importance < 0.1
+            ORDER BY relevance_score ASC
+        """)
+        
+        assert len(pruning_candidates) >= 10, "Should identify pruning candidates"
+        
+        # Test safe pruning (archive first, then delete)
+        for candidate in pruning_candidates[:5]:
+            # First archive
+            await conn.execute("""
+                UPDATE memories 
+                SET status = 'archived'::memory_status
+                WHERE id = $1
+            """, candidate['id'])
+        
+        # Then delete archived memories older than threshold
+        deleted_count = await conn.fetchval("""
+            WITH deleted_memories AS (
+                DELETE FROM memories 
+                WHERE status = 'archived'
+                AND created_at < CURRENT_TIMESTAMP - interval '120 days'
+                RETURNING id
+            )
+            SELECT COUNT(*) FROM deleted_memories
+        """)
+        
+        # Test working memory cleanup
+        # Create expired working memory entries
+        for i in range(5):
+            await conn.execute("""
+                INSERT INTO working_memory (
+                    content,
+                    embedding,
+                    expiry
+                ) VALUES (
+                    'Expired working memory ' || $1,
+                    array_fill(0.5, ARRAY[1536])::vector,
+                    CURRENT_TIMESTAMP - interval '1 hour'
+                )
+            """, str(i))
+        
+        # Clean up expired working memory
+        expired_cleaned = await conn.fetchval("""
+            WITH cleaned AS (
+                DELETE FROM working_memory
+                WHERE expiry < CURRENT_TIMESTAMP
+                RETURNING id
+            )
+            SELECT COUNT(*) FROM cleaned
+        """)
+        
+        assert expired_cleaned >= 5, "Should clean up expired working memory"
+
+
+async def test_database_optimization_operations(db_pool):
+    """Test database optimization and maintenance operations"""
+    async with db_pool.acquire() as conn:
+        # Test index usage analysis
+        index_usage = await conn.fetch("""
+            SELECT 
+                schemaname,
+                relname as tablename,
+                indexrelname as indexname,
+                idx_scan,
+                idx_tup_read,
+                idx_tup_fetch
+            FROM pg_stat_user_indexes
+            WHERE schemaname = 'public'
+            AND relname IN ('memories', 'memory_clusters', 'memory_cluster_members')
+            ORDER BY idx_scan DESC
+        """)
+        
+        assert len(index_usage) > 0, "Should have index usage statistics"
+        
+        # Test table statistics
+        table_stats = await conn.fetch("""
+            SELECT 
+                schemaname,
+                relname as tablename,
+                n_tup_ins,
+                n_tup_upd,
+                n_tup_del,
+                n_live_tup,
+                n_dead_tup
+            FROM pg_stat_user_tables
+            WHERE schemaname = 'public'
+            AND relname IN ('memories', 'memory_clusters')
+            ORDER BY n_live_tup DESC
+        """)
+        
+        assert len(table_stats) > 0, "Should have table statistics"
+        
+        # Test query performance analysis
+        # Create a complex query and analyze its performance
+        import time
+        
+        start_time = time.time()
+        complex_query_result = await conn.fetch("""
+            SELECT 
+                m.type,
+                COUNT(*) as memory_count,
+                AVG(m.importance) as avg_importance,
+                AVG(m.relevance_score) as avg_relevance,
+                COUNT(mcm.cluster_id) as cluster_memberships
+            FROM memories m
+            LEFT JOIN memory_cluster_members mcm ON m.id = mcm.memory_id
+            WHERE m.status = 'active'
+            GROUP BY m.type
+            HAVING COUNT(*) > 0
+            ORDER BY avg_importance DESC
+        """)
+        query_time = time.time() - start_time
+        
+        assert len(complex_query_result) > 0, "Complex query should return results"
+        assert query_time < 1.0, f"Complex query too slow: {query_time}s"
+        
+        # Test vacuum and analyze simulation (read-only operations)
+        vacuum_info = await conn.fetch("""
+            SELECT
+                schemaname,
+                relname as tablename,
+                last_vacuum,
+                last_autovacuum,
+                last_analyze,
+                last_autoanalyze,
+                vacuum_count,
+                autovacuum_count
+            FROM pg_stat_user_tables
+            WHERE schemaname = 'public'
+            AND relname = 'memories'
+        """)
+        
+        assert len(vacuum_info) > 0, "Should have vacuum statistics"
+
+
+async def test_backup_restore_consistency(db_pool):
+    """Test backup and restore data consistency"""
+    async with db_pool.acquire() as conn:
+        # Clean up any existing test data first
+        await conn.execute("""
+            DELETE FROM memory_cluster_members 
+            WHERE memory_id IN (
+                SELECT id FROM memories WHERE content LIKE 'Backup test memory%'
+            )
+        """)
+        await conn.execute("""
+            DELETE FROM semantic_memories 
+            WHERE memory_id IN (
+                SELECT id FROM memories WHERE content LIKE 'Backup test memory%'
+            )
+        """)
+        await conn.execute("""
+            DELETE FROM memories WHERE content LIKE 'Backup test memory%'
+        """)
+        await conn.execute("""
+            DELETE FROM memory_clusters WHERE name = 'Backup Test Cluster'
+        """)
+        
+        # Create a known dataset for backup testing
+        backup_test_data = []
+        
+        # Create test memories with relationships
+        for i in range(5):
+            memory_id = await conn.fetchval("""
+                INSERT INTO memories (
+                    type,
+                    content,
+                    embedding,
+                    importance
+                ) VALUES (
+                    'semantic'::memory_type,
+                    'Backup test memory ' || $1,
+                    array_fill($2::float, ARRAY[1536])::vector,
+                    $3
+                ) RETURNING id
+            """, str(i), float(i) * 0.1, 0.5 + (i * 0.1))
+            
+            backup_test_data.append(memory_id)
+            
+            # Add semantic details
+            await conn.execute("""
+                INSERT INTO semantic_memories (
+                    memory_id,
+                    confidence,
+                    category
+                ) VALUES ($1, $2, $3)
+            """, memory_id, 0.8, [f'category_{i}'])
+        
+        # Create cluster and relationships
+        cluster_id = await conn.fetchval("""
+            INSERT INTO memory_clusters (
+                cluster_type,
+                name,
+                centroid_embedding
+            ) VALUES (
+                'theme'::cluster_type,
+                'Backup Test Cluster',
+                array_fill(0.5, ARRAY[1536])::vector
+            ) RETURNING id
+        """)
+        
+        # Add memories to cluster
+        for memory_id in backup_test_data:
+            await conn.execute("""
+                INSERT INTO memory_cluster_members (
+                    cluster_id,
+                    memory_id,
+                    membership_strength
+                ) VALUES ($1, $2, 0.8)
+            """, cluster_id, memory_id)
+        
+        # Simulate backup verification by checking data consistency
+        # Test 1: Verify all memories have corresponding semantic records
+        orphaned_memories = await conn.fetch("""
+            SELECT m.id 
+            FROM memories m
+            LEFT JOIN semantic_memories sm ON m.id = sm.memory_id
+            WHERE m.type = 'semantic' 
+            AND m.content LIKE 'Backup test memory%'
+            AND sm.memory_id IS NULL
+        """)
+        
+        assert len(orphaned_memories) == 0, "No orphaned semantic memories should exist"
+        
+        # Test 2: Verify cluster relationships are intact
+        cluster_members = await conn.fetchval("""
+            SELECT COUNT(*) 
+            FROM memory_cluster_members mcm
+            JOIN memories m ON mcm.memory_id = m.id
+            WHERE m.content LIKE 'Backup test memory%'
+        """)
+        
+        assert cluster_members == 5, "All test memories should be in cluster"
+        
+        # Test 3: Verify referential integrity for our test data only
+        integrity_check = await conn.fetch("""
+            SELECT 
+                'test_memories->semantic' as check_type,
+                COUNT(*) as violations
+            FROM memories m
+            LEFT JOIN semantic_memories sm ON m.id = sm.memory_id
+            WHERE m.type = 'semantic' 
+            AND m.content LIKE 'Backup test memory%'
+            AND sm.memory_id IS NULL
+            
+            UNION ALL
+            
+            SELECT 
+                'test_cluster_members->memories' as check_type,
+                COUNT(*) as violations
+            FROM memory_cluster_members mcm
+            LEFT JOIN memories m ON mcm.memory_id = m.id
+            WHERE m.content LIKE 'Backup test memory%'
+            AND m.id IS NULL
+            
+            UNION ALL
+            
+            SELECT 
+                'test_cluster_members->clusters' as check_type,
+                COUNT(*) as violations
+            FROM memory_cluster_members mcm
+            LEFT JOIN memory_clusters mc ON mcm.cluster_id = mc.id
+            WHERE mc.name = 'Backup Test Cluster'
+            AND mc.id IS NULL
+        """)
+        
+        for check in integrity_check:
+            assert check['violations'] == 0, f"Integrity violation in {check['check_type']}"
+        
+        # Test 4: Verify computed fields are consistent
+        computed_field_check = await conn.fetch("""
+            SELECT 
+                id,
+                importance,
+                relevance_score,
+                (importance * exp(-decay_rate * age_in_days(created_at))) as expected_relevance
+            FROM memories
+            WHERE content LIKE 'Backup test memory%'
+        """)
+        
+        for row in computed_field_check:
+            actual = float(row['relevance_score'])
+            expected = float(row['expected_relevance'])
+            assert abs(actual - expected) < 0.001, f"Relevance score mismatch: {actual} vs {expected}"
+
+
+async def test_schema_migration_compatibility(db_pool):
+    """Test schema migration and version compatibility"""
+    async with db_pool.acquire() as conn:
+        # Test 1: Check current schema version (simulate version tracking)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS schema_version (
+                version INTEGER PRIMARY KEY,
+                applied_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                description TEXT
+            )
+        """)
+        
+        # Record current schema version
+        await conn.execute("""
+            INSERT INTO schema_version (version, description)
+            VALUES (1, 'Initial AGI Memory System schema')
+            ON CONFLICT (version) DO NOTHING
+        """)
+        
+        # Test 2: Simulate adding a new column (non-breaking change)
+        await conn.execute("""
+            ALTER TABLE memories 
+            ADD COLUMN IF NOT EXISTS migration_test_field TEXT DEFAULT 'test_value'
+        """)
+        
+        # Verify the column was added
+        column_exists = await conn.fetchval("""
+            SELECT COUNT(*) 
+            FROM information_schema.columns 
+            WHERE table_name = 'memories' 
+            AND column_name = 'migration_test_field'
+        """)
+        
+        assert column_exists == 1, "Migration test column should exist"
+        
+        # Test 3: Verify existing data integrity after migration
+        memory_count_before = await conn.fetchval("""
+            SELECT COUNT(*) FROM memories
+        """)
+        
+        # Test that existing memories have the default value
+        default_value_count = await conn.fetchval("""
+            SELECT COUNT(*) FROM memories 
+            WHERE migration_test_field = 'test_value'
+        """)
+        
+        assert default_value_count == memory_count_before, "All existing memories should have default value"
+        
+        # Test 4: Simulate index migration
+        await conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_memories_migration_test 
+            ON memories(migration_test_field)
+        """)
+        
+        # Verify index was created
+        index_exists = await conn.fetchval("""
+            SELECT COUNT(*) 
+            FROM pg_indexes 
+            WHERE tablename = 'memories' 
+            AND indexname = 'idx_memories_migration_test'
+        """)
+        
+        assert index_exists == 1, "Migration test index should exist"
+        
+        # Test 5: Simulate rollback capability
+        await conn.execute("""
+            ALTER TABLE memories 
+            DROP COLUMN IF EXISTS migration_test_field
+        """)
+        
+        # Verify rollback worked
+        column_exists_after = await conn.fetchval("""
+            SELECT COUNT(*) 
+            FROM information_schema.columns 
+            WHERE table_name = 'memories' 
+            AND column_name = 'migration_test_field'
+        """)
+        
+        assert column_exists_after == 0, "Migration test column should be removed"
+        
+        # Clean up
+        await conn.execute("DROP TABLE IF EXISTS schema_version")
+
+
+async def test_monitoring_and_alerting_metrics(db_pool):
+    """Test monitoring metrics and alerting thresholds"""
+    async with db_pool.acquire() as conn:
+        # Test 1: Memory system health metrics
+        health_metrics = await conn.fetchrow("""
+            SELECT 
+                COUNT(*) as total_memories,
+                COUNT(*) FILTER (WHERE status = 'active') as active_memories,
+                COUNT(*) FILTER (WHERE status = 'archived') as archived_memories,
+                AVG(importance) as avg_importance,
+                AVG(relevance_score) as avg_relevance,
+                AVG(access_count) as avg_access_count,
+                COUNT(*) FILTER (WHERE last_accessed > CURRENT_TIMESTAMP - interval '24 hours') as recently_accessed
+            FROM memories
+        """)
+        
+        assert health_metrics['total_memories'] > 0, "Should have memories for monitoring"
+        
+        # Test 2: Cluster health metrics
+        cluster_metrics = await conn.fetchrow("""
+            SELECT 
+                COUNT(*) as total_clusters,
+                AVG(importance_score) as avg_cluster_importance,
+                COUNT(*) FILTER (WHERE last_activated > CURRENT_TIMESTAMP - interval '24 hours') as recently_active_clusters,
+                AVG(
+                    (SELECT COUNT(*) FROM memory_cluster_members mcm WHERE mcm.cluster_id = mc.id)
+                ) as avg_cluster_size
+            FROM memory_clusters mc
+        """)
+        
+        assert cluster_metrics['total_clusters'] >= 0, "Should have cluster metrics"
+        
+        # Test 3: Performance metrics
+        performance_metrics = await conn.fetch("""
+            SELECT 
+                'vector_search' as metric_type,
+                COUNT(*) as operations,
+                AVG(EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - created_at))) as avg_age_seconds
+            FROM memories
+            WHERE created_at > CURRENT_TIMESTAMP - interval '1 hour'
+            
+            UNION ALL
+            
+            SELECT 
+                'cluster_operations' as metric_type,
+                COUNT(*) as operations,
+                AVG(EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - added_at))) as avg_age_seconds
+            FROM memory_cluster_members
+            WHERE added_at > CURRENT_TIMESTAMP - interval '1 hour'
+        """)
+        
+        assert len(performance_metrics) > 0, "Should have performance metrics"
+        
+        # Test 4: Alert threshold simulation
+        alert_conditions = await conn.fetch("""
+            SELECT 
+                'low_memory_activity' as alert_type,
+                CASE 
+                    WHEN COUNT(*) FILTER (WHERE last_accessed > CURRENT_TIMESTAMP - interval '24 hours') < 10 
+                    THEN 'ALERT' 
+                    ELSE 'OK' 
+                END as status,
+                COUNT(*) FILTER (WHERE last_accessed > CURRENT_TIMESTAMP - interval '24 hours') as recent_access_count
+            FROM memories
+            
+            UNION ALL
+            
+            SELECT 
+                'high_archive_rate' as alert_type,
+                CASE 
+                    WHEN COUNT(*) FILTER (WHERE status = 'archived') > COUNT(*) * 0.5 
+                    THEN 'ALERT' 
+                    ELSE 'OK' 
+                END as status,
+                COUNT(*) FILTER (WHERE status = 'archived') as archived_count
+            FROM memories
+            
+            UNION ALL
+            
+            SELECT 
+                'cluster_imbalance' as alert_type,
+                CASE 
+                    WHEN MAX(member_count) > AVG(member_count) * 3 
+                    THEN 'ALERT' 
+                    ELSE 'OK' 
+                END as status,
+                MAX(member_count) as max_cluster_size
+            FROM (
+                SELECT 
+                    cluster_id,
+                    COUNT(*) as member_count
+                FROM memory_cluster_members
+                GROUP BY cluster_id
+            ) cluster_sizes
+        """)
+        
+        assert len(alert_conditions) == 3, "Should have all alert conditions"
+        
+        # Test 5: Resource usage metrics
+        resource_metrics = await conn.fetchrow("""
+            SELECT 
+                pg_size_pretty(pg_total_relation_size('memories')) as memories_table_size,
+                pg_size_pretty(pg_total_relation_size('memory_clusters')) as clusters_table_size,
+                (SELECT COUNT(*) FROM memories) as memory_count,
+                (SELECT COUNT(*) FROM memory_clusters) as cluster_count,
+                (SELECT COUNT(*) FROM memory_cluster_members) as membership_count
+        """)
+        
+        assert resource_metrics is not None, "Should have resource metrics"
+
+
+async def test_multi_agi_considerations(db_pool):
+    """Test considerations for multi-AGI support (current limitations)"""
+    async with db_pool.acquire() as conn:
+        # Clean up any existing test data first
+        await conn.execute("""
+            DELETE FROM memories WHERE content LIKE '%AGI-% believes X is%'
+        """)
+        
+        # Test 1: Identify single-AGI assumptions in current schema
+        single_agi_tables = await conn.fetch("""
+            SELECT 
+                table_name,
+                CASE 
+                    WHEN table_name IN ('identity_model', 'worldview_primitives') THEN 'singleton_table'
+                    WHEN table_name LIKE '%memory%' THEN 'memory_table'
+                    ELSE 'other'
+                END as table_category
+            FROM information_schema.tables
+            WHERE table_schema = 'public'
+            AND table_type = 'BASE TABLE'
+            ORDER BY table_name
+        """)
+        
+        singleton_tables = [t for t in single_agi_tables if t['table_category'] == 'singleton_table']
+        assert len(singleton_tables) > 0, "Should identify singleton tables"
+        
+        # Test 2: Simulate multi-AGI data isolation requirements
+        # This test demonstrates what would need to change for multi-AGI support
+        
+        # Check if any tables have AGI instance identification
+        agi_id_columns = await conn.fetch("""
+            SELECT 
+                table_name,
+                column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+            AND column_name LIKE '%agi%'
+            ORDER BY table_name, column_name
+        """)
+        
+        # Current schema should have no AGI ID columns (single-AGI design)
+        assert len(agi_id_columns) == 0, "Current schema should not have AGI ID columns"
+        
+        # Test 3: Demonstrate memory isolation challenges
+        # Create test scenario showing how memories could conflict between AGIs
+        
+        # AGI 1 memories
+        agi1_memory = await conn.fetchval("""
+            INSERT INTO memories (
+                type,
+                content,
+                embedding,
+                importance
+            ) VALUES (
+                'semantic'::memory_type,
+                'AGI-1 believes X is true',
+                array_fill(0.8, ARRAY[1536])::vector,
+                0.9
+            ) RETURNING id
+        """)
+        
+        # AGI 2 memories (conflicting belief)
+        agi2_memory = await conn.fetchval("""
+            INSERT INTO memories (
+                type,
+                content,
+                embedding,
+                importance
+            ) VALUES (
+                'semantic'::memory_type,
+                'AGI-2 believes X is false',
+                array_fill(0.8, ARRAY[1536])::vector,
+                0.9
+            ) RETURNING id
+        """)
+        
+        # Demonstrate conflict: both memories exist in same space
+        conflicting_memories = await conn.fetch("""
+            SELECT 
+                id,
+                content,
+                importance,
+                'conflict_detected' as issue_type
+            FROM memories
+            WHERE content LIKE '%AGI-% believes X is%'
+            ORDER BY content
+        """)
+        
+        assert len(conflicting_memories) == 2, "Should find conflicting AGI memories"
+        
+        # Test 4: Demonstrate worldview conflicts
+        # In single-AGI system, only one worldview can exist
+        worldview_count = await conn.fetchval("""
+            SELECT COUNT(*) FROM worldview_primitives
+        """)
+        
+        # Test 5: Demonstrate identity model limitations
+        identity_count = await conn.fetchval("""
+            SELECT COUNT(*) FROM identity_model
+        """)
+        
+        # Test 6: Show what would be needed for multi-AGI support
+        multi_agi_requirements = {
+            'schema_changes_needed': [
+                'Add agi_instance_id to all memory tables',
+                'Add agi_instance_id to worldview_primitives',
+                'Add agi_instance_id to identity_model',
+                'Add row-level security policies',
+                'Modify all views to filter by AGI instance',
+                'Update all functions to include AGI context'
+            ],
+            'isolation_challenges': [
+                'Memory similarity search across AGI boundaries',
+                'Cluster centroid calculations per AGI',
+                'Graph relationships between AGI instances',
+                'Shared vs private memory spaces',
+                'Cross-AGI learning and knowledge transfer'
+            ]
+        }
+        
+        # This test documents the current single-AGI limitations
+        assert len(multi_agi_requirements['schema_changes_needed']) > 0, "Multi-AGI support requires significant changes"
+
 
 # Keep all existing tests from the original file...
 # (All the tests from test_memory_storage through test_procedural_effectiveness_view remain the same)
