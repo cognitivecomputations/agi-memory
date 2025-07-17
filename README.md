@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/cognitivecomputations-agi-memory-badge.png)](https://mseep.ai/app/cognitivecomputations-agi-memory)
+
 # AGI Memory System
 
 A sophisticated database design for Artificial General Intelligence (AGI) memory management, implementing multiple types of memory storage and retrieval mechanisms inspired by human cognitive architecture.
