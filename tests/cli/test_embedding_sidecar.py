@@ -23,7 +23,11 @@ def test_local_embedding_binary_uses_published_command(monkeypatch, tmp_path):
     binary.write_text("#!/bin/sh\n", encoding="utf-8")
     binary.chmod(0o755)
 
-    monkeypatch.setattr(hexis_cli.shutil, "which", lambda name: str(binary) if name == "embeddinggemma" else None)
+    monkeypatch.setattr(
+        hexis_cli.shutil,
+        "which",
+        lambda name: str(binary) if name == "embeddinggemma" else None,
+    )
 
     assert hexis_cli._local_embedding_binary() == binary
 
@@ -63,7 +67,7 @@ def test_local_embedding_sidecar_rejects_legacy_port(monkeypatch, tmp_path):
     assert hexis_cli._uses_legacy_embedding_sidecar_port(env_file) is True
 
 
-def test_start_local_embedding_uses_screen_on_macos(monkeypatch, tmp_path):
+def test_start_local_embedding_launches_installed_binary_directly(monkeypatch, tmp_path):
     from apps import hexis_cli
 
     binary = tmp_path / "embeddinggemma"
@@ -81,8 +85,6 @@ def test_start_local_embedding_uses_screen_on_macos(monkeypatch, tmp_path):
     def fake_which(name: str):
         if name == "embeddinggemma":
             return str(binary)
-        if name == "screen":
-            return "/usr/bin/screen"
         return None
 
     def fake_popen(args, **_kwargs):
@@ -99,5 +101,27 @@ def test_start_local_embedding_uses_screen_on_macos(monkeypatch, tmp_path):
 
     assert hexis_cli._start_local_embedding_service(wait_seconds=1) is True
     assert launched
-    assert launched[0][:4] == ["/usr/bin/screen", "-L", "-Logfile", str(log_path)]
-    assert str(binary) in launched[0]
+    assert launched[0] == [str(binary)]
+
+
+def test_start_local_embedding_reports_early_exit(monkeypatch, tmp_path):
+    from apps import hexis_cli
+
+    binary = tmp_path / "embeddinggemma"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    binary.chmod(0o755)
+    log_path = tmp_path / "embeddinggemma.log"
+    log_path.write_text("loading model\nfatal: no model\n", encoding="utf-8")
+
+    class FakeProc:
+        returncode = 1
+
+        def poll(self):
+            return 1
+
+    monkeypatch.setattr(hexis_cli.shutil, "which", lambda name: str(binary) if name == "embeddinggemma" else None)
+    monkeypatch.setattr(hexis_cli.subprocess, "Popen", lambda *_args, **_kwargs: FakeProc())
+    monkeypatch.setattr(hexis_cli, "_LOCAL_EMBEDDING_LOG", log_path)
+    monkeypatch.setattr(hexis_cli, "_port_ready", lambda _port: False)
+
+    assert hexis_cli._start_local_embedding_service(wait_seconds=1) is False

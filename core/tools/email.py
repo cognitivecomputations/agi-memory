@@ -8,9 +8,11 @@ Supports SMTP/SendGrid for sending, and Google Gmail API for reading.
 from __future__ import annotations
 
 import logging
+import inspect
 import os
 import smtplib
 import ssl
+import uuid
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from typing import Any, Callable
@@ -34,9 +36,66 @@ from .base import (
 logger = logging.getLogger(__name__)
 
 GMAIL_SETUP_HINT = (
-    "Gmail credentials not configured. Use the gmail-connector-setup skill "
-    "to open the structured Gmail setup flow in this conversation."
+    "Gmail is not connected yet. Open the structured Gmail setup flow in this "
+    "conversation before reading or managing email."
 )
+
+
+async def _gmail_setup_required_result(context: ToolExecutionContext) -> ToolResult:
+    """Return a Gmail auth failure with the setup UI attached when available."""
+    display = "Gmail is not connected. Open the Gmail setup panel to approve access with Google."
+    output: dict[str, Any] = {
+        "connector_id": "gmail",
+        "status": "needs_connection",
+        "next_step": display,
+    }
+
+    registry = context.registry
+    execute = getattr(registry, "execute", None)
+    if callable(execute):
+        try:
+            status_context = ToolExecutionContext(
+                tool_context=context.tool_context,
+                call_id=f"gmail-setup-status:{uuid.uuid4()}",
+                heartbeat_id=context.heartbeat_id,
+                session_id=context.session_id,
+                energy_available=context.energy_available,
+                workspace_path=context.workspace_path,
+                is_group=context.is_group,
+                allow_network=False,
+                allow_shell=False,
+                allow_file_write=False,
+                allow_file_read=context.allow_file_read,
+                registry=registry,
+            )
+            maybe_result = execute("gmail_setup_status", {}, status_context)
+            if inspect.isawaitable(maybe_result):
+                maybe_result = await maybe_result
+            if isinstance(maybe_result, ToolResult) and isinstance(maybe_result.output, dict):
+                output = dict(maybe_result.output)
+                display = maybe_result.display_output or display
+        except Exception:
+            logger.debug("Could not attach Gmail setup status to auth failure", exc_info=True)
+
+    if not isinstance(output.get("ui"), dict):
+        try:
+            from core.tools.integrations import _gmail_connector_setup_ui
+
+            output["ui"] = _gmail_connector_setup_ui(
+                output,
+                status="needs_client_secret",
+                next_step=output.get("next_step") or display,
+            )
+        except Exception:
+            logger.debug("Could not build Gmail setup UI for auth failure", exc_info=True)
+
+    return ToolResult(
+        success=False,
+        output=output,
+        display_output=display,
+        error=GMAIL_SETUP_HINT,
+        error_type=ToolErrorType.AUTH_FAILED,
+    )
 
 
 def _integration_tool_error_type(exc: IntegrationHttpError) -> ToolErrorType:
@@ -412,12 +471,7 @@ class EmailListHandler(ToolHandler):
             credentials = self._credentials_resolver()
 
         if not credentials:
-            return ToolResult(
-                success=False,
-                output=None,
-                error=GMAIL_SETUP_HINT,
-                error_type=ToolErrorType.AUTH_FAILED,
-            )
+            return await _gmail_setup_required_result(context)
 
         try:
             from google.oauth2.credentials import Credentials
@@ -553,12 +607,7 @@ class EmailReadHandler(ToolHandler):
             credentials = self._credentials_resolver()
 
         if not credentials:
-            return ToolResult(
-                success=False,
-                output=None,
-                error=GMAIL_SETUP_HINT,
-                error_type=ToolErrorType.AUTH_FAILED,
-            )
+            return await _gmail_setup_required_result(context)
 
         try:
             from google.oauth2.credentials import Credentials
@@ -688,12 +737,7 @@ class EmailSearchHandler(ToolHandler):
             credentials = self._credentials_resolver()
 
         if not credentials:
-            return ToolResult(
-                success=False,
-                output=None,
-                error=GMAIL_SETUP_HINT,
-                error_type=ToolErrorType.AUTH_FAILED,
-            )
+            return await _gmail_setup_required_result(context)
 
         try:
             from google.oauth2.credentials import Credentials
@@ -892,12 +936,7 @@ class IngestEmailsHandler(ToolHandler):
             credentials = self._credentials_resolver()
 
         if not credentials:
-            return ToolResult(
-                success=False,
-                output=None,
-                error=GMAIL_SETUP_HINT,
-                error_type=ToolErrorType.AUTH_FAILED,
-            )
+            return await _gmail_setup_required_result(context)
 
         try:
             from google.oauth2.credentials import Credentials

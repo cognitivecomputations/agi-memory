@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import html
 import json
 import logging
 import os
@@ -29,7 +30,7 @@ import asyncpg
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from starlette.middleware.base import BaseHTTPMiddleware
 
@@ -110,7 +111,10 @@ _API_KEY = (os.getenv("HEXIS_API_KEY") or "").strip() or None
 
 class _BearerAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        if _API_KEY and request.url.path != "/health":
+        gmail_callback = request.url.path == "/api/integrations/gmail/callback" or (
+            request.url.path == "/" and ("code" in request.query_params or "error" in request.query_params)
+        )
+        if _API_KEY and request.url.path != "/health" and not gmail_callback:
             auth = request.headers.get("authorization", "")
             if not auth.startswith("Bearer ") or auth[7:] != _API_KEY:
                 return JSONResponse({"error": "Unauthorized"}, status_code=401)
@@ -545,6 +549,173 @@ async def health():
     )
 
 
+def _ui_return_url() -> str:
+    return (
+        os.getenv("HEXIS_UI_URL")
+        or os.getenv("HEXIS_WEB_URL")
+        or os.getenv("NEXT_PUBLIC_HEXIS_UI_URL")
+        or "http://localhost:3477/chat"
+    ).rstrip("/")
+
+
+def _gmail_callback_page(
+    *,
+    title: str,
+    message: str,
+    status: str,
+    status_code: int = 200,
+) -> HTMLResponse:
+    return_url = _ui_return_url()
+    status_class = "ok" if status == "connected" else "error"
+    body = f"""<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{html.escape(title)}</title>
+    <style>
+      :root {{
+        color-scheme: light;
+        --ink: #17211d;
+        --soft: #64716c;
+        --line: #d9e2de;
+        --teal: #0f766e;
+        --warn: #9f3a17;
+        --paper: #fbfcfb;
+      }}
+      body {{
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        background: var(--paper);
+        color: var(--ink);
+        font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }}
+      main {{
+        width: min(560px, calc(100vw - 32px));
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: white;
+        padding: 28px;
+        box-shadow: 0 18px 50px rgba(20, 31, 27, 0.10);
+      }}
+      .label {{
+        display: inline-flex;
+        margin-bottom: 14px;
+        border-radius: 999px;
+        padding: 5px 10px;
+        background: #edf7f4;
+        color: var(--teal);
+        font-size: 13px;
+        font-weight: 700;
+      }}
+      .label.error {{
+        background: #fff0ea;
+        color: var(--warn);
+      }}
+      h1 {{
+        margin: 0;
+        font-size: 28px;
+        line-height: 1.2;
+      }}
+      p {{
+        margin: 14px 0 0;
+        color: var(--soft);
+        line-height: 1.55;
+      }}
+      a {{
+        display: inline-flex;
+        margin-top: 22px;
+        border-radius: 6px;
+        background: var(--ink);
+        color: white;
+        padding: 10px 14px;
+        text-decoration: none;
+        font-weight: 700;
+      }}
+    </style>
+  </head>
+  <body>
+    <main>
+      <span class="label {status_class}">{html.escape(status)}</span>
+      <h1>{html.escape(title)}</h1>
+      <p>{html.escape(message)}</p>
+      <p>You can return to Hexis now. The Gmail setup panel will show the updated status.</p>
+      <a href="{html.escape(return_url)}">Return to Hexis</a>
+    </main>
+  </body>
+</html>"""
+    return HTMLResponse(body, status_code=status_code)
+
+
+async def _handle_gmail_oauth_callback(request: Request) -> HTMLResponse:
+    if request.query_params.get("error"):
+        detail = request.query_params.get("error_description") or request.query_params["error"]
+        return _gmail_callback_page(
+            title="Gmail was not connected",
+            message=f"Google returned: {detail}",
+            status="authorization failed",
+            status_code=400,
+        )
+
+    if not request.query_params.get("code"):
+        return _gmail_callback_page(
+            title="Gmail connection is incomplete",
+            message="Google did not include an authorization code in this callback.",
+            status="incomplete",
+            status_code=400,
+        )
+
+    pool = _pool
+    if pool is None:
+        return _gmail_callback_page(
+            title="Hexis is still starting",
+            message="The local Hexis API is not ready yet. Return to Hexis and start Gmail sign-in again.",
+            status="not ready",
+            status_code=503,
+        )
+
+    try:
+        from core.auth.google_gmail import GmailOAuthError, complete_gmail_oauth
+
+        completed = await complete_gmail_oauth(pool, authorization_response=str(request.url))
+    except GmailOAuthError as exc:
+        return _gmail_callback_page(
+            title="Gmail was not connected",
+            message=str(exc),
+            status="setup failed",
+            status_code=400,
+        )
+    except Exception as exc:
+        logger.exception("Gmail OAuth callback failed")
+        return _gmail_callback_page(
+            title="Gmail was not connected",
+            message=str(exc),
+            status="setup failed",
+            status_code=500,
+        )
+
+    account = completed.display_name or completed.account_key
+    return _gmail_callback_page(
+        title="Gmail connected",
+        message=f"{account} is connected to Hexis with the Gmail permissions you approved.",
+        status="connected",
+    )
+
+
+@app.get("/", include_in_schema=False)
+async def root(request: Request):
+    if "code" in request.query_params or "error" in request.query_params:
+        return await _handle_gmail_oauth_callback(request)
+    return JSONResponse({"service": "hexis-api", "health": "/health"})
+
+
+@app.get("/api/integrations/gmail/callback", response_class=HTMLResponse)
+async def gmail_oauth_callback(request: Request):
+    return await _handle_gmail_oauth_callback(request)
+
+
 @app.get("/api/status")
 async def status():
     try:
@@ -632,6 +803,7 @@ _INTEGRATION_ACTION_TO_TOOL = {
     "start_setup": "start_integration_setup",
     "configure_channel": "configure_channel_integration",
     "connect_gmail": "connect_gmail",
+    "gmail_setup_status": "gmail_setup_status",
     "complete_gmail": "complete_gmail_connection",
     "revoke_gmail": "revoke_gmail_connection",
     "connect_twitter_x": "connect_twitter_x",
@@ -1686,11 +1858,16 @@ async def _stream_chat(req: ChatRequest) -> AsyncIterator[str]:
                     if status and status != "end":
                         continue
                     count = event.data.get("count", 0)
+                    memories = event.data.get("memories")
+                    if not isinstance(memories, list):
+                        memories = []
                     yield _sse_event("log", {
                         "id": str(uuid.uuid4()),
                         "kind": "memory_recall",
                         "title": "Memory Recall",
                         "detail": f"Retrieved {count} relevant memories",
+                        "count": count,
+                        "memories": memories,
                     })
                 elif phase == "subconscious":
                     if status == "start":

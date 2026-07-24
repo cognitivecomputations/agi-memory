@@ -25,6 +25,7 @@ Use this when the user asks to connect Gmail, inspect Gmail setup, choose whethe
 - For ongoing send/reply/label/spam-triage/delete behavior, use `connector-action-authorization` after connection setup so the grant is scoped and DB-audited.
 - Prefer the structured setup UI and built-in Google sign-in when configured. Do not ask the user to paste Google setup JSON into chat; tool calls and activity traces are audited. If this local build needs setup, rely on the setup UI's step-by-step guide and upload control.
 - Never ask for Google account passwords.
+- For ordinary email work ("check my inbox", "read a batch", "is anything urgent", "find the email from Alice"), use the operational Gmail/email tool first. If it reports Gmail is not connected, use the returned `ui.kind = connector_setup` artifact or call `connect_gmail` to open setup. Do not route already-connected operational requests back into setup.
 
 ## Flow
 

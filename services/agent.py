@@ -182,6 +182,30 @@ def _subconscious_trace_events(output: SubconsciousOutput) -> list[AgentEventDat
     ]
 
 
+def _memory_event_preview(memory: "Memory", content_budget: int = 260) -> dict[str, Any]:
+    memory_type = getattr(memory, "type", None)
+    if hasattr(memory_type, "value"):
+        memory_type = memory_type.value
+    content = str(getattr(memory, "content", "") or "").strip()
+    preview: dict[str, Any] = {
+        "id": str(getattr(memory, "id", "") or ""),
+        "type": str(memory_type or ""),
+        "content": content[:content_budget],
+    }
+    for field_name in ("similarity", "relevance_score", "importance", "trust_level", "confidence"):
+        value = getattr(memory, field_name, None)
+        if isinstance(value, (int, float)):
+            preview[field_name] = float(value)
+    source = getattr(memory, "source", None)
+    if source:
+        preview["source"] = str(source)
+    return {key: value for key, value in preview.items() if value not in ("", None)}
+
+
+def _memory_event_previews(memories: list["Memory"], limit: int = 10) -> list[dict[str, Any]]:
+    return [_memory_event_preview(memory) for memory in memories[:limit]]
+
+
 # ---------------------------------------------------------------------------
 # Subconscious pre-phase
 # ---------------------------------------------------------------------------
@@ -720,7 +744,9 @@ async def run_agent(
                             event=AgentEvent.PHASE_CHANGE,
                             data={
                                 "phase": "memory_recall",
+                                "status": "end",
                                 "count": len(context.memories),
+                                "memories": _memory_event_previews(context.memories),
                             },
                         )
                     )
@@ -986,6 +1012,7 @@ async def stream_agent(
                         "phase": "memory_recall",
                         "status": "end",
                         "count": len(context.memories),
+                        "memories": _memory_event_previews(context.memories),
                     },
                 )
             except Exception as exc:

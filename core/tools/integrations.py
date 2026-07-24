@@ -238,6 +238,9 @@ def _gmail_connector_setup_ui(
             resolved_status = "client_secret_saved"
         else:
             resolved_status = "needs_client_secret"
+    if connected:
+        pending = None
+        resolved_status = "connected"
 
     caps = _gmail_capabilities_from_status(payload, capabilities)
     resolved_memory_policy = _gmail_memory_policy_from_payload(payload, memory_policy)
@@ -269,12 +272,13 @@ def _gmail_connector_setup_ui(
     authorization_url = None
     attempt_id = None
     pending_next_step = None
-    if pending:
+    if pending and resolved_status != "connected":
         authorization_url = pending.get("authorization_url")
         attempt_id = pending.get("attempt_id") or pending.get("id")
         pending_next_step = pending.get("user_next_step") or pending.get("next_step")
-    authorization_url = authorization_url or payload.get("authorization_url")
-    attempt_id = attempt_id or payload.get("attempt_id")
+    if resolved_status != "connected":
+        authorization_url = authorization_url or payload.get("authorization_url")
+        attempt_id = attempt_id or payload.get("attempt_id")
     try:
         from core.auth.google_gmail import has_env_gmail_client_secret, has_hexis_gmail_oauth_client
 
@@ -402,6 +406,8 @@ def _gmail_connector_setup_ui(
         "technical_next_step": GMAIL_SETUP_TECHNICAL_NEXT_STEP,
         "authorization_url": authorization_url,
         "attempt_id": attempt_id,
+        "completion_mode": "automatic_with_manual_fallback" if attempt_id and resolved_status != "connected" else None,
+        "manual_completion_available": bool(attempt_id and resolved_status != "connected"),
         "connected_accounts": connected,
         "next_step": resolved_next_step,
         "primary_action": {
@@ -1213,7 +1219,8 @@ class ConnectGmailHandler(ToolHandler):
             "Google sign-in started for Gmail.\n"
             f"Attempt: {payload['attempt_id']}\n"
             f"{payload['authorization_url']}\n\n"
-            "After approving, paste the full redirected localhost URL back here."
+            "Approve access in Google. Hexis will finish the connection automatically "
+            "when the browser returns to the local callback."
         )
         return ToolResult.success_result(payload, display_output=display)
 
@@ -1226,15 +1233,15 @@ class CompleteGmailConnectionHandler(ToolHandler):
         return ToolSpec(
             name="complete_gmail_connection",
             description=(
-                "Complete Gmail sign-in setup after the user pastes the full redirected localhost URL "
-                "or authorization code from Google."
+                "Complete Gmail sign-in setup from a Google callback URL or raw authorization code. "
+                "Normally the local Hexis callback completes this automatically; use this as a fallback."
             ),
             parameters={
                 "type": "object",
                 "properties": {
                     "authorization_response": {
                         "type": "string",
-                        "description": "Full redirected URL or raw authorization code.",
+                        "description": "Full Google callback URL or raw authorization code.",
                     },
                     "attempt_id": {
                         "type": "string",
@@ -1672,9 +1679,23 @@ class StartGmailBackfillHandler(ToolHandler):
         from core.auth.google_gmail import load_default_credentials
 
         if load_default_credentials() is None:
-            return ToolResult.error_result(
-                "Gmail credentials are not saved locally. Use connect_gmail first.",
-                ToolErrorType.AUTH_FAILED,
+            payload = {
+                "connector_id": "gmail",
+                "status": "needs_connection",
+                "next_step": "Gmail is not connected. Open the Gmail setup panel before starting an email backfill.",
+            }
+            payload["ui"] = _gmail_connector_setup_ui(
+                payload,
+                status="needs_client_secret",
+                capabilities=["read", "search"],
+                next_step=payload["next_step"],
+            )
+            return ToolResult(
+                success=False,
+                output=payload,
+                display_output=payload["next_step"],
+                error="Gmail is not connected. Open the structured Gmail setup flow before backfilling email.",
+                error_type=ToolErrorType.AUTH_FAILED,
             )
         try:
             account_key = await _resolve_gmail_account(

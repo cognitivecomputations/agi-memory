@@ -3,7 +3,12 @@ import json
 import pytest
 
 from core.tools import ToolResult
-from services.connector_setup import detect_connector_setup_intent, run_connector_setup_intent
+from services import connector_setup
+from services.connector_setup import (
+    ConnectorSetupIntent,
+    detect_connector_setup_intent,
+    run_connector_setup_intent,
+)
 
 
 class _NoDbPool:
@@ -87,25 +92,30 @@ class _BuiltInGmailRegistry(_FakeRegistry):
         )
 
 
+def _patch_classifier(monkeypatch, doc):
+    async def fake_classifier(_pool, _text, *, pending, gmail_connected):
+        assert pending is not None
+        assert gmail_connected is False
+        return doc
+
+    monkeypatch.setattr(connector_setup, "_classify_connector_setup_intent", fake_classifier)
+
+
 @pytest.mark.asyncio
-async def test_detects_natural_email_connection_request():
+async def test_direct_email_connection_request_is_agent_routed():
     intent = await detect_connector_setup_intent(
         _NoDbPool(),
         "Can you connect to my email?",
         session_id="setup-natural",
     )
 
-    assert intent is not None
-    assert intent.connector_id == "gmail"
-    assert intent.action == "choose_scope"
-    assert "capabilities" not in intent.arguments
+    assert intent is None
 
 
 @pytest.mark.asyncio
-async def test_scope_then_memory_answers_route_without_llm():
+async def test_scope_then_memory_answers_route_from_pending_setup(monkeypatch):
     session_id = "setup-staged"
-    first = await detect_connector_setup_intent(_NoDbPool(), "connect my email", session_id=session_id)
-    assert first is not None
+    first = ConnectorSetupIntent("gmail", "choose_scope")
 
     registry = _FakeRegistry()
     opened = await run_connector_setup_intent(
@@ -119,6 +129,10 @@ async def test_scope_then_memory_answers_route_without_llm():
     assert opened.ui is not None
     assert opened.ui["status"] == "needs_capability_choice"
 
+    _patch_classifier(
+        monkeypatch,
+        {"route": "connector_setup", "capability_tier": "read_only"},
+    )
     second = await detect_connector_setup_intent(_NoDbPool(), "just read them", session_id=session_id)
     assert second is not None
     assert second.action == "choose_memory"
@@ -135,6 +149,10 @@ async def test_scope_then_memory_answers_route_without_llm():
     assert prompted.ui["status"] == "needs_memory_choice"
     assert prompted.ui["memory_config_key"] == "integrations.gmail.memory_policy"
 
+    _patch_classifier(
+        monkeypatch,
+        {"route": "connector_setup", "memory_policy": "forget"},
+    )
     third = await detect_connector_setup_intent(_NoDbPool(), "forget what they say", session_id=session_id)
     assert third is not None
     assert third.action == "choose_autonomy"
@@ -152,6 +170,10 @@ async def test_scope_then_memory_answers_route_without_llm():
     assert autonomy_prompt.ui["status"] == "needs_autonomy_choice"
     assert autonomy_prompt.ui["heartbeat_digest_config_key"] == "integrations.gmail.heartbeat_digest_enabled"
 
+    _patch_classifier(
+        monkeypatch,
+        {"route": "connector_setup", "heartbeat_digest_enabled": False},
+    )
     fourth = await detect_connector_setup_intent(_NoDbPool(), "only when I ask", session_id=session_id)
     assert fourth is not None
     assert fourth.action == "start"
@@ -161,64 +183,53 @@ async def test_scope_then_memory_answers_route_without_llm():
 
 
 @pytest.mark.asyncio
-async def test_direct_email_setup_can_include_powers_and_memory_policy():
+async def test_connected_gmail_clears_stale_pending_setup():
+    session_id = "setup-connected"
+    connector_setup._PENDING_SETUP_BY_SESSION[session_id] = {
+        "connector_id": "gmail",
+        "stage": "capability_choice",
+    }
+
+    class _ConnectedConn:
+        async def fetchval(self, _sql):
+            return json.dumps(
+                {
+                    "connections": [
+                        {
+                            "connector_id": "gmail",
+                            "status": "connected",
+                            "account_key": "eric@example.com",
+                        }
+                    ],
+                    "recent_attempts": [
+                        {
+                            "connector_id": "gmail",
+                            "status": "pending_user",
+                            "authorization_url": "https://accounts.google.com/stale",
+                        }
+                    ],
+                }
+            )
+
+    class _ConnectedAcquire:
+        async def __aenter__(self):
+            return _ConnectedConn()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class _ConnectedPool:
+        def acquire(self):
+            return _ConnectedAcquire()
+
     intent = await detect_connector_setup_intent(
-        _NoDbPool(),
-        "connect Gmail so you can send replies, remember what you read, and check during hourly heartbeats",
-        session_id="setup-direct",
+        _ConnectedPool(),
+        "read a batch of my emails and notify me if anything is urgent",
+        session_id=session_id,
     )
 
-    assert intent is not None
-    assert intent.action == "start"
-    assert intent.arguments["capabilities"] == ["read", "search", "send", "reply"]
-    assert intent.arguments["memory_policy"] == "remember"
-    assert intent.arguments["heartbeat_digest_enabled"] is True
-
-
-@pytest.mark.asyncio
-async def test_delete_power_is_provider_capability_but_memory_is_config():
-    intent = await detect_connector_setup_intent(
-        _NoDbPool(),
-        "connect my email so you can delete spam, forget what you read, and only check when I ask",
-        session_id="setup-delete",
-    )
-
-    assert intent is not None
-    assert intent.action == "start"
-    assert intent.arguments["capabilities"] == [
-        "read",
-        "search",
-        "send",
-        "reply",
-        "label",
-        "spam_triage",
-        "delete",
-    ]
-    assert "ingest" not in intent.arguments["capabilities"]
-    assert intent.arguments["memory_policy"] == "forget"
-    assert intent.arguments["heartbeat_digest_enabled"] is False
-
-
-@pytest.mark.asyncio
-async def test_direct_setup_pauses_for_autonomous_gmail_choice_when_missing():
-    intent = await detect_connector_setup_intent(
-        _NoDbPool(),
-        "connect my email so you can delete spam but forget what you read",
-        session_id="setup-delete-autonomy",
-    )
-
-    assert intent is not None
-    assert intent.action == "choose_autonomy"
-    assert intent.arguments["base_capabilities"] == [
-        "read",
-        "search",
-        "send",
-        "reply",
-        "label",
-        "spam_triage",
-        "delete",
-    ]
-    assert intent.arguments["memory_policy"] == "forget"
+    assert intent is None
+    assert session_id not in connector_setup._PENDING_SETUP_BY_SESSION
 
 
 @pytest.mark.asyncio
@@ -237,8 +248,7 @@ async def test_detects_google_setup_file_path():
 @pytest.mark.asyncio
 async def test_pending_setup_accepts_bare_absolute_json_path():
     session_id = "setup-bare-path"
-    first = await detect_connector_setup_intent(_NoDbPool(), "connect my email", session_id=session_id)
-    assert first is not None
+    first = ConnectorSetupIntent("gmail", "choose_scope")
 
     registry = _FakeRegistry()
     await run_connector_setup_intent(
@@ -274,8 +284,7 @@ async def test_detects_pending_gmail_oauth_redirect_as_completion():
 
 @pytest.mark.asyncio
 async def test_run_connector_setup_returns_assistant_text_and_ui():
-    intent = await detect_connector_setup_intent(_NoDbPool(), "connect gmail", session_id="session-1")
-    assert intent is not None
+    intent = ConnectorSetupIntent("gmail", "choose_scope")
     registry = _FakeRegistry()
 
     result = await run_connector_setup_intent(
@@ -295,12 +304,15 @@ async def test_run_connector_setup_returns_assistant_text_and_ui():
 
 @pytest.mark.asyncio
 async def test_run_connector_setup_start_passes_policy_separate_from_capabilities():
-    intent = await detect_connector_setup_intent(
-        _NoDbPool(),
-        "connect gmail so you can reply, forget what you read, and only check when I ask",
-        session_id="session-2",
+    intent = ConnectorSetupIntent(
+        "gmail",
+        "start",
+        {
+            "capabilities": ["read", "search", "send", "reply"],
+            "memory_policy": "forget",
+            "heartbeat_digest_enabled": False,
+        },
     )
-    assert intent is not None
     registry = _FakeRegistry()
 
     result = await run_connector_setup_intent(
@@ -329,12 +341,15 @@ async def test_run_connector_setup_start_passes_policy_separate_from_capabilitie
 
 @pytest.mark.asyncio
 async def test_run_connector_setup_start_uses_built_in_sign_in_copy():
-    intent = await detect_connector_setup_intent(
-        _NoDbPool(),
-        "connect gmail so you can read my email, remember what you read, and check during hourly heartbeats",
-        session_id="session-built-in",
+    intent = ConnectorSetupIntent(
+        "gmail",
+        "start",
+        {
+            "capabilities": ["read", "search"],
+            "memory_policy": "remember",
+            "heartbeat_digest_enabled": True,
+        },
     )
-    assert intent is not None
     registry = _BuiltInGmailRegistry()
 
     result = await run_connector_setup_intent(

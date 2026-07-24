@@ -500,9 +500,9 @@ async def _run_chat(dsn: str, *, verbose: bool = False, debug: bool = False,
                         success = event.data.get("success", False)
                         duration = event.data.get("duration")
                         dur_str = f" [{duration:.1f}s]" if isinstance(duration, (int, float)) else ""
+                        ui = _connector_setup_ui(event.data.get("output"))
                         if success:
                             console.print(f" [ok]done[/ok][dim]{dur_str}[/dim]")
-                            ui = _connector_setup_ui(event.data.get("output"))
                             if ui:
                                 _print_connector_setup_ui(ui)
                             if verbose:
@@ -512,6 +512,8 @@ async def _run_chat(dsn: str, *, verbose: bool = False, debug: bool = False,
                         else:
                             error_msg = event.data.get("error", "")
                             console.print(f" [fail]failed[/fail][dim]{dur_str}[/dim] [muted]{error_msg[:120]}[/muted]")
+                            if ui:
+                                _print_connector_setup_ui(ui)
 
                     elif event.event == AgentEvent.UI_ARTIFACT:
                         ui = _connector_setup_ui(event.data)

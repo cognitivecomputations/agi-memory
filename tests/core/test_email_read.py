@@ -153,6 +153,8 @@ class TestAuthFailures:
         result = await handler.execute({}, _make_context())
         assert not result.success
         assert result.error_type == ToolErrorType.AUTH_FAILED
+        assert result.output["ui"]["kind"] == "connector_setup"
+        assert result.output["ui"]["connector_id"] == "gmail"
 
     @pytest.mark.asyncio
     async def test_read_no_credentials(self):
@@ -160,6 +162,7 @@ class TestAuthFailures:
         result = await handler.execute({"message_id": "abc"}, _make_context())
         assert not result.success
         assert result.error_type == ToolErrorType.AUTH_FAILED
+        assert result.output["ui"]["kind"] == "connector_setup"
 
     @pytest.mark.asyncio
     async def test_search_no_credentials(self):
@@ -167,6 +170,7 @@ class TestAuthFailures:
         result = await handler.execute({"query": "test"}, _make_context())
         assert not result.success
         assert result.error_type == ToolErrorType.AUTH_FAILED
+        assert result.output["ui"]["kind"] == "connector_setup"
 
     @pytest.mark.asyncio
     async def test_list_resolver_returns_none(self):
@@ -174,6 +178,7 @@ class TestAuthFailures:
         result = await handler.execute({}, _make_context())
         assert not result.success
         assert result.error_type == ToolErrorType.AUTH_FAILED
+        assert result.output["ui"]["kind"] == "connector_setup"
 
 
 # ---------------------------------------------------------------------------

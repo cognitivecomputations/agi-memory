@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import httpx
 import pytest
 from fastapi import HTTPException
@@ -128,3 +130,32 @@ async def test_save_gmail_client_secret_action_returns_ui_without_secret(monkeyp
     assert body["output"]["ui"]["kind"] == "connector_setup"
     assert body["output"]["ui"]["status"] == "client_secret_saved"
     assert "actual-secret" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_gmail_oauth_callback_completes_attempt_without_manual_paste(monkeypatch) -> None:
+    calls: list[str] = []
+
+    async def fake_complete(_pool, *, authorization_response: str):
+        calls.append(authorization_response)
+        return SimpleNamespace(
+            account_key="eric@example.com",
+            display_name="eric@example.com",
+            credential_ref="integration.gmail.default",
+            granted_scopes=["https://www.googleapis.com/auth/gmail.readonly"],
+            capabilities=["read", "search"],
+        )
+
+    monkeypatch.setattr(hexis_api, "_pool", object())
+    monkeypatch.setattr("core.auth.google_gmail.complete_gmail_oauth", fake_complete)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://127.0.0.1:43817",
+    ) as client:
+        response = await client.get("/?code=oauth-code&state=state-value")
+
+    assert response.status_code == 200
+    assert "Gmail connected" in response.text
+    assert "eric@example.com" in response.text
+    assert calls and "code=oauth-code" in calls[0]

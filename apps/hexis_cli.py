@@ -3625,6 +3625,18 @@ def _port_ready(port: int, host: str = "127.0.0.1", timeout: float = 0.5) -> boo
         return False
 
 
+def _http_ready(url: str, timeout: float = 1.0) -> bool:
+    """True if a local HTTP endpoint responds without a transport error."""
+    import urllib.error
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            return 200 <= int(getattr(resp, "status", 0)) < 500
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+        return False
+
+
 _LOCAL_EMBEDDING_COMMAND = "embeddinggemma"
 _LOCAL_EMBEDDING_INSTALLER = "curl -fsSL https://raw.githubusercontent.com/QuixiAI/embeddinggemma.c/main/install.sh | sh"
 _LOCAL_EMBEDDING_PORT = 42666
@@ -3716,6 +3728,14 @@ def _local_embedding_binary() -> Path | None:
     return None
 
 
+def _tail_text(path: Path, *, max_lines: int = 12) -> str:
+    """Best-effort text tail for CLI diagnostics."""
+    try:
+        return "\n".join(path.read_text(errors="replace").splitlines()[-max_lines:])
+    except Exception:
+        return ""
+
+
 def _start_local_embedding_service(wait_seconds: float = 90.0) -> bool:
     """Start the published embeddinggemma sidecar if port 42666 is idle."""
     import time as _time
@@ -3757,38 +3777,15 @@ def _start_local_embedding_service(wait_seconds: float = 90.0) -> bool:
     proc: subprocess.Popen[Any] | None = None
     launch_detail = str(binary)
     try:
-        screen_bin = shutil.which("screen") if sys.platform == "darwin" else None
-        if screen_bin:
-            # The Metal build currently requires a live tty on macOS. Detached
-            # screen keeps that invariant while still giving `hexis up/ui` a
-            # background sidecar derived from the installed binary.
-            session_name = f"hexis-embeddinggemma-{os.getpid()}"
-            launch_detail = f"{screen_bin} session {session_name}"
+        with _LOCAL_EMBEDDING_LOG.open("ab") as log_f:
             proc = subprocess.Popen(
-                [
-                    screen_bin,
-                    "-L",
-                    "-Logfile",
-                    str(_LOCAL_EMBEDDING_LOG),
-                    "-dmS",
-                    session_name,
-                    str(binary),
-                ],
+                [str(binary)],
                 stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=log_f,
+                stderr=subprocess.STDOUT,
                 env=os.environ.copy(),
+                start_new_session=True,
             )
-        else:
-            with _LOCAL_EMBEDDING_LOG.open("ab") as log_f:
-                proc = subprocess.Popen(
-                    [str(binary)],
-                    stdin=subprocess.DEVNULL,
-                    stdout=log_f,
-                    stderr=subprocess.STDOUT,
-                    env=os.environ.copy(),
-                    start_new_session=True,
-                )
     except Exception as exc:
         console.print(
             f"[warn]Couldn't start local embedding service: {exc}[/warn]\n"
@@ -3796,24 +3793,31 @@ def _start_local_embedding_service(wait_seconds: float = 90.0) -> bool:
         )
         return False
 
+    console.print(f"[muted]Waiting for embedding service on port {_LOCAL_EMBEDDING_PORT}...[/muted]")
     deadline = _time.monotonic() + wait_seconds
     while _time.monotonic() < deadline:
         if _port_ready(_LOCAL_EMBEDDING_PORT):
             console.print(f"[ok]Embedding service is ready on port {_LOCAL_EMBEDDING_PORT}.[/ok]")
             return True
-        if proc is not None and proc.poll() is not None and sys.platform != "darwin":
+        if proc is not None and proc.poll() is not None:
+            tail = _tail_text(_LOCAL_EMBEDDING_LOG)
+            tail_block = f"\n  Recent log:\n{tail}" if tail else ""
             console.print(
                 f"[warn]Embedding service exited with code {proc.returncode}.[/warn]\n"
                 f"  See log: [accent]{_LOCAL_EMBEDDING_LOG}[/accent]\n"
                 f"  Or run directly: [accent]{binary}[/accent]"
+                f"{tail_block}"
             )
             return False
         _time.sleep(0.5)
 
+    tail = _tail_text(_LOCAL_EMBEDDING_LOG)
+    tail_block = f"\n  Recent log:\n{tail}" if tail else ""
     console.print(
         f"[warn]Embedding service did not become ready within {int(wait_seconds)} seconds.[/warn]\n"
         f"  It may still be downloading/loading the model. See log: [accent]{_LOCAL_EMBEDDING_LOG}[/accent]\n"
         f"  Launcher: [accent]{launch_detail}[/accent]"
+        f"{tail_block}"
     )
     return False
 
@@ -3885,6 +3889,28 @@ def _handle_ui(
         or os.getenv("HEXIS_API_BASE_URL")
         or "http://127.0.0.1:43817"
     )
+    chat_url = f"http://localhost:{port}/chat"
+    local_chat_url = f"http://127.0.0.1:{port}/chat"
+    if _http_ready(local_chat_url) or _http_ready(chat_url):
+        listener = _port_listener_summary(port)
+        detail = f" Listener: {listener}." if listener else ""
+        _print_err(
+            f"Web dashboard is already running on port {port}."
+            f"{detail}\n"
+            "`hexis ui` runs the dashboard in the foreground. Stop the existing UI process, "
+            "then run `hexis ui` again."
+        )
+        return 1
+
+    if _port_ready(port):
+        listener = _port_listener_summary(port)
+        detail = f" Listener: {listener}." if listener else ""
+        _print_err(
+            f"Port {port} is already in use, but Hexis did not get a dashboard response."
+            f"{detail}\n"
+            f"Stop that process, then run `hexis ui` again."
+        )
+        return 1
 
     def _api_healthcheck(url: str) -> bool:
         health_url = f"{url.rstrip('/')}/health"
@@ -3916,6 +3942,8 @@ def _handle_ui(
             api_env = os.environ.copy()
             if active_instance:
                 api_env["HEXIS_INSTANCE"] = active_instance
+            api_env.setdefault("HEXIS_API_URL", api_url)
+            api_env.setdefault("HEXIS_UI_URL", f"http://localhost:{port}/chat")
             api_proc = subprocess.Popen(
                 api_cmd,
                 cwd=stack_root,
@@ -3947,12 +3975,13 @@ def _handle_ui(
 
     from apps.cli_theme import console
     console.print(f"\n[accent]Starting web dashboard on port {port}...[/accent]")
+    console.print("[muted]Dashboard runs in this terminal. Press Ctrl+C to stop it.[/muted]")
 
     # Open the browser only once the server actually responds — not on a timer.
     if not no_open:
         def _open_browser():
             if _wait_port_ready(port):
-                webbrowser.open(f"http://localhost:{port}")
+                webbrowser.open(chat_url)
         t = threading.Thread(target=_open_browser, daemon=True)
         t.start()
 
@@ -3965,6 +3994,7 @@ def _handle_ui(
 
     dev_env = os.environ.copy()
     dev_env["HEXIS_API_URL"] = api_url
+    dev_env["HEXIS_UI_URL"] = chat_url
     dev_env["HEXIS_DATABASE_URL"] = dsn
     dev_env["DATABASE_URL"] = dsn
     if active_instance:
@@ -4044,6 +4074,26 @@ def _handle_ui_container(
 
     from apps.cli_theme import console
 
+    if _http_ready(f"http://127.0.0.1:{port}/chat") or _http_ready(f"http://localhost:{port}/chat"):
+        listener = _port_listener_summary(port)
+        detail = f" Listener: {listener}." if listener else ""
+        _print_err(
+            f"Web dashboard is already running on port {port}."
+            f"{detail}\n"
+            "`hexis ui` runs the dashboard in the foreground. Stop the existing UI process, "
+            "then run `hexis ui` again."
+        )
+        return 1
+    if _port_ready(port):
+        listener = _port_listener_summary(port)
+        detail = f" Listener: {listener}." if listener else ""
+        _print_err(
+            f"Port {port} is already in use, but Hexis did not get a dashboard response."
+            f"{detail}\n"
+            f"Stop that process, then run `hexis ui` again."
+        )
+        return 1
+
     try:
         if _uses_local_embedding_sidecar(env_file):
             _start_local_embedding_service()
@@ -4053,14 +4103,10 @@ def _handle_ui_container(
         pass  # advisory only; init write routes surface embedding failures
 
     console.print("[accent]Starting containerized web dashboard...[/accent]")
+    console.print("[muted]Dashboard runs in this terminal. Press Ctrl+C to stop it.[/muted]")
 
     # Bring up both the UI and the canonical Python API (hexis-api).
     # The Next.js BFF proxies chat + consent to hexis-api.
-    rc = run_compose(compose_cmd, compose_file, stack_root, ["up", "-d", "api", "ui"], env_file)
-    if rc != 0:
-        _print_err("Failed to start UI container.")
-        return rc
-
     # Open the browser only once the server actually responds — not on a timer.
     if not no_open:
         def _open_browser():
@@ -4069,15 +4115,12 @@ def _handle_ui_container(
         t = threading.Thread(target=_open_browser, daemon=True)
         t.start()
 
-    console.print(f"\n[ok]Dashboard running at http://localhost:{port}[/ok]")
-    console.print("[muted]Tailing container logs (Ctrl+C to stop)...[/muted]\n")
-
-    # Tail logs in foreground
     try:
-        run_compose(compose_cmd, compose_file, stack_root, ["logs", "-f", "ui"], env_file)
+        return run_compose(compose_cmd, compose_file, stack_root, ["up", "api", "ui"], env_file)
     except KeyboardInterrupt:
-        pass
-    return 0
+        return 0
+    finally:
+        run_compose(compose_cmd, compose_file, stack_root, ["stop", "ui", "api"], env_file)
 
 
 def main(argv: list[str] | None = None) -> int:

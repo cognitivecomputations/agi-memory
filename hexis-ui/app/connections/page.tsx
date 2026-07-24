@@ -897,28 +897,36 @@ function GmailControls({
       )}
 
       {pendingAttempt ? (
-        <div className="grid gap-2 md:grid-cols-[1fr_auto]">
-          <TextInput
-            value={authorizationResponse}
-            onChange={(event) => setAuthorizationResponse(event.target.value)}
-            placeholder="Paste redirected URL or authorization code"
-            className="py-2 text-xs"
-          />
-          <Button
-            type="button"
-            variant="secondary"
-            disabled={Boolean(actionBusy) || authorizationResponse.trim().length === 0}
-            onClick={() =>
-              void onAction("gmail:complete", "complete_gmail", {
-                attempt_id: pendingAttempt.attempt_id,
-                authorization_response: authorizationResponse.trim(),
-              })
-            }
-            className="px-3 py-2 text-xs"
-          >
-            {completeBusy ? "Completing..." : "Complete"}
-          </Button>
-        </div>
+        <details className="rounded-md border border-[var(--outline)] bg-white px-3 py-2 text-xs">
+          <summary className="cursor-pointer font-semibold text-[var(--teal)]">
+            Google did not return automatically
+          </summary>
+          <p className="mt-2 leading-5 text-[var(--ink-soft)]">
+            This page refreshes Gmail status automatically. Use this fallback only if Google leaves you on a callback page that did not complete.
+          </p>
+          <div className="mt-2 grid gap-2 md:grid-cols-[1fr_auto]">
+            <TextInput
+              value={authorizationResponse}
+              onChange={(event) => setAuthorizationResponse(event.target.value)}
+              placeholder="Paste Google callback URL or authorization code"
+              className="py-2 text-xs"
+            />
+            <Button
+              type="button"
+              variant="secondary"
+              disabled={Boolean(actionBusy) || authorizationResponse.trim().length === 0}
+              onClick={() =>
+                void onAction("gmail:complete", "complete_gmail", {
+                  attempt_id: pendingAttempt.attempt_id,
+                  authorization_response: authorizationResponse.trim(),
+                })
+              }
+              className="px-3 py-2 text-xs"
+            >
+              {completeBusy ? "Completing..." : "Complete"}
+            </Button>
+          </div>
+        </details>
       ) : null}
     </div>
   );
@@ -1382,7 +1390,7 @@ function connectorSetupNotice(ui: Record<string, unknown>): string {
     return `${connector} setup file saved. Start Google sign-in from the setup panel.`;
   }
   if (status === "pending_authorization") {
-    return `${connector} sign-in started. Open Google, then paste the redirected localhost URL.`;
+    return `${connector} sign-in started. Open Google; Hexis will complete the connection when Google returns.`;
   }
   if (status === "connected") return `${connector} is connected.`;
   return `${connector} setup updated.`;

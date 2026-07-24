@@ -53,6 +53,8 @@ class GmailSendHandler(ToolHandler):
         )
 
     async def execute(self, arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
+        from core.auth.google_gmail import GmailOAuthError
+        from core.tools.email import _gmail_setup_required_result
         from services.gmail_actions import GmailActionError, send_gmail_message
 
         try:
@@ -65,6 +67,8 @@ class GmailSendHandler(ToolHandler):
                 bcc=arguments.get("bcc"),
                 reply_to=arguments.get("reply_to"),
             )
+        except GmailOAuthError:
+            return await _gmail_setup_required_result(context)
         except GmailActionError as exc:
             return ToolResult.error_result(str(exc), ToolErrorType.EXECUTION_FAILED)
         return ToolResult.success_result(
@@ -103,6 +107,8 @@ class GmailReplyHandler(ToolHandler):
         )
 
     async def execute(self, arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
+        from core.auth.google_gmail import GmailOAuthError
+        from core.tools.email import _gmail_setup_required_result
         from services.gmail_actions import GmailActionError, reply_gmail_message
 
         try:
@@ -117,6 +123,8 @@ class GmailReplyHandler(ToolHandler):
                 cc=arguments.get("cc"),
                 bcc=arguments.get("bcc"),
             )
+        except GmailOAuthError:
+            return await _gmail_setup_required_result(context)
         except GmailActionError as exc:
             return ToolResult.error_result(str(exc), ToolErrorType.EXECUTION_FAILED)
         return ToolResult.success_result(
@@ -158,6 +166,8 @@ class GmailLabelHandler(ToolHandler):
         )
 
     async def execute(self, arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
+        from core.auth.google_gmail import GmailOAuthError
+        from core.tools.email import _gmail_setup_required_result
         from services.gmail_actions import GmailActionError, modify_gmail_labels
 
         try:
@@ -167,6 +177,8 @@ class GmailLabelHandler(ToolHandler):
                 add_label_ids=_string_list(arguments.get("add_label_ids")),
                 remove_label_ids=_string_list(arguments.get("remove_label_ids")),
             )
+        except GmailOAuthError:
+            return await _gmail_setup_required_result(context)
         except GmailActionError as exc:
             return ToolResult.error_result(str(exc), ToolErrorType.EXECUTION_FAILED)
         return ToolResult.success_result(
@@ -203,6 +215,8 @@ class GmailSpamTriageHandler(ToolHandler):
         )
 
     async def execute(self, arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
+        from core.auth.google_gmail import GmailOAuthError
+        from core.tools.email import _gmail_setup_required_result
         from services.gmail_actions import GmailActionError, triage_gmail_spam
 
         try:
@@ -211,6 +225,8 @@ class GmailSpamTriageHandler(ToolHandler):
                 message_id=str(arguments.get("message_id") or ""),
                 action=str(arguments.get("action") or ""),
             )
+        except GmailOAuthError:
+            return await _gmail_setup_required_result(context)
         except GmailActionError as exc:
             return ToolResult.error_result(str(exc), ToolErrorType.EXECUTION_FAILED)
         return ToolResult.success_result(
@@ -250,6 +266,8 @@ class GmailDeleteHandler(ToolHandler):
         )
 
     async def execute(self, arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
+        from core.auth.google_gmail import GmailOAuthError
+        from core.tools.email import _gmail_setup_required_result
         from services.gmail_actions import GmailActionError, delete_gmail_message
 
         try:
@@ -258,6 +276,8 @@ class GmailDeleteHandler(ToolHandler):
                 message_id=str(arguments.get("message_id") or ""),
                 permanent=bool(arguments.get("permanent", False)),
             )
+        except GmailOAuthError:
+            return await _gmail_setup_required_result(context)
         except GmailActionError as exc:
             return ToolResult.error_result(str(exc), ToolErrorType.EXECUTION_FAILED)
         verb = "permanently deleted" if result.get("permanent") else "moved to trash"

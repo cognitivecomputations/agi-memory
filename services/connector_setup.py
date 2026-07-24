@@ -9,12 +9,15 @@ freehands OAuth instructions.
 from __future__ import annotations
 
 import json
-import re
+import shlex
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Literal
+from urllib.parse import parse_qs, urlparse
 
 from core.tools import ToolContext, ToolExecutionContext, ToolRegistry
+from core.llm_config import load_llm_config
+from core.llm_json import chat_json
 
 
 ConnectorSetupAction = Literal["choose_scope", "choose_memory", "choose_autonomy", "start", "complete"]
@@ -27,43 +30,17 @@ _GMAIL_MANAGE_CAPABILITIES = [
     "spam_triage",
     "delete",
 ]
-_CONNECTOR_SETUP_WORDS = r"(?:connect|link|set\s*up|setup|authorize|auth|hook\s*up)"
-_GMAIL_WORDS = r"(?:gmail|google\s+mail|mailbox|email|inbox|mail)"
-_GMAIL_SETUP_RE = re.compile(
-    rf"\b{_CONNECTOR_SETUP_WORDS}\b[\s\S]{{0,80}}\b{_GMAIL_WORDS}\b"
-    rf"|\b{_GMAIL_WORDS}\b[\s\S]{{0,80}}\b{_CONNECTOR_SETUP_WORDS}\b",
-    re.IGNORECASE,
+_CANCEL_MESSAGES = {"cancel", "stop", "never mind", "nevermind"}
+_CLIENT_SECRET_HINTS = (
+    "gmail",
+    "google",
+    "oauth",
+    "client_secret",
+    "client secret",
+    "desktop client",
+    "json file",
+    "credentials",
 )
-_OAUTH_REDIRECT_RE = re.compile(
-    r"https?://(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?/[^\s\"'<>]*[?&]code=",
-    re.IGNORECASE,
-)
-_JSON_PATH_RE = re.compile(r"(?P<path>(?:~|/)[^\s\"'<>]+?\.json)\b", re.IGNORECASE)
-_CLIENT_SECRET_HINT_RE = re.compile(
-    r"\b(?:gmail|google|oauth|client[_ -]?secret|desktop client|json file|credentials?)\b",
-    re.IGNORECASE,
-)
-_READ_ONLY_RE = re.compile(r"\b(?:read\s*only|just\s+read|only\s+read|read|browse|search)\b", re.IGNORECASE)
-_WRITE_RE = re.compile(r"\b(?:write|send|reply|respond|email\s+on\s+my\s+behalf)\b", re.IGNORECASE)
-_MANAGE_RE = re.compile(r"\b(?:delete|trash|manage|label|labels|spam|archive|filter)\b", re.IGNORECASE)
-_REMEMBER_RE = re.compile(r"\b(?:remember|learn|ingest|store|keep|retain)\b", re.IGNORECASE)
-_FORGET_RE = re.compile(
-    r"\b(?:forget|do\s+not\s+remember|don't\s+remember|dont\s+remember|do\s+not\s+ingest|don't\s+ingest|dont\s+ingest|ephemeral|temporary)\b",
-    re.IGNORECASE,
-)
-_AUTONOMOUS_EMAIL_RE = re.compile(
-    r"\b(?:heartbeat|background|autonomous|automatically|auto|proactive|hourly|digest|while\s+i(?:'|’)?m\s+away|without\s+me\s+asking|only\s+(?:check\s+)?when\s+i\s+ask|when\s+i\s+ask)\b",
-    re.IGNORECASE,
-)
-_AUTONOMOUS_ENABLE_RE = re.compile(
-    r"\b(?:yes|sure|ok|okay|enable|allow|authorize|proactive|automatic|automatically|hourly|heartbeat|background|digest)\b",
-    re.IGNORECASE,
-)
-_AUTONOMOUS_DISABLE_RE = re.compile(
-    r"\b(?:no|not|never|disable|only\s+when\s+i\s+ask|when\s+i\s+ask|do\s+not|don't|dont|manual)\b",
-    re.IGNORECASE,
-)
-_CANCEL_RE = re.compile(r"^\s*(?:cancel|stop|never mind|nevermind)\s*$", re.IGNORECASE)
 
 _PENDING_SETUP_BY_SESSION: dict[str, dict[str, Any]] = {}
 
@@ -112,17 +89,43 @@ def _tool_result_payload(result: Any) -> dict[str, Any]:
     }
 
 
+def _message_tokens(message: str) -> list[str]:
+    try:
+        tokens = shlex.split(message)
+    except ValueError:
+        tokens = message.split()
+    return [token.strip().strip("<>'\".,;)(") for token in tokens if token.strip()]
+
+
 def _extract_client_secret_path(message: str, *, pending_setup: bool = False) -> str | None:
-    match = _JSON_PATH_RE.search(message)
-    if not match:
-        return None
-    if (
-        not pending_setup
-        and not _CLIENT_SECRET_HINT_RE.search(message)
-        and "client_secret" not in match.group("path").lower()
-    ):
-        return None
-    return match.group("path").rstrip(".,;)")
+    normalized = " ".join(message.lower().replace("_", " ").replace("-", " ").split())
+    for token in _message_tokens(message):
+        lowered = token.lower()
+        if not (token.startswith("/") or token.startswith("~")):
+            continue
+        if not lowered.endswith(".json"):
+            continue
+        if (
+            not pending_setup
+            and "client_secret" not in lowered
+            and not any(hint in normalized for hint in _CLIENT_SECRET_HINTS)
+        ):
+            continue
+        return token.rstrip(".,;)")
+    return None
+
+
+def _extract_oauth_redirect(message: str) -> str | None:
+    for token in _message_tokens(message):
+        parsed = urlparse(token)
+        if parsed.scheme not in {"http", "https"}:
+            continue
+        if parsed.hostname not in {"localhost", "127.0.0.1", "::1"}:
+            continue
+        params = parse_qs(parsed.query)
+        if params.get("code") or params.get("error"):
+            return token
+    return None
 
 
 def _capability_options() -> list[dict[str, Any]]:
@@ -273,34 +276,69 @@ def _capabilities_for_tier(tier: str) -> list[str]:
     return list(_GMAIL_READ_CAPABILITIES)
 
 
-def _tier_from_text(text: str) -> str | None:
-    if _MANAGE_RE.search(text):
+def _dedupe_capabilities(capabilities: list[str]) -> list[str]:
+    return list(dict.fromkeys(str(item).strip() for item in capabilities if str(item).strip()))
+
+
+def _normalized_choice_text(text: str) -> str:
+    return " ".join(str(text or "").strip().lower().split())
+
+
+def _gmail_word_candidate(text: str) -> bool:
+    """Cheap gate before spending an LLM call; the model still decides intent."""
+    lowered = f" {text.lower()} "
+    return any(
+        marker in lowered
+        for marker in (
+            " gmail",
+            " email",
+            " e-mail",
+            " inbox",
+            " mailbox",
+            " mail ",
+            " emails",
+            " messages",
+        )
+    )
+
+
+def _tier_from_classification(classification: dict[str, Any]) -> str | None:
+    tier = str(classification.get("capability_tier") or "").strip().lower()
+    if tier in {"read_only", "write", "manage"}:
+        return tier
+
+    capabilities = classification.get("capabilities")
+    if not isinstance(capabilities, list):
+        return None
+    normalized = {str(item).strip().lower() for item in capabilities}
+    if normalized & {"delete", "trash", "label", "archive", "spam_triage", "spam", "manage"}:
         return "manage"
-    if _WRITE_RE.search(text):
+    if normalized & {"send", "reply", "write", "compose"}:
         return "write"
-    if _READ_ONLY_RE.search(text):
+    if normalized & {"read", "search", "list", "check"}:
         return "read_only"
     return None
 
 
-def _memory_choice_from_text(text: str) -> str | None:
-    if _FORGET_RE.search(text):
-        return "forget"
-    if _REMEMBER_RE.search(text):
-        return "remember"
+def _memory_choice_from_classification(classification: dict[str, Any]) -> str | None:
+    memory_policy = str(classification.get("memory_policy") or "").strip().lower()
+    if memory_policy in {"remember", "forget"}:
+        return memory_policy
     return None
 
 
-def _autonomy_choice_from_text(text: str) -> bool | None:
-    if _AUTONOMOUS_DISABLE_RE.search(text):
-        return False
-    if _AUTONOMOUS_ENABLE_RE.search(text):
+def _autonomy_choice_from_classification(classification: dict[str, Any]) -> bool | None:
+    value = classification.get("heartbeat_digest_enabled")
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    if normalized in {"true", "yes", "allow", "allowed", "enable", "enabled"}:
         return True
+    if normalized in {"false", "no", "deny", "denied", "disable", "disabled"}:
+        return False
     return None
-
-
-def _dedupe_capabilities(capabilities: list[str]) -> list[str]:
-    return list(dict.fromkeys(str(item).strip() for item in capabilities if str(item).strip()))
 
 
 def _pop_pending(session_id: str | None) -> dict[str, Any] | None:
@@ -314,13 +352,26 @@ def _set_pending(session_id: str | None, payload: dict[str, Any]) -> None:
         _PENDING_SETUP_BY_SESSION[session_id] = payload
 
 
-async def _has_pending_gmail_attempt(pool: Any) -> bool:
+async def _gmail_setup_status(pool: Any) -> dict[str, Any]:
     try:
         async with pool.acquire() as conn:
             raw = await conn.fetchval("SELECT integration_status('gmail')")
-        payload = _json(raw) or {}
     except Exception:
-        return False
+        return {}
+    payload = _json(raw) or {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _payload_has_connected_gmail(payload: dict[str, Any]) -> bool:
+    for item in payload.get("connections", []):
+        if not isinstance(item, dict):
+            continue
+        if item.get("connector_id") == "gmail" and item.get("status") == "connected":
+            return True
+    return False
+
+
+def _payload_has_pending_gmail_attempt(payload: dict[str, Any]) -> bool:
     if not isinstance(payload, dict):
         return False
     for item in payload.get("recent_attempts", []):
@@ -337,6 +388,176 @@ async def _has_pending_gmail_attempt(pool: Any) -> bool:
     return False
 
 
+async def _has_pending_gmail_attempt(pool: Any) -> bool:
+    return _payload_has_pending_gmail_attempt(await _gmail_setup_status(pool))
+
+
+async def _classify_connector_setup_intent(
+    pool: Any,
+    text: str,
+    *,
+    pending: dict[str, Any] | None,
+    gmail_connected: bool,
+) -> dict[str, Any]:
+    """Use the chat LLM to separate connector setup from ordinary email work."""
+    pending_stage = str((pending or {}).get("stage") or "")
+    if not pending and not _gmail_word_candidate(text):
+        return {"route": "normal_chat", "reason": "no mail connector candidate"}
+
+    system = (
+        "You classify whether a user message should enter the Gmail connector setup wizard. "
+        "Return JSON only with keys: route, action, capability_tier, memory_policy, "
+        "heartbeat_digest_enabled, reason. route is connector_setup or normal_chat. "
+        "Only classify as connector_setup when the user is explicitly connecting, reconnecting, "
+        "changing Gmail permissions/configuration, answering an active setup step, or trying to use "
+        "Gmail while Gmail is not connected. When Gmail is already connected, requests to read, "
+        "search, check, summarize, triage, send, reply, label, delete, or batch-process actual email "
+        "are normal_chat so the operational email tools can run. For capability_tier use read_only, "
+        "write, manage, or null. write means send/reply; manage means label/spam/archive/delete. "
+        "memory_policy is remember, forget, or null. heartbeat_digest_enabled is true, false, or null."
+    )
+    user = {
+        "message": text,
+        "gmail_connected": gmail_connected,
+        "pending_setup_stage": pending_stage or None,
+        "pending_setup_payload": pending or None,
+    }
+    try:
+        async with pool.acquire() as conn:
+            llm_config = await load_llm_config(conn, "llm.intent", fallback_key="llm.chat")
+        doc, _raw = await chat_json(
+            llm_config=llm_config,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": json.dumps(user, sort_keys=True)},
+            ],
+            max_tokens=240,
+            temperature=0,
+            response_format={"type": "json_object"},
+            fallback={"route": "normal_chat", "reason": "classifier fallback"},
+        )
+    except Exception:
+        return {"route": "normal_chat", "reason": "classifier unavailable"}
+    return doc if isinstance(doc, dict) else {"route": "normal_chat"}
+
+
+def _intent_from_classification(
+    classification: dict[str, Any],
+    *,
+    pending: dict[str, Any] | None,
+    client_secret_path: str | None,
+    session_id: str | None,
+) -> ConnectorSetupIntent | None:
+    if str(classification.get("route") or "").strip().lower() != "connector_setup":
+        return None
+
+    action = str(classification.get("action") or "").strip().lower()
+    if action == "cancel":
+        _pop_pending(session_id)
+        return ConnectorSetupIntent(
+            connector_id="gmail",
+            action="choose_scope",
+            arguments={"cancelled": True},
+        )
+
+    tier = _tier_from_classification(classification)
+    memory_choice = _memory_choice_from_classification(classification)
+    heartbeat_digest = _autonomy_choice_from_classification(classification)
+
+    if pending and pending.get("stage") == "capability_choice":
+        if not tier:
+            return None
+        return ConnectorSetupIntent(
+            connector_id="gmail",
+            action="choose_memory",
+            arguments={
+                "base_capabilities": _capabilities_for_tier(tier),
+                "tier": tier,
+                "client_secret_path": client_secret_path or pending.get("client_secret_path"),
+            },
+        )
+
+    if pending and pending.get("stage") == "memory_choice":
+        base = [str(item) for item in pending.get("base_capabilities") or _GMAIL_READ_CAPABILITIES]
+        if not memory_choice:
+            return None
+        return ConnectorSetupIntent(
+            connector_id="gmail",
+            action="choose_autonomy",
+            arguments={
+                "base_capabilities": _dedupe_capabilities(base),
+                "tier": pending.get("tier"),
+                "memory_policy": memory_choice,
+                "client_secret_path": client_secret_path or pending.get("client_secret_path"),
+            },
+        )
+
+    if pending and pending.get("stage") == "autonomy_choice":
+        if heartbeat_digest is None:
+            return None
+        base = [str(item) for item in pending.get("base_capabilities") or _GMAIL_READ_CAPABILITIES]
+        arguments: dict[str, Any] = {
+            "capabilities": _dedupe_capabilities(base),
+            "memory_policy": str(pending.get("memory_policy") or "forget"),
+            "heartbeat_digest_enabled": heartbeat_digest,
+        }
+        if client_secret_path or pending.get("client_secret_path"):
+            arguments["client_secret_path"] = client_secret_path or pending.get("client_secret_path")
+        return ConnectorSetupIntent(
+            connector_id="gmail",
+            action="start",
+            arguments=arguments,
+        )
+
+    if client_secret_path and not tier:
+        return ConnectorSetupIntent(
+            connector_id="gmail",
+            action="choose_scope",
+            arguments={"client_secret_path": client_secret_path},
+        )
+
+    if tier and memory_choice:
+        base = _dedupe_capabilities(_capabilities_for_tier(tier))
+        if heartbeat_digest is None:
+            return ConnectorSetupIntent(
+                connector_id="gmail",
+                action="choose_autonomy",
+                arguments={
+                    "base_capabilities": base,
+                    "tier": tier,
+                    **({"client_secret_path": client_secret_path} if client_secret_path else {}),
+                    "memory_policy": memory_choice,
+                },
+            )
+        return ConnectorSetupIntent(
+            connector_id="gmail",
+            action="start",
+            arguments={
+                "capabilities": base,
+                **({"client_secret_path": client_secret_path} if client_secret_path else {}),
+                "memory_policy": memory_choice,
+                "heartbeat_digest_enabled": heartbeat_digest,
+            },
+        )
+
+    if tier:
+        return ConnectorSetupIntent(
+            connector_id="gmail",
+            action="choose_memory",
+            arguments={
+                "base_capabilities": _capabilities_for_tier(tier),
+                "tier": tier,
+                **({"client_secret_path": client_secret_path} if client_secret_path else {}),
+            },
+        )
+
+    return ConnectorSetupIntent(
+        connector_id="gmail",
+        action="choose_scope",
+        arguments=({"client_secret_path": client_secret_path} if client_secret_path else {}),
+    )
+
+
 async def detect_connector_setup_intent(
     pool: Any,
     message: str,
@@ -347,8 +568,14 @@ async def detect_connector_setup_intent(
     if not text:
         return None
 
-    pending = _PENDING_SETUP_BY_SESSION.get(session_id or "")
-    if pending and _CANCEL_RE.search(text):
+    status_payload = await _gmail_setup_status(pool)
+    gmail_connected = _payload_has_connected_gmail(status_payload)
+    if gmail_connected:
+        _pop_pending(session_id)
+
+    pending = None if gmail_connected else _PENDING_SETUP_BY_SESSION.get(session_id or "")
+    normalized = _normalized_choice_text(text).strip(".,!?:;")
+    if pending and normalized in _CANCEL_MESSAGES:
         _pop_pending(session_id)
         return ConnectorSetupIntent(
             connector_id="gmail",
@@ -356,86 +583,21 @@ async def detect_connector_setup_intent(
             arguments={"cancelled": True},
         )
 
-    if pending and pending.get("stage") == "capability_choice":
-        tier = _tier_from_text(text)
-        if tier:
-            base = _capabilities_for_tier(tier)
-            return ConnectorSetupIntent(
-                connector_id="gmail",
-                action="choose_memory",
-                arguments={
-                    "base_capabilities": base,
-                    "tier": tier,
-                    "client_secret_path": pending.get("client_secret_path"),
-                },
-            )
-
-    if pending and pending.get("stage") == "memory_choice":
-        choice = _memory_choice_from_text(text)
-        if choice:
-            base = [str(item) for item in pending.get("base_capabilities") or _GMAIL_READ_CAPABILITIES]
-            return ConnectorSetupIntent(
-                connector_id="gmail",
-                action="choose_autonomy",
-                arguments={
-                    "base_capabilities": _dedupe_capabilities(base),
-                    "tier": pending.get("tier"),
-                    "memory_policy": choice,
-                    "client_secret_path": pending.get("client_secret_path"),
-                },
-            )
-
-    if pending and pending.get("stage") == "autonomy_choice":
-        choice = _autonomy_choice_from_text(text)
-        if choice is not None:
-            base = [str(item) for item in pending.get("base_capabilities") or _GMAIL_READ_CAPABILITIES]
-            arguments: dict[str, Any] = {
-                "capabilities": _dedupe_capabilities(base),
-                "memory_policy": str(pending.get("memory_policy") or "forget"),
-                "heartbeat_digest_enabled": choice,
-            }
-            if pending.get("client_secret_path"):
-                arguments["client_secret_path"] = pending["client_secret_path"]
-            return ConnectorSetupIntent(
-                connector_id="gmail",
-                action="start",
-                arguments=arguments,
-            )
-
-    if _OAUTH_REDIRECT_RE.search(text) and await _has_pending_gmail_attempt(pool):
+    oauth_redirect = _extract_oauth_redirect(text)
+    if oauth_redirect and not gmail_connected and _payload_has_pending_gmail_attempt(status_payload):
         return ConnectorSetupIntent(
             connector_id="gmail",
             action="complete",
-            arguments={"authorization_response": text},
+            arguments={"authorization_response": oauth_redirect},
         )
 
     client_secret_path = _extract_client_secret_path(text, pending_setup=bool(pending))
     if client_secret_path:
-        pending = _PENDING_SETUP_BY_SESSION.get(session_id or "")
-        tier = _tier_from_text(text)
-        memory_choice = _memory_choice_from_text(text)
-        if pending and pending.get("stage") == "memory_choice":
-            base = [str(item) for item in pending.get("base_capabilities") or _GMAIL_READ_CAPABILITIES]
-            if memory_choice:
-                return ConnectorSetupIntent(
-                    connector_id="gmail",
-                    action="choose_autonomy",
-                    arguments={
-                        "base_capabilities": _dedupe_capabilities(base),
-                        "tier": pending.get("tier"),
-                        "client_secret_path": client_secret_path,
-                        "memory_policy": memory_choice,
-                    },
-                )
-            _set_pending(session_id, {**pending, "client_secret_path": client_secret_path})
+        if not pending:
             return ConnectorSetupIntent(
                 connector_id="gmail",
-                action="choose_memory",
-                arguments={
-                    "base_capabilities": base,
-                    "tier": pending.get("tier"),
-                    "client_secret_path": client_secret_path,
-                },
+                action="choose_scope",
+                arguments={"client_secret_path": client_secret_path},
             )
         if pending and pending.get("stage") == "capability_choice":
             _set_pending(session_id, {**pending, "client_secret_path": client_secret_path})
@@ -456,89 +618,22 @@ async def detect_connector_setup_intent(
                     "memory_policy": pending.get("memory_policy") or "forget",
                 },
             )
-        if tier and memory_choice:
-            heartbeat_digest = (
-                _autonomy_choice_from_text(text)
-                if _AUTONOMOUS_EMAIL_RE.search(text)
-                else None
-            )
-            if heartbeat_digest is None:
-                return ConnectorSetupIntent(
-                    connector_id="gmail",
-                    action="choose_autonomy",
-                    arguments={
-                        "base_capabilities": _dedupe_capabilities(_capabilities_for_tier(tier)),
-                        "tier": tier,
-                        "client_secret_path": client_secret_path,
-                        "memory_policy": memory_choice,
-                    },
-                )
-            return ConnectorSetupIntent(
-                connector_id="gmail",
-                action="start",
-                arguments={
-                    "capabilities": _dedupe_capabilities(_capabilities_for_tier(tier)),
-                    "client_secret_path": client_secret_path,
-                    "memory_policy": memory_choice,
-                    "heartbeat_digest_enabled": heartbeat_digest,
-                },
-            )
-        if tier:
-            return ConnectorSetupIntent(
-                connector_id="gmail",
-                action="choose_memory",
-                arguments={
-                    "base_capabilities": _capabilities_for_tier(tier),
-                    "tier": tier,
-                    "client_secret_path": client_secret_path,
-                },
-            )
-        return ConnectorSetupIntent(
-            connector_id="gmail",
-            action="choose_scope",
-            arguments={"client_secret_path": client_secret_path},
-        )
 
-    if _GMAIL_SETUP_RE.search(text):
-        tier = _tier_from_text(text)
-        memory_choice = _memory_choice_from_text(text)
-        if tier and memory_choice:
-            heartbeat_digest = (
-                _autonomy_choice_from_text(text)
-                if _AUTONOMOUS_EMAIL_RE.search(text)
-                else None
-            )
-            if heartbeat_digest is None:
-                return ConnectorSetupIntent(
-                    connector_id="gmail",
-                    action="choose_autonomy",
-                    arguments={
-                        "base_capabilities": _dedupe_capabilities(_capabilities_for_tier(tier)),
-                        "tier": tier,
-                        "memory_policy": memory_choice,
-                    },
-                )
-            return ConnectorSetupIntent(
-                connector_id="gmail",
-                action="start",
-                arguments={
-                    "capabilities": _dedupe_capabilities(_capabilities_for_tier(tier)),
-                    "memory_policy": memory_choice,
-                    "heartbeat_digest_enabled": heartbeat_digest,
-                },
-            )
-        if tier:
-            return ConnectorSetupIntent(
-                connector_id="gmail",
-                action="choose_memory",
-                arguments={"base_capabilities": _capabilities_for_tier(tier), "tier": tier},
-            )
-        return ConnectorSetupIntent(
-            connector_id="gmail",
-            action="choose_scope",
-        )
+    if not pending:
+        return None
 
-    return None
+    classification = await _classify_connector_setup_intent(
+        pool,
+        text,
+        pending=pending,
+        gmail_connected=gmail_connected,
+    )
+    return _intent_from_classification(
+        classification,
+        pending=pending,
+        client_secret_path=client_secret_path,
+        session_id=session_id,
+    )
 
 
 def _assistant_message_for(intent: ConnectorSetupIntent, result_payload: dict[str, Any], ui: dict[str, Any] | None) -> str:

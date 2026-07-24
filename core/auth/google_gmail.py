@@ -23,17 +23,21 @@ GMAIL_CONNECTOR_ID = "gmail"
 GMAIL_DEFAULT_CREDENTIAL_REF = "integration.gmail.default"
 GMAIL_CLIENT_SECRET_REF = "integration.gmail.client"
 GMAIL_PENDING_PREFIX = "integration.gmail.pending."
+GMAIL_CALLBACK_PATH = "/api/integrations/gmail/callback"
+GMAIL_DEFAULT_API_BASE_URL = "http://127.0.0.1:43817"
 
 GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GOOGLE_GMAIL_PROFILE_URL = "https://gmail.googleapis.com/gmail/v1/users/me/profile"
 GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v1/userinfo?alt=json"
-GMAIL_REDIRECT_URI = "http://localhost"
+GMAIL_REDIRECT_URI = GMAIL_DEFAULT_API_BASE_URL
 
 _CLIENT_SECRET_ENV_JSON = ("GOOGLE_GMAIL_CLIENT_SECRET_JSON", "GOOGLE_CLIENT_SECRET_JSON")
 _CLIENT_SECRET_ENV_PATH = ("GOOGLE_GMAIL_CLIENT_SECRET_PATH", "GOOGLE_CLIENT_SECRET_PATH")
 _HEXIS_CLIENT_ID_ENV = ("HEXIS_GMAIL_OAUTH_CLIENT_ID", "GOOGLE_GMAIL_OAUTH_CLIENT_ID")
 _HEXIS_CLIENT_SECRET_ENV = ("HEXIS_GMAIL_OAUTH_CLIENT_SECRET", "GOOGLE_GMAIL_OAUTH_CLIENT_SECRET")
+_GMAIL_REDIRECT_URI_ENV = ("HEXIS_GMAIL_OAUTH_REDIRECT_URI", "GOOGLE_GMAIL_OAUTH_REDIRECT_URI")
+_HEXIS_API_BASE_URL_ENV = ("HEXIS_API_URL", "HEXIS_API_BASE_URL")
 _DISABLE_BUNDLED_CLIENT_ENV = "HEXIS_GMAIL_OAUTH_DISABLE_BUNDLED"
 GMAIL_BUNDLED_CLIENT_SECRET_PATHS = (
     Path(__file__).resolve().with_name("gmail-credentials.json"),
@@ -101,7 +105,16 @@ async def prepare_gmail_connection_attempt(pool: Any, capabilities: Any = None) 
 
 
 def _client_section(payload: dict[str, Any], *, require_installed: bool = False) -> dict[str, Any]:
-    section = payload.get("installed") if require_installed else payload.get("installed") or payload.get("web")
+    return _client_section_with_kind(payload, require_installed=require_installed)[1]
+
+
+def _client_section_with_kind(
+    payload: dict[str, Any],
+    *,
+    require_installed: bool = False,
+) -> tuple[str, dict[str, Any]]:
+    kind = "installed" if require_installed or isinstance(payload.get("installed"), dict) else "web"
+    section = payload.get("installed") if kind == "installed" else payload.get("web")
     if not isinstance(section, dict):
         if require_installed:
             raise GmailOAuthError(
@@ -113,7 +126,27 @@ def _client_section(payload: dict[str, Any], *, require_installed: bool = False)
         )
     if not isinstance(section.get("client_id"), str) or not isinstance(section.get("client_secret"), str):
         raise GmailOAuthError("The Google setup file is missing client_id or client_secret.")
-    return section
+    return kind, section
+
+
+def _clean_redirect_uri(value: str) -> str:
+    parsed = urlparse(value.strip())
+    if not parsed.scheme or not parsed.netloc:
+        raise GmailOAuthError(f"Invalid Gmail OAuth redirect URI: {value}")
+    return parsed._replace(params="", query="", fragment="").geturl().rstrip("/")
+
+
+def configured_gmail_redirect_uri() -> str:
+    """Return the loopback redirect URI Hexis will use for Gmail OAuth."""
+    raw, _ = _first_env(_GMAIL_REDIRECT_URI_ENV)
+    if raw:
+        return _clean_redirect_uri(raw)
+
+    api_base, _ = _first_env(_HEXIS_API_BASE_URL_ENV)
+    if api_base:
+        return _clean_redirect_uri(api_base)
+
+    return GMAIL_REDIRECT_URI
 
 
 def _select_redirect_uri(client: dict[str, Any]) -> str:
@@ -209,7 +242,7 @@ def _load_hexis_env_client_secret() -> tuple[dict[str, Any] | None, str | None]:
             "client_secret": client_secret,
             "auth_uri": GOOGLE_AUTH_URL,
             "token_uri": GOOGLE_TOKEN_URL,
-            "redirect_uris": [GMAIL_REDIRECT_URI],
+            "redirect_uris": [configured_gmail_redirect_uri()],
         }
     }
     _client_section(payload)
@@ -426,8 +459,12 @@ async def start_gmail_oauth(
     scopes = list(prepared.get("requested_scopes") or [])
     if not caps or not scopes:
         raise GmailOAuthError("Gmail connector preparation did not return capabilities and scopes.")
-    client = _client_section(client_secret)
-    redirect_uri = _select_redirect_uri(client)
+    client_kind, client = _client_section_with_kind(client_secret)
+    redirect_uri = (
+        configured_gmail_redirect_uri()
+        if client_kind == "installed"
+        else _select_redirect_uri(client)
+    )
     verifier, challenge = generate_pkce()
     state = create_state()
     params = {
@@ -443,13 +480,14 @@ async def start_gmail_oauth(
     }
     authorization_url = f"{GOOGLE_AUTH_URL}?{urlencode(params)}"
     next_step = (
-        "Open authorization_url, approve the requested Gmail scopes, ignore the expected "
-        "localhost connection failure, then paste the full redirected URL back into this conversation."
+        "Open authorization_url and approve the requested Gmail scopes. Hexis will finish "
+        "the connection automatically when Google returns to the local callback."
     )
     flow_state = {
         "pending_auth_ref": None,
         "state_hash": hashlib.sha256(state.encode("utf-8")).hexdigest(),
         "redirect_uri": redirect_uri,
+        "callback_path": GMAIL_CALLBACK_PATH,
         "client_secret_source": source,
         "scope_count": len(scopes),
     }
@@ -602,18 +640,33 @@ async def complete_gmail_oauth(
     authorization_response: str,
     attempt_id: str | None = None,
 ) -> GmailOAuthComplete:
+    code, returned_state = parse_authorization_response(authorization_response)
     if not attempt_id:
         async with pool.acquire() as conn:
-            attempt_id = await conn.fetchval(
-                """
-                SELECT id::text
-                FROM connection_attempts
-                WHERE connector_id = 'gmail'
-                  AND status IN ('pending_user', 'awaiting_input', 'error')
-                ORDER BY created_at DESC
-                LIMIT 1
-                """
-            )
+            if returned_state:
+                attempt_id = await conn.fetchval(
+                    """
+                    SELECT id::text
+                    FROM connection_attempts
+                    WHERE connector_id = 'gmail'
+                      AND status IN ('pending_user', 'awaiting_input', 'error')
+                      AND flow_state->>'state_hash' = $1
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    hashlib.sha256(returned_state.encode("utf-8")).hexdigest(),
+                )
+            if not attempt_id:
+                attempt_id = await conn.fetchval(
+                    """
+                    SELECT id::text
+                    FROM connection_attempts
+                    WHERE connector_id = 'gmail'
+                      AND status IN ('pending_user', 'awaiting_input', 'error')
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """
+                )
     if not attempt_id:
         raise GmailOAuthError("No pending Gmail connection attempt. Start with connect_gmail first.")
 
@@ -622,7 +675,6 @@ async def complete_gmail_oauth(
     if not isinstance(pending, dict):
         raise GmailOAuthError("The pending Gmail OAuth session expired or is missing. Start connect_gmail again.")
 
-    code, returned_state = parse_authorization_response(authorization_response)
     if returned_state and returned_state != pending.get("state"):
         raise GmailOAuthError("OAuth state mismatch. Start a fresh Gmail connection attempt and use the newest browser tab.")
 

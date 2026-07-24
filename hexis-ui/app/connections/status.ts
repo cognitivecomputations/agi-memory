@@ -143,7 +143,7 @@ export function summarizeConnectors(data: IntegrationStatusData): ConnectorSumma
       (item) => item.connector_id === connector.id
     );
     const activeAttempts = recentAttempts.filter((item) =>
-      ["pending_user", "pending", "in_progress"].includes(item.status)
+      ["pending_user", "awaiting_input", "pending", "in_progress"].includes(item.status)
     );
     const runtime = runtimeByChannel.get(connector.id) ?? null;
     const backfillJobs = data.backfill.jobs.filter(

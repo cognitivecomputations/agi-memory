@@ -10,6 +10,7 @@ from core.auth.google_gmail import (
     GMAIL_CLIENT_SECRET_REF,
     GMAIL_DEFAULT_CREDENTIAL_REF,
     GMAIL_PENDING_PREFIX,
+    GMAIL_REDIRECT_URI,
     has_bundled_gmail_oauth_client,
     has_hexis_gmail_oauth_client,
     save_gmail_client_secret_payload,
@@ -28,6 +29,7 @@ from core.tools.integrations import (
     RevokeGmailConnectionHandler,
     RevokeConnectorActionPolicyHandler,
     StartGmailBackfillHandler,
+    _gmail_connector_setup_ui,
 )
 from core.tools.registry import create_default_registry
 from tests.utils import get_test_identifier
@@ -168,6 +170,10 @@ async def test_connect_gmail_uses_configured_hexis_oauth_client(db_pool, monkeyp
         "GOOGLE_CLIENT_SECRET_PATH",
         "GOOGLE_GMAIL_OAUTH_CLIENT_ID",
         "GOOGLE_GMAIL_OAUTH_CLIENT_SECRET",
+        "HEXIS_GMAIL_OAUTH_REDIRECT_URI",
+        "GOOGLE_GMAIL_OAUTH_REDIRECT_URI",
+        "HEXIS_API_URL",
+        "HEXIS_API_BASE_URL",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -313,11 +319,49 @@ async def test_gmail_setup_status_executes_through_registry(db_pool, monkeypatch
     assert result.output["ui"]["status"] == "needs_client_secret"
 
 
+async def test_connected_gmail_setup_ui_suppresses_stale_authorization_url():
+    ui = _gmail_connector_setup_ui(
+        {
+            "authorization_url": "https://accounts.google.com/stale",
+            "attempt_id": "stale-attempt",
+            "recent_attempts": [
+                {
+                    "connector_id": "gmail",
+                    "status": "pending_user",
+                    "attempt_id": "stale-attempt",
+                    "authorization_url": "https://accounts.google.com/stale",
+                }
+            ],
+        },
+        connected_accounts=[
+            {
+                "connector_id": "gmail",
+                "account_key": "eric@example.com",
+                "status": "connected",
+            }
+        ],
+        credentials_saved=True,
+    )
+
+    assert ui["status"] == "connected"
+    assert ui["authorization_url"] is None
+    assert ui["attempt_id"] is None
+    assert ui["completion_mode"] is None
+    assert ui["manual_completion_available"] is False
+
+
 async def test_connect_and_complete_gmail_oauth_round_trip(db_pool, monkeypatch, tmp_path):
     import core.auth.google_gmail as google_gmail
     import core.auth.store as auth_store
 
     monkeypatch.setattr(auth_store, "AUTH_DIR", tmp_path / "auth")
+    for name in (
+        "HEXIS_GMAIL_OAUTH_REDIRECT_URI",
+        "GOOGLE_GMAIL_OAUTH_REDIRECT_URI",
+        "HEXIS_API_URL",
+        "HEXIS_API_BASE_URL",
+    ):
+        monkeypatch.delenv(name, raising=False)
     save_auth(GMAIL_CLIENT_SECRET_REF, _client_secret())
 
     marker = get_test_identifier("gmail-connector")
@@ -327,7 +371,7 @@ async def test_connect_and_complete_gmail_oauth_round_trip(db_pool, monkeypatch,
         assert kwargs["code"] == "oauth-code"
         assert kwargs["client_id"] == "gmail-test-client"
         assert kwargs["client_secret"] == "gmail-test-secret"
-        assert kwargs["redirect_uri"] == "http://localhost"
+        assert kwargs["redirect_uri"] == GMAIL_REDIRECT_URI
         return {
             "access_token": "access-token",
             "refresh_token": "refresh-token",
@@ -360,7 +404,7 @@ async def test_connect_and_complete_gmail_oauth_round_trip(db_pool, monkeypatch,
 
         auth_params = parse_qs(urlparse(started.output["authorization_url"]).query)
         assert auth_params["client_id"] == ["gmail-test-client"]
-        assert auth_params["redirect_uri"] == ["http://localhost"]
+        assert auth_params["redirect_uri"] == [GMAIL_REDIRECT_URI]
 
         attempt_id = started.output["attempt_id"]
         pending = load_auth(f"{GMAIL_PENDING_PREFIX}{attempt_id}")
@@ -368,8 +412,7 @@ async def test_connect_and_complete_gmail_oauth_round_trip(db_pool, monkeypatch,
 
         completed = await CompleteGmailConnectionHandler().execute(
             {
-                "attempt_id": attempt_id,
-                "authorization_response": f"http://localhost/?code=oauth-code&state={pending['state']}",
+                "authorization_response": f"{GMAIL_REDIRECT_URI}/?code=oauth-code&state={pending['state']}",
             },
             _ctx(db_pool, marker),
         )

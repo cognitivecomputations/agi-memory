@@ -145,7 +145,19 @@ async def test_chat_memory_recall_start_does_not_log_fake_zero(client):
         )
         yield AgentEventData(
             event=AgentEvent.PHASE_CHANGE,
-            data={"phase": "memory_recall", "status": "end", "count": 7},
+            data={
+                "phase": "memory_recall",
+                "status": "end",
+                "count": 7,
+                "memories": [
+                    {
+                        "id": "memory-1",
+                        "type": "semantic",
+                        "content": "Samantha should show retrieved memory previews in the Activity panel.",
+                        "similarity": 0.91,
+                    }
+                ],
+            },
         )
         yield AgentEventData(event=AgentEvent.LOOP_START)
         yield AgentEventData(event=AgentEvent.TEXT_DELTA, data={"text": "I remember."})
@@ -166,6 +178,9 @@ async def test_chat_memory_recall_start_does_not_log_fake_zero(client):
         and json.loads(event["data"]).get("kind") == "memory_recall"
     ]
     assert [log["detail"] for log in logs] == ["Retrieved 7 relevant memories"]
+    assert logs[0]["memories"][0]["content"] == (
+        "Samantha should show retrieved memory previews in the Activity panel."
+    )
 
 
 async def test_chat_forwards_visual_attachments_and_logs_model_context(client):

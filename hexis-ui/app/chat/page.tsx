@@ -24,6 +24,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { ReactNode } from "react";
 import { useGatewayEvents } from "../hooks/use-gateway-events";
 import Image from "next/image";
 import { Card } from "../components/ui/card";
@@ -110,6 +111,8 @@ type ConnectorSetupUi = {
   docs_url?: string;
   authorization_url?: string;
   attempt_id?: string;
+  completion_mode?: string;
+  manual_completion_available?: boolean;
   connected_accounts?: Record<string, unknown>[];
   next_step?: string;
   safety_note?: string;
@@ -317,6 +320,44 @@ type AgentStatus = {
   portrait_url?: string | null;
   mood?: string;
   valence?: number | null;
+};
+
+type ActivityPaneId = "thoughts" | "emotion" | "activity" | "memory";
+
+type StreamMeter = {
+  active: boolean;
+  startedAt: number | null;
+  tokens: number;
+  tokensPerSecond: number;
+};
+
+type MemoryPreview = {
+  id?: string;
+  type?: string;
+  content: string;
+  similarity?: number | null;
+  relevance_score?: number | null;
+  importance?: number | null;
+  trust_level?: number | null;
+  confidence?: number | null;
+  source?: string;
+};
+
+type ThoughtPair = {
+  id: string;
+  ts: number;
+  subconscious?: LogEvent;
+  conscious?: LogEvent;
+  subconsciousText: string;
+  consciousText: string;
+};
+
+type EmotionSnapshot = {
+  id: string;
+  ts: number;
+  label: string;
+  valence: number | null;
+  detail: string;
 };
 
 type SsePayload = Record<string, unknown>;
@@ -570,6 +611,11 @@ function normalizeConnectorSetupUi(value: unknown): ConnectorSetupUi | null {
     docs_url: asString(record.docs_url) || undefined,
     authorization_url: asString(record.authorization_url) || undefined,
     attempt_id: asString(record.attempt_id) || undefined,
+    completion_mode: asString(record.completion_mode) || undefined,
+    manual_completion_available:
+      typeof record.manual_completion_available === "boolean"
+        ? record.manual_completion_available
+        : undefined,
     connected_accounts: Array.isArray(record.connected_accounts)
       ? record.connected_accounts.filter(
           (item): item is Record<string, unknown> =>
@@ -671,11 +717,16 @@ export default function ChatPage() {
     assistantId: string;
     ui: ConnectorSetupUi;
   } | null>(null);
-  const [activityFilters, setActivityFilters] = useState<Set<LogEvent["category"]>>(
-    new Set(["subconscious", "model", "tool", "memory", "error"]),
+  const [expandedActivityPanes, setExpandedActivityPanes] = useState<Set<ActivityPaneId>>(
+    new Set(["thoughts"]),
   );
+  const [streamMeter, setStreamMeter] = useState<StreamMeter>({
+    active: false,
+    startedAt: null,
+    tokens: 0,
+    tokensPerSecond: 0,
+  });
   const scrollRef = useRef<HTMLDivElement>(null);
-  const logRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   const inboxBadgeCount = inbox.unread + inbox.pending_requests.length;
@@ -835,11 +886,6 @@ export default function ChatPage() {
   }, [messages]);
 
   useEffect(() => {
-    if (!logRef.current) return;
-    logRef.current.scrollTop = logRef.current.scrollHeight;
-  }, [events]);
-
-  useEffect(() => {
     const timer = setInterval(() => {
       const cutoff = Date.now() - ACTIVITY_TTL_MS;
       setEvents((current) => current.filter((event) => event.ts >= cutoff));
@@ -858,6 +904,15 @@ export default function ChatPage() {
 
   const appendLog = (event: LogEvent) => {
     setEvents((prev) => [...prev.slice(-(MAX_ACTIVITY_EVENTS - 1)), sanitizeActivityEvent(event)]);
+  };
+
+  const toggleActivityPane = (pane: ActivityPaneId) => {
+    setExpandedActivityPanes((current) => {
+      const next = new Set(current);
+      if (next.has(pane)) next.delete(pane);
+      else next.add(pane);
+      return next;
+    });
   };
 
   const updateAssistantMessage = (assistantId: string, text: string) => {
@@ -963,6 +1018,41 @@ export default function ChatPage() {
       return { error: detail };
     } finally {
       setConnectorActionBusy(null);
+    }
+  };
+
+  const refreshConnectorSetupStatus = async (
+    assistantId: string,
+    currentUi: ConnectorSetupUi
+  ): Promise<IntegrationActionResult> => {
+    try {
+      const currentSessionId = sessionId || loadSessionId() || "web-chat";
+      const response = await fetch("/api/integrations/action", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "gmail_setup_status",
+          arguments: {},
+          source_session_id: currentSessionId,
+        }),
+      });
+      const payload = await readIntegrationActionPayload(response);
+      const nextUi = connectorSetupUiFromPayload(payload);
+      if (nextUi) {
+        const changed =
+          nextUi.id !== currentUi.id ||
+          nextUi.status !== currentUi.status ||
+          nextUi.credentials_saved !== currentUi.credentials_saved ||
+          (nextUi.connected_accounts?.length || 0) !==
+            (currentUi.connected_accounts?.length || 0);
+        if (changed) {
+          replaceAssistantUi(assistantId, currentUi, nextUi);
+          setActiveConnectorSetup({ assistantId, ui: nextUi });
+        }
+      }
+      return payload;
+    } catch (error: unknown) {
+      return { error: error instanceof Error ? error.message : "Could not refresh connector status." };
     }
   };
 
@@ -1364,6 +1454,12 @@ export default function ChatPage() {
     setHistoryIndex(null);
     setHistoryDraft("");
     setSending(true);
+    setStreamMeter({
+      active: true,
+      startedAt: Date.now(),
+      tokens: 0,
+      tokensPerSecond: 0,
+    });
     setCurrentPhase(null);
     setShowSearchConfig(false);
     setSearchConfigError(null);
@@ -1406,6 +1502,7 @@ export default function ChatPage() {
           ts: Date.now(),
         });
         setSending(false);
+        setStreamMeter((current) => ({ ...current, active: false }));
         return;
       }
 
@@ -1449,6 +1546,18 @@ export default function ChatPage() {
             setCurrentPhase(phase);
             if ((phase === "conscious_final" || phase === "connector_setup") && text) {
               updateAssistantMessage(assistantMessage.id, text);
+              setStreamMeter((current) => {
+                const now = Date.now();
+                const startedAt = current.startedAt || now;
+                const tokens = current.tokens + Math.max(0, text.length / 4);
+                const elapsedSeconds = Math.max(0.25, (now - startedAt) / 1000);
+                return {
+                  active: true,
+                  startedAt,
+                  tokens,
+                  tokensPerSecond: tokens / elapsedSeconds,
+                };
+              });
               if (isSearchToolMisconfigured(text)) {
                 setShowSearchConfig(true);
               }
@@ -1567,6 +1676,7 @@ export default function ChatPage() {
             }
             setSending(false);
             setCurrentPhase(null);
+            setStreamMeter((current) => ({ ...current, active: false }));
           }
         }
       }
@@ -1584,6 +1694,7 @@ export default function ChatPage() {
     } finally {
       setSending(false);
       setCurrentPhase(null);
+      setStreamMeter((current) => ({ ...current, active: false }));
     }
   };
 
@@ -1639,16 +1750,6 @@ export default function ChatPage() {
     }
   };
 
-  const filteredEvents = events.filter((event) => activityFilters.has(event.category));
-  const toggleActivityFilter = (category: LogEvent["category"]) => {
-    setActivityFilters((current) => {
-      const next = new Set(current);
-      if (next.has(category)) next.delete(category);
-      else next.add(category);
-      return next;
-    });
-  };
-
   if (ready === false) {
     return (
       <div className="flex min-h-screen items-center justify-center">
@@ -1683,6 +1784,7 @@ export default function ChatPage() {
           setup={activeConnectorSetup}
           busy={connectorActionBusy}
           onAction={runConnectorSetupAction}
+          onRefresh={refreshConnectorSetupStatus}
           onClose={() => setActiveConnectorSetup(null)}
         />
       ) : null}
@@ -1839,6 +1941,7 @@ export default function ChatPage() {
                             assistantId={message.id}
                             busy={connectorActionBusy}
                             onAction={runConnectorSetupAction}
+                            onRefresh={refreshConnectorSetupStatus}
                           />
                         ))}
                       </div>
@@ -2119,32 +2222,18 @@ export default function ChatPage() {
             </div>
           </aside>
         ) : showInspector ? (
-          <aside className="fixed inset-y-14 right-0 z-20 flex w-full flex-col border-l border-[var(--outline)] bg-[#f8faf8] sm:w-[390px] lg:static lg:inset-auto lg:w-[380px]">
-            <div className="flex h-16 items-center justify-between border-b border-[var(--outline)] px-4">
-              <div><h2 className="text-sm font-semibold">Activity</h2><p className="text-xs text-[var(--ink-soft)]">{filteredEvents.length} events</p></div>
-              <div className="flex items-center gap-1">
-                <button type="button" title="Clear activity" aria-label="Clear activity" onClick={() => setEvents([])} className="flex h-8 w-8 items-center justify-center rounded-md text-[var(--ink-soft)] hover:bg-[var(--surface-strong)]"><Trash2 size={16} /></button>
-                <button type="button" title="Close activity" aria-label="Close activity" onClick={() => setShowInspector(false)} className="flex h-8 w-8 items-center justify-center rounded-md text-[var(--ink-soft)] hover:bg-[var(--surface-strong)] lg:hidden"><X size={17} /></button>
-              </div>
-            </div>
-            <div className="flex flex-wrap gap-1 border-b border-[var(--outline)] p-3">
-              <FilterButton icon={BrainCircuit} label="Subconscious" active={activityFilters.has("subconscious")} onClick={() => toggleActivityFilter("subconscious")} />
-              <FilterButton icon={Database} label="Memory" active={activityFilters.has("memory")} onClick={() => toggleActivityFilter("memory")} />
-              <FilterButton icon={Wrench} label="Tools" active={activityFilters.has("tool")} onClick={() => toggleActivityFilter("tool")} />
-              <FilterButton icon={Activity} label="Models" active={activityFilters.has("model")} onClick={() => toggleActivityFilter("model")} />
-            </div>
-            <div ref={logRef} className="flex-1 overflow-y-auto">
-              {filteredEvents.length === 0 ? <p className="p-5 text-sm text-[var(--ink-soft)]">No matching activity.</p> : filteredEvents.map((event) => (
-                <details key={event.id} className={`border-b border-[var(--outline)] px-4 py-3 ${event.category === "error" ? "bg-red-50" : "bg-white"}`}>
-                  <summary className="cursor-pointer list-none">
-                    <div className="flex items-center justify-between gap-3"><span className="text-xs font-semibold">{event.title}</span><Badge variant={event.category === "subconscious" ? "accent" : event.category === "error" ? "error" : "muted"}>{event.category}</Badge></div>
-                    <p className="mt-1 line-clamp-2 text-xs leading-5 text-[var(--ink-soft)]">{event.detail || "No summary"}</p>
-                  </summary>
-                  {event.raw !== undefined ? <pre className="mt-3 max-h-80 overflow-auto whitespace-pre-wrap break-words rounded-md bg-[#eef2ef] p-3 text-xs leading-5">{JSON.stringify(event.raw, null, 2)}</pre> : null}
-                </details>
-              ))}
-            </div>
-          </aside>
+          <ActivityInspector
+            events={events}
+            messages={messages}
+            agentStatus={agentStatus}
+            currentPhase={currentPhase}
+            sending={sending}
+            streamMeter={streamMeter}
+            expandedPanes={expandedActivityPanes}
+            onTogglePane={toggleActivityPane}
+            onClear={() => setEvents([])}
+            onClose={() => setShowInspector(false)}
+          />
         ) : null}
       </div>
     </div>
@@ -2155,6 +2244,7 @@ function ConnectorSetupModal({
   setup,
   busy,
   onAction,
+  onRefresh,
   onClose,
 }: {
   setup: { assistantId: string; ui: ConnectorSetupUi };
@@ -2164,6 +2254,10 @@ function ConnectorSetupModal({
     currentUi: ConnectorSetupUi,
     action: string,
     argumentsPayload: Record<string, unknown>
+  ) => Promise<IntegrationActionResult>;
+  onRefresh: (
+    assistantId: string,
+    currentUi: ConnectorSetupUi
   ) => Promise<IntegrationActionResult>;
   onClose: () => void;
 }) {
@@ -2207,6 +2301,7 @@ function ConnectorSetupModal({
             assistantId={setup.assistantId}
             busy={busy}
             onAction={onAction}
+            onRefresh={onRefresh}
           />
         </div>
       </div>
@@ -2219,6 +2314,7 @@ function ConnectorSetupCard({
   assistantId,
   busy,
   onAction,
+  onRefresh,
 }: {
   ui: ConnectorSetupUi;
   assistantId: string;
@@ -2228,6 +2324,10 @@ function ConnectorSetupCard({
     currentUi: ConnectorSetupUi,
     action: string,
     argumentsPayload: Record<string, unknown>
+  ) => Promise<IntegrationActionResult>;
+  onRefresh: (
+    assistantId: string,
+    currentUi: ConnectorSetupUi
   ) => Promise<IntegrationActionResult>;
 }) {
   const [clientSecretPath, setClientSecretPath] = useState("");
@@ -2240,13 +2340,14 @@ function ConnectorSetupCard({
   const [error, setError] = useState<string | null>(null);
   const [showAdvancedCredentialSetup, setShowAdvancedCredentialSetup] = useState(true);
   const clientSecretFileRef = useRef<HTMLInputElement>(null);
+  const refreshInFlightRef = useRef(false);
 
   const connectorName = ui.display_name || ui.connector_id;
   const capabilityOptions = ui.capability_options || [];
   const memoryOptions = ui.memory_options || [];
   const autonomyOptions = ui.autonomy_options || [];
   const connectedAccounts = ui.connected_accounts || [];
-  const connected = ui.status === "connected" || connectedAccounts.length > 0 || ui.credentials_saved;
+  const connected = ui.status === "connected" || connectedAccounts.length > 0;
   const startBusy = busy === `${assistantId}:${ui.connector_id}:connect_gmail`;
   const completeBusy = busy === `${assistantId}:${ui.connector_id}:complete_gmail`;
   const needsCapabilityChoice =
@@ -2278,6 +2379,32 @@ function ConnectorSetupCard({
   const needsLocalGoogleSetup = requiresClientSecret && !hostedAvailable;
   const showLocalGoogleSetup = needsLocalGoogleSetup && showAdvancedCredentialSetup;
   const setupSteps = ui.setup_steps?.length ? ui.setup_steps : GMAIL_SETUP_STEPS;
+
+  useEffect(() => {
+    if (ui.connector_id !== "gmail" || !canCompleteOAuth || connected) return;
+    let stopped = false;
+    const refresh = async () => {
+      if (stopped || refreshInFlightRef.current) return;
+      refreshInFlightRef.current = true;
+      try {
+        const payload = await onRefresh(assistantId, ui);
+        const nextUi = connectorSetupUiFromPayload(payload);
+        if (nextUi?.status === "connected") {
+          setNotice("Gmail connected. You can return to the conversation.");
+        }
+      } finally {
+        refreshInFlightRef.current = false;
+      }
+    };
+    const timer = window.setInterval(() => {
+      void refresh();
+    }, 3000);
+    void refresh();
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+    };
+  }, [assistantId, canCompleteOAuth, connected, ui.attempt_id, ui.connector_id, ui.id, ui.status]);
 
   const runSaveClientSecret = async (file: File | null | undefined) => {
     if (!file) return;
@@ -2342,7 +2469,7 @@ function ConnectorSetupCard({
     setError(null);
     const response = authorizationResponse.trim();
     if (!response) {
-      setError("Paste the redirected localhost URL or authorization code from Google.");
+      setError("Paste the Google callback URL or authorization code.");
       return;
     }
     const payload = await onAction(assistantId, ui, "complete_gmail", {
@@ -2660,7 +2787,7 @@ function ConnectorSetupCard({
         </div>
       ) : null}
 
-      {ui.authorization_url ? (
+      {!connected && ui.authorization_url ? (
         <div className="mt-4 rounded-md border border-[var(--outline)] bg-white p-3">
           <a
             href={ui.authorization_url}
@@ -2673,27 +2800,35 @@ function ConnectorSetupCard({
           <p className="mt-1 break-all font-mono text-[11px] leading-5 text-[var(--ink-soft)]">
             {ui.authorization_url}
           </p>
+          <p className="mt-2 text-xs leading-5 text-[var(--ink-soft)]">
+            After you approve access, Google returns to Hexis and this panel checks for completion automatically.
+          </p>
         </div>
       ) : null}
 
       {canCompleteOAuth ? (
-        <div className="mt-3 grid gap-2 sm:grid-cols-[1fr_auto]">
-          <input
-            type="text"
-            value={authorizationResponse}
-            onChange={(event) => setAuthorizationResponse(event.target.value)}
-            placeholder="Paste redirected localhost URL or authorization code"
-            className="w-full rounded-md border border-[var(--outline)] bg-white px-3 py-2 text-sm outline-none focus:border-[var(--teal)] focus:ring-2 focus:ring-[var(--teal)]/10"
-          />
-          <button
-            type="button"
-            onClick={() => void runComplete()}
-            disabled={Boolean(busy) || !authorizationResponse.trim()}
-            className="rounded-md bg-[var(--foreground)] px-3 py-2 text-xs font-semibold text-white hover:bg-[var(--teal)] disabled:opacity-40"
-          >
-            {completeBusy ? "Completing..." : "Complete"}
-          </button>
-        </div>
+        <details className="mt-3 rounded-md border border-[var(--outline)] bg-white p-3 text-xs">
+          <summary className="cursor-pointer font-semibold text-[var(--teal)]">
+            Google did not return automatically
+          </summary>
+          <div className="mt-3 grid gap-2 sm:grid-cols-[1fr_auto]">
+            <input
+              type="text"
+              value={authorizationResponse}
+              onChange={(event) => setAuthorizationResponse(event.target.value)}
+              placeholder="Paste Google callback URL or authorization code"
+              className="w-full rounded-md border border-[var(--outline)] bg-white px-3 py-2 text-sm outline-none focus:border-[var(--teal)] focus:ring-2 focus:ring-[var(--teal)]/10"
+            />
+            <button
+              type="button"
+              onClick={() => void runComplete()}
+              disabled={Boolean(busy) || !authorizationResponse.trim()}
+              className="rounded-md bg-[var(--foreground)] px-3 py-2 text-xs font-semibold text-white hover:bg-[var(--teal)] disabled:opacity-40"
+            >
+              {completeBusy ? "Completing..." : "Complete"}
+            </button>
+          </div>
+        </details>
       ) : null}
 
       {ui.safety_note ? (
@@ -2718,17 +2853,363 @@ function ConnectorSetupCard({
   );
 }
 
-function FilterButton({ icon: Icon, label, active, onClick }: { icon: LucideIcon; label: string; active: boolean; onClick: () => void }) {
+function ActivityInspector({
+  events,
+  messages,
+  agentStatus,
+  currentPhase,
+  sending,
+  streamMeter,
+  expandedPanes,
+  onTogglePane,
+  onClear,
+  onClose,
+}: {
+  events: LogEvent[];
+  messages: ChatMessage[];
+  agentStatus: AgentStatus;
+  currentPhase: string | null;
+  sending: boolean;
+  streamMeter: StreamMeter;
+  expandedPanes: Set<ActivityPaneId>;
+  onTogglePane: (pane: ActivityPaneId) => void;
+  onClear: () => void;
+  onClose: () => void;
+}) {
+  const thoughtPairs = useMemo(() => buildThoughtPairs(events, messages), [events, messages]);
+  const emotionHistory = useMemo(() => buildEmotionHistory(events, agentStatus), [events, agentStatus]);
+  const toolEvents = useMemo(
+    () => events.filter((event) => event.category === "tool" || event.category === "error"),
+    [events],
+  );
+  const recallEvents = useMemo(() => events.filter(isMemoryRecallEvent), [events]);
+
+  const currentEmotion = emotionHistory.length > 0
+    ? emotionHistory[emotionHistory.length - 1]
+    : {
+        id: "current-emotion",
+        ts: Date.now(),
+        label: agentStatus.mood || "neutral",
+        valence: typeof agentStatus.valence === "number" ? agentStatus.valence : null,
+        detail: agentStatus.mood || "No emotional state reported yet.",
+      };
+  const latestThought = thoughtPairs.length > 0 ? thoughtPairs[thoughtPairs.length - 1] : null;
+  const latestTool = toolEvents.length > 0 ? toolEvents[toolEvents.length - 1] : null;
+  const latestRecall = recallEvents.length > 0 ? recallEvents[recallEvents.length - 1] : null;
+  const latestMemories = latestRecall ? memoryPreviewsFromEvent(latestRecall) : [];
+  const latestMemory = latestMemories.length > 0 ? latestMemories[0] : null;
+  const workLabel = sending
+    ? streamLabel(currentPhase || "stream")
+    : latestTool && Date.now() - latestTool.ts < 15000
+      ? latestTool.title
+      : "Idle";
+
   return (
-    <button
-      type="button"
-      onClick={onClick}
-      aria-pressed={active}
-      className={`flex items-center gap-1.5 rounded-md px-2 py-1.5 text-xs font-medium ${active ? "bg-[var(--foreground)] text-white" : "bg-white text-[var(--ink-soft)] hover:bg-[var(--surface-strong)]"}`}
-    >
-      <Icon size={13} />
-      {label}
-    </button>
+    <aside className="fixed inset-y-14 right-0 z-20 flex w-full flex-col border-l border-[var(--outline)] bg-[#f8faf8] sm:w-[390px] lg:static lg:inset-auto lg:w-[380px]">
+      <div className="flex h-16 items-center justify-between border-b border-[var(--outline)] px-4">
+        <div>
+          <h2 className="text-sm font-semibold">Activity</h2>
+          <p className="text-xs text-[var(--ink-soft)]">{events.length} recent events</p>
+        </div>
+        <div className="flex items-center gap-1">
+          <button type="button" title="Clear activity" aria-label="Clear activity" onClick={onClear} className="flex h-8 w-8 items-center justify-center rounded-md text-[var(--ink-soft)] hover:bg-[var(--surface-strong)]"><Trash2 size={16} /></button>
+          <button type="button" title="Close activity" aria-label="Close activity" onClick={onClose} className="flex h-8 w-8 items-center justify-center rounded-md text-[var(--ink-soft)] hover:bg-[var(--surface-strong)] lg:hidden"><X size={17} /></button>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-2 gap-2 border-b border-[var(--outline)] p-3">
+        <ActivityKpi
+          label="Tok/s"
+          value={streamMeter.tokensPerSecond > 0 ? streamMeter.tokensPerSecond.toFixed(1) : "0.0"}
+          detail={streamMeter.active ? "streaming" : "last turn"}
+          gaugeValue={Math.min(1, streamMeter.tokensPerSecond / 60)}
+        />
+        <ActivityKpi
+          label="Emotion"
+          value={titleCase(currentEmotion.label)}
+          detail={formatValence(currentEmotion.valence)}
+          gaugeValue={valenceGauge(currentEmotion.valence)}
+        />
+        <ActivityKpi
+          label="Work"
+          value={workLabel}
+          detail={sending ? "active" : "standing by"}
+          gaugeValue={sending ? 0.82 : 0.18}
+        />
+        <ActivityKpi
+          label="Recall"
+          value={String(memoryCountFromEvent(latestRecall))}
+          detail="memories"
+          gaugeValue={Math.min(1, memoryCountFromEvent(latestRecall) / 10)}
+        />
+      </div>
+
+      <div className="flex-1 overflow-y-auto">
+        <ActivityPane
+          id="thoughts"
+          title="Thoughts"
+          icon={BrainCircuit}
+          count={thoughtPairs.length}
+          expanded={expandedPanes.has("thoughts")}
+          onToggle={onTogglePane}
+          summary={
+            latestThought ? (
+              <ThoughtPairView pair={latestThought} compact />
+            ) : (
+              <p className="text-xs leading-5 text-[var(--ink-soft)]">No thought trace yet.</p>
+            )
+          }
+        >
+          {thoughtPairs.length === 0 ? (
+            <p className="text-xs leading-5 text-[var(--ink-soft)]">No thought history yet.</p>
+          ) : (
+            <div className="space-y-3">
+              {[...thoughtPairs].reverse().map((pair) => (
+                <ThoughtPairView key={pair.id} pair={pair} />
+              ))}
+            </div>
+          )}
+        </ActivityPane>
+
+        <ActivityPane
+          id="emotion"
+          title="Emotion"
+          icon={Activity}
+          count={emotionHistory.length}
+          expanded={expandedPanes.has("emotion")}
+          onToggle={onTogglePane}
+          summary={<EmotionSnapshotView snapshot={currentEmotion} compact />}
+        >
+          {emotionHistory.length === 0 ? (
+            <p className="text-xs leading-5 text-[var(--ink-soft)]">No emotion history yet.</p>
+          ) : (
+            <div className="space-y-2">
+              {[...emotionHistory].reverse().map((snapshot) => (
+                <EmotionSnapshotView key={snapshot.id} snapshot={snapshot} />
+              ))}
+            </div>
+          )}
+        </ActivityPane>
+
+        <ActivityPane
+          id="activity"
+          title="Activity"
+          icon={Wrench}
+          count={toolEvents.length}
+          expanded={expandedPanes.has("activity")}
+          onToggle={onTogglePane}
+          summary={
+            latestTool ? (
+              <ActivityEventRow event={latestTool} compact />
+            ) : (
+              <p className="text-xs leading-5 text-[var(--ink-soft)]">No tool activity yet.</p>
+            )
+          }
+        >
+          {toolEvents.length === 0 ? (
+            <p className="text-xs leading-5 text-[var(--ink-soft)]">No tool history yet.</p>
+          ) : (
+            <div className="space-y-2">
+              {[...toolEvents].reverse().map((event) => (
+                <ActivityEventRow key={event.id} event={event} />
+              ))}
+            </div>
+          )}
+        </ActivityPane>
+
+        <ActivityPane
+          id="memory"
+          title="Memory"
+          icon={Database}
+          count={recallEvents.length}
+          expanded={expandedPanes.has("memory")}
+          onToggle={onTogglePane}
+          summary={
+            latestMemory ? (
+              <MemoryPreviewRow memory={latestMemory} compact />
+            ) : latestRecall ? (
+              <p className="text-xs leading-5 text-[var(--ink-soft)]">{latestRecall.detail}</p>
+            ) : (
+              <p className="text-xs leading-5 text-[var(--ink-soft)]">No memory retrieval yet.</p>
+            )
+          }
+        >
+          {recallEvents.length === 0 ? (
+            <p className="text-xs leading-5 text-[var(--ink-soft)]">No memory retrieval history yet.</p>
+          ) : (
+            <div className="space-y-4">
+              {[...recallEvents].reverse().map((event) => {
+                const memories = memoryPreviewsFromEvent(event);
+                return (
+                  <div key={event.id} className="border-t border-[var(--outline)] pt-3 first:border-t-0 first:pt-0">
+                    <div className="flex items-center justify-between gap-2">
+                      <p className="text-xs font-semibold">{event.detail}</p>
+                      <span className="text-[10px] text-[var(--ink-soft)]">{timeLabel(event.ts)}</span>
+                    </div>
+                    {memories.length > 0 ? (
+                      <div className="mt-2 space-y-2">
+                        {memories.map((memory, index) => (
+                          <MemoryPreviewRow
+                            key={`${event.id}:${memory.id || index}`}
+                            memory={memory}
+                          />
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="mt-2 text-xs leading-5 text-[var(--ink-soft)]">No memory previews were attached to this recall event.</p>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </ActivityPane>
+      </div>
+    </aside>
+  );
+}
+
+function ActivityKpi({
+  label,
+  value,
+  detail,
+  gaugeValue,
+}: {
+  label: string;
+  value: string;
+  detail: string;
+  gaugeValue: number;
+}) {
+  const pct = Math.max(0, Math.min(1, gaugeValue));
+  const degrees = Math.round(pct * 360);
+  return (
+    <div className="min-w-0 border border-[var(--outline)] bg-white p-2">
+      <div className="flex items-center gap-2">
+        <span
+          className="flex h-8 w-8 flex-none items-center justify-center rounded-full"
+          style={{ background: `conic-gradient(var(--teal) ${degrees}deg, #e6ece8 ${degrees}deg)` }}
+          aria-hidden="true"
+        >
+          <span className="h-4 w-4 rounded-full bg-white" />
+        </span>
+        <div className="min-w-0">
+          <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-[var(--ink-soft)]">{label}</p>
+          <p className="line-clamp-2 min-h-4 break-words text-sm font-semibold leading-4">{value}</p>
+        </div>
+      </div>
+      <p className="mt-1 truncate text-[10px] text-[var(--ink-soft)]">{detail}</p>
+    </div>
+  );
+}
+
+function ActivityPane({
+  id,
+  title,
+  icon: Icon,
+  count,
+  expanded,
+  onToggle,
+  summary,
+  children,
+}: {
+  id: ActivityPaneId;
+  title: string;
+  icon: LucideIcon;
+  count: number;
+  expanded: boolean;
+  onToggle: (pane: ActivityPaneId) => void;
+  summary: ReactNode;
+  children: ReactNode;
+}) {
+  return (
+    <section className="border-b border-[var(--outline)] bg-white">
+      <button
+        type="button"
+        aria-expanded={expanded}
+        onClick={() => onToggle(id)}
+        className="flex w-full items-center justify-between gap-3 px-4 py-3 text-left hover:bg-[var(--surface-strong)]"
+      >
+        <span className="flex min-w-0 items-center gap-2">
+          <Icon size={16} className="flex-none text-[var(--teal)]" />
+          <span className="truncate text-sm font-semibold">{title}</span>
+          <Badge variant="muted">{count}</Badge>
+        </span>
+        <span className="flex h-6 w-6 flex-none items-center justify-center rounded-md border border-[var(--outline)] text-sm text-[var(--ink-soft)]">
+          {expanded ? "-" : "+"}
+        </span>
+      </button>
+      <div className="px-4 pb-3">{expanded ? children : summary}</div>
+    </section>
+  );
+}
+
+function ThoughtPairView({ pair, compact = false }: { pair: ThoughtPair; compact?: boolean }) {
+  return (
+    <div className={compact ? "space-y-2" : "space-y-2 border-t border-[var(--outline)] pt-3 first:border-t-0 first:pt-0"}>
+      <div>
+        <div className="flex items-center justify-between gap-2">
+          <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-[var(--ink-soft)]">Subconscious</p>
+          {!compact ? <span className="text-[10px] text-[var(--ink-soft)]">{timeLabel(pair.ts)}</span> : null}
+        </div>
+        <p className={`${compact ? "line-clamp-2" : ""} text-xs leading-5 text-[var(--foreground)]`}>
+          {pair.subconsciousText || "No subconscious response captured."}
+        </p>
+      </div>
+      <div>
+        <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-[var(--ink-soft)]">Conscious</p>
+        <p className={`${compact ? "line-clamp-2" : ""} text-xs leading-5 text-[var(--ink-soft)]`}>
+          {pair.consciousText || "No conscious response captured yet."}
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function EmotionSnapshotView({ snapshot, compact = false }: { snapshot: EmotionSnapshot; compact?: boolean }) {
+  return (
+    <div className={compact ? "" : "border-t border-[var(--outline)] pt-2 first:border-t-0 first:pt-0"}>
+      <div className="flex items-center justify-between gap-2">
+        <p className="truncate text-xs font-semibold">{titleCase(snapshot.label)}</p>
+        <span className="text-[10px] text-[var(--ink-soft)]">
+          {compact ? formatValence(snapshot.valence) : `${formatValence(snapshot.valence)} | ${timeLabel(snapshot.ts)}`}
+        </span>
+      </div>
+      <p className={`${compact ? "line-clamp-2" : ""} mt-1 text-xs leading-5 text-[var(--ink-soft)]`}>
+        {snapshot.detail}
+      </p>
+    </div>
+  );
+}
+
+function ActivityEventRow({ event, compact = false }: { event: LogEvent; compact?: boolean }) {
+  return (
+    <div className={compact ? "" : "border-t border-[var(--outline)] pt-2 first:border-t-0 first:pt-0"}>
+      <div className="flex items-center justify-between gap-2">
+        <p className="truncate text-xs font-semibold">{event.title}</p>
+        <Badge variant={event.category === "error" ? "error" : "muted"}>{event.category === "error" ? "error" : "tool"}</Badge>
+      </div>
+      <p className={`${compact ? "line-clamp-2" : ""} mt-1 text-xs leading-5 text-[var(--ink-soft)]`}>
+        {event.detail || "No detail"}
+      </p>
+      {!compact ? <p className="mt-1 text-[10px] text-[var(--ink-soft)]">{timeLabel(event.ts)}</p> : null}
+    </div>
+  );
+}
+
+function MemoryPreviewRow({ memory, compact = false }: { memory: MemoryPreview; compact?: boolean }) {
+  const score = memory.similarity ?? memory.relevance_score ?? memory.importance ?? null;
+  return (
+    <div className={compact ? "" : "border-l-2 border-[var(--teal)]/30 pl-2"}>
+      <div className="flex items-center justify-between gap-2">
+        <p className="truncate text-[10px] font-semibold uppercase tracking-[0.16em] text-[var(--ink-soft)]">
+          {memory.type || "memory"}
+        </p>
+        {score !== null ? <span className="text-[10px] text-[var(--ink-soft)]">{score.toFixed(2)}</span> : null}
+      </div>
+      <p className={`${compact ? "line-clamp-3" : ""} mt-1 text-xs leading-5 text-[var(--foreground)]`}>
+        {memory.content || "Memory preview unavailable."}
+      </p>
+    </div>
   );
 }
 
@@ -2752,6 +3233,215 @@ function summarizeSubconscious(output: Record<string, unknown>): string {
   const memories = Array.isArray(signals.salient_memories) ? signals.salient_memories.length : 0;
   if (memories) parts.push(`${memories} salient ${memories === 1 ? "memory" : "memories"}`);
   return parts.join(" · ") || `${asString(output.provider, "provider")}/${asString(output.model, "model")}`;
+}
+
+function buildThoughtPairs(events: LogEvent[], messages: ChatMessage[]): ThoughtPair[] {
+  const pairs: ThoughtPair[] = [];
+  let pendingSubconscious: LogEvent | undefined;
+  for (const event of events) {
+    if (event.category === "subconscious") {
+      pendingSubconscious = event;
+      continue;
+    }
+    if (!isConsciousModelResponse(event)) continue;
+    pairs.push({
+      id: `${pendingSubconscious?.id || "no-subconscious"}:${event.id}`,
+      ts: event.ts,
+      subconscious: pendingSubconscious,
+      conscious: event,
+      subconsciousText: pendingSubconscious ? subconsciousResponseText(pendingSubconscious) : "",
+      consciousText: modelResponseText(event),
+    });
+    pendingSubconscious = undefined;
+  }
+  if (pendingSubconscious) {
+    pairs.push({
+      id: pendingSubconscious.id,
+      ts: pendingSubconscious.ts,
+      subconscious: pendingSubconscious,
+      subconsciousText: subconsciousResponseText(pendingSubconscious),
+      consciousText: latestAssistantText(messages),
+    });
+  } else if (pairs.length > 0 && !pairs[pairs.length - 1].consciousText) {
+    pairs[pairs.length - 1] = {
+      ...pairs[pairs.length - 1],
+      consciousText: latestAssistantText(messages),
+    };
+  } else if (pairs.length === 0) {
+    const assistantText = latestAssistantText(messages);
+    if (assistantText) {
+      pairs.push({
+        id: "latest-assistant",
+        ts: Date.now(),
+        subconsciousText: "",
+        consciousText: assistantText,
+      });
+    }
+  }
+  return pairs;
+}
+
+function buildEmotionHistory(events: LogEvent[], agentStatus: AgentStatus): EmotionSnapshot[] {
+  const snapshots = events
+    .filter((event) => event.category === "subconscious")
+    .map(emotionSnapshotFromEvent)
+    .filter((snapshot): snapshot is EmotionSnapshot => snapshot !== null);
+  if (
+    snapshots.length === 0 &&
+    (agentStatus.mood || typeof agentStatus.valence === "number")
+  ) {
+    snapshots.push({
+      id: "agent-status",
+      ts: Date.now(),
+      label: agentStatus.mood || "neutral",
+      valence: typeof agentStatus.valence === "number" ? agentStatus.valence : null,
+      detail: agentStatus.mood || "Current status",
+    });
+  }
+  return snapshots;
+}
+
+function emotionSnapshotFromEvent(event: LogEvent): EmotionSnapshot | null {
+  const raw = asRecord(event.raw);
+  const signals = asRecord(raw.signals);
+  const emotion = asRecord(signals.emotional_state);
+  const label =
+    asString(emotion.primary_emotion) ||
+    asString(emotion.mood) ||
+    asString(emotion.state) ||
+    firstDetailPart(event.detail) ||
+    "neutral";
+  const valence = asNumber(emotion.valence);
+  const detail =
+    asString(emotion.summary) ||
+    asString(emotion.reason) ||
+    asString(signals.subconscious_response) ||
+    event.detail ||
+    label;
+  return {
+    id: event.id,
+    ts: event.ts,
+    label,
+    valence,
+    detail,
+  };
+}
+
+function subconsciousResponseText(event: LogEvent): string {
+  const raw = asRecord(event.raw);
+  const signals = asRecord(raw.signals);
+  return (
+    asString(signals.subconscious_response).trim() ||
+    afterFirstDetailPart(event.detail) ||
+    event.detail ||
+    ""
+  );
+}
+
+function isConsciousModelResponse(event: LogEvent): boolean {
+  if (event.category !== "model") return false;
+  const raw = asRecord(event.raw);
+  return asString(raw.kind) === "llm_response" && asString(raw.phase) !== "subconscious";
+}
+
+function modelResponseText(event: LogEvent): string {
+  const raw = asRecord(event.raw);
+  const content = raw.content;
+  if (typeof content === "string") return trimDisplayText(content);
+  if (content && typeof content === "object") return trimDisplayText(JSON.stringify(content));
+  return event.detail || "";
+}
+
+function latestAssistantText(messages: ChatMessage[]): string {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message.role === "assistant" && message.content.trim()) {
+      return trimDisplayText(message.content);
+    }
+  }
+  return "";
+}
+
+function isMemoryRecallEvent(event: LogEvent): boolean {
+  if (event.category !== "memory") return false;
+  const raw = asRecord(event.raw);
+  const kind = asString(raw.kind).toLowerCase();
+  return kind === "memory_recall" || event.title.toLowerCase().includes("recall");
+}
+
+function memoryPreviewsFromEvent(event: LogEvent): MemoryPreview[] {
+  const raw = asRecord(event.raw);
+  const memories = Array.isArray(raw.memories) ? raw.memories : [];
+  return memories.flatMap((item): MemoryPreview[] => {
+    const record = asRecord(item);
+    const content = asString(record.content).trim();
+    if (!content) return [];
+    return [{
+      id: asString(record.id) || undefined,
+      type: asString(record.type) || undefined,
+      content,
+      similarity: asNumber(record.similarity),
+      relevance_score: asNumber(record.relevance_score),
+      importance: asNumber(record.importance),
+      trust_level: asNumber(record.trust_level),
+      confidence: asNumber(record.confidence),
+      source: asString(record.source) || undefined,
+    }];
+  });
+}
+
+function memoryCountFromEvent(event: LogEvent | null): number {
+  if (!event) return 0;
+  const raw = asRecord(event.raw);
+  const count = asNumber(raw.count);
+  if (count !== null) return Math.round(count);
+  const match = event.detail.match(/Retrieved\s+(\d+)/i);
+  return match ? Number(match[1]) : memoryPreviewsFromEvent(event).length;
+}
+
+function firstDetailPart(value: string): string {
+  return value.split(" · ")[0]?.trim() || "";
+}
+
+function afterFirstDetailPart(value: string): string {
+  const parts = value.split(" · ");
+  return parts.slice(1).join(" · ").trim();
+}
+
+function trimDisplayText(value: string, maxLength = 520): string {
+  const trimmed = value.replace(/\s+/g, " ").trim();
+  if (trimmed.length <= maxLength) return trimmed;
+  return `${trimmed.slice(0, maxLength - 1)}...`;
+}
+
+function asNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function formatValence(value: number | null): string {
+  if (value === null) return "valence n/a";
+  return `valence ${value >= 0 ? "+" : ""}${value.toFixed(2)}`;
+}
+
+function valenceGauge(value: number | null): number {
+  if (value === null) return 0.5;
+  return Math.max(0, Math.min(1, (value + 1) / 2));
+}
+
+function titleCase(value: string): string {
+  return value
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/\b\w/g, (letter) => letter.toUpperCase()) || "Neutral";
+}
+
+function timeLabel(ts: number): string {
+  return new Date(ts).toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
 }
 
 function streamLabel(phase: string) {
@@ -2826,7 +3516,7 @@ function connectorSetupNotice(ui: ConnectorSetupUi): string {
     case "client_secret_saved":
       return `${connector} setup file saved. Start Google sign-in from the setup panel.`;
     case "pending_authorization":
-      return `${connector} sign-in started. Open Google, then paste the redirected localhost URL.`;
+      return `${connector} sign-in started. Open Google; Hexis will complete the connection when Google returns.`;
     case "connected":
       return `${connector} is connected.`;
     default:
