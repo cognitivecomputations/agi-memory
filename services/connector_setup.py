@@ -17,7 +17,7 @@ from typing import Any, Literal
 from core.tools import ToolContext, ToolExecutionContext, ToolRegistry
 
 
-ConnectorSetupAction = Literal["choose_scope", "choose_memory", "start", "complete"]
+ConnectorSetupAction = Literal["choose_scope", "choose_memory", "choose_autonomy", "start", "complete"]
 
 _GMAIL_READ_CAPABILITIES = ["read", "search"]
 _GMAIL_WRITE_CAPABILITIES = [*_GMAIL_READ_CAPABILITIES, "send", "reply"]
@@ -49,6 +49,18 @@ _MANAGE_RE = re.compile(r"\b(?:delete|trash|manage|label|labels|spam|archive|fil
 _REMEMBER_RE = re.compile(r"\b(?:remember|learn|ingest|store|keep|retain)\b", re.IGNORECASE)
 _FORGET_RE = re.compile(
     r"\b(?:forget|do\s+not\s+remember|don't\s+remember|dont\s+remember|do\s+not\s+ingest|don't\s+ingest|dont\s+ingest|ephemeral|temporary)\b",
+    re.IGNORECASE,
+)
+_AUTONOMOUS_EMAIL_RE = re.compile(
+    r"\b(?:heartbeat|background|autonomous|automatically|auto|proactive|hourly|digest|while\s+i(?:'|’)?m\s+away|without\s+me\s+asking|only\s+(?:check\s+)?when\s+i\s+ask|when\s+i\s+ask)\b",
+    re.IGNORECASE,
+)
+_AUTONOMOUS_ENABLE_RE = re.compile(
+    r"\b(?:yes|sure|ok|okay|enable|allow|authorize|proactive|automatic|automatically|hourly|heartbeat|background|digest)\b",
+    re.IGNORECASE,
+)
+_AUTONOMOUS_DISABLE_RE = re.compile(
+    r"\b(?:no|not|never|disable|only\s+when\s+i\s+ask|when\s+i\s+ask|do\s+not|don't|dont|manual)\b",
     re.IGNORECASE,
 )
 _CANCEL_RE = re.compile(r"^\s*(?:cancel|stop|never mind|nevermind)\s*$", re.IGNORECASE)
@@ -100,11 +112,15 @@ def _tool_result_payload(result: Any) -> dict[str, Any]:
     }
 
 
-def _extract_client_secret_path(message: str) -> str | None:
+def _extract_client_secret_path(message: str, *, pending_setup: bool = False) -> str | None:
     match = _JSON_PATH_RE.search(message)
     if not match:
         return None
-    if not _CLIENT_SECRET_HINT_RE.search(message) and "client_secret" not in match.group("path").lower():
+    if (
+        not pending_setup
+        and not _CLIENT_SECRET_HINT_RE.search(message)
+        and "client_secret" not in match.group("path").lower()
+    ):
         return None
     return match.group("path").rstrip(".,;)")
 
@@ -152,6 +168,23 @@ def _memory_options() -> list[dict[str, Any]]:
     ]
 
 
+def _autonomy_options() -> list[dict[str, Any]]:
+    return [
+        {
+            "id": "ask_only",
+            "label": "Only when I ask",
+            "description": "Samantha can read/search Gmail during a live request, but heartbeats will not check email on their own.",
+            "heartbeat_digest_enabled": False,
+        },
+        {
+            "id": "heartbeat_digest",
+            "label": "Allow heartbeat checks",
+            "description": "Samantha may check connected Gmail during hourly heartbeats for important messages and digests.",
+            "heartbeat_digest_enabled": True,
+        },
+    ]
+
+
 def _gmail_scope_choice_ui() -> dict[str, Any]:
     return {
         "kind": "connector_setup",
@@ -161,7 +194,7 @@ def _gmail_scope_choice_ui() -> dict[str, Any]:
         "display_name": "Gmail",
         "title": "Connect Gmail",
         "status": "needs_capability_choice",
-        "summary": "Choose what powers Samantha should request before OAuth starts.",
+        "summary": "Choose what email powers Samantha should ask Google for.",
         "question": (
             "Do you want me to just be able to read them, write emails on your behalf, "
             "or also manage and delete emails on your behalf?"
@@ -195,8 +228,39 @@ def _gmail_memory_choice_ui(base_capabilities: list[str], tier: str | None = Non
         "memory_config_key": "integrations.gmail.memory_policy",
         "docs_url": "https://console.cloud.google.com/apis/credentials",
         "safety_note": (
-            "OAuth controls provider permissions. Remembering or forgetting is a Hexis-side memory setting, "
-            "not a Google scope."
+            "Google controls provider permissions. Remembering or forgetting is a Hexis-side memory setting, "
+            "not a Google permission."
+        ),
+    }
+
+
+def _gmail_autonomy_choice_ui(
+    base_capabilities: list[str],
+    memory_policy: str,
+    tier: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "kind": "connector_setup",
+        "version": 1,
+        "id": f"connector_setup:gmail:autonomy_choice:{tier or 'custom'}",
+        "connector_id": "gmail",
+        "display_name": "Gmail",
+        "title": "Connect Gmail",
+        "status": "needs_autonomy_choice",
+        "summary": "Choose whether Samantha may check Gmail while you are away.",
+        "question": (
+            "Do you want me to check Gmail during heartbeats on my own, or only read it "
+            "when you ask while you are here?"
+        ),
+        "capabilities": list(base_capabilities),
+        "memory_policy": memory_policy,
+        "memory_config_key": "integrations.gmail.memory_policy",
+        "autonomy_options": _autonomy_options(),
+        "heartbeat_digest_config_key": "integrations.gmail.heartbeat_digest_enabled",
+        "docs_url": "https://console.cloud.google.com/apis/credentials",
+        "safety_note": (
+            "Google sign-in grants provider access. Background heartbeat reading is a separate Hexis "
+            "autonomy setting and is off until you choose it."
         ),
     }
 
@@ -224,6 +288,14 @@ def _memory_choice_from_text(text: str) -> str | None:
         return "forget"
     if _REMEMBER_RE.search(text):
         return "remember"
+    return None
+
+
+def _autonomy_choice_from_text(text: str) -> bool | None:
+    if _AUTONOMOUS_DISABLE_RE.search(text):
+        return False
+    if _AUTONOMOUS_ENABLE_RE.search(text):
+        return True
     return None
 
 
@@ -302,9 +374,25 @@ async def detect_connector_setup_intent(
         choice = _memory_choice_from_text(text)
         if choice:
             base = [str(item) for item in pending.get("base_capabilities") or _GMAIL_READ_CAPABILITIES]
+            return ConnectorSetupIntent(
+                connector_id="gmail",
+                action="choose_autonomy",
+                arguments={
+                    "base_capabilities": _dedupe_capabilities(base),
+                    "tier": pending.get("tier"),
+                    "memory_policy": choice,
+                    "client_secret_path": pending.get("client_secret_path"),
+                },
+            )
+
+    if pending and pending.get("stage") == "autonomy_choice":
+        choice = _autonomy_choice_from_text(text)
+        if choice is not None:
+            base = [str(item) for item in pending.get("base_capabilities") or _GMAIL_READ_CAPABILITIES]
             arguments: dict[str, Any] = {
                 "capabilities": _dedupe_capabilities(base),
-                "memory_policy": choice,
+                "memory_policy": str(pending.get("memory_policy") or "forget"),
+                "heartbeat_digest_enabled": choice,
             }
             if pending.get("client_secret_path"):
                 arguments["client_secret_path"] = pending["client_secret_path"]
@@ -321,7 +409,7 @@ async def detect_connector_setup_intent(
             arguments={"authorization_response": text},
         )
 
-    client_secret_path = _extract_client_secret_path(text)
+    client_secret_path = _extract_client_secret_path(text, pending_setup=bool(pending))
     if client_secret_path:
         pending = _PENDING_SETUP_BY_SESSION.get(session_id or "")
         tier = _tier_from_text(text)
@@ -331,9 +419,10 @@ async def detect_connector_setup_intent(
             if memory_choice:
                 return ConnectorSetupIntent(
                     connector_id="gmail",
-                    action="start",
+                    action="choose_autonomy",
                     arguments={
-                        "capabilities": _dedupe_capabilities(base),
+                        "base_capabilities": _dedupe_capabilities(base),
+                        "tier": pending.get("tier"),
                         "client_secret_path": client_secret_path,
                         "memory_policy": memory_choice,
                     },
@@ -355,7 +444,35 @@ async def detect_connector_setup_intent(
                 action="choose_scope",
                 arguments={"client_secret_path": client_secret_path},
             )
+        if pending and pending.get("stage") == "autonomy_choice":
+            _set_pending(session_id, {**pending, "client_secret_path": client_secret_path})
+            return ConnectorSetupIntent(
+                connector_id="gmail",
+                action="choose_autonomy",
+                arguments={
+                    "base_capabilities": pending.get("base_capabilities") or _GMAIL_READ_CAPABILITIES,
+                    "tier": pending.get("tier"),
+                    "client_secret_path": client_secret_path,
+                    "memory_policy": pending.get("memory_policy") or "forget",
+                },
+            )
         if tier and memory_choice:
+            heartbeat_digest = (
+                _autonomy_choice_from_text(text)
+                if _AUTONOMOUS_EMAIL_RE.search(text)
+                else None
+            )
+            if heartbeat_digest is None:
+                return ConnectorSetupIntent(
+                    connector_id="gmail",
+                    action="choose_autonomy",
+                    arguments={
+                        "base_capabilities": _dedupe_capabilities(_capabilities_for_tier(tier)),
+                        "tier": tier,
+                        "client_secret_path": client_secret_path,
+                        "memory_policy": memory_choice,
+                    },
+                )
             return ConnectorSetupIntent(
                 connector_id="gmail",
                 action="start",
@@ -363,6 +480,7 @@ async def detect_connector_setup_intent(
                     "capabilities": _dedupe_capabilities(_capabilities_for_tier(tier)),
                     "client_secret_path": client_secret_path,
                     "memory_policy": memory_choice,
+                    "heartbeat_digest_enabled": heartbeat_digest,
                 },
             )
         if tier:
@@ -385,12 +503,28 @@ async def detect_connector_setup_intent(
         tier = _tier_from_text(text)
         memory_choice = _memory_choice_from_text(text)
         if tier and memory_choice:
+            heartbeat_digest = (
+                _autonomy_choice_from_text(text)
+                if _AUTONOMOUS_EMAIL_RE.search(text)
+                else None
+            )
+            if heartbeat_digest is None:
+                return ConnectorSetupIntent(
+                    connector_id="gmail",
+                    action="choose_autonomy",
+                    arguments={
+                        "base_capabilities": _dedupe_capabilities(_capabilities_for_tier(tier)),
+                        "tier": tier,
+                        "memory_policy": memory_choice,
+                    },
+                )
             return ConnectorSetupIntent(
                 connector_id="gmail",
                 action="start",
                 arguments={
                     "capabilities": _dedupe_capabilities(_capabilities_for_tier(tier)),
                     "memory_policy": memory_choice,
+                    "heartbeat_digest_enabled": heartbeat_digest,
                 },
             )
         if tier:
@@ -420,6 +554,11 @@ def _assistant_message_for(intent: ConnectorSetupIntent, result_payload: dict[st
             "Do you want me to remember what I read in your emails so I can learn about you, "
             "or should I forget what they say after the task?"
         )
+    if intent.action == "choose_autonomy":
+        return (
+            "Do you want me to check Gmail during heartbeats on my own, or only read it "
+            "when you ask while you are here?"
+        )
 
     if not result_payload.get("success"):
         error = str(result_payload.get("error") or "setup could not start")
@@ -434,14 +573,36 @@ def _assistant_message_for(intent: ConnectorSetupIntent, result_payload: dict[st
     if status == "connected":
         return "Gmail is already connected. I opened the connection status."
     if status == "pending_authorization":
-        return "I started Gmail authorization and opened the setup panel. Approve it in Google, then paste the localhost redirect back into the panel."
+        return "I started Google sign-in for Gmail and opened the setup panel. Approve it in Google, then paste the localhost redirect back into the panel."
     if status in {"needs_client_secret", "setup"}:
+        if _ui_has_built_in_gmail_sign_in(ui):
+            return "Gmail sign-in is ready. I opened the setup panel so you can approve access with Google."
         return (
-            "I opened Gmail setup. Add your Google OAuth Desktop client JSON path in the setup panel to continue."
+            "I opened Gmail setup. The panel walks you through the one-time Google setup this local build needs before sign-in can start."
         )
     if status == "client_secret_saved":
-        return "I opened Gmail setup. The OAuth client is saved; start authorization from the setup panel."
+        return "I opened Gmail setup. The Google setup file is saved; start Google sign-in from the panel."
     return "I opened Gmail setup."
+
+
+def _ui_has_built_in_gmail_sign_in(ui: dict[str, Any] | None) -> bool:
+    """Return whether the UI payload can start Google sign-in without local setup."""
+    if not isinstance(ui, dict):
+        return False
+    if ui.get("hexis_oauth_client_available") is True:
+        return True
+    step = ui.get("credential_step")
+    if not isinstance(step, dict):
+        return False
+    modes = step.get("modes")
+    if not isinstance(modes, list):
+        return False
+    return any(
+        isinstance(mode, dict)
+        and mode.get("id") == "hosted_oauth"
+        and mode.get("available") is True
+        for mode in modes
+    )
 
 
 async def run_connector_setup_intent(
@@ -494,6 +655,31 @@ async def run_connector_setup_intent(
             assistant_message=_assistant_message_for(intent, {"success": True}, ui),
             ui=ui,
             tool_name="connector_setup_memory",
+            tool_result={"success": True, "output": {"ui": ui}, "display_output": None},
+        )
+
+    if intent.action == "choose_autonomy":
+        base = [str(item) for item in intent.arguments.get("base_capabilities") or _GMAIL_READ_CAPABILITIES]
+        tier = str(intent.arguments.get("tier") or "")
+        memory_policy = str(intent.arguments.get("memory_policy") or "forget")
+        _set_pending(
+            session_id,
+            {
+                "connector_id": "gmail",
+                "stage": "autonomy_choice",
+                "tier": tier,
+                "base_capabilities": base,
+                "memory_policy": memory_policy,
+                "client_secret_path": intent.arguments.get("client_secret_path"),
+            },
+        )
+        ui = _gmail_autonomy_choice_ui(base, memory_policy, tier)
+        return ConnectorSetupRun(
+            connector_id=intent.connector_id,
+            action=intent.action,
+            assistant_message=_assistant_message_for(intent, {"success": True}, ui),
+            ui=ui,
+            tool_name="connector_setup_autonomy",
             tool_result={"success": True, "output": {"ui": ui}, "display_output": None},
         )
 

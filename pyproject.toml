@@ -118,6 +118,8 @@ where = ["."]
 include = ["apps*", "core*", "services*", "channels*", "plugins*", "skills*", "schemas*", "db*", "ops*", "characters*"]
 
 [tool.setuptools.package-data]
+core = ["auth/gmail-credentials.json"]
+"core.auth" = ["gmail-credentials.json"]
 services = ["prompts/*.md"]
 characters = ["*.json", "*.jpg", "*.png"]
 db = ["*.sql", "migrations/*.sql"]

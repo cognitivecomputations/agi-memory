@@ -10,6 +10,9 @@ from core.auth.google_gmail import (
     GMAIL_CLIENT_SECRET_REF,
     GMAIL_DEFAULT_CREDENTIAL_REF,
     GMAIL_PENDING_PREFIX,
+    has_bundled_gmail_oauth_client,
+    has_hexis_gmail_oauth_client,
+    save_gmail_client_secret_payload,
 )
 from core.auth.store import load_auth, save_auth
 from core.auth.utils import now_ms
@@ -20,7 +23,9 @@ from core.tools.integrations import (
     ControlGmailBackfillHandler,
     ConnectorActionPolicyStatusHandler,
     GmailBackfillStatusHandler,
+    GmailSetupStatusHandler,
     GrantConnectorActionPolicyHandler,
+    RevokeGmailConnectionHandler,
     RevokeConnectorActionPolicyHandler,
     StartGmailBackfillHandler,
 )
@@ -52,6 +57,17 @@ def _client_secret() -> dict[str, object]:
             "token_uri": "https://oauth2.googleapis.com/token",
         }
     }
+
+
+async def test_gmail_setup_contexts_respect_user_presence():
+    assert ToolContext.HEARTBEAT in GmailSetupStatusHandler().spec.allowed_contexts
+    assert ToolContext.HEARTBEAT in GmailBackfillStatusHandler().spec.allowed_contexts
+
+    # Starting/completing account authorization needs a present user surface.
+    assert ToolContext.HEARTBEAT not in ConnectGmailHandler().spec.allowed_contexts
+    assert ToolContext.HEARTBEAT not in CompleteGmailConnectionHandler().spec.allowed_contexts
+    assert ToolContext.HEARTBEAT not in RevokeGmailConnectionHandler().spec.allowed_contexts
+    assert ToolContext.HEARTBEAT not in StartGmailBackfillHandler().spec.allowed_contexts
 
 
 async def _seed_connected_gmail(db_pool, marker: str, account: str) -> None:
@@ -102,6 +118,10 @@ async def test_connect_gmail_without_client_secret_returns_next_step(monkeypatch
         "GOOGLE_CLIENT_SECRET_JSON",
         "GOOGLE_GMAIL_CLIENT_SECRET_PATH",
         "GOOGLE_CLIENT_SECRET_PATH",
+        "HEXIS_GMAIL_OAUTH_CLIENT_ID",
+        "HEXIS_GMAIL_OAUTH_CLIENT_SECRET",
+        "GOOGLE_GMAIL_OAUTH_CLIENT_ID",
+        "GOOGLE_GMAIL_OAUTH_CLIENT_SECRET",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -116,15 +136,98 @@ async def test_connect_gmail_without_client_secret_returns_next_step(monkeypatch
 
     assert result.success
     assert result.output["status"] == "needs_client_secret"
+    assert "hexis_oauth_client" in result.output["accepted_inputs"]
+    assert "advanced_self_hosted" in result.output["accepted_inputs"]
+    assert "client_secret_file" in result.output["accepted_inputs"]
     assert "client_secret_path" in result.output["accepted_inputs"]
-    assert "connect_gmail" in result.output["next_step"]
+    assert "Gmail sign-in is not enabled" in result.output["next_step"]
+    assert "setup guide" in result.output["next_step"]
+    assert result.output["setup_steps"]
     assert result.output["ui"]["kind"] == "connector_setup"
     assert result.output["ui"]["connector_id"] == "gmail"
     assert result.output["ui"]["status"] == "needs_client_secret"
     assert result.output["ui"]["capabilities"] == ["read", "search"]
+    assert result.output["ui"]["credential_step"]["preferred_mode"] == "hosted_oauth_missing"
+    assert result.output["ui"]["hexis_oauth_client_available"] is False
+    assert result.output["ui"]["setup_steps"]
+    assert result.output["ui"]["credential_step"]["modes"][0]["label"] == "Built-in Google sign-in"
+    assert "advanced_self_hosted" in result.output["ui"]["accepted_inputs"]
+    assert "client_secret_file" in result.output["ui"]["accepted_inputs"]
 
 
-async def test_connect_gmail_persists_memory_policy_as_config(db_pool, monkeypatch, tmp_path):
+async def test_connect_gmail_uses_configured_hexis_oauth_client(db_pool, monkeypatch, tmp_path):
+    import core.auth.store as auth_store
+
+    monkeypatch.setattr(auth_store, "AUTH_DIR", tmp_path / "auth")
+    monkeypatch.setenv("HEXIS_GMAIL_OAUTH_CLIENT_ID", "hexis-hosted-client")
+    monkeypatch.setenv("HEXIS_GMAIL_OAUTH_CLIENT_SECRET", "hexis-hosted-secret")
+    for name in (
+        "GOOGLE_GMAIL_CLIENT_SECRET_JSON",
+        "GOOGLE_CLIENT_SECRET_JSON",
+        "GOOGLE_GMAIL_CLIENT_SECRET_PATH",
+        "GOOGLE_CLIENT_SECRET_PATH",
+        "GOOGLE_GMAIL_OAUTH_CLIENT_ID",
+        "GOOGLE_GMAIL_OAUTH_CLIENT_SECRET",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    marker = get_test_identifier("gmail-hosted-oauth")
+    result = await ConnectGmailHandler().execute(
+        {"capabilities": ["read", "search"], "source_channel": "web"},
+        _ctx(db_pool, marker),
+    )
+
+    try:
+        assert result.success
+        assert result.output["status"] == "pending_user"
+        assert result.output["ui"]["status"] == "pending_authorization"
+        assert result.output["ui"]["client_secret_saved"] is True
+        auth_params = parse_qs(urlparse(result.output["authorization_url"]).query)
+        assert auth_params["client_id"] == ["hexis-hosted-client"]
+        assert load_auth(GMAIL_CLIENT_SECRET_REF)["installed"]["client_secret"] == "hexis-hosted-secret"
+    finally:
+        async with db_pool.acquire() as conn:
+            await conn.execute("DELETE FROM connection_attempts WHERE source_session_id = $1", marker)
+
+
+async def test_bundled_gmail_oauth_client_is_available(monkeypatch, tmp_path):
+    import core.auth.store as auth_store
+
+    monkeypatch.setattr(auth_store, "AUTH_DIR", tmp_path / "auth")
+    monkeypatch.delenv("HEXIS_GMAIL_OAUTH_DISABLE_BUNDLED", raising=False)
+    for name in (
+        "GOOGLE_GMAIL_CLIENT_SECRET_JSON",
+        "GOOGLE_CLIENT_SECRET_JSON",
+        "GOOGLE_GMAIL_CLIENT_SECRET_PATH",
+        "GOOGLE_CLIENT_SECRET_PATH",
+        "HEXIS_GMAIL_OAUTH_CLIENT_ID",
+        "HEXIS_GMAIL_OAUTH_CLIENT_SECRET",
+        "GOOGLE_GMAIL_OAUTH_CLIENT_ID",
+        "GOOGLE_GMAIL_OAUTH_CLIENT_SECRET",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    assert has_bundled_gmail_oauth_client() is True
+    assert has_hexis_gmail_oauth_client() is True
+
+
+async def test_save_gmail_client_secret_payload_redacts_saved_client(monkeypatch, tmp_path):
+    import core.auth.store as auth_store
+
+    monkeypatch.setattr(auth_store, "AUTH_DIR", tmp_path / "auth")
+
+    saved = save_gmail_client_secret_payload(_client_secret(), source="test_upload")
+
+    assert saved["status"] == "client_secret_saved"
+    assert saved["connector_id"] == "gmail"
+    assert saved["client_secret_saved"] is True
+    assert saved["client_id_hint"].endswith("t-client")
+    assert saved["source"] == "test_upload"
+    assert "gmail-test-secret" not in json.dumps(saved)
+    assert load_auth(GMAIL_CLIENT_SECRET_REF) == _client_secret()
+
+
+async def test_connect_gmail_persists_memory_and_heartbeat_policy_as_config(db_pool, monkeypatch, tmp_path):
     import core.auth.store as auth_store
 
     monkeypatch.setattr(auth_store, "AUTH_DIR", tmp_path / "auth")
@@ -133,28 +236,44 @@ async def test_connect_gmail_persists_memory_policy_as_config(db_pool, monkeypat
         "GOOGLE_CLIENT_SECRET_JSON",
         "GOOGLE_GMAIL_CLIENT_SECRET_PATH",
         "GOOGLE_CLIENT_SECRET_PATH",
+        "HEXIS_GMAIL_OAUTH_CLIENT_ID",
+        "HEXIS_GMAIL_OAUTH_CLIENT_SECRET",
+        "GOOGLE_GMAIL_OAUTH_CLIENT_ID",
+        "GOOGLE_GMAIL_OAUTH_CLIENT_SECRET",
     ):
         monkeypatch.delenv(name, raising=False)
 
     try:
         result = await ConnectGmailHandler().execute(
-            {"capabilities": ["read", "search"], "memory_policy": "forget"},
+            {
+                "capabilities": ["read", "search"],
+                "memory_policy": "forget",
+                "heartbeat_digest_enabled": True,
+            },
             _ctx(db_pool, get_test_identifier("gmail-memory-policy")),
         )
 
         assert result.success
         assert result.output["status"] == "needs_client_secret"
         assert result.output["ui"]["memory_policy"] == "forget"
+        assert result.output["ui"]["heartbeat_digest_enabled"] is True
 
         async with db_pool.acquire() as conn:
             policy = await conn.fetchval(
                 "SELECT get_config_text('integrations.gmail.memory_policy')"
             )
+            heartbeat_digest_enabled = await conn.fetchval(
+                "SELECT get_config_bool('integrations.gmail.heartbeat_digest_enabled')"
+            )
         assert policy == "forget"
+        assert heartbeat_digest_enabled is True
     finally:
         async with db_pool.acquire() as conn:
             await conn.execute(
                 "SELECT set_config('integrations.gmail.memory_policy', '\"ask\"'::jsonb)"
+            )
+            await conn.execute(
+                "SELECT set_config('integrations.gmail.heartbeat_digest_enabled', 'false'::jsonb)"
             )
 
 
@@ -162,6 +281,17 @@ async def test_gmail_setup_status_executes_through_registry(db_pool, monkeypatch
     import core.auth.store as auth_store
 
     monkeypatch.setattr(auth_store, "AUTH_DIR", tmp_path / "auth")
+    for name in (
+        "GOOGLE_GMAIL_CLIENT_SECRET_JSON",
+        "GOOGLE_CLIENT_SECRET_JSON",
+        "GOOGLE_GMAIL_CLIENT_SECRET_PATH",
+        "GOOGLE_CLIENT_SECRET_PATH",
+        "HEXIS_GMAIL_OAUTH_CLIENT_ID",
+        "HEXIS_GMAIL_OAUTH_CLIENT_SECRET",
+        "GOOGLE_GMAIL_OAUTH_CLIENT_ID",
+        "GOOGLE_GMAIL_OAUTH_CLIENT_SECRET",
+    ):
+        monkeypatch.delenv(name, raising=False)
     registry = create_default_registry(db_pool)
 
     result = await registry.execute(
@@ -197,7 +327,7 @@ async def test_connect_and_complete_gmail_oauth_round_trip(db_pool, monkeypatch,
         assert kwargs["code"] == "oauth-code"
         assert kwargs["client_id"] == "gmail-test-client"
         assert kwargs["client_secret"] == "gmail-test-secret"
-        assert kwargs["redirect_uri"] == "http://localhost:1"
+        assert kwargs["redirect_uri"] == "http://localhost"
         return {
             "access_token": "access-token",
             "refresh_token": "refresh-token",
@@ -230,7 +360,7 @@ async def test_connect_and_complete_gmail_oauth_round_trip(db_pool, monkeypatch,
 
         auth_params = parse_qs(urlparse(started.output["authorization_url"]).query)
         assert auth_params["client_id"] == ["gmail-test-client"]
-        assert auth_params["redirect_uri"] == ["http://localhost:1"]
+        assert auth_params["redirect_uri"] == ["http://localhost"]
 
         attempt_id = started.output["attempt_id"]
         pending = load_auth(f"{GMAIL_PENDING_PREFIX}{attempt_id}")
@@ -239,7 +369,7 @@ async def test_connect_and_complete_gmail_oauth_round_trip(db_pool, monkeypatch,
         completed = await CompleteGmailConnectionHandler().execute(
             {
                 "attempt_id": attempt_id,
-                "authorization_response": f"http://localhost:1/?code=oauth-code&state={pending['state']}",
+                "authorization_response": f"http://localhost/?code=oauth-code&state={pending['state']}",
             },
             _ctx(db_pool, marker),
         )

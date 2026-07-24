@@ -8,6 +8,7 @@ Endpoints:
     POST /api/chat  — SSE streaming chat via AgentLoop.stream()
     GET  /v1/models — Active chat model in OpenAI-compatible form
     POST /v1/chat/completions — OpenAI-compatible buffered/streaming chat
+    GET  /api/integrations/status — Connector status and runtime setup hints
     GET  /api/status — Rich agent status
     GET  /health     — Simple health check
 """
@@ -554,6 +555,79 @@ async def status():
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+def _json_value(value: Any) -> Any:
+    return json.loads(value) if isinstance(value, str) else value
+
+
+async def _integration_status_payload(
+    pool: asyncpg.Pool,
+    connector_id: str | None = None,
+) -> dict[str, Any]:
+    normalized_id = str(connector_id or "").strip().lower().replace("-", "_") or None
+    channel_filter = normalized_id if normalized_id in {"slack", "telegram", "signal"} else None
+    include_gmail_config = normalized_id in {None, "gmail"}
+    async with pool.acquire() as conn:
+        integration_raw = await conn.fetchval("SELECT integration_status($1)", normalized_id)
+        runtime_raw = await conn.fetchval("SELECT list_channel_adapter_status($1)", channel_filter)
+        backfill_raw = await conn.fetchval("SELECT get_connector_backfill_status($1, NULL)", normalized_id)
+        gmail_memory_policy = (
+            await conn.fetchval(
+                "SELECT COALESCE(get_config_text('integrations.gmail.memory_policy'), 'ask')"
+            )
+            if include_gmail_config
+            else None
+        )
+        gmail_heartbeat_digest_enabled = (
+            await conn.fetchval(
+                "SELECT COALESCE(get_config_bool('integrations.gmail.heartbeat_digest_enabled'), FALSE)"
+            )
+            if include_gmail_config
+            else None
+        )
+
+    payload = _json_value(integration_raw) or {}
+    from core.tools.integrations import enrich_gmail_setup_runtime
+
+    enrich_gmail_setup_runtime(payload)
+    if include_gmail_config:
+        for connector in payload.get("connectors", []):
+            if not isinstance(connector, dict) or connector.get("id") != "gmail":
+                continue
+            setup_manifest = _json_value(connector.get("setup_manifest")) or {}
+            if not isinstance(setup_manifest, dict):
+                setup_manifest = {}
+            setup_manifest.update(
+                {
+                    "memory_policy": gmail_memory_policy,
+                    "memory_config_key": "integrations.gmail.memory_policy",
+                    "heartbeat_digest_enabled": bool(gmail_heartbeat_digest_enabled),
+                    "heartbeat_digest_config_key": "integrations.gmail.heartbeat_digest_enabled",
+                }
+            )
+            connector["setup_manifest"] = setup_manifest
+    backfill = _json_value(backfill_raw) or {}
+    payload["channel_runtime"] = _json_value(runtime_raw) or []
+    payload["backfill"] = {
+        "jobs": backfill.get("jobs") if isinstance(backfill.get("jobs"), list) else [],
+        "cursors": backfill.get("cursors") if isinstance(backfill.get("cursors"), list) else [],
+        "item_counts": backfill.get("item_counts") if isinstance(backfill.get("item_counts"), list) else [],
+    }
+    payload["generated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    return payload
+
+
+@app.get("/api/integrations/status")
+async def integration_status(connector_id: str | None = None):
+    pool = _pool
+    if pool is None:
+        return JSONResponse({"error": "Server not ready (no DB pool)"}, status_code=503)
+    try:
+        return JSONResponse(jsonable_encoder(await _integration_status_payload(pool, connector_id)))
+    except Exception as exc:
+        logger.error("Integration status failed: %s", exc)
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
 _INTEGRATION_ACTION_TO_TOOL = {
     "start_setup": "start_integration_setup",
     "configure_channel": "configure_channel_integration",
@@ -580,7 +654,7 @@ def _integration_action_arguments(
     if action == "start_setup" and args.get("connector_id") == "gmail":
         raise HTTPException(
             status_code=422,
-            detail="Use connect_gmail for Gmail OAuth setup.",
+            detail="Use connect_gmail for Gmail setup.",
         )
     if action in {"start_setup", "configure_channel", "verify_channel"}:
         connector_id = (
@@ -661,6 +735,73 @@ async def integration_action(req: IntegrationActionRequest):
                 "error": None,
                 "error_type": None,
             }
+        )
+
+    if action == "save_gmail_client_secret":
+        from core.auth.google_gmail import GmailOAuthError, save_gmail_client_secret_payload
+        from core.tools.base import ToolContext, ToolExecutionContext
+
+        secret_payload = action_arguments.get("client_secret_json")
+        if isinstance(secret_payload, str):
+            try:
+                secret_payload = json.loads(secret_payload)
+            except json.JSONDecodeError as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Uploaded Google setup file is not valid JSON.",
+                ) from exc
+        if not isinstance(secret_payload, dict):
+            raise HTTPException(
+                status_code=422,
+                detail="client_secret_json must be the parsed Google setup file JSON object.",
+            )
+
+        try:
+            saved = save_gmail_client_secret_payload(secret_payload, source="web_upload")
+        except GmailOAuthError as exc:
+            return JSONResponse(
+                {
+                    "success": False,
+                    "output": {
+                        "connector_id": "gmail",
+                        "status": "needs_client_secret",
+                        "client_secret_saved": False,
+                    },
+                    "display_output": None,
+                    "error": str(exc),
+                    "error_type": "missing_config",
+                },
+                status_code=400,
+            )
+
+        registry = create_default_registry(pool)
+        context = ToolExecutionContext(
+            tool_context=ToolContext.CHAT,
+            call_id=f"web-integration:{uuid.uuid4()}",
+            session_id=req.source_session_id or "web-connections",
+        )
+        status_result = await registry.execute("gmail_setup_status", {}, context)
+        status_payload = _tool_result_payload(status_result)
+        output = status_payload.get("output") if isinstance(status_payload.get("output"), dict) else {}
+        merged_output = {**output, **saved}
+        ui = merged_output.get("ui")
+        if isinstance(ui, dict):
+            merged_output["ui"] = {
+                **ui,
+                "status": "client_secret_saved",
+                "client_secret_saved": True,
+                "next_step": saved["next_step"],
+            }
+        return JSONResponse(
+            jsonable_encoder(
+                {
+                    "success": True,
+                    "output": merged_output,
+                    "display_output": "Gmail setup file saved. Start Google sign-in from the setup panel.",
+                    "error": None,
+                    "error_type": None,
+                }
+            )
         )
 
     tool_name = _INTEGRATION_ACTION_TO_TOOL.get(action)

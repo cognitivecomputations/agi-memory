@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 GMAIL_SETUP_HINT = (
     "Gmail credentials not configured. Use the gmail-connector-setup skill "
-    "and call connect_gmail to start OAuth setup in this conversation."
+    "to open the structured Gmail setup flow in this conversation."
 )
 
 
@@ -399,6 +399,7 @@ class EmailListHandler(ToolHandler):
             energy_cost=2,
             is_read_only=True,
             optional=True,
+            allowed_contexts={ToolContext.HEARTBEAT, ToolContext.CHAT, ToolContext.MCP},
         )
 
     async def execute(
@@ -539,6 +540,7 @@ class EmailReadHandler(ToolHandler):
             energy_cost=2,
             is_read_only=True,
             optional=True,
+            allowed_contexts={ToolContext.HEARTBEAT, ToolContext.CHAT, ToolContext.MCP},
         )
 
     async def execute(
@@ -673,6 +675,7 @@ class EmailSearchHandler(ToolHandler):
             energy_cost=2,
             is_read_only=True,
             optional=True,
+            allowed_contexts={ToolContext.HEARTBEAT, ToolContext.CHAT, ToolContext.MCP},
         )
 
     async def execute(

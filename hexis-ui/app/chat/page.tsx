@@ -73,6 +73,13 @@ type ConnectorSetupMemoryOption = {
   memory_policy?: string;
 };
 
+type ConnectorSetupAutonomyOption = {
+  id: string;
+  label: string;
+  description?: string;
+  heartbeat_digest_enabled?: boolean;
+};
+
 type ConnectorSetupUi = {
   kind: "connector_setup";
   version?: number;
@@ -86,17 +93,40 @@ type ConnectorSetupUi = {
   capabilities?: string[];
   capability_options?: ConnectorSetupCapabilityOption[];
   memory_options?: ConnectorSetupMemoryOption[];
+  autonomy_options?: ConnectorSetupAutonomyOption[];
   memory_policy?: string;
   memory_config_key?: string;
+  heartbeat_digest_enabled?: boolean;
+  heartbeat_digest_config_key?: string;
   client_secret_saved?: boolean;
   credentials_saved?: boolean;
+  hexis_oauth_client_available?: boolean;
   accepted_inputs?: string[];
+  env_client_secret_available?: boolean;
+  credential_step?: ConnectorCredentialStep;
+  credential_step_label?: string;
+  setup_steps?: string[];
+  technical_next_step?: string;
   docs_url?: string;
   authorization_url?: string;
   attempt_id?: string;
   connected_accounts?: Record<string, unknown>[];
   next_step?: string;
   safety_note?: string;
+};
+
+type ConnectorCredentialStep = {
+  status?: string;
+  preferred_mode?: string;
+  save_action?: string;
+  modes?: ConnectorCredentialMode[];
+};
+
+type ConnectorCredentialMode = {
+  id: string;
+  label: string;
+  available?: boolean;
+  description?: string;
 };
 
 type ChatUiArtifact = ConnectorSetupUi;
@@ -148,6 +178,16 @@ function searchConfigPlaceholder(provider: SearchConfigProvider): string {
   if (provider === "auto") return "uses keyless fallback";
   return "tvly-... or env:TAVILY_API_KEY";
 }
+
+const GMAIL_SETUP_STEPS = [
+  "Open the Google setup page.",
+  "Create or choose a project named Hexis.",
+  "Enable the Gmail API for that project.",
+  "Set up the app consent screen. For a personal Gmail account, choose External and add your Gmail address as a test user if Google asks.",
+  "On the Credentials page, click Create credentials, choose Google's sign-in client option, set Application type to Desktop app, and name it Hexis.",
+  "Download the setup file Google gives you.",
+  "Upload that setup file here, then start Google sign-in.",
+];
 
 function formatBytes(size: number): string {
   if (size < 1024) return `${size} B`;
@@ -240,6 +280,15 @@ async function fileToDataUrl(file: File): Promise<string> {
   let binary = "";
   for (const byte of bytes) binary += String.fromCharCode(byte);
   return `data:${file.type || "application/octet-stream"};base64,${btoa(binary)}`;
+}
+
+async function fileToJsonRecord(file: File): Promise<Record<string, unknown>> {
+  const text = await file.text();
+  const parsed = JSON.parse(text) as unknown;
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("JSON file must contain an object.");
+  }
+  return parsed as Record<string, unknown>;
 }
 
 function clipboardImageFiles(event: React.ClipboardEvent<HTMLTextAreaElement>): File[] {
@@ -371,16 +420,31 @@ function parseActivityEvents(value: unknown): LogEvent[] {
     ) {
       continue;
     }
-    events.push({
+    events.push(sanitizeActivityEvent({
       id: record.id,
       category,
       title: record.title,
       detail: record.detail,
       raw: record.raw,
       ts: record.ts,
-    });
+    }));
   }
   return pruneActivityEvents(events);
+}
+
+function sanitizeActivityEvent(event: LogEvent): LogEvent {
+  if (
+    event.category === "tool" &&
+    event.title.toLowerCase().includes("gmail") &&
+      /Create a Google OAuth Desktop client|call connect_gmail|client_secret_path|upload the Google OAuth client JSON|Hexis Google OAuth app|advanced self-hosted OAuth/i.test(event.detail)
+  ) {
+    return {
+      ...event,
+      detail:
+        "Gmail setup needs a one-time local Google setup. Open the setup panel for the guided steps.",
+    };
+  }
+  return event;
 }
 
 function loadActivityEvents(): LogEvent[] {
@@ -450,6 +514,24 @@ function connectorMemoryOptions(value: unknown): ConnectorSetupMemoryOption[] {
   });
 }
 
+function connectorAutonomyOptions(value: unknown): ConnectorSetupAutonomyOption[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item): ConnectorSetupAutonomyOption[] => {
+    const record = asRecord(item);
+    const id = asString(record.id);
+    const label = asString(record.label);
+    if (!id || !label) return [];
+    return [
+      {
+        id,
+        label,
+        description: asString(record.description) || undefined,
+        heartbeat_digest_enabled: record.heartbeat_digest_enabled === true,
+      },
+    ];
+  });
+}
+
 function normalizeConnectorSetupUi(value: unknown): ConnectorSetupUi | null {
   const record = asRecord(value);
   if (record.kind !== "connector_setup") return null;
@@ -468,13 +550,23 @@ function normalizeConnectorSetupUi(value: unknown): ConnectorSetupUi | null {
     capabilities: stringArray(record.capabilities),
     capability_options: connectorCapabilityOptions(record.capability_options),
     memory_options: connectorMemoryOptions(record.memory_options),
+    autonomy_options: connectorAutonomyOptions(record.autonomy_options),
     memory_policy: asString(record.memory_policy) || undefined,
     memory_config_key: asString(record.memory_config_key) || undefined,
+    heartbeat_digest_enabled: record.heartbeat_digest_enabled === true,
+    heartbeat_digest_config_key: asString(record.heartbeat_digest_config_key) || undefined,
     client_secret_saved:
       typeof record.client_secret_saved === "boolean" ? record.client_secret_saved : undefined,
     credentials_saved:
       typeof record.credentials_saved === "boolean" ? record.credentials_saved : undefined,
     accepted_inputs: stringArray(record.accepted_inputs),
+    env_client_secret_available:
+      typeof record.env_client_secret_available === "boolean"
+        ? record.env_client_secret_available
+        : undefined,
+    credential_step: normalizeCredentialStep(record.credential_step),
+    setup_steps: stringArray(record.setup_steps),
+    technical_next_step: asString(record.technical_next_step) || undefined,
     docs_url: asString(record.docs_url) || undefined,
     authorization_url: asString(record.authorization_url) || undefined,
     attempt_id: asString(record.attempt_id) || undefined,
@@ -486,6 +578,32 @@ function normalizeConnectorSetupUi(value: unknown): ConnectorSetupUi | null {
       : [],
     next_step: asString(record.next_step) || undefined,
     safety_note: asString(record.safety_note) || undefined,
+  };
+}
+
+function normalizeCredentialStep(value: unknown): ConnectorCredentialStep | undefined {
+  const record = asRecord(value);
+  if (!Object.keys(record).length) return undefined;
+  const rawModes = Array.isArray(record.modes) ? record.modes : [];
+  const modes = rawModes.flatMap((item): ConnectorCredentialMode[] => {
+    const mode = asRecord(item);
+    const id = asString(mode.id);
+    const label = asString(mode.label);
+    if (!id || !label) return [];
+    return [
+      {
+        id,
+        label,
+        available: typeof mode.available === "boolean" ? mode.available : undefined,
+        description: asString(mode.description) || undefined,
+      },
+    ];
+  });
+  return {
+    status: asString(record.status) || undefined,
+    preferred_mode: asString(record.preferred_mode) || undefined,
+    save_action: asString(record.save_action) || undefined,
+    modes,
   };
 }
 
@@ -739,7 +857,7 @@ export default function ChatPage() {
   }, [messages]);
 
   const appendLog = (event: LogEvent) => {
-    setEvents((prev) => [...prev.slice(-(MAX_ACTIVITY_EVENTS - 1)), event]);
+    setEvents((prev) => [...prev.slice(-(MAX_ACTIVITY_EVENTS - 1)), sanitizeActivityEvent(event)]);
   };
 
   const updateAssistantMessage = (assistantId: string, text: string) => {
@@ -1376,9 +1494,17 @@ export default function ChatPage() {
           }
 
           if (eventType === "log") {
-            const detail = asString(payload.detail);
+            const connectorUi = connectorSetupUiFromPayload(payload);
+            const detail = connectorUi
+              ? connectorSetupNotice(connectorUi)
+              : asString(payload.detail);
             const logKind = asString(payload.kind).toLowerCase();
-            const title = asString(payload.title) || logKind || "Activity";
+            const title =
+              connectorUi?.display_name ||
+              connectorUi?.connector_id ||
+              asString(payload.title) ||
+              logKind ||
+              "Activity";
             appendLog({
               id: crypto.randomUUID(),
               category: logKind.includes("memory") || title.toLowerCase().includes("memory") ? "memory" : "tool",
@@ -1387,7 +1513,6 @@ export default function ChatPage() {
               raw: payload,
               ts: Date.now(),
             });
-            const connectorUi = connectorSetupUiFromPayload(payload);
             if (connectorUi) {
               upsertAssistantUi(assistantMessage.id, connectorUi);
               setActiveConnectorSetup({ assistantId: assistantMessage.id, ui: connectorUi });
@@ -2110,12 +2235,16 @@ function ConnectorSetupCard({
   const [authorizationResponse, setAuthorizationResponse] = useState("");
   const [selectedCapabilityOption, setSelectedCapabilityOption] =
     useState<ConnectorSetupCapabilityOption | null>(null);
+  const [selectedMemoryPolicy, setSelectedMemoryPolicy] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [showAdvancedCredentialSetup, setShowAdvancedCredentialSetup] = useState(true);
+  const clientSecretFileRef = useRef<HTMLInputElement>(null);
 
   const connectorName = ui.display_name || ui.connector_id;
   const capabilityOptions = ui.capability_options || [];
   const memoryOptions = ui.memory_options || [];
+  const autonomyOptions = ui.autonomy_options || [];
   const connectedAccounts = ui.connected_accounts || [];
   const connected = ui.status === "connected" || connectedAccounts.length > 0 || ui.credentials_saved;
   const startBusy = busy === `${assistantId}:${ui.connector_id}:connect_gmail`;
@@ -2125,30 +2254,80 @@ function ConnectorSetupCard({
   const capabilities =
     selectedCapabilityOption?.capabilities ||
     (ui.capabilities?.length ? ui.capabilities : needsCapabilityChoice ? [] : ["read", "search"]);
-  const memoryPolicy = ui.memory_policy;
+  const memoryPolicy = selectedMemoryPolicy || ui.memory_policy;
   const needsMemoryChoice =
-    ui.status === "needs_memory_choice" || Boolean(selectedCapabilityOption);
+    ui.status === "needs_memory_choice" || (Boolean(selectedCapabilityOption) && !selectedMemoryPolicy);
+  const needsAutonomyChoice =
+    ui.status === "needs_autonomy_choice" || Boolean(selectedMemoryPolicy);
   const canStartOAuth =
-    ui.connector_id === "gmail" && !connected && !ui.authorization_url && !needsCapabilityChoice && !needsMemoryChoice;
+    ui.connector_id === "gmail" &&
+    !connected &&
+    !ui.authorization_url &&
+    !needsCapabilityChoice &&
+    !needsMemoryChoice &&
+    !needsAutonomyChoice;
   const canCompleteOAuth = ui.connector_id === "gmail" && !connected && Boolean(ui.authorization_url || ui.attempt_id);
   const requiresClientSecret = canStartOAuth && !ui.client_secret_saved;
+  const credentialModes = ui.credential_step?.modes || [];
+  const hostedAvailable =
+    ui.hexis_oauth_client_available ||
+    credentialModes.some((mode) => mode.id === "hosted_oauth" && mode.available);
+  const envAvailable =
+    ui.env_client_secret_available ||
+    credentialModes.some((mode) => mode.id === "configured_env" && mode.available);
+  const needsLocalGoogleSetup = requiresClientSecret && !hostedAvailable;
+  const showLocalGoogleSetup = needsLocalGoogleSetup && showAdvancedCredentialSetup;
+  const setupSteps = ui.setup_steps?.length ? ui.setup_steps : GMAIL_SETUP_STEPS;
+
+  const runSaveClientSecret = async (file: File | null | undefined) => {
+    if (!file) return;
+    setNotice(null);
+    setError(null);
+    try {
+      const clientSecretJson = await fileToJsonRecord(file);
+      const payload = await onAction(assistantId, ui, "save_gmail_client_secret", {
+        client_secret_json: clientSecretJson,
+      });
+      if (payload.error || payload.detail || payload.success === false) {
+        setError(integrationActionError(payload, 400));
+      } else {
+        setClientSecretPath("");
+        setNotice(integrationActionNotice(payload, 200));
+      }
+    } catch (uploadError: unknown) {
+      setError(uploadError instanceof Error ? uploadError.message : "Could not read Google setup file.");
+    } finally {
+      if (clientSecretFileRef.current) clientSecretFileRef.current.value = "";
+    }
+  };
 
   const runStart = async (
     selectedCapabilities = capabilities,
     selectedMemoryPolicy = memoryPolicy,
+    heartbeatDigestEnabled = ui.heartbeat_digest_enabled || false,
     options: { allowMissingClientSecret?: boolean } = {}
   ) => {
     setNotice(null);
     setError(null);
     const path = clientSecretPath.trim();
-    if (!options.allowMissingClientSecret && requiresClientSecret && !path && !useEnvSecret) {
-      setError("Enter the Google OAuth Desktop client JSON path, or choose the configured environment secret.");
+    if (
+      !options.allowMissingClientSecret &&
+      requiresClientSecret &&
+      !hostedAvailable &&
+      !path &&
+      !useEnvSecret
+    ) {
+      setError(
+        "This local Hexis build needs Gmail sign-in setup first. Follow the guide in this panel, upload the Google setup file, then start Google sign-in."
+      );
       return;
     }
     const payload = await onAction(assistantId, ui, "connect_gmail", {
       capabilities: selectedCapabilities,
       memory_policy: selectedMemoryPolicy || undefined,
+      heartbeat_digest_enabled: heartbeatDigestEnabled,
       client_secret_path: path || undefined,
+      use_hexis_oauth_client: true,
       use_env_client_secret: useEnvSecret,
     });
     if (payload.error || payload.detail || payload.success === false) {
@@ -2192,7 +2371,7 @@ function ConnectorSetupCard({
           </div>
         </div>
         <Badge variant={connected ? "success" : ui.status === "needs_client_secret" ? "warning" : "muted"}>
-          {(ui.status || "setup").replace(/_/g, " ")}
+          {connectorSetupStatusLabel(ui)}
         </Badge>
       </div>
 
@@ -2219,6 +2398,7 @@ function ConnectorSetupCard({
                 type="button"
                 onClick={() => {
                   setSelectedCapabilityOption(option);
+                  setSelectedMemoryPolicy(null);
                   setNotice(null);
                   setError(null);
                 }}
@@ -2269,9 +2449,56 @@ function ConnectorSetupCard({
                 key={option.id}
                 type="button"
                 onClick={() =>
+                  setSelectedMemoryPolicy(option.memory_policy || option.id)
+                }
+                disabled={Boolean(busy)}
+                className="rounded-md border border-[var(--outline)] bg-white px-3 py-2 text-left text-xs hover:border-[var(--teal)] disabled:opacity-40"
+              >
+                <span className="block font-semibold">{option.label}</span>
+                {option.description ? (
+                  <span className="mt-1 block leading-5 text-[var(--ink-soft)]">
+                    {option.description}
+                  </span>
+                ) : null}
+              </button>
+            ))}
+          </div>
+        </div>
+      ) : null}
+
+      {needsAutonomyChoice && !needsMemoryChoice ? (
+        <div className="mt-4 space-y-3">
+          <p className="text-sm font-medium">
+            {ui.question && ui.status === "needs_autonomy_choice"
+              ? ui.question
+              : "Do you want me to check Gmail during heartbeats on my own, or only when you ask while you are here?"}
+          </p>
+          <div className="grid gap-2 sm:grid-cols-2">
+            {(autonomyOptions.length
+              ? autonomyOptions
+              : [
+                  {
+                    id: "ask_only",
+                    label: "Only when I ask",
+                    description: "No autonomous heartbeat email checks.",
+                    heartbeat_digest_enabled: false,
+                  },
+                  {
+                    id: "heartbeat_digest",
+                    label: "Allow heartbeat checks",
+                    description: "Allow hourly heartbeats to check Gmail for important messages and digests.",
+                    heartbeat_digest_enabled: true,
+                  },
+                ]
+            ).map((option) => (
+              <button
+                key={option.id}
+                type="button"
+                onClick={() =>
                   void runStart(
                     capabilities,
-                    option.memory_policy || option.id,
+                    memoryPolicy,
+                    option.heartbeat_digest_enabled === true,
                     { allowMissingClientSecret: true }
                   )
                 }
@@ -2287,6 +2514,9 @@ function ConnectorSetupCard({
               </button>
             ))}
           </div>
+          <p className="text-xs leading-5 text-[var(--ink-soft)]">
+            This is separate from Google sign-in. Connecting Gmail does not by itself permit background reads.
+          </p>
         </div>
       ) : null}
 
@@ -2310,33 +2540,123 @@ function ConnectorSetupCard({
       ) : null}
 
       {canStartOAuth ? (
-        <div className="mt-4 grid gap-2 sm:grid-cols-[1fr_auto]">
-          <div className="space-y-2">
-            <input
-              type="text"
-              value={clientSecretPath}
-              onChange={(event) => setClientSecretPath(event.target.value)}
-              placeholder="Google OAuth Desktop client JSON path"
-              className="w-full rounded-md border border-[var(--outline)] bg-white px-3 py-2 text-sm outline-none focus:border-[var(--teal)] focus:ring-2 focus:ring-[var(--teal)]/10"
-            />
-            <label className="flex items-center gap-2 text-xs text-[var(--ink-soft)]">
-              <input
-                type="checkbox"
-                checked={useEnvSecret}
-                onChange={(event) => setUseEnvSecret(event.target.checked)}
-                className="h-4 w-4 accent-[var(--teal)]"
-              />
-              Use explicitly configured environment client secret
-            </label>
+        <div className="mt-4 space-y-3 rounded-md border border-[var(--outline)] bg-white p-3">
+          <div className="flex items-start justify-between gap-3">
+            <div className="min-w-0">
+              <p className="text-sm font-medium">Gmail sign-in</p>
+              <p className="mt-1 text-xs leading-5 text-[var(--ink-soft)]">
+                {ui.client_secret_saved
+                  ? "Google setup is saved locally. You can start sign-in."
+                  : hostedAvailable
+                    ? "Use Google sign-in to connect the Gmail powers you chose."
+                    : "This local Hexis build needs a one-time Gmail setup before Samantha can connect. The guide below walks through each step."}
+              </p>
+            </div>
+            <Badge variant={ui.client_secret_saved ? "success" : "warning"}>
+              {ui.client_secret_saved || hostedAvailable ? "ready" : "setup needed"}
+            </Badge>
           </div>
-          <button
-            type="button"
-            onClick={() => void runStart()}
-            disabled={Boolean(busy)}
-            className="self-start rounded-md bg-[var(--foreground)] px-3 py-2 text-xs font-semibold text-white hover:bg-[var(--teal)] disabled:opacity-40"
-          >
-            {startBusy ? "Starting..." : "Start authorization"}
-          </button>
+          {showLocalGoogleSetup ? (
+            <div className="space-y-3 rounded-md border border-[var(--outline)] bg-[#fbfdfc] p-3">
+              <ol className="list-decimal space-y-2 pl-5 text-xs leading-5 text-[var(--ink-soft)]">
+                {setupSteps.map((step) => (
+                  <li key={step}>{step}</li>
+                ))}
+              </ol>
+              {ui.docs_url ? (
+                <a
+                  href={ui.docs_url}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="inline-flex items-center gap-1 text-xs font-semibold text-[var(--teal)] underline"
+                >
+                  Open Google setup page <ExternalLink size={12} />
+                </a>
+              ) : null}
+              <div className="grid gap-2 sm:grid-cols-[auto_1fr]">
+                <input
+                  ref={clientSecretFileRef}
+                  type="file"
+                  accept="application/json,.json"
+                  className="hidden"
+                  onChange={(event) => void runSaveClientSecret(event.target.files?.[0])}
+                />
+                <button
+                  type="button"
+                  onClick={() => clientSecretFileRef.current?.click()}
+                  disabled={Boolean(busy)}
+                  className="inline-flex items-center justify-center gap-2 rounded-md bg-[var(--foreground)] px-3 py-2 text-xs font-semibold text-white hover:bg-[var(--teal)] disabled:opacity-40"
+                >
+                  <Paperclip size={14} />
+                  Upload Google setup file
+                </button>
+                <input
+                  type="text"
+                  value={clientSecretPath}
+                  onChange={(event) => setClientSecretPath(event.target.value)}
+                  placeholder="Or paste the downloaded setup file path"
+                  className="w-full rounded-md border border-[var(--outline)] bg-white px-3 py-2 text-sm outline-none focus:border-[var(--teal)] focus:ring-2 focus:ring-[var(--teal)]/10"
+                />
+              </div>
+              <details className="text-xs text-[var(--ink-soft)]">
+                <summary className="cursor-pointer font-semibold text-[var(--teal)]">
+                  Developer options
+                </summary>
+                <div className="mt-2 space-y-2">
+                  {ui.technical_next_step ? (
+                    <p className="rounded-md bg-[var(--surface-strong)] px-3 py-2 leading-5">
+                      {ui.technical_next_step}
+                    </p>
+                  ) : null}
+                  <label className="flex items-center gap-2">
+                    <input
+                      type="checkbox"
+                      checked={useEnvSecret}
+                      onChange={(event) => setUseEnvSecret(event.target.checked)}
+                      disabled={!envAvailable}
+                      className="h-4 w-4 accent-[var(--teal)] disabled:opacity-40"
+                    />
+                    Use server-provided setup file
+                    {!envAvailable ? <span className="text-amber-700">(not configured)</span> : null}
+                  </label>
+                </div>
+              </details>
+            </div>
+          ) : null}
+          {needsLocalGoogleSetup ? (
+            <button
+              type="button"
+              onClick={() => setShowAdvancedCredentialSetup((current) => !current)}
+              className="text-xs font-semibold text-[var(--teal)] underline"
+            >
+              {showAdvancedCredentialSetup ? "Hide setup guide" : "Walk me through setup"}
+            </button>
+          ) : null}
+          <div className="grid gap-2 sm:grid-cols-[1fr_auto]">
+            <div className="space-y-2">
+              {!ui.client_secret_saved ? null : (
+                <p className="text-xs text-[var(--ink-soft)]">
+                  Google will show the exact Gmail scopes before you approve them.
+                </p>
+              )}
+            </div>
+            {ui.client_secret_saved || hostedAvailable || showLocalGoogleSetup ? (
+              <button
+                type="button"
+                onClick={() => void runStart()}
+                disabled={
+                  Boolean(busy) ||
+                  (!ui.client_secret_saved &&
+                    !hostedAvailable &&
+                    !clientSecretPath.trim() &&
+                    !useEnvSecret)
+                }
+                className="self-start rounded-md bg-[var(--foreground)] px-3 py-2 text-xs font-semibold text-white hover:bg-[var(--teal)] disabled:opacity-40"
+              >
+                {startBusy ? "Starting..." : "Start Google sign-in"}
+              </button>
+            ) : null}
+          </div>
         </div>
       ) : null}
 
@@ -2348,7 +2668,7 @@ function ConnectorSetupCard({
             rel="noreferrer"
             className="inline-flex items-center gap-1 text-xs font-semibold text-[var(--teal)] underline"
           >
-            Open Google authorization <ExternalLink size={12} />
+            Open Google sign-in <ExternalLink size={12} />
           </a>
           <p className="mt-1 break-all font-mono text-[11px] leading-5 text-[var(--ink-soft)]">
             {ui.authorization_url}
@@ -2379,14 +2699,14 @@ function ConnectorSetupCard({
       {ui.safety_note ? (
         <p className="mt-3 text-xs leading-5 text-[var(--ink-soft)]">{ui.safety_note}</p>
       ) : null}
-      {ui.docs_url ? (
+      {ui.docs_url && !showLocalGoogleSetup && !hostedAvailable ? (
         <a
           href={ui.docs_url}
           target="_blank"
           rel="noreferrer"
           className="mt-2 inline-flex items-center gap-1 text-xs font-semibold text-[var(--teal)] underline"
         >
-          Google OAuth client setup <ExternalLink size={12} />
+          Open Google setup page <ExternalLink size={12} />
         </a>
       ) : null}
       <a href="/connections" className="ml-3 inline-flex items-center gap-1 text-xs font-semibold text-[var(--ink-soft)] underline">
@@ -2474,6 +2794,8 @@ function integrationActionNotice(payload: IntegrationActionResult, status: numbe
   if (payload.error || payload.detail || payload.success === false) {
     return integrationActionError(payload, status);
   }
+  const connectorUi = connectorSetupUiFromPayload(payload);
+  if (connectorUi) return connectorSetupNotice(connectorUi);
   if (payload.display_output) return payload.display_output;
   const output = asRecord(payload.output);
   return (
@@ -2482,6 +2804,51 @@ function integrationActionNotice(payload: IntegrationActionResult, status: numbe
     asString(output.status) ||
     "Action complete."
   );
+}
+
+function connectorSetupNotice(ui: ConnectorSetupUi): string {
+  const connector = ui.display_name || ui.connector_id || "Connector";
+  const modes = ui.credential_step?.modes || [];
+  const hostedAvailable =
+    ui.hexis_oauth_client_available ||
+    modes.some((mode) => mode.id === "hosted_oauth" && mode.available);
+  switch (ui.status) {
+    case "needs_capability_choice":
+      return `${connector} setup opened. Choose what access to request.`;
+    case "needs_memory_choice":
+      return `${connector} setup is waiting for the memory policy choice.`;
+    case "needs_autonomy_choice":
+      return `${connector} setup is waiting for the background email check choice.`;
+    case "needs_client_secret":
+    case "setup":
+      if (hostedAvailable) return `${connector} is ready for Google sign-in.`;
+      return `${connector} setup needs one-time Google setup. The panel walks through the steps.`;
+    case "client_secret_saved":
+      return `${connector} setup file saved. Start Google sign-in from the setup panel.`;
+    case "pending_authorization":
+      return `${connector} sign-in started. Open Google, then paste the redirected localhost URL.`;
+    case "connected":
+      return `${connector} is connected.`;
+    default:
+      return `${connector} setup updated.`;
+  }
+}
+
+function connectorSetupStatusLabel(ui: ConnectorSetupUi): string {
+  if (ui.credential_step_label) return ui.credential_step_label;
+  if (ui.status === "needs_client_secret") {
+    const modes = ui.credential_step?.modes || [];
+    const hostedAvailable =
+      ui.hexis_oauth_client_available ||
+      modes.some((mode) => mode.id === "hosted_oauth" && mode.available);
+    return hostedAvailable ? "ready to connect" : "setup needed";
+  }
+  if (ui.status === "client_secret_saved") return "ready to connect";
+  if (ui.status === "pending_authorization") return "authorization pending";
+  if (ui.status === "needs_capability_choice") return "choose access";
+  if (ui.status === "needs_memory_choice") return "choose memory";
+  if (ui.status === "needs_autonomy_choice") return "choose background use";
+  return (ui.status || "setup").replace(/_/g, " ");
 }
 
 function humanizeCapability(value: string): string {

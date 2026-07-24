@@ -6,10 +6,11 @@ import {
   ExternalLink,
   Mail,
   MessageCircle,
+  Paperclip,
   Plug,
   RadioTower,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { Badge } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
@@ -41,6 +42,16 @@ type IntegrationActionHandler = (
   action: string,
   argumentsPayload?: Record<string, unknown>
 ) => Promise<void>;
+
+const GMAIL_SETUP_STEPS = [
+  "Open the Google setup page.",
+  "Create or choose a project named Hexis.",
+  "Enable the Gmail API for that project.",
+  "Set up the app consent screen. For a personal Gmail account, choose External and add your Gmail address as a test user if Google asks.",
+  "On the Credentials page, click Create credentials, choose Google's sign-in client option, set Application type to Desktop app, and name it Hexis.",
+  "Download the setup file Google gives you.",
+  "Upload that setup file here, then start Google sign-in.",
+];
 
 export default function ConnectionsPage() {
   const [data, setData] = useState<IntegrationStatusData | null>(null);
@@ -195,7 +206,7 @@ function ConnectorCard({
             <h2 className="truncate text-sm font-semibold">{connector.display_name}</h2>
           </div>
           <p className="mt-1 text-xs text-[var(--ink-soft)]">
-            {connector.category} · {connector.auth_type}
+            {humanize(connector.category)} · {authTypeLabel(connector)}
           </p>
         </div>
         <Badge variant={stateVariant(summary.state)} className="capitalize">
@@ -417,14 +428,14 @@ function TwitterXControls({
             <TextInput
               value={clientId}
               onChange={(event) => setClientId(event.target.value)}
-              placeholder="OAuth client ID"
+              placeholder="X app client ID"
               className="py-2 text-xs"
             />
             <TextInput
               type="password"
               value={clientSecret}
               onChange={(event) => setClientSecret(event.target.value)}
-              placeholder="Optional client secret"
+              placeholder="Optional X app secret"
               className="py-2 text-xs"
             />
             <div className="flex flex-wrap gap-x-4 gap-y-2 text-xs text-[var(--ink-soft)]">
@@ -462,7 +473,7 @@ function TwitterXControls({
                   onChange={(event) => setUseEnvClient(event.target.checked)}
                   className="h-4 w-4 accent-[var(--teal)]"
                 />
-                Use env client
+                Use server-provided X app
               </label>
             </div>
           </div>
@@ -571,17 +582,25 @@ function GmailControls({
   actionBusy: string | null;
   onAction: IntegrationActionHandler;
 }) {
+  const clientSecretFileRef = useRef<HTMLInputElement>(null);
   const [clientSecretPath, setClientSecretPath] = useState("");
   const [useEnvSecret, setUseEnvSecret] = useState(false);
   const [authorizationResponse, setAuthorizationResponse] = useState("");
   const [backfillQuery, setBackfillQuery] = useState("newer_than:30d");
   const [maxMessages, setMaxMessages] = useState("100");
+  const [accessTier, setAccessTier] = useState<"read_only" | "write" | "manage">("read_only");
+  const [memoryPolicy, setMemoryPolicy] = useState<"remember" | "forget">("remember");
+  const [heartbeatDigestEnabled, setHeartbeatDigestEnabled] = useState(false);
+  const [uploadError, setUploadError] = useState<string | null>(null);
+  const [showAdvancedCredentialSetup, setShowAdvancedCredentialSetup] = useState(true);
+  const [uploadedSetupFileSaved, setUploadedSetupFileSaved] = useState(false);
 
-  const setupManifest = asRecord(summary.connector.setup_manifest);
-  const defaultCapabilities = stringArray(setupManifest.default_capabilities);
-  const capabilities = defaultCapabilities.length
-    ? defaultCapabilities
-    : ["read", "search", "ingest"];
+  const capabilities =
+    accessTier === "manage"
+      ? ["read", "search", "send", "reply", "label", "spam_triage", "delete"]
+      : accessTier === "write"
+        ? ["read", "search", "send", "reply"]
+        : ["read", "search"];
   const pendingAttempt =
     summary.activeAttempts[0] ||
     summary.recentAttempts.find((attempt) =>
@@ -591,6 +610,34 @@ function GmailControls({
   const connectBusy = actionBusy === "gmail:connect";
   const completeBusy = actionBusy === "gmail:complete";
   const backfillBusy = actionBusy === "gmail:backfill";
+  const saveClientBusy = actionBusy === "gmail:save-client";
+  const setupManifest = asRecord(summary.connector.setup_manifest);
+  const setupManifestSteps = stringArray(setupManifest.setup_steps);
+  const setupSteps = setupManifestSteps.length ? setupManifestSteps : GMAIL_SETUP_STEPS;
+  const hostedConfigured = setupManifest.hosted_oauth_configured === true;
+  const envConfigured = setupManifest.env_client_secret_available === true;
+  const storedHeartbeatDigestEnabled = setupManifest.heartbeat_digest_enabled === true;
+  const showLocalGoogleSetup = !hostedConfigured && showAdvancedCredentialSetup;
+  const technicalNextStep = asString(setupManifest.technical_next_step);
+  const hasGmailSignInSetup =
+    hostedConfigured || uploadedSetupFileSaved || clientSecretPath.trim().length > 0 || (useEnvSecret && envConfigured);
+
+  const saveClientSecretFile = async (file: File | null | undefined) => {
+    if (!file || actionBusy) return;
+    setUploadError(null);
+    try {
+      const parsed = await fileToJsonRecord(file);
+      await onAction("gmail:save-client", "save_gmail_client_secret", {
+        client_secret_json: parsed,
+      });
+      setClientSecretPath("");
+      setUploadedSetupFileSaved(true);
+    } catch (error: unknown) {
+      setUploadError(error instanceof Error ? error.message : "Could not read Google setup file.");
+    } finally {
+      if (clientSecretFileRef.current) clientSecretFileRef.current.value = "";
+    }
+  };
 
   return (
     <div className="space-y-3 rounded-md border border-[var(--outline)] px-3 py-3">
@@ -602,72 +649,250 @@ function GmailControls({
       </div>
 
       {!connection ? (
-        <div className="grid gap-2 md:grid-cols-[1fr_auto]">
-          <div className="space-y-2">
-            <TextInput
-              value={clientSecretPath}
-              onChange={(event) => setClientSecretPath(event.target.value)}
-              placeholder="OAuth client JSON path"
-              className="py-2 text-xs"
-            />
-            <label className="flex items-center gap-2 text-xs text-[var(--ink-soft)]">
-              <input
-                type="checkbox"
-                checked={useEnvSecret}
-                onChange={(event) => setUseEnvSecret(event.target.checked)}
-                className="h-4 w-4 accent-[var(--teal)]"
-              />
-              Use explicitly configured environment client secret
-            </label>
+        <div className="space-y-3">
+          <div className="grid gap-2 lg:grid-cols-3">
+            {[
+              {
+                id: "read_only",
+                label: "Read/search",
+                detail: "Browse and search mail when asked.",
+              },
+              {
+                id: "write",
+                label: "Send/reply",
+                detail: "Adds draft, send, and reply powers.",
+              },
+              {
+                id: "manage",
+                label: "Manage/delete",
+                detail: "Adds labels, spam triage, trash, and delete.",
+              },
+            ].map((option) => (
+              <button
+                key={option.id}
+                type="button"
+                onClick={() => setAccessTier(option.id as "read_only" | "write" | "manage")}
+                className={`rounded-md border px-3 py-2 text-left text-xs ${
+                  accessTier === option.id
+                    ? "border-[var(--teal)] bg-white shadow-sm"
+                    : "border-[var(--outline)] bg-white/70 hover:border-[var(--teal)]"
+                }`}
+              >
+                <span className="block font-semibold">{option.label}</span>
+                <span className="mt-1 block leading-5 text-[var(--ink-soft)]">
+                  {option.detail}
+                </span>
+              </button>
+            ))}
           </div>
-          <Button
-            type="button"
-            variant="secondary"
-            disabled={Boolean(actionBusy)}
-            onClick={() =>
-              void onAction("gmail:connect", "connect_gmail", {
-                capabilities,
-                client_secret_path: clientSecretPath.trim() || undefined,
-                use_env_client_secret: useEnvSecret,
-              })
-            }
-            className="self-start px-3 py-2 text-xs"
-          >
-            {connectBusy ? "Starting..." : "Connect"}
-          </Button>
+          <div className="grid gap-2 sm:grid-cols-2">
+            {[
+              {
+                id: "remember",
+                label: "Remember and learn",
+                detail: "Email reads may feed ingestion and user-model evidence.",
+              },
+              {
+                id: "forget",
+                label: "Forget after reading",
+                detail: "Email reads stay task-scoped by default.",
+              },
+            ].map((option) => (
+              <button
+                key={option.id}
+                type="button"
+                onClick={() => setMemoryPolicy(option.id as "remember" | "forget")}
+                className={`rounded-md border px-3 py-2 text-left text-xs ${
+                  memoryPolicy === option.id
+                    ? "border-[var(--teal)] bg-white shadow-sm"
+                    : "border-[var(--outline)] bg-white/70 hover:border-[var(--teal)]"
+                }`}
+              >
+                <span className="block font-semibold">{option.label}</span>
+                <span className="mt-1 block leading-5 text-[var(--ink-soft)]">
+                  {option.detail}
+                </span>
+              </button>
+            ))}
+          </div>
+          <div className="grid gap-2 sm:grid-cols-2">
+            {[
+              {
+                id: "ask_only",
+                label: "Only when I ask",
+                detail: "No autonomous heartbeat email checks.",
+                enabled: false,
+              },
+              {
+                id: "heartbeat_digest",
+                label: "Allow heartbeat checks",
+                detail: "Hourly heartbeats may check Gmail for important messages and digests.",
+                enabled: true,
+              },
+            ].map((option) => (
+              <button
+                key={option.id}
+                type="button"
+                onClick={() => setHeartbeatDigestEnabled(option.enabled)}
+                className={`rounded-md border px-3 py-2 text-left text-xs ${
+                  heartbeatDigestEnabled === option.enabled
+                    ? "border-[var(--teal)] bg-white shadow-sm"
+                    : "border-[var(--outline)] bg-white/70 hover:border-[var(--teal)]"
+                }`}
+              >
+                <span className="block font-semibold">{option.label}</span>
+                <span className="mt-1 block leading-5 text-[var(--ink-soft)]">
+                  {option.detail}
+                </span>
+              </button>
+            ))}
+          </div>
+          <div className="grid gap-2 md:grid-cols-[auto_1fr_auto]">
+            {showLocalGoogleSetup ? (
+              <>
+                <div className="md:col-span-3 space-y-3 rounded-md border border-[var(--outline)] bg-white px-3 py-3">
+                  <p className="text-xs font-semibold text-[var(--foreground)]">Gmail sign-in setup</p>
+                  <p className="text-xs leading-5 text-[var(--ink-soft)]">
+                    This local Hexis build needs a one-time Gmail setup before Samantha can connect.
+                    Follow these steps, then upload the setup file Google gives you.
+                  </p>
+                  <ol className="list-decimal space-y-2 pl-5 text-xs leading-5 text-[var(--ink-soft)]">
+                    {setupSteps.map((step) => (
+                      <li key={step}>{step}</li>
+                    ))}
+                  </ol>
+                  {summary.connector.docs_url ? (
+                    <a
+                      href={summary.connector.docs_url}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="inline-flex items-center gap-1 text-xs font-semibold text-[var(--teal)] underline"
+                    >
+                      Open Google setup page <ExternalLink size={12} />
+                    </a>
+                  ) : null}
+                </div>
+                <input
+                  ref={clientSecretFileRef}
+                  type="file"
+                  accept="application/json,.json"
+                  className="hidden"
+                  onChange={(event) => void saveClientSecretFile(event.target.files?.[0])}
+                />
+                <Button
+                  type="button"
+                  variant="secondary"
+                  disabled={Boolean(actionBusy)}
+                  onClick={() => clientSecretFileRef.current?.click()}
+                  className="gap-2 px-3 py-2 text-xs"
+                >
+                  <Paperclip size={14} />
+                  {saveClientBusy ? "Saving..." : "Upload Google setup file"}
+                </Button>
+                <TextInput
+                  value={clientSecretPath}
+                  onChange={(event) => setClientSecretPath(event.target.value)}
+                  placeholder="Or paste the downloaded setup file path"
+                  className="py-2 text-xs"
+                />
+              </>
+            ) : (
+              <div className="md:col-span-2 rounded-md border border-[var(--outline)] bg-white px-3 py-2 text-xs leading-5 text-[var(--ink-soft)]">
+                Use Google sign-in to connect the Gmail powers you selected.
+              </div>
+            )}
+            <Button
+              type="button"
+              variant="secondary"
+              disabled={Boolean(actionBusy) || !hasGmailSignInSetup}
+              onClick={() =>
+                void onAction("gmail:connect", "connect_gmail", {
+                  capabilities,
+                  memory_policy: memoryPolicy,
+                  heartbeat_digest_enabled: heartbeatDigestEnabled,
+                  client_secret_path: clientSecretPath.trim() || undefined,
+                  use_hexis_oauth_client: true,
+                  use_env_client_secret: useEnvSecret,
+                })
+              }
+              className="px-3 py-2 text-xs"
+            >
+              {connectBusy ? "Starting..." : "Start Google sign-in"}
+            </Button>
+          </div>
+          {!hostedConfigured ? (
+            <button
+              type="button"
+              onClick={() => setShowAdvancedCredentialSetup((current) => !current)}
+              className="text-left text-xs font-semibold text-[var(--teal)] underline"
+            >
+              {showAdvancedCredentialSetup ? "Hide setup guide" : "Walk me through setup"}
+            </button>
+          ) : null}
+          {showLocalGoogleSetup ? (
+            <details className="text-xs text-[var(--ink-soft)]">
+              <summary className="cursor-pointer font-semibold text-[var(--teal)]">
+                Developer options
+              </summary>
+              <div className="mt-2 space-y-2">
+                {technicalNextStep ? (
+                  <p className="rounded-md bg-[var(--surface-strong)] px-3 py-2 leading-5">
+                    {technicalNextStep}
+                  </p>
+                ) : null}
+                <label className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={useEnvSecret}
+                    onChange={(event) => setUseEnvSecret(event.target.checked)}
+                    disabled={!envConfigured}
+                    className="h-4 w-4 accent-[var(--teal)]"
+                  />
+                  Use server-provided setup file
+                  {!envConfigured ? <span className="text-amber-700">(not configured)</span> : null}
+                </label>
+              </div>
+            </details>
+          ) : null}
+          {uploadError ? <p className="text-xs text-red-700">{uploadError}</p> : null}
         </div>
       ) : (
-        <div className="grid gap-2 md:grid-cols-[1fr_8rem_auto]">
-          <TextInput
-            value={backfillQuery}
-            onChange={(event) => setBackfillQuery(event.target.value)}
-            placeholder="Gmail search query"
-            className="py-2 text-xs"
-          />
-          <TextInput
-            type="number"
-            min={1}
-            max={500}
-            value={maxMessages}
-            onChange={(event) => setMaxMessages(event.target.value)}
-            aria-label="Max messages"
-            className="py-2 text-xs"
-          />
-          <Button
-            type="button"
-            variant="secondary"
-            disabled={Boolean(actionBusy)}
-            onClick={() =>
-              void onAction("gmail:backfill", "start_gmail_backfill", {
-                account_key: connection.account_key,
-                query: backfillQuery.trim() || undefined,
-                max_messages: parseMaxMessages(maxMessages),
-              })
-            }
-            className="px-3 py-2 text-xs"
-          >
-            {backfillBusy ? "Queuing..." : "Import"}
-          </Button>
+        <div className="space-y-3">
+          <div className="rounded-md border border-[var(--outline)] bg-white px-3 py-2 text-xs leading-5 text-[var(--ink-soft)]">
+            Heartbeat email checks are {storedHeartbeatDigestEnabled ? "enabled" : "off"}. Gmail connection does not by itself allow background reading.
+          </div>
+          <div className="grid gap-2 md:grid-cols-[1fr_8rem_auto]">
+            <TextInput
+              value={backfillQuery}
+              onChange={(event) => setBackfillQuery(event.target.value)}
+              placeholder="Gmail search query"
+              className="py-2 text-xs"
+            />
+            <TextInput
+              type="number"
+              min={1}
+              max={500}
+              value={maxMessages}
+              onChange={(event) => setMaxMessages(event.target.value)}
+              aria-label="Max messages"
+              className="py-2 text-xs"
+            />
+            <Button
+              type="button"
+              variant="secondary"
+              disabled={Boolean(actionBusy)}
+              onClick={() =>
+                void onAction("gmail:backfill", "start_gmail_backfill", {
+                  account_key: connection.account_key,
+                  query: backfillQuery.trim() || undefined,
+                  max_messages: parseMaxMessages(maxMessages),
+                })
+              }
+              className="px-3 py-2 text-xs"
+            >
+              {backfillBusy ? "Queuing..." : "Import"}
+            </Button>
+          </div>
         </div>
       )}
 
@@ -1078,6 +1303,12 @@ function humanize(value: string): string {
   return value.replace(/_/g, " ");
 }
 
+function authTypeLabel(connector: { id: string; auth_type: string }): string {
+  if (connector.id === "gmail") return "Google sign-in";
+  if (connector.auth_type === "oauth2") return "account sign-in";
+  return humanize(connector.auth_type);
+}
+
 function formatDate(value: string): string {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return value;
@@ -1099,6 +1330,14 @@ async function readActionPayload(response: Response): Promise<IntegrationActionR
   }
 }
 
+async function fileToJsonRecord(file: File): Promise<Record<string, unknown>> {
+  const parsed = JSON.parse(await file.text()) as unknown;
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("JSON file must contain an object.");
+  }
+  return parsed as Record<string, unknown>;
+}
+
 function actionError(payload: IntegrationActionResult, status: number): string {
   if (payload.error) return payload.error;
   if (payload.detail) return payload.detail;
@@ -1109,6 +1348,8 @@ function actionError(payload: IntegrationActionResult, status: number): string {
 }
 
 function actionNotice(payload: IntegrationActionResult): string {
+  const connectorUi = connectorSetupUiFromPayload(payload);
+  if (connectorUi) return connectorSetupNotice(connectorUi);
   if (payload.display_output) return payload.display_output;
   const output = asRecord(payload.output);
   return (
@@ -1117,6 +1358,34 @@ function actionNotice(payload: IntegrationActionResult): string {
     asString(output.status) ||
     "Action complete."
   );
+}
+
+function connectorSetupUiFromPayload(payload: IntegrationActionResult): Record<string, unknown> | null {
+  const output = asRecord(payload.output);
+  const ui = asRecord(output.ui);
+  return ui.kind === "connector_setup" ? ui : null;
+}
+
+function connectorSetupNotice(ui: Record<string, unknown>): string {
+  const connector = asString(ui.display_name) || asString(ui.connector_id) || "Connector";
+  const status = asString(ui.status) || "";
+  if (status === "needs_client_secret" || status === "setup") {
+    const rawModes = asRecord(ui.credential_step).modes;
+    const modes = Array.isArray(rawModes) ? rawModes.map(asRecord) : [];
+    const builtInAvailable =
+      ui.hexis_oauth_client_available === true ||
+      modes.some((mode) => mode.id === "hosted_oauth" && mode.available === true);
+    if (builtInAvailable) return `${connector} is ready for Google sign-in.`;
+    return `${connector} setup needs one-time Google setup. The panel walks through the steps.`;
+  }
+  if (status === "client_secret_saved") {
+    return `${connector} setup file saved. Start Google sign-in from the setup panel.`;
+  }
+  if (status === "pending_authorization") {
+    return `${connector} sign-in started. Open Google, then paste the redirected localhost URL.`;
+  }
+  if (status === "connected") return `${connector} is connected.`;
+  return `${connector} setup updated.`;
 }
 
 function parseMaxMessages(value: string, max = 500): number {

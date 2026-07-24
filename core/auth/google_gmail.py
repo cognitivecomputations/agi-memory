@@ -28,10 +28,36 @@ GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GOOGLE_GMAIL_PROFILE_URL = "https://gmail.googleapis.com/gmail/v1/users/me/profile"
 GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v1/userinfo?alt=json"
-GMAIL_REDIRECT_URI = "http://localhost:1"
+GMAIL_REDIRECT_URI = "http://localhost"
 
 _CLIENT_SECRET_ENV_JSON = ("GOOGLE_GMAIL_CLIENT_SECRET_JSON", "GOOGLE_CLIENT_SECRET_JSON")
 _CLIENT_SECRET_ENV_PATH = ("GOOGLE_GMAIL_CLIENT_SECRET_PATH", "GOOGLE_CLIENT_SECRET_PATH")
+_HEXIS_CLIENT_ID_ENV = ("HEXIS_GMAIL_OAUTH_CLIENT_ID", "GOOGLE_GMAIL_OAUTH_CLIENT_ID")
+_HEXIS_CLIENT_SECRET_ENV = ("HEXIS_GMAIL_OAUTH_CLIENT_SECRET", "GOOGLE_GMAIL_OAUTH_CLIENT_SECRET")
+_DISABLE_BUNDLED_CLIENT_ENV = "HEXIS_GMAIL_OAUTH_DISABLE_BUNDLED"
+GMAIL_BUNDLED_CLIENT_SECRET_PATHS = (
+    Path(__file__).resolve().with_name("gmail-credentials.json"),
+    Path(__file__).resolve().parents[2] / "gmail-credentials.json",
+)
+GMAIL_SETUP_DOCS_URL = "https://console.cloud.google.com/apis/credentials"
+GMAIL_SETUP_STEPS = [
+    "Open the Google setup page.",
+    "Create or choose a project named Hexis.",
+    "Enable the Gmail API for that project.",
+    "Set up the app consent screen. For a personal Gmail account, choose External and add your Gmail address as a test user if Google asks.",
+    "On the Credentials page, click Create credentials, choose Google's sign-in client option, set Application type to Desktop app, and name it Hexis.",
+    "Download the setup file Google gives you.",
+    "Upload that setup file here, then start Google sign-in.",
+]
+GMAIL_SETUP_NEXT_STEP = (
+    "Gmail sign-in is not enabled for this local Hexis build yet. "
+    "Use the setup guide in the panel to enable it once, then start Google sign-in."
+)
+GMAIL_SETUP_TECHNICAL_NEXT_STEP = (
+    "For developers and hosted builds: configure HEXIS_GMAIL_OAUTH_CLIENT_ID and "
+    "HEXIS_GMAIL_OAUTH_CLIENT_SECRET in the Hexis API environment to make built-in "
+    "Google sign-in available."
+)
 
 
 class GmailOAuthError(RuntimeError):
@@ -74,28 +100,41 @@ async def prepare_gmail_connection_attempt(pool: Any, capabilities: Any = None) 
     return payload
 
 
-def _client_section(payload: dict[str, Any]) -> dict[str, Any]:
-    section = payload.get("installed") or payload.get("web")
+def _client_section(payload: dict[str, Any], *, require_installed: bool = False) -> dict[str, Any]:
+    section = payload.get("installed") if require_installed else payload.get("installed") or payload.get("web")
     if not isinstance(section, dict):
+        if require_installed:
+            raise GmailOAuthError(
+                "The bundled Gmail sign-in setup must be a Google Desktop app credential."
+            )
         raise GmailOAuthError(
-            "Google OAuth client JSON must contain an 'installed' or 'web' object. "
-            "Create a Desktop OAuth client in Google Cloud Console and pass its JSON file path."
+            "The Google setup file must contain an 'installed' or 'web' object. "
+            "Use the Gmail setup guide to upload the downloaded setup file."
         )
     if not isinstance(section.get("client_id"), str) or not isinstance(section.get("client_secret"), str):
-        raise GmailOAuthError("Google OAuth client JSON is missing client_id or client_secret.")
+        raise GmailOAuthError("The Google setup file is missing client_id or client_secret.")
     return section
+
+
+def _select_redirect_uri(client: dict[str, Any]) -> str:
+    redirects = client.get("redirect_uris")
+    if isinstance(redirects, list):
+        for value in redirects:
+            if isinstance(value, str) and value.startswith(("http://localhost", "http://127.0.0.1", "http://[::1]")):
+                return value
+    return GMAIL_REDIRECT_URI
 
 
 def _load_client_secret_path(path: str) -> dict[str, Any]:
     src = Path(path).expanduser()
     if not src.exists():
-        raise GmailOAuthError(f"Google OAuth client secret file not found: {src}")
+        raise GmailOAuthError(f"Google setup file not found: {src}")
     try:
         payload = json.loads(src.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
-        raise GmailOAuthError(f"Google OAuth client secret file is not valid JSON: {src}") from exc
+        raise GmailOAuthError(f"Google setup file is not valid JSON: {src}") from exc
     if not isinstance(payload, dict):
-        raise GmailOAuthError("Google OAuth client secret file must contain a JSON object.")
+        raise GmailOAuthError("Google setup file must contain a JSON object.")
     _client_section(payload)
     return payload
 
@@ -119,8 +158,107 @@ def _load_env_client_secret() -> tuple[dict[str, Any] | None, str | None]:
     return None, None
 
 
+def _first_env(names: tuple[str, ...]) -> tuple[str | None, str | None]:
+    for name in names:
+        value = os.getenv(name)
+        if value and value.strip():
+            return value.strip(), name
+    return None, None
+
+
+def _truthy_env(name: str) -> bool:
+    return str(os.getenv(name) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _load_bundled_client_secret() -> tuple[dict[str, Any] | None, str | None]:
+    if _truthy_env(_DISABLE_BUNDLED_CLIENT_ENV):
+        return None, None
+    for path in GMAIL_BUNDLED_CLIENT_SECRET_PATHS:
+        if not path.exists():
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise GmailOAuthError(f"Bundled Gmail sign-in setup is not valid JSON: {path}") from exc
+        if not isinstance(payload, dict):
+            raise GmailOAuthError("Bundled Gmail sign-in setup must contain a JSON object.")
+        _client_section(payload, require_installed=True)
+        return payload, f"bundled:{path.name}"
+    return None, None
+
+
+def has_bundled_gmail_oauth_client() -> bool:
+    try:
+        payload, _ = _load_bundled_client_secret()
+        return payload is not None
+    except GmailOAuthError:
+        return False
+
+
+def _load_hexis_env_client_secret() -> tuple[dict[str, Any] | None, str | None]:
+    client_id, id_name = _first_env(_HEXIS_CLIENT_ID_ENV)
+    client_secret, secret_name = _first_env(_HEXIS_CLIENT_SECRET_ENV)
+    if not client_id and not client_secret:
+        return None, None
+    if not client_id or not client_secret:
+        missing = "client id" if not client_id else "client secret"
+        raise GmailOAuthError(f"Hexis Gmail OAuth client is partially configured; missing {missing}.")
+    payload = {
+        "installed": {
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "auth_uri": GOOGLE_AUTH_URL,
+            "token_uri": GOOGLE_TOKEN_URL,
+            "redirect_uris": [GMAIL_REDIRECT_URI],
+        }
+    }
+    _client_section(payload)
+    return payload, f"{id_name}+{secret_name}"
+
+
+def _load_hexis_client_secret() -> tuple[dict[str, Any] | None, str | None]:
+    payload, source = _load_hexis_env_client_secret()
+    if payload:
+        return payload, source
+    return _load_bundled_client_secret()
+
+
+def has_hexis_gmail_oauth_client() -> bool:
+    client_id, _ = _first_env(_HEXIS_CLIENT_ID_ENV)
+    client_secret, _ = _first_env(_HEXIS_CLIENT_SECRET_ENV)
+    return bool(client_id and client_secret) or has_bundled_gmail_oauth_client()
+
+
+def has_env_gmail_client_secret() -> bool:
+    """Return whether an explicitly configured Gmail client secret env value exists.
+
+    This is a presence check only. The setup flow must still ask the user before
+    consuming environment credentials, because ambient state should not be used
+    silently.
+    """
+    return any(os.getenv(name) for name in (*_CLIENT_SECRET_ENV_JSON, *_CLIENT_SECRET_ENV_PATH))
+
+
 def has_saved_gmail_client_secret() -> bool:
     return isinstance(load_auth(GMAIL_CLIENT_SECRET_REF), dict)
+
+
+def save_gmail_client_secret_payload(payload: dict[str, Any], *, source: str = "upload") -> dict[str, Any]:
+    """Validate and save a Google setup file payload without returning secrets."""
+    if not isinstance(payload, dict):
+        raise GmailOAuthError("Google setup file upload must be a JSON object.")
+    client = _client_section(payload)
+    save_auth(GMAIL_CLIENT_SECRET_REF, payload)
+    client_id = str(client["client_id"])
+    suffix = client_id[-8:] if len(client_id) > 8 else client_id
+    return {
+        "status": "client_secret_saved",
+        "connector_id": GMAIL_CONNECTOR_ID,
+        "client_secret_saved": True,
+        "client_id_hint": f"...{suffix}" if len(client_id) > len(suffix) else suffix,
+        "source": source,
+        "next_step": "Start Google sign-in from the setup panel.",
+    }
 
 
 def load_default_credentials() -> dict[str, Any] | None:
@@ -212,6 +350,7 @@ def delete_default_credentials() -> None:
 def _resolve_client_secret(
     *,
     client_secret_path: str | None = None,
+    use_hexis_oauth_client: bool = True,
     use_env_client_secret: bool = False,
 ) -> tuple[dict[str, Any] | None, str | None]:
     if client_secret_path and client_secret_path.strip():
@@ -223,6 +362,12 @@ def _resolve_client_secret(
     if isinstance(stored, dict):
         _client_section(stored)
         return stored, "stored"
+
+    if use_hexis_oauth_client:
+        payload, env_names = _load_hexis_client_secret()
+        if payload:
+            save_auth(GMAIL_CLIENT_SECRET_REF, payload)
+            return payload, env_names or "hexis_oauth_client"
 
     if use_env_client_secret:
         payload, env_name = _load_env_client_secret()
@@ -238,14 +383,22 @@ def build_client_secret_needed_payload() -> dict[str, Any]:
         "status": "needs_client_secret",
         "connector_id": GMAIL_CONNECTOR_ID,
         "client_secret_saved": False,
-        "accepted_inputs": ["client_secret_path", "use_env_client_secret"],
+        "accepted_inputs": [
+            "hexis_oauth_client",
+            "advanced_self_hosted",
+            "client_secret_file",
+            "client_secret_path",
+            "use_env_client_secret",
+        ],
         "env_options": [*_CLIENT_SECRET_ENV_PATH, *_CLIENT_SECRET_ENV_JSON],
-        "next_step": (
-            "Create a Google OAuth Desktop client, download its JSON file, then call "
-            "connect_gmail with client_secret_path set to that local file. If the path "
-            "starts with '/', send it in a sentence so chat surfaces do not treat it as a command."
-        ),
-        "docs_url": "https://console.cloud.google.com/apis/credentials",
+        "hexis_oauth_client_env": [*_HEXIS_CLIENT_ID_ENV, *_HEXIS_CLIENT_SECRET_ENV],
+        "hexis_oauth_client_available": has_hexis_gmail_oauth_client(),
+        "bundled_oauth_client_available": has_bundled_gmail_oauth_client(),
+        "env_client_secret_available": has_env_gmail_client_secret(),
+        "next_step": GMAIL_SETUP_NEXT_STEP,
+        "technical_next_step": GMAIL_SETUP_TECHNICAL_NEXT_STEP,
+        "setup_steps": list(GMAIL_SETUP_STEPS),
+        "docs_url": GMAIL_SETUP_DOCS_URL,
     }
 
 
@@ -254,6 +407,7 @@ async def start_gmail_oauth(
     *,
     capabilities: Any = None,
     client_secret_path: str | None = None,
+    use_hexis_oauth_client: bool = True,
     use_env_client_secret: bool = False,
     source_channel: str | None = None,
     source_session_id: str | None = None,
@@ -261,6 +415,7 @@ async def start_gmail_oauth(
     """Create a DB connection attempt and persisted pending PKCE state."""
     client_secret, source = _resolve_client_secret(
         client_secret_path=client_secret_path,
+        use_hexis_oauth_client=use_hexis_oauth_client,
         use_env_client_secret=use_env_client_secret,
     )
     if not client_secret:
@@ -272,12 +427,13 @@ async def start_gmail_oauth(
     if not caps or not scopes:
         raise GmailOAuthError("Gmail connector preparation did not return capabilities and scopes.")
     client = _client_section(client_secret)
+    redirect_uri = _select_redirect_uri(client)
     verifier, challenge = generate_pkce()
     state = create_state()
     params = {
         "client_id": client["client_id"],
         "response_type": "code",
-        "redirect_uri": GMAIL_REDIRECT_URI,
+        "redirect_uri": redirect_uri,
         "scope": " ".join(scopes),
         "code_challenge": challenge,
         "code_challenge_method": "S256",
@@ -293,7 +449,7 @@ async def start_gmail_oauth(
     flow_state = {
         "pending_auth_ref": None,
         "state_hash": hashlib.sha256(state.encode("utf-8")).hexdigest(),
-        "redirect_uri": GMAIL_REDIRECT_URI,
+        "redirect_uri": redirect_uri,
         "client_secret_source": source,
         "scope_count": len(scopes),
     }
@@ -327,7 +483,7 @@ async def start_gmail_oauth(
         {
             "state": state,
             "verifier": verifier,
-            "redirect_uri": GMAIL_REDIRECT_URI,
+            "redirect_uri": redirect_uri,
             "client_ref": GMAIL_CLIENT_SECRET_REF,
             "scopes": list(payload.get("requested_scopes") or scopes),
             "capabilities": list(payload.get("requested_capabilities") or caps),
@@ -472,7 +628,9 @@ async def complete_gmail_oauth(
 
     client_secret = load_auth(str(pending.get("client_ref") or GMAIL_CLIENT_SECRET_REF))
     if not isinstance(client_secret, dict):
-        raise GmailOAuthError("Stored Gmail OAuth client secret is missing. Start connect_gmail with client_secret_path again.")
+        raise GmailOAuthError(
+            "Stored Gmail setup is missing. Open Gmail setup again, follow the guide if needed, then start Google sign-in."
+        )
     client = _client_section(client_secret)
 
     async with pool.acquire() as conn:

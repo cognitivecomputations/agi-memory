@@ -104,6 +104,28 @@ def _connector_setup_ui(output: Any) -> dict[str, Any] | None:
     return ui
 
 
+def _looks_like_json_path(value: str) -> bool:
+    text = value.strip()
+    return (text.startswith("/") or text.startswith("~/")) and text.lower().endswith(".json")
+
+
+def _ui_has_built_in_gmail_sign_in(ui: dict[str, Any]) -> bool:
+    if ui.get("hexis_oauth_client_available") is True:
+        return True
+    credential_step = ui.get("credential_step")
+    if not isinstance(credential_step, dict):
+        return False
+    modes = credential_step.get("modes")
+    if not isinstance(modes, list):
+        return False
+    return any(
+        isinstance(mode, dict)
+        and mode.get("id") == "hosted_oauth"
+        and mode.get("available") is True
+        for mode in modes
+    )
+
+
 def _print_connector_setup_ui(ui: dict[str, Any]) -> None:
     from rich.panel import Panel
 
@@ -112,11 +134,16 @@ def _print_connector_setup_ui(ui: dict[str, Any]) -> None:
     caps = _string_list(ui.get("capabilities"))
     memory_policy = str(ui.get("memory_policy") or "")
     memory_config_key = str(ui.get("memory_config_key") or "")
+    heartbeat_digest_enabled = bool(ui.get("heartbeat_digest_enabled"))
+    heartbeat_digest_config_key = str(ui.get("heartbeat_digest_config_key") or "")
     docs_url = str(ui.get("docs_url") or "")
     next_step = str(ui.get("next_step") or "")
     authorization_url = str(ui.get("authorization_url") or "")
     attempt_id = str(ui.get("attempt_id") or "")
     client_secret_saved = bool(ui.get("client_secret_saved"))
+    built_in_sign_in_available = _ui_has_built_in_gmail_sign_in(ui)
+    credential_step_label = str(ui.get("credential_step_label") or "").strip()
+    setup_steps = _string_list(ui.get("setup_steps"))
 
     lines = [
         f"[bold]{connector} setup[/bold]",
@@ -128,12 +155,32 @@ def _print_connector_setup_ui(ui: dict[str, Any]) -> None:
         lines.append(f"[muted]Memory policy:[/muted] {memory_policy}")
     if memory_config_key:
         lines.append(f"[muted]Memory config:[/muted] {memory_config_key}")
-    if not client_secret_saved and status in {"needs_client_secret", "setup"}:
+    if heartbeat_digest_config_key:
+        heartbeat_state = "enabled" if heartbeat_digest_enabled else "off until you authorize it"
+        lines.append(f"[muted]Heartbeat email checks:[/muted] {heartbeat_state}")
+    if credential_step_label:
+        lines.append(f"[muted]Google setup:[/muted] {credential_step_label}")
+    if not client_secret_saved and not built_in_sign_in_available and status in {"needs_client_secret", "setup"}:
+        lines.extend(["", "Gmail sign-in is not enabled for this local Hexis build yet."])
+        if setup_steps:
+            lines.append("Walkthrough:")
+            for index, step in enumerate(setup_steps, start=1):
+                lines.append(f"{index}. {step}")
+        else:
+            lines.extend([
+                "1. Open Google Cloud Console.",
+                "2. Create or choose a project for Hexis.",
+                "3. Enable the Gmail API.",
+                "4. Configure the consent screen, adding your Gmail address as a test user if Google asks.",
+                "5. Create a Desktop app sign-in credential and download the setup file.",
+            ])
         lines.extend([
             "",
-            "Paste the local Google OAuth Desktop client JSON path in this chat, for example:",
-            "[accent]My Google OAuth client JSON is /Users/eric/Downloads/client_secret.json[/accent]",
+            "When you have the downloaded setup file, paste its path here:",
+            "[accent]/Users/eric/Downloads/client_secret.json[/accent]",
         ])
+    elif not client_secret_saved and built_in_sign_in_available and status in {"needs_client_secret", "setup"}:
+        lines.extend(["", "Built-in Google sign-in is ready. Start Gmail setup to open Google's consent page."])
     if authorization_url:
         lines.extend([
             "",
@@ -148,7 +195,7 @@ def _print_connector_setup_ui(ui: dict[str, Any]) -> None:
     if next_step and next_step not in lines:
         lines.extend(["", next_step])
     if docs_url:
-        lines.extend(["", f"[muted]Google OAuth clients:[/muted] {docs_url}"])
+        lines.extend(["", f"[muted]Google setup page:[/muted] {docs_url}"])
 
     console.print()
     console.print(Panel("\n".join(lines), border_style="teal", title="Connector setup"))
@@ -285,7 +332,7 @@ async def _run_chat(dsn: str, *, verbose: bool = False, debug: bool = False,
                 continue
 
             # Slash commands — one failing command must never crash the session.
-            if user_input.startswith("/"):
+            if user_input.startswith("/") and not _looks_like_json_path(user_input):
                 cmd_parts = user_input.split(maxsplit=1)
                 cmd = cmd_parts[0].lower()
                 try:

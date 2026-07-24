@@ -7,6 +7,7 @@ skills. This keeps prompts smaller and makes capability use intentional.
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -24,6 +25,7 @@ if False:  # pragma: no cover - typing only
 DISCOVERY_TOOL_NAMES = {"list_skills", "use_skill", "propose_skill", "queue_user_message"}
 DEFAULT_SKILL_NAMES = {"core-memory"}
 HEARTBEAT_DEFAULT_SKILL_NAMES = {"core-memory", "self-reflection"}
+GMAIL_HEARTBEAT_DIGEST_CONFIG_KEY = "integrations.gmail.heartbeat_digest_enabled"
 AUTO_ACTIVATE_SCORE_THRESHOLD = 5
 STOPWORDS = {
     "about", "after", "again", "also", "before", "could", "did", "does",
@@ -87,6 +89,37 @@ def _passes_specialized_gate(skill: SkillSpec, query_tokens: set[str]) -> bool:
     }
     required = gates.get(skill.name)
     return True if required is None else bool(query_tokens & required)
+
+
+async def _gmail_heartbeat_digest_authorized(registry: "ToolRegistry") -> bool:
+    """Autonomous email checks require both a connected account and a DB grant.
+
+    Google OAuth authorizes provider access. This config authorizes Hexis to use
+    that access from heartbeat without a live user turn.
+    """
+    pool = getattr(registry, "pool", None)
+    if pool is None:
+        return False
+    try:
+        async with pool.acquire() as conn:
+            enabled = await conn.fetchval(
+                "SELECT COALESCE(get_config_bool($1), FALSE)",
+                GMAIL_HEARTBEAT_DIGEST_CONFIG_KEY,
+            )
+            if not enabled:
+                return False
+            raw = await conn.fetchval("SELECT integration_status('gmail')")
+    except Exception:
+        return False
+    payload = json.loads(raw) if isinstance(raw, str) else raw
+    if not isinstance(payload, dict):
+        return False
+    return any(
+        isinstance(item, dict)
+        and item.get("connector_id") == "gmail"
+        and item.get("status") == "connected"
+        for item in payload.get("connections", [])
+    )
 
 
 def skill_bound_tools(skill: SkillSpec) -> list[str]:
@@ -178,7 +211,16 @@ async def select_skills(
         registry, tool_context, mcp_configs=await _mcp_configs(registry)
     )
 
-    default_names = HEARTBEAT_DEFAULT_SKILL_NAMES if tool_context == ToolContext.HEARTBEAT else DEFAULT_SKILL_NAMES
+    default_names = (
+        set(HEARTBEAT_DEFAULT_SKILL_NAMES)
+        if tool_context == ToolContext.HEARTBEAT
+        else set(DEFAULT_SKILL_NAMES)
+    )
+    if (
+        tool_context == ToolContext.HEARTBEAT
+        and await _gmail_heartbeat_digest_authorized(registry)
+    ):
+        default_names.add("email-digest")
     selected: list[SkillSpec] = [s for s in skills if s.name in default_names]
 
     selected_names = {s.name for s in selected}

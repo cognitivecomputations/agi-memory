@@ -145,10 +145,10 @@ def build_client_needed_payload() -> dict[str, Any]:
         "accepted_inputs": ["client_id", "client_secret", "use_env_client"],
         "env_options": [*_CLIENT_ID_ENV, *_CLIENT_SECRET_ENV],
         "next_step": (
-            "Create or choose an X Developer app with OAuth 2.0 enabled, add "
-            f"{TWITTER_X_REDIRECT_URI} as a callback URI, then call connect_twitter_x "
-            "with client_id. Include client_secret only for a confidential X app. "
-            "Set use_env_client only if you explicitly want Hexis to read the configured env vars."
+            "Create or choose an X Developer app, enable user sign-in, add "
+            f"{TWITTER_X_REDIRECT_URI} as the callback URI, then enter the X app client ID. "
+            "Include the app secret only if X says the app is confidential. "
+            "Use server-provided settings only if you explicitly want Hexis to read configured environment values."
         ),
         "docs_url": "https://docs.x.com/fundamentals/authentication/oauth-2-0/authorization-code",
     }

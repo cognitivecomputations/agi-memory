@@ -26,7 +26,17 @@ _ENV_NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 _SECRET_CHANNEL_KEYS = {"bot_token", "app_token", "access_token", "password"}
 _GMAIL_DEFAULT_CAPABILITIES = ["read", "search"]
 _GMAIL_MEMORY_POLICY_CONFIG_KEY = "integrations.gmail.memory_policy"
+_GMAIL_HEARTBEAT_DIGEST_CONFIG_KEY = "integrations.gmail.heartbeat_digest_enabled"
 _GMAIL_MEMORY_POLICIES = {"remember", "forget"}
+_GMAIL_SETUP_FALLBACK_STEPS = [
+    "Open the Google setup page.",
+    "Create or choose a project named Hexis.",
+    "Enable the Gmail API for that project.",
+    "Set up the app consent screen. For a personal Gmail account, choose External and add your Gmail address as a test user if Google asks.",
+    "On the Credentials page, click Create credentials, choose Google's sign-in client option, set Application type to Desktop app, and name it Hexis.",
+    "Download the setup file Google gives you.",
+    "Upload that setup file here, then start Google sign-in.",
+]
 
 
 def _connector_id(value: Any) -> str:
@@ -44,6 +54,43 @@ def _setup_next_step(plan: dict[str, Any]) -> str:
     if isinstance(notes, list) and notes:
         return " ".join(str(item) for item in notes if item)
     return "Follow the connector setup manifest, then verify the connection."
+
+
+def enrich_gmail_setup_runtime(payload: dict[str, Any]) -> dict[str, Any]:
+    """Attach runtime Gmail setup availability without exposing secrets."""
+    connectors = payload.get("connectors")
+    if not isinstance(connectors, list):
+        return payload
+
+    try:
+        from core.auth.google_gmail import (
+            GMAIL_SETUP_STEPS,
+            has_env_gmail_client_secret,
+            has_hexis_gmail_oauth_client,
+        )
+
+        hosted_available = has_hexis_gmail_oauth_client()
+        env_available = has_env_gmail_client_secret()
+        setup_steps = list(GMAIL_SETUP_STEPS)
+    except Exception:
+        hosted_available = False
+        env_available = False
+        setup_steps = list(_GMAIL_SETUP_FALLBACK_STEPS)
+
+    for connector in connectors:
+        if not isinstance(connector, dict) or connector.get("id") != "gmail":
+            continue
+        manifest = _json(connector.get("setup_manifest")) or {}
+        if not isinstance(manifest, dict):
+            manifest = {}
+        connector["setup_manifest"] = {
+            **manifest,
+            "hosted_oauth_configured": hosted_available,
+            "hexis_oauth_client_available": hosted_available,
+            "env_client_secret_available": env_available,
+            "setup_steps": manifest.get("setup_steps") or setup_steps,
+        }
+    return payload
 
 
 def _gmail_capabilities_from_status(payload: dict[str, Any], fallback: Any = None) -> list[str]:
@@ -100,12 +147,59 @@ async def _persist_gmail_memory_policy(pool: Any, policy: str) -> None:
         )
 
 
+def _gmail_heartbeat_digest_from_payload(payload: dict[str, Any], fallback: Any = None) -> bool | None:
+    if fallback is not None:
+        value = fallback
+    elif "heartbeat_digest_enabled" in payload:
+        value = payload.get("heartbeat_digest_enabled")
+    elif "autonomous_gmail_digest" in payload:
+        value = payload.get("autonomous_gmail_digest")
+    elif "enable_heartbeat_digest" in payload:
+        value = payload.get("enable_heartbeat_digest")
+    else:
+        value = payload.get(_GMAIL_HEARTBEAT_DIGEST_CONFIG_KEY)
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    normalized = str(value).strip().lower().replace("-", "_")
+    if normalized in {"true", "1", "yes", "y", "enable", "enabled", "allow", "allowed", "heartbeat_digest"}:
+        return True
+    if normalized in {"false", "0", "no", "n", "disable", "disabled", "deny", "ask_only", "manual"}:
+        return False
+    return None
+
+
+async def _persist_gmail_heartbeat_digest_enabled(pool: Any, enabled: bool) -> None:
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO config (key, value, description, updated_at)
+            VALUES (
+                $1,
+                to_jsonb($2::boolean),
+                'Controls whether heartbeat may proactively check connected Gmail for digests or important messages without a live user turn.',
+                CURRENT_TIMESTAMP
+            )
+            ON CONFLICT (key) DO UPDATE SET
+                value = EXCLUDED.value,
+                description = COALESCE(config.description, EXCLUDED.description),
+                updated_at = EXCLUDED.updated_at
+            """,
+            _GMAIL_HEARTBEAT_DIGEST_CONFIG_KEY,
+            enabled,
+        )
+
+
 def _gmail_connector_setup_ui(
     payload: dict[str, Any],
     *,
     status: str | None = None,
     capabilities: Any = None,
     memory_policy: Any = None,
+    heartbeat_digest_enabled: Any = None,
     pending_attempt: dict[str, Any] | None = None,
     connected_accounts: list[dict[str, Any]] | None = None,
     client_secret_saved: bool | None = None,
@@ -147,7 +241,31 @@ def _gmail_connector_setup_ui(
 
     caps = _gmail_capabilities_from_status(payload, capabilities)
     resolved_memory_policy = _gmail_memory_policy_from_payload(payload, memory_policy)
-    docs_url = "https://console.cloud.google.com/apis/credentials"
+    resolved_heartbeat_digest_enabled = _gmail_heartbeat_digest_from_payload(
+        payload,
+        heartbeat_digest_enabled,
+    )
+    try:
+        from core.auth.google_gmail import (
+            GMAIL_SETUP_DOCS_URL,
+            GMAIL_SETUP_NEXT_STEP,
+            GMAIL_SETUP_STEPS,
+            GMAIL_SETUP_TECHNICAL_NEXT_STEP,
+        )
+    except Exception:
+        GMAIL_SETUP_DOCS_URL = "https://console.cloud.google.com/apis/credentials"
+        GMAIL_SETUP_NEXT_STEP = (
+            "Gmail sign-in is not enabled for this local Hexis build yet. "
+            "Use the setup guide in the panel to enable it once, then start Google sign-in."
+        )
+        GMAIL_SETUP_STEPS = list(_GMAIL_SETUP_FALLBACK_STEPS)
+        GMAIL_SETUP_TECHNICAL_NEXT_STEP = (
+            "For developers and hosted builds: configure HEXIS_GMAIL_OAUTH_CLIENT_ID and "
+            "HEXIS_GMAIL_OAUTH_CLIENT_SECRET in the Hexis API environment to make built-in "
+            "Google sign-in available."
+        )
+
+    docs_url = GMAIL_SETUP_DOCS_URL
     authorization_url = None
     attempt_id = None
     pending_next_step = None
@@ -157,6 +275,74 @@ def _gmail_connector_setup_ui(
         pending_next_step = pending.get("user_next_step") or pending.get("next_step")
     authorization_url = authorization_url or payload.get("authorization_url")
     attempt_id = attempt_id or payload.get("attempt_id")
+    try:
+        from core.auth.google_gmail import has_env_gmail_client_secret, has_hexis_gmail_oauth_client
+
+        hexis_oauth_client_available = has_hexis_gmail_oauth_client()
+        env_client_secret_available = has_env_gmail_client_secret()
+    except Exception:
+        hexis_oauth_client_available = bool(payload.get("hexis_oauth_client_available"))
+        env_client_secret_available = bool(payload.get("env_client_secret_available"))
+    saved_client_secret = (
+        bool(client_secret_saved) if client_secret_saved is not None else bool(payload.get("client_secret_saved"))
+    )
+    resolved_next_step = next_step or pending_next_step or payload.get("next_step") or payload.get("user_next_step")
+    if not resolved_next_step and resolved_status in {"needs_client_secret", "setup"}:
+        resolved_next_step = GMAIL_SETUP_NEXT_STEP
+    credential_step = {
+        "status": "saved" if saved_client_secret else "needs_client",
+        "preferred_mode": (
+            "saved"
+            if saved_client_secret
+            else "hosted_oauth"
+            if hexis_oauth_client_available
+            else "hosted_oauth_missing"
+        ),
+        "save_action": "save_gmail_client_secret",
+        "modes": [
+            {
+                "id": "hosted_oauth",
+                "label": "Built-in Google sign-in",
+                "available": hexis_oauth_client_available,
+                "description": (
+                    "Connect Gmail with the sign-in flow already configured for this Hexis build."
+                    if hexis_oauth_client_available
+                    else "This local build needs one-time Google setup before built-in sign-in can be used."
+                ),
+            },
+            {
+                "id": "advanced_self_hosted",
+                "label": "Walk me through setup",
+                "available": True,
+                "description": (
+                    "Step-by-step setup for a local or self-hosted Hexis install."
+                ),
+            },
+            {
+                "id": "upload_json",
+                "label": "Upload Google setup file",
+                "available": True,
+                "description": (
+                    "Pick the downloaded Google setup file. Hexis saves it privately and never sends it to the model."
+                ),
+            },
+            {
+                "id": "path",
+                "label": "Use downloaded setup file path",
+                "available": True,
+                "description": "CLI fallback for the downloaded setup file already on this machine.",
+            },
+            {
+                "id": "configured_env",
+                "label": "Use server-provided setup file",
+                "available": env_client_secret_available,
+                "description": (
+                    "Use GOOGLE_GMAIL_CLIENT_SECRET_PATH/JSON or GOOGLE_CLIENT_SECRET_PATH/JSON "
+                    "only after the user explicitly selects this developer mode."
+                ),
+            },
+        ],
+    }
 
     return {
         "kind": "connector_setup",
@@ -167,30 +353,64 @@ def _gmail_connector_setup_ui(
         "title": "Connect Gmail",
         "status": resolved_status,
         "summary": (
-            "Authorize Gmail through Google OAuth so Samantha can use only the provider "
-            "permissions you approve."
+            "Connect Gmail after you approve access with Google. Samantha only gets the email powers you choose."
         ),
         "capabilities": caps,
         "memory_policy": resolved_memory_policy,
         "memory_config_key": _GMAIL_MEMORY_POLICY_CONFIG_KEY,
-        "client_secret_saved": (
-            bool(client_secret_saved) if client_secret_saved is not None else bool(payload.get("client_secret_saved"))
-        ),
+        "heartbeat_digest_enabled": bool(resolved_heartbeat_digest_enabled),
+        "heartbeat_digest_config_key": _GMAIL_HEARTBEAT_DIGEST_CONFIG_KEY,
+        "autonomy_options": [
+            {
+                "id": "ask_only",
+                "label": "Only when I ask",
+                "description": (
+                    "Samantha can read/search Gmail during a live request, but heartbeats will not check email on their own."
+                ),
+                "heartbeat_digest_enabled": False,
+            },
+            {
+                "id": "heartbeat_digest",
+                "label": "Allow heartbeat checks",
+                "description": (
+                    "Samantha may check connected Gmail during hourly heartbeats for important messages and digests."
+                ),
+                "heartbeat_digest_enabled": True,
+            },
+        ],
+        "client_secret_saved": saved_client_secret,
         "credentials_saved": (
             bool(credentials_saved) if credentials_saved is not None else bool(payload.get("credentials_saved"))
         ),
-        "accepted_inputs": ["client_secret_path", "use_env_client_secret"],
+        "accepted_inputs": [
+            "hexis_oauth_client",
+            "advanced_self_hosted",
+            "client_secret_file",
+            "client_secret_path",
+            "use_env_client_secret",
+        ],
+        "hexis_oauth_client_available": hexis_oauth_client_available,
+        "env_client_secret_available": env_client_secret_available,
+        "credential_step": credential_step,
+        "credential_step_label": (
+            "Google sign-in ready"
+            if saved_client_secret or hexis_oauth_client_available
+            else "Google setup needed"
+        ),
         "docs_url": docs_url,
+        "setup_steps": list(GMAIL_SETUP_STEPS),
+        "technical_next_step": GMAIL_SETUP_TECHNICAL_NEXT_STEP,
         "authorization_url": authorization_url,
         "attempt_id": attempt_id,
         "connected_accounts": connected,
-        "next_step": next_step or pending_next_step or payload.get("next_step") or payload.get("user_next_step"),
+        "next_step": resolved_next_step,
         "primary_action": {
             "action": "connect_gmail",
-            "label": "Start Gmail authorization",
+            "label": "Start Google sign-in",
             "arguments": {
                 "capabilities": caps,
                 **({"memory_policy": resolved_memory_policy} if resolved_memory_policy else {}),
+                "heartbeat_digest_enabled": bool(resolved_heartbeat_digest_enabled),
             },
         },
         "completion_action": {
@@ -199,9 +419,8 @@ def _gmail_connector_setup_ui(
             "arguments": {"attempt_id": attempt_id} if attempt_id else {},
         },
         "safety_note": (
-            "Gmail OAuth controls provider permissions. Email remembering is a Hexis memory "
-            "configuration setting, not a Google scope. Sending, replying, labeling, spam triage, "
-            "and delete actions require explicit later authorization."
+            "Google controls the provider permissions. Email remembering is a Hexis memory setting. "
+            "Sending, replying, labeling, spam triage, and delete actions require explicit later authorization."
         ),
     }
 
@@ -376,6 +595,7 @@ class IntegrationSetupStatusHandler(ToolHandler):
                 connector_id if connector_id in _CHANNEL_CONNECTORS else None,
             )
         payload = _json(raw) or {}
+        enrich_gmail_setup_runtime(payload)
         payload["channel_runtime"] = _json(runtime_raw) or []
         connectors = payload.get("connectors", [])
         connected = payload.get("connections", [])
@@ -405,7 +625,7 @@ class StartIntegrationSetupHandler(ToolHandler):
             name="start_integration_setup",
             description=(
                 "Start a first-class connector setup attempt for manual/pairing/API-key channels "
-                "such as Slack, Telegram, or Signal. Gmail OAuth uses connect_gmail; Twitter/X "
+                "such as Slack, Telegram, or Signal. Gmail sign-in uses connect_gmail; Twitter/X "
                 "OAuth uses connect_twitter_x. Twitter/X archive import uses start_connector_backfill "
                 "after the account/archive path is available."
             ),
@@ -453,7 +673,7 @@ class StartIntegrationSetupHandler(ToolHandler):
         connector_id = _connector_id(arguments.get("connector_id"))
         if connector_id == "gmail":
             return ToolResult.error_result(
-                "Use connect_gmail for Gmail OAuth setup.",
+                "Use connect_gmail for Gmail setup.",
                 ToolErrorType.INVALID_PARAMS,
             )
         if connector_id == "twitter_x":
@@ -733,7 +953,7 @@ class GmailSetupStatusHandler(ToolHandler):
         return ToolSpec(
             name="gmail_setup_status",
             description=(
-                "Show Gmail connector setup status, granted capabilities, pending OAuth attempts, "
+                "Show Gmail connector setup status, granted capabilities, pending sign-in attempts, "
                 "and whether local credential files exist. Does not expose secrets."
             ),
             parameters={"type": "object", "properties": {}},
@@ -751,6 +971,7 @@ class GmailSetupStatusHandler(ToolHandler):
                 ToolErrorType.EXECUTION_FAILED,
             )
         from core.auth.google_gmail import (
+            has_hexis_gmail_oauth_client,
             has_saved_gmail_client_secret,
             load_default_credentials,
         )
@@ -761,10 +982,16 @@ class GmailSetupStatusHandler(ToolHandler):
                 "SELECT COALESCE(get_config_text($1), 'ask')",
                 _GMAIL_MEMORY_POLICY_CONFIG_KEY,
             )
+            heartbeat_digest_enabled = await conn.fetchval(
+                "SELECT COALESCE(get_config_bool($1), FALSE)",
+                _GMAIL_HEARTBEAT_DIGEST_CONFIG_KEY,
+            )
         payload = _json(raw) or {}
         payload["client_secret_saved"] = has_saved_gmail_client_secret()
+        payload["hexis_oauth_client_available"] = has_hexis_gmail_oauth_client()
         payload["credentials_saved"] = load_default_credentials() is not None
         payload["memory_policy"] = memory_policy
+        payload["heartbeat_digest_enabled"] = bool(heartbeat_digest_enabled)
 
         connected = [
             item
@@ -783,13 +1010,16 @@ class GmailSetupStatusHandler(ToolHandler):
         elif pending:
             display += "setup pending"
         elif payload["client_secret_saved"]:
-            display += "OAuth client saved; no account connected"
+            display += "Google setup saved; no account connected"
+        elif payload["hexis_oauth_client_available"]:
+            display += "Google sign-in ready; no account connected"
         else:
             display += "not connected"
 
         payload["ui"] = _gmail_connector_setup_ui(
             payload,
             memory_policy=memory_policy,
+            heartbeat_digest_enabled=heartbeat_digest_enabled,
             client_secret_saved=payload["client_secret_saved"],
             credentials_saved=payload["credentials_saved"],
         )
@@ -797,18 +1027,21 @@ class GmailSetupStatusHandler(ToolHandler):
 
 
 class ConnectGmailHandler(ToolHandler):
-    """Start a Gmail OAuth connection attempt."""
+    """Start a Gmail sign-in connection attempt."""
 
     @property
     def spec(self) -> ToolSpec:
         return ToolSpec(
             name="connect_gmail",
             description=(
-                "Start the Gmail connector OAuth setup flow. Use when the user asks to connect Gmail, "
+                "Start the Gmail connector setup flow. Use when the user asks to connect Gmail, "
                 "authorize email reading/search, label or spam triage, sending/replying, or delete powers. "
                 "Ask separately whether Gmail reads should be remembered; memory_policy is a Hexis config "
-                "choice, not a Google OAuth scope. "
-                "Prefer client_secret_path over pasted client JSON because tool arguments are audited."
+                "choice, not a Google permission. "
+                "Ask separately whether heartbeat may proactively check Gmail while the user is away; "
+                "heartbeat_digest_enabled is a Hexis autonomy config choice and defaults off. "
+                "Use the built-in Google sign-in path when configured. If it is not configured, "
+                "the structured setup UI walks the user through the one-time local setup."
             ),
             parameters={
                 "type": "object",
@@ -829,19 +1062,35 @@ class ConnectGmailHandler(ToolHandler):
                         "enum": ["remember", "forget"],
                         "description": (
                             "Hexis-side policy for whether email contents may feed ingestion/memory by default. "
-                            "This is stored in config and is not sent to Google as an OAuth capability."
+                            "This is stored in config and is not sent to Google as a provider permission."
+                        ),
+                    },
+                    "heartbeat_digest_enabled": {
+                        "type": "boolean",
+                        "description": (
+                            "Hexis-side autonomy grant for background heartbeat Gmail checks. "
+                            "Default is false. Only set true after the user explicitly authorizes "
+                            "Samantha to check Gmail while they are away."
                         ),
                     },
                     "client_secret_path": {
                         "type": "string",
-                        "description": "Local path to the Google OAuth Desktop client JSON file.",
+                        "description": "Local path to the downloaded Google setup JSON file.",
                     },
                     "use_env_client_secret": {
                         "type": "boolean",
                         "default": False,
                         "description": (
                             "Use GOOGLE_GMAIL_CLIENT_SECRET_PATH/JSON or GOOGLE_CLIENT_SECRET_PATH/JSON. "
-                            "Only set true after the user explicitly asks to use environment-provided client credentials."
+                            "Only set true after the user explicitly asks to use a server-provided setup file."
+                        ),
+                    },
+                    "use_hexis_oauth_client": {
+                        "type": "boolean",
+                        "default": True,
+                        "description": (
+                            "Use the product-provided Gmail sign-in client when configured. "
+                            "This is the default user-friendly path and still shows Google's consent screen."
                         ),
                     },
                     "source_channel": {
@@ -886,11 +1135,40 @@ class ConnectGmailHandler(ToolHandler):
                     ToolErrorType.EXECUTION_FAILED,
                 )
 
+        heartbeat_digest_raw = None
+        if "heartbeat_digest_enabled" in arguments:
+            heartbeat_digest_raw = arguments["heartbeat_digest_enabled"]
+        elif "autonomous_gmail_digest" in arguments:
+            heartbeat_digest_raw = arguments.get("autonomous_gmail_digest")
+        elif "enable_heartbeat_digest" in arguments:
+            heartbeat_digest_raw = arguments.get("enable_heartbeat_digest")
+        heartbeat_digest_enabled = _gmail_heartbeat_digest_from_payload(
+            {},
+            heartbeat_digest_raw,
+        )
+        if heartbeat_digest_raw is not None and heartbeat_digest_enabled is None:
+            return ToolResult.error_result(
+                "heartbeat_digest_enabled must be a boolean.",
+                ToolErrorType.INVALID_PARAMS,
+            )
+        if heartbeat_digest_enabled is not None:
+            try:
+                await _persist_gmail_heartbeat_digest_enabled(
+                    context.registry.pool,
+                    heartbeat_digest_enabled,
+                )
+            except Exception as exc:
+                return ToolResult.error_result(
+                    f"Could not save Gmail heartbeat authorization: {exc}",
+                    ToolErrorType.EXECUTION_FAILED,
+                )
+
         try:
             started = await start_gmail_oauth(
                 context.registry.pool,
                 capabilities=arguments.get("capabilities"),
                 client_secret_path=arguments.get("client_secret_path"),
+                use_hexis_oauth_client=bool(arguments.get("use_hexis_oauth_client", True)),
                 use_env_client_secret=bool(arguments.get("use_env_client_secret", False)),
                 source_channel=arguments.get("source_channel"),
                 source_session_id=arguments.get("source_session_id") or context.session_id,
@@ -900,11 +1178,13 @@ class ConnectGmailHandler(ToolHandler):
 
         if isinstance(started, dict):
             started["memory_policy"] = memory_policy
+            started["heartbeat_digest_enabled"] = bool(heartbeat_digest_enabled)
             started["ui"] = _gmail_connector_setup_ui(
                 started,
                 status=str(started.get("status") or "needs_client_secret"),
                 capabilities=arguments.get("capabilities"),
                 memory_policy=memory_policy,
+                heartbeat_digest_enabled=heartbeat_digest_enabled,
                 client_secret_saved=bool(started.get("client_secret_saved")),
                 credentials_saved=False,
                 next_step=started.get("next_step"),
@@ -917,18 +1197,20 @@ class ConnectGmailHandler(ToolHandler):
         assert isinstance(started, GmailOAuthStart)
         payload = started.attempt_payload
         payload["memory_policy"] = memory_policy
+        payload["heartbeat_digest_enabled"] = bool(heartbeat_digest_enabled)
         payload["ui"] = _gmail_connector_setup_ui(
             payload,
             status="pending_authorization",
             capabilities=payload.get("requested_capabilities") or arguments.get("capabilities"),
             memory_policy=memory_policy,
+            heartbeat_digest_enabled=heartbeat_digest_enabled,
             pending_attempt=payload,
             client_secret_saved=True,
             credentials_saved=False,
             next_step=payload.get("user_next_step") or payload.get("next_step"),
         )
         display = (
-            "Gmail authorization started.\n"
+            "Google sign-in started for Gmail.\n"
             f"Attempt: {payload['attempt_id']}\n"
             f"{payload['authorization_url']}\n\n"
             "After approving, paste the full redirected localhost URL back here."
@@ -937,14 +1219,14 @@ class ConnectGmailHandler(ToolHandler):
 
 
 class CompleteGmailConnectionHandler(ToolHandler):
-    """Complete a pending Gmail OAuth attempt from the pasted redirect URL."""
+    """Complete a pending Gmail sign-in attempt from the pasted redirect URL."""
 
     @property
     def spec(self) -> ToolSpec:
         return ToolSpec(
             name="complete_gmail_connection",
             description=(
-                "Complete Gmail OAuth setup after the user pastes the full redirected localhost URL "
+                "Complete Gmail sign-in setup after the user pastes the full redirected localhost URL "
                 "or authorization code from Google."
             ),
             parameters={
@@ -1001,14 +1283,21 @@ class CompleteGmailConnectionHandler(ToolHandler):
                     "SELECT COALESCE(get_config_text($1), 'ask')",
                     _GMAIL_MEMORY_POLICY_CONFIG_KEY,
                 )
+                heartbeat_digest_enabled = await conn.fetchval(
+                    "SELECT COALESCE(get_config_bool($1), FALSE)",
+                    _GMAIL_HEARTBEAT_DIGEST_CONFIG_KEY,
+                )
         except Exception:
             memory_policy = None
+            heartbeat_digest_enabled = False
         output["memory_policy"] = memory_policy
+        output["heartbeat_digest_enabled"] = bool(heartbeat_digest_enabled)
         output["ui"] = _gmail_connector_setup_ui(
             output,
             status="connected",
             capabilities=completed.capabilities,
             memory_policy=memory_policy,
+            heartbeat_digest_enabled=heartbeat_digest_enabled,
             connected_accounts=[
                 {
                     "account_key": completed.account_key,
@@ -1078,8 +1367,8 @@ class RevokeGmailConnectionHandler(ToolHandler):
         payload["local_credentials_deleted"] = True
         payload["remote_revocation"] = "not_attempted"
         payload["next_step"] = (
-            "Local Gmail credentials are removed. To remove the Google-side OAuth grant too, "
-            "open your Google Account security settings and remove Hexis/your OAuth client from third-party access."
+            "Local Gmail credentials are removed. To remove provider-side access too, "
+            "open your Google Account security settings and remove Hexis from third-party access."
         )
         return ToolResult.success_result(
             payload,

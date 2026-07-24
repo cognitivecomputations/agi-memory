@@ -18,6 +18,12 @@ from tenacity import (
 from tests.utils import _db_dsn
 
 
+@pytest.fixture(autouse=True)
+def disable_bundled_gmail_oauth_client(monkeypatch):
+    """Keep tests from consuming the real bundled Google Desktop client."""
+    monkeypatch.setenv("HEXIS_GMAIL_OAUTH_DISABLE_BUNDLED", "1")
+
+
 async def _connect_with_retry(dsn: str, *, wait_seconds: int, timeout_seconds: float) -> asyncpg.Connection:
     retrying = AsyncRetrying(
         stop=stop_after_delay(wait_seconds),

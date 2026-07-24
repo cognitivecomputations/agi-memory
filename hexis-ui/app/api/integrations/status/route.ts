@@ -29,6 +29,21 @@ function errorMessage(error: unknown): string {
 
 export async function GET(): Promise<Response> {
   try {
+    const upstream = await fetch(resolveHexisApiUrl("/api/integrations/status"), {
+      method: "GET",
+      headers: hexisApiHeaders(),
+      cache: "no-store",
+    });
+    if (upstream.ok) {
+      const payload = await upstream.text();
+      return jsonProxyResponse(upstream, payload);
+    }
+    console.warn("Integration status upstream returned", upstream.status);
+  } catch (error: unknown) {
+    console.warn("Integration status upstream unavailable; falling back to DB:", error);
+  }
+
+  try {
     const rows = await prisma.$queryRawUnsafe<Row[]>(`
       SELECT
         integration_status(NULL) AS integration,

@@ -20,6 +20,7 @@ from skills.loader import (
     load_skills,
     load_skills_from_dir,
 )
+from tests.utils import get_test_identifier
 
 pytestmark = [pytest.mark.asyncio(loop_scope="session")]
 
@@ -192,6 +193,103 @@ class TestSkillRuntimeSelection:
         assert {"web_search", "web_fetch"} <= selection.allowed_tool_names
         assert "twitter_search" not in selection.allowed_tool_names
         assert "youtube_channel_stats" not in selection.allowed_tool_names
+
+    async def test_default_heartbeat_keeps_email_digest_gated_by_autonomy_config(self, db_pool):
+        from core.tools import ToolContext, create_default_registry
+        from services.skill_runtime import select_skills
+
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM config WHERE key = 'integrations.gmail.heartbeat_digest_enabled'"
+            )
+
+        registry = create_default_registry(db_pool)
+        selection = await select_skills(
+            registry,
+            ToolContext.HEARTBEAT,
+            query="run heartbeat cycle",
+        )
+        names = [s.name for s in selection.skills]
+
+        assert "email-digest" not in names
+        assert not {"gmail_setup_status", "email_list", "email_read", "email_search"} & (
+            selection.allowed_tool_names
+        )
+
+    async def test_heartbeat_exposes_email_digest_after_explicit_autonomous_gmail_authorization(self, db_pool):
+        from core.tools import ToolContext, create_default_registry
+        from services.skill_runtime import select_skills
+
+        marker = get_test_identifier("heartbeat-gmail-digest")
+        account = f"{marker}@example.com"
+
+        try:
+            async with db_pool.acquire() as conn:
+                raw_attempt = await conn.fetchval(
+                    """
+                    SELECT start_connection_attempt(
+                        'gmail',
+                        '["read", "search"]'::jsonb,
+                        ARRAY[]::text[],
+                        '{}'::jsonb,
+                        NULL,
+                        NULL,
+                        'test',
+                        $1,
+                        CURRENT_TIMESTAMP + INTERVAL '10 minutes'
+                    )
+                    """,
+                    marker,
+                )
+                attempt = json.loads(raw_attempt) if isinstance(raw_attempt, str) else raw_attempt
+                await conn.fetchval(
+                    """
+                    SELECT complete_connection_attempt(
+                        $1::uuid,
+                        $2,
+                        $2,
+                        'integration.gmail.default',
+                        $3::text[],
+                        '["read", "search"]'::jsonb,
+                        '{"test": true}'::jsonb
+                    )
+                    """,
+                    attempt["attempt_id"],
+                    account,
+                    [
+                        "https://www.googleapis.com/auth/userinfo.email",
+                        "https://www.googleapis.com/auth/gmail.readonly",
+                    ],
+                )
+                await conn.execute(
+                    "SELECT set_config('integrations.gmail.heartbeat_digest_enabled', 'true'::jsonb)"
+                )
+
+            registry = create_default_registry(db_pool)
+            selection = await select_skills(
+                registry,
+                ToolContext.HEARTBEAT,
+                query="run heartbeat cycle",
+            )
+            names = [s.name for s in selection.skills]
+
+            assert "email-digest" in names
+            assert {"gmail_setup_status", "email_list", "email_read", "email_search"} <= (
+                selection.allowed_tool_names
+            )
+        finally:
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    "DELETE FROM integration_connections WHERE connector_id = 'gmail' AND account_key = $1",
+                    account,
+                )
+                await conn.execute(
+                    "DELETE FROM connection_attempts WHERE source_session_id = $1",
+                    marker,
+                )
+                await conn.execute(
+                    "DELETE FROM config WHERE key = 'integrations.gmail.heartbeat_digest_enabled'"
+                )
 
     async def test_explicit_skill_request_activates_skill_authoring(self, db_pool):
         from core.tools import ToolContext, create_default_registry

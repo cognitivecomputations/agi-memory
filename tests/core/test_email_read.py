@@ -104,6 +104,7 @@ class TestEmailListSpec:
         assert spec.is_read_only is True
         assert spec.energy_cost == 2
         assert spec.optional is True
+        assert ToolContext.HEARTBEAT in spec.allowed_contexts
 
     def test_spec_parameters(self):
         spec = EmailListHandler().spec
@@ -121,6 +122,7 @@ class TestEmailReadSpec:
         assert spec.category == ToolCategory.EMAIL
         assert spec.is_read_only is True
         assert "message_id" in spec.parameters["required"]
+        assert ToolContext.HEARTBEAT in spec.allowed_contexts
 
     def test_spec_parameters(self):
         spec = EmailReadHandler().spec
@@ -137,6 +139,7 @@ class TestEmailSearchSpec:
         assert spec.category == ToolCategory.EMAIL
         assert spec.is_read_only is True
         assert "query" in spec.parameters["required"]
+        assert ToolContext.HEARTBEAT in spec.allowed_contexts
 
 
 # ---------------------------------------------------------------------------

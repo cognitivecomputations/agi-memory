@@ -122,7 +122,19 @@ async def test_integration_setup_status_tool_is_registered(db_pool):
     assert result.output["channel_runtime"][0]["status"] == "running"
 
 
-async def test_integration_setup_status_tool_lists_connectors(db_pool):
+async def test_integration_setup_status_tool_lists_connectors(db_pool, monkeypatch):
+    for name in (
+        "HEXIS_GMAIL_OAUTH_CLIENT_ID",
+        "HEXIS_GMAIL_OAUTH_CLIENT_SECRET",
+        "GOOGLE_GMAIL_OAUTH_CLIENT_ID",
+        "GOOGLE_GMAIL_OAUTH_CLIENT_SECRET",
+        "GOOGLE_GMAIL_CLIENT_SECRET_JSON",
+        "GOOGLE_CLIENT_SECRET_JSON",
+        "GOOGLE_GMAIL_CLIENT_SECRET_PATH",
+        "GOOGLE_CLIENT_SECRET_PATH",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
     registry = create_default_registry(db_pool)
     result = await registry.execute(
         "integration_setup_status",
@@ -137,6 +149,10 @@ async def test_integration_setup_status_tool_lists_connectors(db_pool):
     assert result.success
     ids = {item["id"] for item in result.output["connectors"]}
     assert {"gmail", "slack", "telegram", "signal"} <= ids
+    gmail = next(item for item in result.output["connectors"] if item["id"] == "gmail")
+    assert gmail["setup_manifest"]["hexis_oauth_client_available"] is False
+    assert gmail["setup_manifest"]["env_client_secret_available"] is False
+    assert "Open the Google setup page." in gmail["setup_manifest"]["setup_steps"]
 
 
 async def test_start_configure_and_verify_telegram_channel_setup(db_pool, monkeypatch):

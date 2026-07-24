@@ -69,11 +69,15 @@ INSERT INTO integration_connectors (
     }'::jsonb,
     '{
       "flow": "oauth2_authorization_code_pkce",
-      "redirect_uri": "http://localhost:1",
-      "requires_user_client_secret": true,
-      "secret_storage": "~/.hexis/auth",
-      "supported_surfaces": ["chat", "cli", "web", "channels"],
-      "default_capabilities": ["read", "search"],
+      "redirect_uri": "http://localhost",
+      "requires_user_client_secret": false,
+      "preferred_credential_mode": "hosted_oauth",
+	      "credential_modes": ["hosted_oauth", "advanced_self_hosted", "upload_json", "path", "configured_env"],
+	      "hosted_oauth_configured": false,
+	      "setup_label": "Gmail sign-in",
+	      "secret_storage": "~/.hexis/auth",
+	      "supported_surfaces": ["chat", "cli", "web", "channels"],
+	      "default_capabilities": ["read", "search"],
       "capability_order": ["read", "search", "ingest", "label", "spam_triage", "send", "reply", "delete"],
       "required_scopes": ["https://www.googleapis.com/auth/userinfo.email"],
       "scope_order": [
@@ -97,14 +101,27 @@ INSERT INTO integration_connectors (
         "spam": "spam_triage",
         "modify": "label",
         "labels": "label",
-        "write": "send",
-        "respond": "reply"
-      },
-      "notes": [
-        "Create a Google OAuth Desktop client once.",
-        "Paste the full localhost redirect URL back into the conversation.",
-        "Long-lived tokens are stored outside Postgres in the private auth store."
-      ]
+	        "write": "send",
+	        "respond": "reply"
+	      },
+	      "setup_steps": [
+	        "Open the Google setup page.",
+	        "Create or choose a project named Hexis.",
+	        "Enable the Gmail API for that project.",
+	        "Set up the app consent screen. For a personal Gmail account, choose External and add your Gmail address as a test user if Google asks.",
+	        "On the Credentials page, click Create credentials, choose Google''s sign-in client option, set Application type to Desktop app, and name it Hexis.",
+	        "Download the setup file Google gives you.",
+	        "Upload that setup file here, then start Google sign-in."
+	      ],
+	      "technical_next_step": "For developers and hosted builds: configure HEXIS_GMAIL_OAUTH_CLIENT_ID and HEXIS_GMAIL_OAUTH_CLIENT_SECRET in the Hexis API environment to make built-in Google sign-in available.",
+	      "notes": [
+	        "Use the structured Gmail setup UI to choose provider powers and email memory policy before Google sign-in.",
+	        "The default user path is built-in Google sign-in when configured for the build.",
+	        "If this local build needs setup, the UI should walk the user through Google Cloud step by step and accept the downloaded setup file.",
+	        "CLI surfaces can accept a local JSON path directly after the guide explains what file to download.",
+	        "Paste the full localhost redirect URL back into the conversation.",
+	        "Long-lived tokens are stored outside Postgres in the private auth store."
+	      ]
     }'::jsonb,
     'https://console.cloud.google.com/apis/credentials',
     '{"provider": "google", "seeded_by": "db/77_functions_integrations.sql"}'::jsonb
@@ -125,6 +142,11 @@ INSERT INTO config_defaults (key, value, description) VALUES
         'integrations.gmail.memory_policy',
         '"ask"'::jsonb,
         'Controls whether Gmail reads may feed Hexis ingestion and memory by default; ask until the user chooses remember or forget.'
+    ),
+    (
+        'integrations.gmail.heartbeat_digest_enabled',
+        'false'::jsonb,
+        'Controls whether heartbeat may proactively check connected Gmail for digests or important messages without a live user turn.'
     )
 ON CONFLICT (key) DO UPDATE SET
     value = EXCLUDED.value,
@@ -321,7 +343,7 @@ INSERT INTO integration_connectors (
         "reply": "send",
         "respond": "send"
       },
-      "user_next_step": "Create or choose an X Developer app with OAuth 2.0 enabled, register http://localhost:1 as a callback URI, then start Twitter/X connection setup. Request only the capabilities you want; archive import is still available through a local export path."
+      "user_next_step": "Create or choose an X Developer app, enable user sign-in, register http://localhost:1 as the callback URI, then start Twitter/X connection setup. Request only the capabilities you want; archive import is still available through a local export path."
     }'::jsonb,
     'https://docs.x.com',
     '{"provider": "twitter_x", "twitter_x_live_oauth": true, "twitter_x_archive_import": true, "seeded_by": "db/77_functions_integrations.sql"}'::jsonb

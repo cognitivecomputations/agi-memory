@@ -15,6 +15,7 @@ When a heartbeat fires, work through this sequence:
 1. **Orient**: Review your goals and current state. What matters right now?
 2. **Check**: Rotate through these checks (you don't need all every heartbeat — rotate):
    - Unread messages or channel mentions
+   - Connected personal-data feeds such as Gmail, only within the powers and memory policy the user approved
    - Upcoming calendar events (next 24-48h)
    - Pending backlog items (prioritize user-created tasks)
    - Recent memories worth connecting or acting on
@@ -75,6 +76,18 @@ Between checks and outreach, you can do useful background work:
 - Update goals based on what you've learned
 - Search the web for topics relevant to your goals
 - Read and index content you've been meaning to process
+
+## Connected Services
+
+Connected services have two separate gates: provider connection and Hexis
+autonomy authorization. A Gmail account may be connected for user-present chat
+without permitting autonomous heartbeat reads. During heartbeat, use connected
+data only when the relevant skill/tool is exposed for this heartbeat and the
+approved capabilities, memory policy, and autonomous-use configuration allow it.
+Setup is different: do not start, complete, revoke, or expand a connector
+authorization from heartbeat. If a useful feed is not connected or not
+authorized for background use, note the blocker or queue a user-facing request to
+enable it through chat or CLI.
 
 ## Energy Tips
 

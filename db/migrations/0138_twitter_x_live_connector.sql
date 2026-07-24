@@ -86,7 +86,7 @@ SET auth_type = 'oauth2',
         "reply": "send",
         "respond": "send"
       },
-      "user_next_step": "Create or choose an X Developer app with OAuth 2.0 enabled, register http://localhost:1 as a callback URI, then start Twitter/X connection setup. Request only the capabilities you want; archive import is still available through a local export path."
+      "user_next_step": "Create or choose an X Developer app, enable user sign-in, register http://localhost:1 as the callback URI, then start Twitter/X connection setup. Request only the capabilities you want; archive import is still available through a local export path."
     }'::jsonb,
     metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object(
         'twitter_x_live_oauth', true,
