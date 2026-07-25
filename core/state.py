@@ -62,6 +62,13 @@ async def run_scheduled_tasks(conn, limit: int = 25) -> dict[str, Any] | None:
     return _coerce_json(raw)
 
 
+async def ambient_responsibility_status(conn) -> dict[str, Any] | None:
+    raw = await conn.fetchval("SELECT ambient_responsibility_status()")
+    if raw is None:
+        return None
+    return _coerce_json(raw)
+
+
 async def recompute_cron_next_runs(conn, task_ids: list[str]) -> int:
     """Ask Postgres to recompute cron next-run placeholders.
 

@@ -43,6 +43,7 @@ from services.connector_cognition import (
     run_user_model_synthesis_step,
 )
 from services.gmail_backfill import run_gmail_backfill_step
+from services.ambient_responsibilities import run_ambient_responsibility_step
 from services.summarization import run_memory_summarization_step
 from services.skill_improvement import run_skill_improvement_review_step
 from services.reconsolidation import run_reconsolidation_step
@@ -689,6 +690,7 @@ class MaintenanceWorker:
             ("inbox_poll", self._run_inbox_poll),
             ("outbox_delivery", self._run_outbox_delivery),
             ("scheduled_tasks", self._run_scheduled_tasks),
+            ("ambient_responsibilities", self._run_ambient_responsibilities),
             ("hmx_reembedding", self._run_hmx_reembedding),
             ("subconscious_maintenance", self._run_maintenance_if_due),
             ("subconscious_decider", self._run_subconscious_if_due),
@@ -819,6 +821,30 @@ class MaintenanceWorker:
             if executed:
                 return payload
             return {"skipped": True, "reason": "no_due_scheduled_tasks", "payload": payload}
+
+    async def _run_ambient_responsibilities(self) -> dict[str, Any]:
+        if not self.pool:
+            return {"skipped": True, "reason": "no_pool"}
+        payload = await run_ambient_responsibility_step(self.pool)
+        if not isinstance(payload, dict):
+            return {"skipped": True, "reason": "no_ambient_payload"}
+        outbox_messages = payload.get("outbox_messages")
+        if isinstance(outbox_messages, list) and outbox_messages:
+            async with self.pool.acquire() as conn:
+                delivered = await self._tee_outbox_to_web_inbox(conn, outbox_messages)
+                if delivered:
+                    payload["web_inbox_delivered"] = delivered
+            await self._publish_outbox(outbox_messages)
+        if not payload.get("skipped"):
+            try:
+                await Gateway(self.pool).record(
+                    EventSource.CRON,
+                    "cron::ambient_responsibility",
+                    {"summary": {k: v for k, v in payload.items() if k != "outbox_messages"}},
+                )
+            except Exception:
+                logger.debug("Gateway record failed (non-fatal)", exc_info=True)
+        return payload
 
     async def _run_maintenance_if_due(self) -> dict[str, Any]:
         if not self.pool:

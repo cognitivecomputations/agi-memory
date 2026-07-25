@@ -104,6 +104,11 @@ def _connector_setup_ui(output: Any) -> dict[str, Any] | None:
     return ui
 
 
+def _connector_setup_requires_action(ui: dict[str, Any]) -> bool:
+    status = str(ui.get("status") or "").strip().lower()
+    return status not in {"connected", "complete", "verified"}
+
+
 def _looks_like_json_path(value: str) -> bool:
     text = value.strip()
     return (text.startswith("/") or text.startswith("~/")) and text.lower().endswith(".json")
@@ -503,7 +508,7 @@ async def _run_chat(dsn: str, *, verbose: bool = False, debug: bool = False,
                         ui = _connector_setup_ui(event.data.get("output"))
                         if success:
                             console.print(f" [ok]done[/ok][dim]{dur_str}[/dim]")
-                            if ui:
+                            if ui and _connector_setup_requires_action(ui):
                                 _print_connector_setup_ui(ui)
                             if verbose:
                                 display = event.data.get("display_output") or event.data.get("output")
@@ -512,12 +517,12 @@ async def _run_chat(dsn: str, *, verbose: bool = False, debug: bool = False,
                         else:
                             error_msg = event.data.get("error", "")
                             console.print(f" [fail]failed[/fail][dim]{dur_str}[/dim] [muted]{error_msg[:120]}[/muted]")
-                            if ui:
+                            if ui and _connector_setup_requires_action(ui):
                                 _print_connector_setup_ui(ui)
 
                     elif event.event == AgentEvent.UI_ARTIFACT:
                         ui = _connector_setup_ui(event.data)
-                        if ui:
+                        if ui and _connector_setup_requires_action(ui):
                             _print_connector_setup_ui(ui)
 
                     elif event.event == AgentEvent.LOOP_START:

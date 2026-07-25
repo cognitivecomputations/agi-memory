@@ -690,6 +690,7 @@ def create_default_registry(pool: "asyncpg.Pool") -> ToolRegistry:
     from .goals import create_goal_tools
     from .backlog import create_backlog_tools
     from .cron import create_cron_tools
+    from .responsibilities import create_responsibility_tools
     from .sessions import create_session_tools
     from .contacts import create_contact_tools
     from .image_gen import create_image_gen_tools
@@ -768,6 +769,7 @@ def create_default_registry(pool: "asyncpg.Pool") -> ToolRegistry:
     builder.add_all(create_goal_tools())
     builder.add_all(create_backlog_tools())
     builder.add_all(create_cron_tools())
+    builder.add_all(create_responsibility_tools())
     builder.add_all(create_session_tools())
     builder.add_all(create_contact_tools())
     builder.add_all(create_image_gen_tools())

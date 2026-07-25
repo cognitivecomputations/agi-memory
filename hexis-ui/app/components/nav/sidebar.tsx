@@ -2,6 +2,7 @@
 
 import {
   Activity,
+  BellRing,
   Brain,
   FilePlus2,
   FolderOpen,
@@ -35,6 +36,7 @@ const navItems = [
   { href: "/", label: "Overview", icon: LayoutDashboard },
   { href: "/chat", label: "Conversation", icon: MessageCircle },
   { href: "/goals", label: "Goals", icon: Target },
+  { href: "/responsibilities", label: "Responsibilities", icon: BellRing },
   { href: "/memories", label: "Memory", icon: Brain },
   { href: "/user-model", label: "User Model", icon: UserRound },
   { href: "/documents", label: "Documents", icon: FolderOpen },

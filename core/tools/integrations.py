@@ -348,16 +348,20 @@ def _gmail_connector_setup_ui(
         ],
     }
 
+    connected_status = resolved_status == "connected"
+
     return {
         "kind": "connector_setup",
         "version": 1,
         "id": f"connector_setup:gmail:{attempt_id or resolved_status}",
         "connector_id": "gmail",
         "display_name": "Gmail",
-        "title": "Connect Gmail",
+        "title": "Gmail Connected" if connected_status else "Connect Gmail",
         "status": resolved_status,
         "summary": (
-            "Connect Gmail after you approve access with Google. Samantha only gets the email powers you choose."
+            "Gmail is connected. Samantha can use only the email powers you approved."
+            if connected_status
+            else "Connect Gmail after you approve access with Google. Samantha only gets the email powers you choose."
         ),
         "capabilities": caps,
         "memory_policy": resolved_memory_policy,
@@ -397,7 +401,9 @@ def _gmail_connector_setup_ui(
         "env_client_secret_available": env_client_secret_available,
         "credential_step": credential_step,
         "credential_step_label": (
-            "Google sign-in ready"
+            "connected"
+            if connected_status
+            else "Google sign-in ready"
             if saved_client_secret or hexis_oauth_client_available
             else "Google setup needed"
         ),
@@ -1614,7 +1620,9 @@ class StartGmailBackfillHandler(ToolHandler):
             description=(
                 "Queue Gmail message history ingestion into raw source documents and the memory ingestion queue. "
                 "Use after Gmail is connected when the user asks Hexis to learn from email, import email history, "
-                "or ingest a Gmail search/label. This only reads Gmail; message sending, replying, labeling, "
+                "or ingest a Gmail search/label. Do not use this for live requests like 'check my email now' "
+                "or 'read a batch of emails'; use email_list/email_search/email_read first. "
+                "This only reads Gmail; message sending, replying, labeling, "
                 "and spam actions require separate tools and explicit authorization."
             ),
             parameters={

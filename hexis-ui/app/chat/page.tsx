@@ -659,6 +659,14 @@ function connectorSetupUiFromPayload(payload: unknown): ConnectorSetupUi | null 
   return normalizeConnectorSetupUi(asRecord(asRecord(payload).output).ui);
 }
 
+const NON_ACTIONABLE_CONNECTOR_SETUP_STATUSES = new Set(["connected", "complete", "verified"]);
+
+function connectorSetupNeedsUserAction(ui: ConnectorSetupUi | null): boolean {
+  if (!ui) return false;
+  const status = (ui.status || "").toLowerCase();
+  return !NON_ACTIONABLE_CONNECTOR_SETUP_STATUSES.has(status);
+}
+
 function uiArtifactKey(ui: ChatUiArtifact): string {
   if (ui.id) return ui.id;
   return `${ui.kind}:${ui.connector_id}:${ui.attempt_id || ui.status || "setup"}`;
@@ -1003,7 +1011,11 @@ export default function ChatPage() {
       const nextUi = connectorSetupUiFromPayload(payload);
       if (nextUi) {
         replaceAssistantUi(assistantId, currentUi, nextUi);
-        setActiveConnectorSetup({ assistantId, ui: nextUi });
+        if (connectorSetupNeedsUserAction(nextUi)) {
+          setActiveConnectorSetup({ assistantId, ui: nextUi });
+        } else {
+          setActiveConnectorSetup(null);
+        }
       }
       return payload;
     } catch (error: unknown) {
@@ -1047,7 +1059,11 @@ export default function ChatPage() {
             (currentUi.connected_accounts?.length || 0);
         if (changed) {
           replaceAssistantUi(assistantId, currentUi, nextUi);
-          setActiveConnectorSetup({ assistantId, ui: nextUi });
+          if (connectorSetupNeedsUserAction(nextUi)) {
+            setActiveConnectorSetup({ assistantId, ui: nextUi });
+          } else {
+            setActiveConnectorSetup(null);
+          }
         }
       }
       return payload;
@@ -1622,9 +1638,13 @@ export default function ChatPage() {
               raw: payload,
               ts: Date.now(),
             });
-            if (connectorUi) {
+            if (connectorUi && connectorSetupNeedsUserAction(connectorUi)) {
               upsertAssistantUi(assistantMessage.id, connectorUi);
               setActiveConnectorSetup({ assistantId: assistantMessage.id, ui: connectorUi });
+            } else if (connectorUi) {
+              setActiveConnectorSetup((current) =>
+                current?.ui.connector_id === connectorUi.connector_id ? null : current
+              );
             }
             if (isSearchToolMisconfigured(detail)) {
               setShowSearchConfig(true);
@@ -1648,9 +1668,13 @@ export default function ChatPage() {
               raw: payload,
               ts: Date.now(),
             });
-            if (connectorUi) {
+            if (connectorUi && connectorSetupNeedsUserAction(connectorUi)) {
               upsertAssistantUi(assistantMessage.id, connectorUi);
               setActiveConnectorSetup({ assistantId: assistantMessage.id, ui: connectorUi });
+            } else if (connectorUi) {
+              setActiveConnectorSetup((current) =>
+                current?.ui.connector_id === connectorUi.connector_id ? null : current
+              );
             }
           }
 

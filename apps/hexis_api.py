@@ -9,6 +9,7 @@ Endpoints:
     GET  /v1/models — Active chat model in OpenAI-compatible form
     POST /v1/chat/completions — OpenAI-compatible buffered/streaming chat
     GET  /api/integrations/status — Connector status and runtime setup hints
+    GET  /api/responsibilities — Ambient responsibility status and controls
     GET  /api/status — Rich agent status
     GET  /health     — Simple health check
 """
@@ -168,6 +169,14 @@ class IngestUrlRequest(BaseModel):
 
 
 class IntegrationActionRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    action: str
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    source_session_id: str | None = None
+
+
+class ResponsibilityActionRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     action: str
@@ -862,6 +871,41 @@ def _tool_result_payload(result: Any) -> dict[str, Any]:
     }
 
 
+async def _tee_outbox_to_web_inbox(pool: asyncpg.Pool, messages: list[Any]) -> int:
+    if not messages:
+        return 0
+    async with pool.acquire() as conn:
+        enabled = await conn.fetchval(
+            "SELECT COALESCE(get_config_bool('channel.web_inbox.enabled'), TRUE)"
+        )
+        if not bool(enabled):
+            return 0
+        delivered = 0
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            payload = msg.get("payload") if isinstance(msg.get("payload"), dict) else {}
+            delivery_info = payload.get("delivery") or msg.get("delivery")
+            if isinstance(delivery_info, dict) and delivery_info.get("mode") == "silent":
+                continue
+            body = {
+                "id": msg.get("message_id") or msg.get("id"),
+                "kind": msg.get("kind"),
+                "payload": payload,
+            }
+            if msg.get("delivery") is not None:
+                body["delivery"] = msg.get("delivery")
+            if msg.get("task_name") is not None:
+                body["task_name"] = msg.get("task_name")
+            web_id = await conn.fetchval(
+                "SELECT web_inbox_deliver($1::jsonb)",
+                json.dumps(body, default=str),
+            )
+            if web_id:
+                delivered += 1
+        return delivered
+
+
 @app.post("/api/integrations/action")
 async def integration_action(req: IntegrationActionRequest):
     """Execute first-class integration setup controls through Python drivers.
@@ -993,6 +1037,84 @@ async def integration_action(req: IntegrationActionRequest):
     result = await registry.execute(tool_name, args, context)
     status_code = 200 if result.success else 400
     return JSONResponse(jsonable_encoder(_tool_result_payload(result)), status_code=status_code)
+
+
+@app.get("/api/responsibilities")
+async def responsibilities(status: str | None = None, limit: int = 50):
+    pool = _pool
+    if pool is None:
+        return JSONResponse({"error": "Server not ready (no DB pool)"}, status_code=503)
+    limit = max(1, min(int(limit or 50), 200))
+    async with pool.acquire() as conn:
+        await conn.fetchval("SELECT refresh_ambient_responsibility_blockers()")
+        status_raw = await conn.fetchval("SELECT ambient_responsibility_status()")
+        rows_raw = await conn.fetchval("SELECT list_ambient_responsibilities($1, $2::int)", status, limit)
+    status_payload = _json_value(status_raw) or {}
+    rows = _json_value(rows_raw) or []
+    return JSONResponse(jsonable_encoder({
+        "status": status_payload,
+        "responsibilities": rows if isinstance(rows, list) else [],
+        "limit": limit,
+    }))
+
+
+@app.get("/api/responsibilities/{responsibility_id}")
+async def responsibility_detail(responsibility_id: str):
+    pool = _pool
+    if pool is None:
+        return JSONResponse({"error": "Server not ready (no DB pool)"}, status_code=503)
+    try:
+        parsed = uuid.UUID(responsibility_id)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="responsibility_id must be a valid UUID")
+    async with pool.acquire() as conn:
+        await conn.fetchval("SELECT refresh_ambient_responsibility_blockers()")
+        raw = await conn.fetchval("SELECT ambient_responsibility_detail($1::uuid)", str(parsed))
+    payload = _json_value(raw) or {}
+    if not payload.get("success"):
+        return JSONResponse(jsonable_encoder(payload), status_code=404)
+    return JSONResponse(jsonable_encoder(payload))
+
+
+@app.post("/api/responsibilities/action")
+async def responsibility_action(req: ResponsibilityActionRequest):
+    pool = _pool
+    if pool is None:
+        return JSONResponse({"error": "Server not ready (no DB pool)"}, status_code=503)
+
+    from core.tools.base import ToolContext, ToolExecutionContext
+
+    action = req.action.strip().lower()
+    args = dict(req.arguments or {})
+    if req.model_extra:
+        args.update(
+            {
+                key: value
+                for key, value in req.model_extra.items()
+                if key not in {"action", "arguments", "source_session_id"}
+            }
+        )
+    args["action"] = action
+    if req.source_session_id:
+        args.setdefault("source_session_id", req.source_session_id)
+
+    registry = create_default_registry(pool)
+    context = ToolExecutionContext(
+        tool_context=ToolContext.CHAT,
+        call_id=f"web-responsibility:{uuid.uuid4()}",
+        session_id=req.source_session_id or "web-responsibilities",
+    )
+    result = await registry.execute("manage_responsibility", args, context)
+    payload = _tool_result_payload(result)
+
+    output = payload.get("output") if isinstance(payload.get("output"), dict) else {}
+    evaluation = output.get("evaluation") if isinstance(output.get("evaluation"), dict) else {}
+    outbox_messages = evaluation.get("outbox_messages") if isinstance(evaluation.get("outbox_messages"), list) else []
+    if outbox_messages:
+        delivered = await _tee_outbox_to_web_inbox(pool, outbox_messages)
+        evaluation["web_inbox_delivered"] = delivered
+
+    return JSONResponse(jsonable_encoder(payload), status_code=200 if result.success else 400)
 
 
 @app.get("/api/user-model/claims")

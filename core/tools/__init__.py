@@ -177,6 +177,10 @@ from .cron import (
     create_cron_tools,
     ManageScheduleHandler,
 )
+from .responsibilities import (
+    create_responsibility_tools,
+    ManageResponsibilityHandler,
+)
 from .sessions import (
     create_session_tools,
     ManageSessionsHandler,
@@ -340,6 +344,9 @@ __all__ = [
     # Cron/scheduling tools
     "create_cron_tools",
     "ManageScheduleHandler",
+    # Ambient responsibility tools
+    "create_responsibility_tools",
+    "ManageResponsibilityHandler",
     # Sub-agent session tools
     "create_session_tools",
     "ManageSessionsHandler",

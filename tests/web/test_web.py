@@ -14,6 +14,7 @@ import pytest
 import apps.hexis_api as web_module
 from apps.hexis_api import app
 from core.agent_loop import AgentEvent, AgentEventData
+from tests.utils import get_test_identifier
 
 pytestmark = [pytest.mark.asyncio(loop_scope="session")]
 
@@ -49,6 +50,53 @@ async def test_status(client):
     data = resp.json()
     # Should have at least instance and identity keys
     assert "instance" in data or "identity" in data or "memories" in data
+
+
+async def test_responsibilities_api_list_detail_and_action(client, db_pool):
+    marker = get_test_identifier("web-responsibilities")
+    title = f"web responsibility {marker}"
+    try:
+        created = await client.post(
+            "/api/responsibilities/action",
+            json={
+                "action": "create",
+                "arguments": {
+                    "title": title,
+                    "kind": "reminder",
+                    "user_intent": f"Remind me about {marker}.",
+                    "trigger": {"kind": "interval", "every_seconds": 300},
+                    "message": f"remember {marker}",
+                },
+                "source_session_id": "web-test",
+            },
+        )
+        assert created.status_code == 200
+        body = created.json()
+        assert body["success"] is True
+        responsibility_id = body["output"]["responsibility_id"]
+
+        listed = await client.get("/api/responsibilities")
+        assert listed.status_code == 200
+        rows = listed.json()["responsibilities"]
+        assert any(row["id"] == responsibility_id for row in rows)
+
+        detail = await client.get(f"/api/responsibilities/{responsibility_id}")
+        assert detail.status_code == 200
+        assert detail.json()["responsibility"]["title"] == title
+
+        paused = await client.post(
+            "/api/responsibilities/action",
+            json={
+                "action": "pause",
+                "arguments": {"responsibility_id": responsibility_id},
+                "source_session_id": "web-test",
+            },
+        )
+        assert paused.status_code == 200
+        assert paused.json()["output"]["responsibility"]["status"] == "paused"
+    finally:
+        async with db_pool.acquire() as conn:
+            await conn.execute("DELETE FROM ambient_responsibilities WHERE title = $1", title)
 
 
 async def test_chat_returns_sse_stream(client):

@@ -430,6 +430,8 @@ class EmailListHandler(ToolHandler):
             name="email_list",
             description=(
                 "List recent emails from the inbox or another label. "
+                "Use this for live requests like 'check my email', 'read a batch of my emails', "
+                "or 'tell me whether anything urgent came in'. "
                 "Returns subject, sender, date, and snippet for each message."
             ),
             parameters={
@@ -697,7 +699,8 @@ class EmailSearchHandler(ToolHandler):
             name="email_search",
             description=(
                 "Search emails using Gmail query syntax. Supports operators like "
-                "from:, to:, subject:, after:, before:, has:attachment, is:unread, label:, etc."
+                "from:, to:, subject:, after:, before:, has:attachment, is:unread, label:, etc. "
+                "Use this for live requests to find specific messages before reading or analyzing them."
             ),
             parameters={
                 "type": "object",
