@@ -939,6 +939,9 @@ BEGIN
     IF state_record.is_paused THEN
         RETURN FALSE;
     END IF;
+    IF state_record.active_heartbeat_id IS NOT NULL THEN
+        RETURN FALSE;
+    END IF;
     IF state_record.last_heartbeat_at IS NULL THEN
         RETURN TRUE;
     END IF;

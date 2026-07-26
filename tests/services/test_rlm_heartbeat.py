@@ -1,5 +1,6 @@
 """Tests for services.hexis_rlm -- RLM heartbeat integration."""
 
+import asyncio
 import json
 import re
 
@@ -263,6 +264,86 @@ class TestMemoryEnv:
 
 class TestReplToolBridge:
     """Unit tests for the sync-to-async tool bridge."""
+
+    def _handler(self, *, name: str, contexts: set | None = None):
+        from core.tools.base import ToolCategory, ToolContext, ToolHandler, ToolResult, ToolSpec
+
+        class Handler(ToolHandler):
+            @property
+            def spec(self) -> ToolSpec:
+                return ToolSpec(
+                    name=name,
+                    description=f"{name} description",
+                    parameters={
+                        "type": "object",
+                        "properties": {"task": {"type": "string"}},
+                        "required": ["task"],
+                    },
+                    category=ToolCategory.MEMORY,
+                    energy_cost=2,
+                    allowed_contexts=contexts or {ToolContext.HEARTBEAT},
+                )
+
+            async def execute(self, arguments, context):
+                return ToolResult.success_result({"ok": True})
+
+        return Handler()
+
+    @pytest.mark.asyncio(loop_scope="module")
+    async def test_list_tools_uses_enabled_registry_and_includes_schema(self):
+        from core.tools.base import ToolContext
+        from core.tools.repl_bridge import ReplToolBridge
+
+        enabled_handler = self._handler(name="get_procedures")
+
+        class Registry:
+            async def get_enabled_tools(self, context):
+                assert context == ToolContext.HEARTBEAT
+                return [enabled_handler]
+
+            def list_all(self):
+                raise AssertionError("enabled registry path should be used")
+
+        bridge = ReplToolBridge(Registry(), asyncio.get_running_loop())
+
+        tools = await asyncio.to_thread(bridge.list_tools)
+
+        assert tools == [{
+            "name": "get_procedures",
+            "description": "get_procedures description",
+            "energy_cost": 2,
+            "category": "memory",
+            "is_read_only": True,
+            "requires_approval": False,
+            "supports_parallel": True,
+            "optional": False,
+            "parameters": {
+                "type": "object",
+                "properties": {"task": {"type": "string"}},
+                "required": ["task"],
+            },
+            "allowed_contexts": ["heartbeat"],
+        }]
+
+    def test_list_tools_fallback_does_not_require_registry_handlers_attr(self):
+        from core.tools.base import ToolContext
+        from core.tools.repl_bridge import ReplToolBridge
+
+        heartbeat_handler = self._handler(name="self_repair")
+        chat_only_handler = self._handler(name="chat_only", contexts={ToolContext.CHAT})
+
+        class Registry:
+            def list_all(self):
+                return [chat_only_handler, heartbeat_handler]
+
+        loop = asyncio.new_event_loop()
+        loop.close()
+        bridge = ReplToolBridge(Registry(), loop)
+
+        tools = bridge.list_tools()
+
+        assert [tool["name"] for tool in tools] == ["self_repair"]
+        assert tools[0]["parameters"]["required"] == ["task"]
 
     def test_tool_call_record_to_action_taken(self):
         from core.tools.repl_bridge import ToolCallRecord

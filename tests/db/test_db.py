@@ -7997,6 +7997,31 @@ async def test_run_heartbeat_respects_pause(db_pool, apply_heartbeat_migration):
         assert hb_payload.get("heartbeat_id") is not None
 
 
+async def test_run_heartbeat_skips_when_active_heartbeat_exists(db_pool, apply_heartbeat_migration):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            await conn.execute(
+                """
+                UPDATE heartbeat_state
+                SET is_paused = FALSE,
+                    last_heartbeat_at = NULL,
+                    active_heartbeat_id = gen_random_uuid(),
+                    active_heartbeat_number = 999
+                WHERE id = 1
+                """
+            )
+
+            should_run = await conn.fetchval("SELECT should_run_heartbeat()")
+            hb_payload = await conn.fetchval("SELECT run_heartbeat()")
+
+            assert should_run is False
+            assert hb_payload is None
+        finally:
+            await tr.rollback()
+
+
 async def test_execute_heartbeat_action_deducts_energy(db_pool, apply_heartbeat_migration):
     async with db_pool.acquire() as conn:
         hb_payload = _coerce_json(await conn.fetchval("SELECT start_heartbeat()"))

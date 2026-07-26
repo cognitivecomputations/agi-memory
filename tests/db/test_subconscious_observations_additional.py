@@ -108,6 +108,75 @@ async def test_apply_goal_changes_updates_priority(db_pool, ensure_embedding_ser
             await tr.rollback()
 
 
+async def test_apply_goal_changes_normalizes_new_priority_alias(db_pool, ensure_embedding_service):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            goal_id = await conn.fetchval(
+                "SELECT create_goal($1, $2, $3, $4, NULL, NULL)",
+                f"Prioritize {get_test_identifier('goal_alias')}",
+                "desc",
+                "curiosity",
+                "queued",
+            )
+            changes = [
+                {"goal_id": str(goal_id), "new_priority": "high", "reason": "urgent audit"}
+            ]
+            result = _coerce_json(
+                await conn.fetchval(
+                    "SELECT apply_goal_changes($1::jsonb)",
+                    json.dumps(changes),
+                )
+            )
+
+            assert result["applied"] == 1
+            assert result["skipped"] == 0
+
+            row = await conn.fetchrow(
+                "SELECT status, metadata->>'priority' as priority FROM memories WHERE id = $1::uuid",
+                goal_id,
+            )
+            assert row["priority"] == "active"
+            assert row["status"] == "active"
+        finally:
+            await tr.rollback()
+
+
+async def test_apply_goal_changes_skips_invalid_priority_without_crashing(db_pool, ensure_embedding_service):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            goal_id = await conn.fetchval(
+                "SELECT create_goal($1, $2, $3, $4, NULL, NULL)",
+                f"Invalid priority {get_test_identifier('goal_invalid')}",
+                "desc",
+                "curiosity",
+                "queued",
+            )
+            changes = [
+                {"goal_id": str(goal_id), "new_priority": "impossibly-important", "reason": "bad label"}
+            ]
+            result = _coerce_json(
+                await conn.fetchval(
+                    "SELECT apply_goal_changes($1::jsonb)",
+                    json.dumps(changes),
+                )
+            )
+
+            assert result["applied"] == 0
+            assert result["skipped"] == 1
+
+            priority = await conn.fetchval(
+                "SELECT metadata->>'priority' FROM memories WHERE id = $1::uuid",
+                goal_id,
+            )
+            assert priority == "queued"
+        finally:
+            await tr.rollback()
+
+
 async def test_execute_heartbeat_actions_batch_halts_on_external_call(db_pool, ensure_embedding_service):
     async with db_pool.acquire() as conn:
         tr = conn.transaction()

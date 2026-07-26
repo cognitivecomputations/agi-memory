@@ -600,13 +600,17 @@ def create_heartbeat_handler(
                     and "decision" in result
                     and heartbeat_id
                 ):
-                    exec_result = await execute_heartbeat_decision(
-                        conn,
-                        heartbeat_id=str(heartbeat_id),
-                        decision=result["decision"],
-                        call_processor=call_processor,
-                        pre_executed_actions=result.get("rlm_repl_actions"),
-                    )
+                    try:
+                        exec_result = await execute_heartbeat_decision(
+                            conn,
+                            heartbeat_id=str(heartbeat_id),
+                            decision=result["decision"],
+                            call_processor=call_processor,
+                            pre_executed_actions=result.get("rlm_repl_actions"),
+                        )
+                    except Exception:
+                        await conn.fetchval("SELECT release_active_heartbeat($1)", str(heartbeat_id))
+                        raise
                     if isinstance(exec_result, dict):
                         outbox_messages = exec_result.get("outbox_messages")
                         if isinstance(outbox_messages, list):

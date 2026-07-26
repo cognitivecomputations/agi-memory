@@ -23,6 +23,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 TOOL_CALL_TIMEOUT = 60  # seconds
+TOOL_DISCOVERY_TIMEOUT = 10  # seconds
 
 
 @dataclass
@@ -169,19 +170,75 @@ class ReplToolBridge:
             return {"success": False, "output": None, "error": str(e), "energy_spent": 0}
 
     def list_tools(self) -> list[dict[str, Any]]:
-        """Return available tools with descriptions and energy costs."""
-        tools = []
-        for name, handler in self._registry.handlers.items():
+        """Return available tools with descriptions, schemas, and energy costs."""
+        if self._loop.is_closed():
+            return self._registered_tool_entries("event loop is closed")
+
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+
+        if running_loop is self._loop:
+            return self._registered_tool_entries("called from owning event loop thread")
+
+        future = asyncio.run_coroutine_threadsafe(
+            self._registry.get_enabled_tools(self._tool_context),
+            self._loop,
+        )
+        try:
+            handlers = future.result(timeout=TOOL_DISCOVERY_TIMEOUT)
+        except TimeoutError:
+            future.cancel()
+            return self._registered_tool_entries(
+                f"registry discovery timed out after {TOOL_DISCOVERY_TIMEOUT}s"
+            )
+        except Exception as exc:
+            return self._registered_tool_entries(f"registry discovery failed: {exc}")
+
+        return self._tool_entries(handlers)
+
+    def _registered_tool_entries(self, reason: str) -> list[dict[str, Any]]:
+        """Fallback to context-filtered in-process registry entries."""
+        logger.warning("REPL list_tools falling back to registered tools: %s", reason)
+        try:
+            handlers = [
+                handler
+                for handler in self._registry.list_all()
+                if self._tool_context in handler.spec.allowed_contexts
+            ]
+        except Exception as exc:
+            logger.exception("REPL list_tools fallback failed")
+            return [{
+                "error": f"Tool inventory unavailable: {exc}",
+                "name": "__tool_inventory_error__",
+                "description": "The tool registry could not be inspected.",
+                "energy_cost": 0,
+                "category": "internal",
+                "is_read_only": True,
+                "parameters": {},
+                "allowed_contexts": [],
+            }]
+        return self._tool_entries(handlers)
+
+    @staticmethod
+    def _tool_entries(handlers: list[Any]) -> list[dict[str, Any]]:
+        entries = []
+        for handler in handlers:
             spec = handler.spec
-            if self._tool_context in spec.allowed_contexts:
-                tools.append({
-                    "name": spec.name,
-                    "description": spec.description,
-                    "energy_cost": spec.energy_cost,
-                    "category": spec.category.value,
-                    "is_read_only": spec.is_read_only,
-                })
-        return tools
+            entries.append({
+                "name": spec.name,
+                "description": spec.description,
+                "energy_cost": spec.energy_cost,
+                "category": spec.category.value,
+                "is_read_only": spec.is_read_only,
+                "requires_approval": spec.requires_approval,
+                "supports_parallel": spec.supports_parallel,
+                "optional": spec.optional,
+                "parameters": spec.parameters,
+                "allowed_contexts": sorted(context.value for context in spec.allowed_contexts),
+            })
+        return sorted(entries, key=lambda item: item["name"])
 
     def energy_remaining(self) -> float:
         """Return remaining energy budget."""
