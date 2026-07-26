@@ -14,6 +14,10 @@ INSERT INTO config_defaults (key, value, description) VALUES
      'Number of recent consolidated exchange summaries rendered in the chat continuity packet'),
     ('chat.continuity_correction_limit', '5'::jsonb,
      'Number of active corrections/invalidated precedents rendered in the chat continuity packet'),
+    ('chat.continuity_heartbeat_limit', '3'::jsonb,
+     'Number of recent autonomous heartbeat summaries rendered in the chat continuity packet'),
+    ('chat.continuity_defect_limit', '5'::jsonb,
+     'Number of unresolved self-observed software defects rendered in the chat continuity packet'),
     ('relationship.injury_min_intensity', '0.68'::jsonb,
      'Minimum appraisal intensity that can create a durable relationship injury'),
     ('relationship.injury_max_valence', '-0.35'::jsonb,
@@ -899,15 +903,19 @@ DECLARE
     max_chars INT := LEAST(GREATEST(COALESCE(get_config_int('chat.recent_carryover_max_chars'), 5000), 500), 20000);
     summary_lim INT := LEAST(GREATEST(COALESCE(get_config_int('chat.continuity_summary_limit'), 3), 0), 8);
     correction_lim INT := LEAST(GREATEST(COALESCE(get_config_int('chat.continuity_correction_limit'), 5), 0), 12);
+    heartbeat_lim INT := LEAST(GREATEST(COALESCE(get_config_int('chat.continuity_heartbeat_limit'), 3), 0), 10);
+    defect_lim INT := LEAST(GREATEST(COALESCE(get_config_int('chat.continuity_defect_limit'), 5), 0), 20);
     injury_lines TEXT;
     affect_line TEXT;
     affect_state JSONB;
     summary_lines TEXT;
     correction_lines TEXT;
+    heartbeat_lines TEXT;
+    defect_lines TEXT;
     turn_lines TEXT;
     body TEXT;
 BEGIN
-    IF p_exclude_sensitive OR lim <= 0 THEN
+    IF p_exclude_sensitive THEN
         RETURN '';
     END IF;
 
@@ -983,6 +991,81 @@ BEGIN
     INTO correction_lines
     FROM corrections;
 
+    WITH heartbeats AS (
+        SELECT
+            m.id,
+            COALESCE((m.metadata->>'event_time')::timestamptz, m.created_at) AS event_time,
+            NULLIF(m.metadata#>>'{context,heartbeat_number}', '') AS heartbeat_number,
+            m.content,
+            NULLIF(m.metadata#>>'{context,reasoning}', '') AS reasoning,
+            COALESCE(m.metadata#>'{context,actions_taken}', '[]'::jsonb) AS actions_taken
+        FROM memories m
+        WHERE heartbeat_lim > 0
+          AND m.type = 'episodic'
+          AND m.status = 'active'
+          AND m.metadata#>>'{context,heartbeat_id}' IS NOT NULL
+          AND COALESCE((m.metadata->>'event_time')::timestamptz, m.created_at) >= CURRENT_TIMESTAMP - (window_minutes * INTERVAL '1 minute')
+          AND COALESCE(m.source_attribution->>'sensitivity', '') <> 'private'
+        ORDER BY COALESCE((m.metadata->>'event_time')::timestamptz, m.created_at) DESC, m.id DESC
+        LIMIT heartbeat_lim
+    ),
+    rendered AS (
+        SELECT
+            h.id,
+            h.event_time,
+            '- [' || to_char(h.event_time, 'YYYY-MM-DD HH24:MI TZ') || '] Heartbeat #'
+            || COALESCE(h.heartbeat_number, '?') || E'\n'
+            || '  summary: ' || left(regexp_replace(COALESCE(h.content, ''), '[[:space:]]+', ' ', 'g'), 520)
+            || CASE WHEN failed.failures IS NOT NULL
+                    THEN E'\n  failures: ' || failed.failures
+                    ELSE '' END
+            || CASE WHEN h.reasoning IS NOT NULL
+                    THEN E'\n  note: ' || left(regexp_replace(h.reasoning, '[[:space:]]+', ' ', 'g'), 700)
+                    ELSE '' END AS line
+        FROM heartbeats h
+        LEFT JOIN LATERAL (
+            SELECT string_agg(
+                COALESCE(a->>'action', 'unknown_action') || ': '
+                || COALESCE(
+                    NULLIF(a#>>'{result,error}', ''),
+                    NULLIF(a#>>'{result,output_preview}', ''),
+                    'failed'
+                ),
+                '; ' ORDER BY ord
+            ) AS failures
+            FROM jsonb_array_elements(h.actions_taken) WITH ORDINALITY AS elem(a, ord)
+            WHERE COALESCE((a#>>'{result,success}')::boolean, FALSE) = FALSE
+        ) failed ON TRUE
+    )
+    SELECT string_agg(line, E'\n' ORDER BY event_time ASC, id)
+    INTO heartbeat_lines
+    FROM rendered;
+
+    WITH defects AS (
+        SELECT *
+        FROM defect_reports
+        WHERE defect_lim > 0
+          AND status IN ('open', 'diagnosed', 'repair_proposed')
+        ORDER BY
+            CASE severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END,
+            last_seen_at DESC
+        LIMIT defect_lim
+    )
+    SELECT string_agg(
+        '- [' || severity || '] ' || title
+        || ' (' || occurrence_count || ' occurrence' || CASE WHEN occurrence_count = 1 THEN '' ELSE 's' END || '; status=' || status || ')' || E'\n'
+        || '  summary: ' || left(regexp_replace(COALESCE(summary, ''), '[[:space:]]+', ' ', 'g'), 360) || E'\n'
+        || '  latest error: ' || left(regexp_replace(COALESCE(last_error, ''), '[[:space:]]+', ' ', 'g'), 360)
+        || CASE WHEN jsonb_typeof(diagnosis) = 'object' AND diagnosis <> '{}'::jsonb
+                THEN E'\n  diagnosis: ' || left(regexp_replace(COALESCE(diagnosis->>'hypothesis', ''), '[[:space:]]+', ' ', 'g'), 360)
+                ELSE '' END,
+        E'\n' ORDER BY
+            CASE severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END,
+            last_seen_at DESC
+    )
+    INTO defect_lines
+    FROM defects;
+
     WITH recent AS (
         SELECT
             s.id,
@@ -993,7 +1076,8 @@ BEGIN
             COALESCE(cs.surface, 'conversation') AS surface
         FROM subconscious_units s
         LEFT JOIN chat_sessions cs ON cs.id = s.session_id
-        WHERE s.status = 'active'
+        WHERE lim > 0
+          AND s.status = 'active'
           AND COALESCE(s.metadata#>>'{recmem,kind}', '') <> 'source_document_desk'
           AND COALESCE(s.metadata->>'type', 'conversation') = 'conversation'
           AND (current_session IS NULL OR s.session_id IS DISTINCT FROM current_session)
@@ -1021,13 +1105,15 @@ BEGIN
     IF injury_lines IS NULL
        AND summary_lines IS NULL
        AND correction_lines IS NULL
+       AND heartbeat_lines IS NULL
+       AND defect_lines IS NULL
        AND turn_lines IS NULL
        AND affect_line IS NULL THEN
         RETURN '';
     END IF;
 
     body := '## Conversation Continuity Packet' || E'\n'
-        || 'This is active working-state continuity, not decorative RAG. Treat it as what you remember right now: recent raw turns, exchange summaries, affect, corrections, and unresolved relationship weather. Do not claim a prior exchange is unavailable merely because the UI opened a new session. Do not reset warmth or trust merely because the session id changed; let sincere repair change the state when there is evidence.' || E'\n';
+        || 'This is active working-state continuity, not decorative RAG. Treat it as what you remember right now: recent raw turns, exchange summaries, affect, corrections, unresolved relationship weather, and unresolved substrate defects. Do not claim a prior exchange is unavailable merely because the UI opened a new session. Do not reset warmth or trust merely because the session id changed; let sincere repair change the state when there is evidence.' || E'\n';
     IF affect_line IS NOT NULL THEN
         body := body || E'\n' || '### Current Emotional State' || E'\n' || affect_line || E'\n';
     END IF;
@@ -1040,12 +1126,22 @@ BEGIN
     IF summary_lines IS NOT NULL THEN
         body := body || E'\n' || '### Recent Exchange Summaries' || E'\n' || summary_lines || E'\n';
     END IF;
+    IF heartbeat_lines IS NOT NULL THEN
+        body := body || E'\n' || '### Recent Autonomous Heartbeats' || E'\n'
+            || 'Recent autonomous cycles are part of what has been on your mind. If a cycle failed or left unresolved work, surface it naturally when relevant instead of waiting for the user to ask.' || E'\n'
+            || heartbeat_lines || E'\n';
+    END IF;
+    IF defect_lines IS NOT NULL THEN
+        body := body || E'\n' || '### Unresolved Software Defects' || E'\n'
+            || 'These are defects observed in your own substrate. Treat them as operational responsibilities: do not dramatize them, but bring them up naturally when they affect the current conversation or when the user asks how you are doing.' || E'\n'
+            || defect_lines || E'\n';
+    END IF;
     IF turn_lines IS NOT NULL THEN
         body := body || E'\n' || '### Recent Prior Turns' || E'\n' || turn_lines;
     END IF;
 
     IF length(body) > max_chars THEN
-        body := left(body, max_chars) || E'\n[truncated recent carryover]';
+        body := left(body, max_chars) || E'\n[truncated chat continuity packet]';
     END IF;
     RETURN body;
 END;

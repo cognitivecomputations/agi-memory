@@ -15,6 +15,7 @@ import pytest
 
 from core.tools.base import ToolContext, ToolExecutionContext
 from core.tools.memory import (
+    GetStrategiesHandler,
     LoadDocumentsHandler,
     OpenDocumentHandler,
     OpenDocumentsHandler,
@@ -167,6 +168,11 @@ class TestQueueUserMessage:
 
 
 class TestProvenanceTooling:
+    async def test_get_strategies_schema_accepts_query_alias(self):
+        handler = GetStrategiesHandler()
+        assert handler.validate({"query": "recover from heartbeat failures"}) == []
+        assert handler.validate({"situation": "recover from heartbeat failures"}) == []
+
     def test_remember_schema_supports_sources_and_confidence(self):
         spec = RememberHandler().spec
         props = spec.parameters["properties"]

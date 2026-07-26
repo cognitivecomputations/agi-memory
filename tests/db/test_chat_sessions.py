@@ -435,6 +435,73 @@ async def test_continuity_packet_includes_affect_summary_and_invalid_precedent(d
     assert "queue_user_message directly" in raw_recall_content
 
 
+async def test_continuity_packet_includes_recent_heartbeat_failures(db_pool):
+    marker = uuid4().hex
+    session_id = str(uuid4())
+
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            await _stub_get_embedding(conn)
+            await conn.fetchval(
+                """
+                SELECT create_episodic_memory(
+                    p_content := $1,
+                    p_action_taken := NULL,
+                    p_context := $2::jsonb,
+                    p_result := jsonb_build_object('status', 'completed_with_failures'),
+                    p_emotional_valence := -0.1,
+                    p_importance := 0.7,
+                    p_source_attribution := jsonb_build_object('kind', 'internal', 'label', 'heartbeat-test')
+                )
+                """,
+                f"Heartbeat #999: - reflect: failed - get_strategies: failed {marker}",
+                json.dumps({
+                    "heartbeat_id": str(uuid4()),
+                    "heartbeat_number": 999,
+                    "reasoning": (
+                        f"I tried to retrieve strategies during autonomous heartbeat {marker}, "
+                        "but the tool/action boundary was mismatched."
+                    ),
+                    "actions_taken": [
+                        {
+                            "action": "reflect",
+                            "source": "rlm_repl",
+                            "params": {"insight": "notice the failure"},
+                            "result": {
+                                "success": False,
+                                "output_preview": "Unknown tool: reflect",
+                                "energy_spent": 0,
+                            },
+                        },
+                        {
+                            "action": "get_strategies",
+                            "source": "rlm_repl",
+                            "params": {"query": "heartbeat failure recovery"},
+                            "result": {
+                                "success": False,
+                                "error": "Missing required field: situation",
+                                "energy_spent": 0,
+                            },
+                        },
+                    ],
+                }),
+            )
+            continuity = await conn.fetchval(
+                "SELECT render_chat_continuity_context($1::text, false)",
+                session_id,
+            )
+        finally:
+            await tr.rollback()
+
+    assert "### Recent Autonomous Heartbeats" in continuity
+    assert "Heartbeat #999" in continuity
+    assert marker in continuity
+    assert "reflect: Unknown tool: reflect" in continuity
+    assert "get_strategies: Missing required field: situation" in continuity
+
+
 async def test_hypothetical_abuse_example_does_not_create_relationship_injury(db_pool):
     marker = uuid4().hex
     session_id = str(uuid4())

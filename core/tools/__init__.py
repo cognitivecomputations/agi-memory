@@ -222,6 +222,10 @@ from .twitter_x_actions import (
     TwitterXReplyHandler,
     TwitterXDMSendHandler,
 )
+from .self_repair import (
+    create_self_repair_tools,
+    SelfRepairHandler,
+)
 
 __all__ = [
     # Base classes
@@ -347,6 +351,9 @@ __all__ = [
     # Ambient responsibility tools
     "create_responsibility_tools",
     "ManageResponsibilityHandler",
+    # Self-repair tools
+    "create_self_repair_tools",
+    "SelfRepairHandler",
     # Sub-agent session tools
     "create_session_tools",
     "ManageSessionsHandler",

@@ -697,8 +697,45 @@ INSERT INTO config_defaults (key, value, description) VALUES
     ('heartbeat.cost_release_memory', '0'::jsonb, 'Let a fading memory go (free)'),
     ('heartbeat.cost_journal_memory', '3'::jsonb, 'Commit a fading memory to the journal before letting it fade')
 ON CONFLICT (key) DO NOTHING;
+
+-- Software defects the agent noticed in its own substrate. These are not chat
+-- memories; they are operational facts the heartbeat can revisit, diagnose,
+-- and ask to repair.
+CREATE TABLE IF NOT EXISTS defect_reports (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    fingerprint TEXT UNIQUE NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open'
+        CHECK (status IN ('open', 'diagnosed', 'repair_proposed', 'verified', 'resolved', 'ignored')),
+    severity TEXT NOT NULL DEFAULT 'medium'
+        CHECK (severity IN ('low', 'medium', 'high', 'critical')),
+    category TEXT NOT NULL DEFAULT 'execution_failure',
+    source TEXT NOT NULL DEFAULT 'unknown',
+    component TEXT,
+    title TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    last_error TEXT,
+    first_seen_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    occurrence_count INT NOT NULL DEFAULT 1 CHECK (occurrence_count > 0),
+    heartbeat_ids UUID[] NOT NULL DEFAULT ARRAY[]::UUID[],
+    tool_names TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+    evidence JSONB NOT NULL DEFAULT '[]'::jsonb,
+    diagnosis JSONB NOT NULL DEFAULT '{}'::jsonb,
+    proposed_repair JSONB NOT NULL DEFAULT '{}'::jsonb,
+    verification JSONB NOT NULL DEFAULT '{}'::jsonb,
+    resolution TEXT,
+    resolved_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_defect_reports_status_seen
+    ON defect_reports(status, last_seen_at DESC);
+CREATE INDEX IF NOT EXISTS idx_defect_reports_category
+    ON defect_reports(category);
+
 INSERT INTO config_defaults (key, value, description) VALUES
-    ('agent.tools', '["recall","sense_memory_availability","request_background_search","recall_recent","recall_episode","explore_concept","explore_cluster","get_procedures","get_strategies","list_recent_episodes","create_goal","schedule_task","list_scheduled_tasks","update_scheduled_task","delete_scheduled_task","queue_user_message"]'::jsonb, 'Allowed tool names for agent tool use')
+    ('agent.tools', '["recall","sense_memory_availability","request_background_search","recall_recent","recall_episode","explore_concept","explore_cluster","get_procedures","get_strategies","list_recent_episodes","create_goal","schedule_task","list_scheduled_tasks","update_scheduled_task","delete_scheduled_task","queue_user_message","self_repair"]'::jsonb, 'Allowed tool names for agent tool use')
 ON CONFLICT (key) DO NOTHING;
 INSERT INTO config_defaults (key, value, description) VALUES
     ('mcp.legacy_compat_enabled', 'false'::jsonb, 'Expose the old handwritten MCP compatibility tool surface in addition to registry-native tools')

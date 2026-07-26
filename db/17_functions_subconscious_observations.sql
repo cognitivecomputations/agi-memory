@@ -1466,6 +1466,7 @@ DECLARE
     batch JSONB;
     new_actions JSONB;
     existing_actions JSONB;
+    defect_actions JSONB := '[]'::jsonb;
     next_index INT;
     pending_external JSONB;
     halt_reason TEXT;
@@ -1499,6 +1500,7 @@ BEGIN
     IF jsonb_typeof(new_actions) <> 'array' THEN
         new_actions := '[]'::jsonb;
     END IF;
+    defect_actions := new_actions;
 
     BEGIN
         next_index := COALESCE((batch->>'next_index')::int, COALESCE(p_start_index, 0));
@@ -1531,6 +1533,7 @@ BEGIN
        AND jsonb_typeof(p_pre_executed_actions) = 'array'
        AND jsonb_array_length(p_pre_executed_actions) > 0 THEN
         existing_actions := p_pre_executed_actions || existing_actions || new_actions;
+        defect_actions := p_pre_executed_actions || new_actions;
         -- Deduct energy already spent by REPL tool calls
         FOR elem IN SELECT * FROM jsonb_array_elements(p_pre_executed_actions) LOOP
             repl_energy := repl_energy + COALESCE((elem->'result'->>'energy_spent')::float, 0);
@@ -1546,6 +1549,11 @@ BEGIN
         active_reasoning = reasoning,
         updated_at = CURRENT_TIMESTAMP
     WHERE id = 1;
+
+    IF jsonb_typeof(defect_actions) = 'array'
+       AND jsonb_array_length(defect_actions) > 0 THEN
+        PERFORM record_heartbeat_action_defects(p_heartbeat_id, defect_actions, reasoning);
+    END IF;
 
     IF pending_external IS NOT NULL AND jsonb_typeof(pending_external) = 'object' THEN
         RETURN jsonb_build_object(

@@ -142,13 +142,16 @@ CREATE OR REPLACE FUNCTION recall_memories_structured(
 DECLARE
     use_vector BOOLEAN;
 BEGIN
-    -- If no query text, we can't use fast_recall; fall back to direct filter
+    -- If no query text, we can't use semantic/lexical search; fall back to
+    -- direct filters. Query+filter recall still needs hybrid candidates so
+    -- just-written async-embedding memories remain visible before the worker
+    -- vectorizes them.
     use_vector := (p_query_text IS NOT NULL AND trim(p_query_text) <> '');
 
     IF use_vector THEN
         RETURN QUERY
         WITH hits AS (
-            SELECT * FROM fast_recall(p_query_text, p_limit * 3)
+            SELECT * FROM recall_hybrid(p_query_text, GREATEST(p_limit * 5, 20))
         )
         SELECT
             h.memory_id,

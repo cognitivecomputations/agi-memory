@@ -1776,6 +1776,10 @@ class GetStrategiesHandler(ToolHandler):
                         "type": "string",
                         "description": "The situation you need strategic guidance for.",
                     },
+                    "query": {
+                        "type": "string",
+                        "description": "Alias for situation, accepted for compatibility with memory-search wording.",
+                    },
                     "limit": {
                         "type": "integer",
                         "description": "Maximum strategies to return.",
@@ -1784,7 +1788,7 @@ class GetStrategiesHandler(ToolHandler):
                         "maximum": 10,
                     },
                 },
-                "required": ["situation"],
+                "required": [],
             },
             category=ToolCategory.MEMORY,
             energy_cost=1,
