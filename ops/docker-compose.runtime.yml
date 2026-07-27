@@ -1,10 +1,13 @@
 # Runtime compose file for pip-installed Hexis.
 # Uses pre-built images from GHCR instead of local build: directives.
 # Automatically selected by `hexis up` when not in a source checkout.
+# HEXIS_IMAGE_TAG pins the image version; the CLI sets it to its own
+# package version so a given pip release always runs the images built
+# from the same commit. `latest` (= newest release) is only the fallback.
 
 services:
   db:
-    image: ghcr.io/quixiai/hexis-brain:latest
+    image: ghcr.io/quixiai/hexis-brain:${HEXIS_IMAGE_TAG:-latest}
     container_name: hexis_brain
     restart: unless-stopped
     environment:
@@ -91,7 +94,7 @@ services:
   #     - public
 
   heartbeat_worker:
-    image: ghcr.io/quixiai/hexis-worker:latest
+    image: ghcr.io/quixiai/hexis-worker:${HEXIS_IMAGE_TAG:-latest}
     container_name: hexis_heartbeat_worker
     restart: unless-stopped
     command: ["hexis-worker", "--mode", "heartbeat"]
@@ -122,7 +125,7 @@ services:
       - public
 
   maintenance_worker:
-    image: ghcr.io/quixiai/hexis-worker:latest
+    image: ghcr.io/quixiai/hexis-worker:${HEXIS_IMAGE_TAG:-latest}
     container_name: hexis_maintenance_worker
     restart: unless-stopped
     command: ["hexis-worker", "--mode", "maintenance"]
@@ -153,7 +156,7 @@ services:
       - public
 
   api:
-    image: ghcr.io/quixiai/hexis-worker:latest
+    image: ghcr.io/quixiai/hexis-worker:${HEXIS_IMAGE_TAG:-latest}
     container_name: hexis_api
     restart: unless-stopped
     profiles:
@@ -190,7 +193,7 @@ services:
       - public
 
   channel_worker:
-    image: ghcr.io/quixiai/hexis-channels:latest
+    image: ghcr.io/quixiai/hexis-channels:${HEXIS_IMAGE_TAG:-latest}
     container_name: hexis_channel_worker
     restart: unless-stopped
     profiles:
@@ -237,7 +240,7 @@ services:
       - public
 
   ui:
-    image: ghcr.io/quixiai/hexis-ui:latest
+    image: ghcr.io/quixiai/hexis-ui:${HEXIS_IMAGE_TAG:-latest}
     container_name: hexis_ui
     restart: unless-stopped
     depends_on:
