@@ -51,7 +51,7 @@ jobs:
       # `latest` therefore always means "newest release", never "tip of main".
       # Packaged installs pin their exact version via HEXIS_IMAGE_TAG (see
       # ops/docker-compose.runtime.yml); `latest` is only the fallback.
-      - uses: docker/metadata-action@v5
+      - uses: docker/metadata-action@v6
         id: meta
         with:
           images: ghcr.io/quixiai/${{ matrix.image }}
