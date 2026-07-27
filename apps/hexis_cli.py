@@ -92,6 +92,21 @@ def resolve_env_file(stack_root: Path) -> Path | None:
     return None
 
 
+def _compose_env() -> dict[str, str]:
+    """Environment for docker compose invocations.
+
+    Pins HEXIS_IMAGE_TAG (used by ops/docker-compose.runtime.yml) to this
+    CLI's own package version, so a pip-installed `hexis` always runs the
+    images published from the same release commit. An explicit
+    HEXIS_IMAGE_TAG in the caller's environment wins; source checkouts
+    ignore the variable entirely (their compose file builds locally).
+    """
+    env = os.environ.copy()
+    if not env.get("HEXIS_IMAGE_TAG"):
+        env["HEXIS_IMAGE_TAG"] = _ver if _ver != "dev" else "latest"
+    return env
+
+
 def run_compose(
     compose_cmd: list[str],
     compose_file: Path,
@@ -105,7 +120,7 @@ def run_compose(
     cmd += args
 
     try:
-        result = subprocess.run(cmd, cwd=stack_root, env=os.environ.copy())
+        result = subprocess.run(cmd, cwd=stack_root, env=_compose_env())
         return result.returncode
     except FileNotFoundError:
         _print_err("Failed to run docker compose. Ensure Docker is installed.")
@@ -120,7 +135,7 @@ def _run_compose_capture(
         cmd += ["--env-file", str(env_file)]
     cmd += args
     try:
-        p = subprocess.run(cmd, cwd=stack_root, env=os.environ.copy(), capture_output=True, text=True)
+        p = subprocess.run(cmd, cwd=stack_root, env=_compose_env(), capture_output=True, text=True)
         out = (p.stdout or "") + (("\n" + p.stderr) if p.stderr else "")
         return p.returncode, out.strip()
     except FileNotFoundError:
@@ -380,9 +395,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     # -- Stack commands --
     up = sub.add_parser("up", help="Start the stack")
-    up.add_argument("--build", action="store_true", help="Build images before starting")
+    up.add_argument(
+        "--build", action="store_true",
+        help="Build images before starting (already the default in a source checkout)",
+    )
+    up.add_argument(
+        "--no-build", action="store_true",
+        help="Skip the image build even in a source checkout",
+    )
     up.add_argument("--profile", "-p", action="append", default=[], help="Compose profile(s)")
     up.set_defaults(func="up")
+
+    dev = sub.add_parser(
+        "dev",
+        help="Start the stack in watch mode: code and migration edits apply automatically",
+    )
+    dev.add_argument("--profile", "-p", action="append", default=[], help="Compose profile(s)")
+    dev.set_defaults(func="dev")
 
     down = sub.add_parser("down", help="Stop the stack")
     down.set_defaults(func="down")
@@ -497,6 +526,10 @@ def build_parser() -> argparse.ArgumentParser:
     migrate.set_defaults(func="migrate")
 
     upgrade = sub.add_parser("upgrade", parents=[_db], help="Update the stack and migrate the schema, keeping your data")
+    upgrade.add_argument(
+        "--no-self-update", action="store_true",
+        help="Skip updating the hexis package itself (packaged installs only)",
+    )
     upgrade.set_defaults(func="upgrade")
 
     backup_p = sub.add_parser("backup", parents=[_db], help="Back up the database to a file")
@@ -4403,7 +4436,7 @@ def _dispatch(argv: list[str] | None = None) -> int:
         }[func]
         return asyncio.run(handler(_get_dsn(args), args))
 
-    docker_cmds = {"up", "down", "ps", "logs", "start", "stop", "reset", "upgrade"}
+    docker_cmds = {"up", "dev", "down", "ps", "logs", "start", "stop", "reset", "upgrade"}
     docker_bin: str | None = None
     compose_cmd: list[str] | None = None
     if func in docker_cmds:
@@ -4429,7 +4462,10 @@ def _dispatch(argv: list[str] | None = None) -> int:
         for profile in args.profile:
             compose_extra += ["--profile", profile]
         up_args = compose_extra + ["up", "-d"]
-        if args.build and is_source:
+        # Source checkouts build by default so the running containers always
+        # match the code on disk (cheap: the dependency layer is cached; code
+        # layers are straight COPYs). `--no-build` opts out.
+        if is_source and not args.no_build:
             up_args.append("--build")
         rc = run_compose(compose_cmd or [], compose_file, stack_root, up_args, env_file)
         if rc == 0:
@@ -4471,6 +4507,55 @@ def _dispatch(argv: list[str] | None = None) -> int:
             console.print("  [accent]hexis ui[/accent]     Open the web dashboard")
             console.print()
         return rc
+    if func == "dev":
+        from apps.cli_theme import console
+        if not is_source:
+            _print_err(
+                "`hexis dev` needs a source checkout — it watches the repo and rebuilds "
+                "from ops/Dockerfile.*. In a packaged install, use `hexis upgrade` to "
+                "pick up new images."
+            )
+            return 1
+        compose_extra = []
+        for profile in args.profile:
+            compose_extra += ["--profile", profile]
+        console.print("[accent]Building and starting the stack...[/accent]")
+        rc = run_compose(
+            compose_cmd or [], compose_file, stack_root,
+            compose_extra + ["up", "-d", "--build"], env_file,
+        )
+        if rc != 0:
+            return rc
+        try:
+            if _uses_local_embedding_sidecar(env_file):
+                _start_local_embedding_service()
+            else:
+                _warn_legacy_embedding_sidecar_port(env_file)
+        except Exception:
+            pass
+        try:
+            from core.agent_api import apply_migrations
+            applied = asyncio.run(apply_migrations(db_dsn_from_env()))
+            if applied:
+                console.print(f"[ok]Applied {len(applied)} schema migration(s) — no data lost.[/ok]")
+        except Exception:
+            pass  # workers also migrate on startup; never block dev mode
+        console.print("\n[ok]Stack is running in watch mode.[/ok]")
+        console.print("  Edits under core/ services/ apps/ channels/ plugins/ skills/ and db/")
+        console.print("  sync into the running containers and restart them; new db/migrations")
+        console.print("  apply on that restart. pyproject.toml changes trigger a rebuild.")
+        console.print("  [dim]Ctrl+C stops watching — the stack keeps running.[/dim]\n")
+        try:
+            rc = run_compose(
+                compose_cmd or [], compose_file, stack_root,
+                compose_extra + ["watch", "--no-up"], env_file,
+            )
+        except KeyboardInterrupt:
+            rc = 130
+        if rc == 130:  # normal Ctrl+C exit from the watch session
+            rc = 0
+        console.print("\n[dim]Stopped watching. The stack is still running; plain `hexis up` also rebuilds on demand.[/dim]")
+        return rc
     if func == "down":
         return run_compose(compose_cmd or [], compose_file, stack_root, ["down"], env_file)
     if func == "reset":
@@ -4509,6 +4594,34 @@ def _dispatch(argv: list[str] | None = None) -> int:
         # The non-destructive counterpart to `reset`: refresh images + code and
         # migrate the schema, WITHOUT removing the data volume.
         from apps.cli_theme import console
+        if not is_source and not args.no_self_update:
+            # Packaged install: images are pinned to the CLI's own version
+            # (see _compose_env), so the package must move first — then the
+            # fresh CLI pulls the images published from its release commit.
+            console.print("[accent]Updating the hexis package...[/accent]")
+            prc = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "--upgrade", "hexis"],
+            ).returncode
+            if prc != 0:
+                console.print(
+                    "[warn]⚠ Could not self-update via pip[/warn] — if hexis was installed "
+                    "with pipx or uv, run [accent]pipx upgrade hexis[/accent] or "
+                    "[accent]uv tool upgrade hexis[/accent], then re-run "
+                    "[accent]hexis upgrade[/accent]. Continuing with the current version."
+                )
+            else:
+                probe = subprocess.run(
+                    [sys.executable, "-c",
+                     "from importlib.metadata import version; print(version('hexis'))"],
+                    capture_output=True, text=True,
+                )
+                new_ver = (probe.stdout or "").strip()
+                if new_ver and new_ver != _ver:
+                    console.print(f"[ok]hexis {_ver} → {new_ver}[/ok] — handing off to the new version...")
+                    rerun = subprocess.run(
+                        [sys.executable, sys.argv[0], "upgrade", "--no-self-update"],
+                    )
+                    return rerun.returncode
         console.print("[accent]Updating the stack (your data is preserved)...[/accent]")
         if is_source:
             run_compose(compose_cmd or [], compose_file, stack_root, ["build"], env_file)

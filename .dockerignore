@@ -1,0 +1,10 @@
+**/__pycache__
+**/*.pyc
+.git
+.venv
+.pytest_cache
+.mypy_cache
+hexis-ui/node_modules
+hexis-ui/.next
+build
+*.egg-info

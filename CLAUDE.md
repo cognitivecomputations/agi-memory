@@ -125,6 +125,12 @@ docker compose up -d
 # Apply a schema change WITHOUT losing data (add db/migrations/NNNN_*.sql first)
 hexis migrate            # or `hexis upgrade` to also refresh images/code
 
+# Dev loop: watch mode — code + migration edits apply to the running stack
+# automatically (sync + restart; Ctrl+C stops watching, stack keeps running).
+# `hexis up` in a source checkout also rebuilds by default, so containers
+# always match the code on disk after any `up`.
+hexis dev
+
 # Wipe the DB volume — deliberate clean slate only (loses all data)
 docker compose down -v && docker compose up -d
 
@@ -236,7 +242,10 @@ forward delta — do NOT reach for `down -v`.
    `db/migrations/README.md`; `-- migrate:no-transaction` for `ALTER TYPE ... ADD VALUE`).
 2. Optionally mirror it into the baseline `db/*.sql` for greenfield clarity.
 3. Apply it: **`hexis migrate`** (or `hexis upgrade` to also refresh images/code).
-   Migrations also auto-apply on `hexis up` and on worker/API startup (advisory-locked).
+   Migrations also auto-apply on `hexis up` and on worker/API startup (advisory-locked) —
+   `db/` ships inside the worker images, so containers migrate themselves on restart.
+   In `hexis dev` watch mode, saving a migration file syncs it in and restarts the
+   worker, which applies it — no command needed.
 
 Back up / restore data with **`hexis backup`** and **`hexis restore <file>`** (AGE-aware).
 

@@ -74,7 +74,8 @@ docker compose stop heartbeat_worker maintenance_worker
 # Restart workers
 docker compose restart heartbeat_worker maintenance_worker
 
-# Rebuild after code changes
+# Rebuild after code changes (also implicit: `hexis up` builds by default
+# in a source checkout, and the dependency layer is cached so it's fast)
 docker compose build
 docker compose up -d
 
@@ -82,6 +83,24 @@ docker compose up -d
 docker compose logs heartbeat_worker -f
 docker compose logs db -f
 ```
+
+## Dev Loop (watch mode)
+
+`hexis dev` (or raw `docker compose watch`) keeps the running containers in
+sync with the source tree — no manual `hexis upgrade` needed while it runs:
+
+- Edits under `core/`, `services/`, `apps/`, `channels/`, `plugins/`, `skills/`,
+  and `db/` sync into the containers and restart the affected services.
+- Restarted workers apply any pending `db/migrations/*.sql` on startup, so
+  schema deltas flow automatically too (never touches data).
+- `pyproject.toml` changes trigger an image rebuild (dependency layer).
+- Ctrl+C stops watching; the stack keeps running.
+
+This works because the worker images use an editable install rooted at `/app`
+(see `ops/Dockerfile.worker`) — file sync is used instead of bind mounts, which
+misbehave on macOS external drives. Without a watch session running, plain
+`hexis up` still rebuilds by default in a source checkout, so the containers
+match the code on disk after any `up`.
 
 ## Overrides
 

@@ -1,3 +1,39 @@
+# Dev watch config (`hexis dev`, or `docker compose watch`): source edits sync
+# into the running containers and restart them; restarted workers re-apply any
+# pending db/migrations on startup, so schema deltas flow automatically too.
+# pyproject.toml changes rebuild the image (dependency layer). This section is
+# inert unless a watch session is running. Sync is used instead of bind mounts
+# on purpose — bind mounts misbehave on macOS external drives (see db note).
+x-dev-watch: &dev-watch
+  - path: ./core
+    target: /app/core
+    action: sync+restart
+    ignore: ["**/__pycache__/", "**/*.pyc"]
+  - path: ./services
+    target: /app/services
+    action: sync+restart
+    ignore: ["**/__pycache__/", "**/*.pyc"]
+  - path: ./apps
+    target: /app/apps
+    action: sync+restart
+    ignore: ["**/__pycache__/", "**/*.pyc"]
+  - path: ./channels
+    target: /app/channels
+    action: sync+restart
+    ignore: ["**/__pycache__/", "**/*.pyc"]
+  - path: ./plugins
+    target: /app/plugins
+    action: sync+restart
+    ignore: ["**/__pycache__/", "**/*.pyc"]
+  - path: ./skills
+    target: /app/skills
+    action: sync+restart
+  - path: ./db
+    target: /app/db
+    action: sync+restart
+  - path: ./pyproject.toml
+    action: rebuild
+
 services:
   db:
     build:
@@ -107,6 +143,8 @@ services:
       dockerfile: ops/Dockerfile.worker
     container_name: hexis_heartbeat_worker
     restart: unless-stopped
+    develop:
+      watch: *dev-watch
     command: ["hexis-worker", "--mode", "heartbeat"]
     depends_on:
       db:
@@ -145,6 +183,8 @@ services:
       dockerfile: ops/Dockerfile.worker
     container_name: hexis_maintenance_worker
     restart: unless-stopped
+    develop:
+      watch: *dev-watch
     command: ["hexis-worker", "--mode", "maintenance"]
     depends_on:
       db:
@@ -183,6 +223,8 @@ services:
       dockerfile: ops/Dockerfile.worker
     container_name: hexis_api
     restart: unless-stopped
+    develop:
+      watch: *dev-watch
     profiles:
       - active
     command: ["hexis-api", "--host", "0.0.0.0", "--port", "43817"]
@@ -227,6 +269,8 @@ services:
       dockerfile: ops/Dockerfile.channels
     container_name: hexis_channel_worker
     restart: unless-stopped
+    develop:
+      watch: *dev-watch
     profiles:
       - active
     command: ["hexis-channels"]
