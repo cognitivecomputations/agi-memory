@@ -116,6 +116,27 @@ services:
       HEXIS_INSTANCE: alice
 ```
 
+## Linux Notes
+
+The stack runs on native Linux Docker (both x86_64 and arm64 images are
+published). Platform specifics:
+
+- **`host.docker.internal`** does not resolve on native Linux Docker by
+  itself; both compose files map it to the host gateway via `extra_hosts`,
+  so the DB reaches the host embedding sidecar without configuration.
+- **Embedding sidecar**: the `embeddinggemma` installer publishes
+  `linux-x86_64` binaries (cpu/cuda/rocm/xpu variants). `linux-arm64` is not
+  published yet — on ARM Linux, point `EMBEDDING_SERVICE_URL` at a TEI
+  container instead (see the commented `embeddings` service in
+  `docker-compose.yml`).
+- **`~/.hexis` ownership**: containers run as root, so files they write to
+  the bind-mounted `~/.hexis` (OAuth token refresh) end up root-owned on
+  native Linux. If host tools later fail to write there, reclaim it with
+  `sudo chown -R "$USER" ~/.hexis`.
+- **`hexis dev`** needs Docker Compose ≥ 2.22 (the `watch` subcommand) —
+  current on any Docker CE install; distro-packaged older compose versions
+  only affect watch mode, not `hexis up`.
+
 ## Default Credentials
 
 | Service | User | Password |

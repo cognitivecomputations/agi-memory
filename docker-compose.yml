@@ -48,6 +48,11 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
       # db/*.sql is baked into the image (see Dockerfile) to avoid bind-mount issues on macOS external drives.
+    # host.docker.internal resolves automatically on Docker Desktop (macOS/
+    # Windows) but NOT on native Linux Docker — map it to the host gateway so
+    # the DB can reach the embedding sidecar on the host everywhere.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-hexis_user} -d ${POSTGRES_DB:-hexis_memory}"]
       interval: 10s
