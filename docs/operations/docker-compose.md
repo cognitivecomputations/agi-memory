@@ -125,10 +125,9 @@ published). Platform specifics:
   itself; both compose files map it to the host gateway via `extra_hosts`,
   so the DB reaches the host embedding sidecar without configuration.
 - **Embedding sidecar**: the `embeddinggemma` installer publishes
-  `linux-x86_64` binaries (cpu/cuda/rocm/xpu variants). `linux-arm64` is not
-  published yet — on ARM Linux, point `EMBEDDING_SERVICE_URL` at a TEI
-  container instead (see the commented `embeddings` service in
-  `docker-compose.yml`).
+  `linux-x86_64` binaries (cpu/cuda/rocm/xpu variants) and `linux-arm64-cpu`
+  (Graviton, Raspberry Pi, Ampere — CPU only; no CUDA/ROCm on ARM, and the
+  installer auto-selects cpu there). All Linux platforms work out of the box.
 - **`~/.hexis` ownership**: containers run as root, so files they write to
   the bind-mounted `~/.hexis` (OAuth token refresh) end up root-owned on
   native Linux. If host tools later fail to write there, reclaim it with
