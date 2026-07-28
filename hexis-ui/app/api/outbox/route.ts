@@ -35,13 +35,16 @@ export async function GET() {
   }
 }
 
+function cleanIds(raw: unknown): string[] {
+  return Array.isArray(raw)
+    ? raw.filter((id: unknown) => typeof id === "string" && id.length > 0)
+    : [];
+}
+
 /** Mark inbox messages read: body { ids: string[] }. */
 export async function POST(request: NextRequest) {
   try {
-    const body = await request.json();
-    const ids = Array.isArray(body?.ids)
-      ? body.ids.filter((id: unknown) => typeof id === "string" && id.length > 0)
-      : [];
+    const ids = cleanIds((await request.json())?.ids);
     if (ids.length === 0) {
       return NextResponse.json({ marked: 0 });
     }
@@ -52,6 +55,24 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ marked: Number(rows[0]?.marked || 0) });
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : "Failed to mark read";
+    return NextResponse.json({ error: message }, { status: 500 });
+  }
+}
+
+/** Delete inbox messages (explicit dismissal): body { ids: string[] }. */
+export async function DELETE(request: NextRequest) {
+  try {
+    const ids = cleanIds((await request.json())?.ids);
+    if (ids.length === 0) {
+      return NextResponse.json({ removed: 0 });
+    }
+    const rows = await prisma.$queryRawUnsafe<DbRow[]>(
+      "SELECT delete_web_inbox(ARRAY(SELECT jsonb_array_elements_text($1::jsonb))::uuid[]) AS removed",
+      JSON.stringify(ids)
+    );
+    return NextResponse.json({ removed: Number(rows[0]?.removed || 0) });
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : "Failed to delete";
     return NextResponse.json({ error: message }, { status: 500 });
   }
 }

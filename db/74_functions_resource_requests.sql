@@ -60,9 +60,12 @@ BEGIN
         CASE WHEN p_target_key IS NOT NULL THEN ' (' || p_target_key || ')' ELSE '' END,
         btrim(p_rationale));
     BEGIN
+        -- delivery doc carries the request id in machine-readable form so the
+        -- dashboard inbox can offer grant/deny without parsing the prose.
         PERFORM queue_outbox_message(
             summary || E'\nDecide with: hexis requests grant/deny ' || left(new_id::text, 8),
-            'resource_request', 'resource_request');
+            'resource_request', 'resource_request',
+            jsonb_build_object('mode', 'web_inbox', 'request_id', new_id));
     EXCEPTION WHEN OTHERS THEN
         RAISE WARNING 'resource request % filed but outbox notification failed: %', new_id, SQLERRM;
     END;

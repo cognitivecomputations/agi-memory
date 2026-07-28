@@ -126,6 +126,7 @@ RETURNS JSONB AS $$
                 'kind', m.kind,
                 'intent', m.intent,
                 'message', m.message,
+                'payload', m.payload,
                 'delivered_at', m.delivered_at,
                 'read_at', m.read_at
             ) ORDER BY m.delivered_at DESC)
@@ -148,5 +149,19 @@ BEGIN
     WHERE id = ANY(COALESCE(p_ids, ARRAY[]::uuid[])) AND read_at IS NULL;
     GET DIAGNOSTICS updated = ROW_COUNT;
     RETURN updated;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Explicit dismissal from the dashboard: the user handled the message and
+-- wants it gone (distinct from read, which keeps it in the feed).
+CREATE OR REPLACE FUNCTION delete_web_inbox(p_ids UUID[])
+RETURNS INT AS $$
+DECLARE
+    removed INT;
+BEGIN
+    DELETE FROM web_inbox
+    WHERE id = ANY(COALESCE(p_ids, ARRAY[]::uuid[]));
+    GET DIAGNOSTICS removed = ROW_COUNT;
+    RETURN removed;
 END;
 $$ LANGUAGE plpgsql;

@@ -721,7 +721,8 @@ BEGIN
             PERFORM queue_outbox_message(
                 'I read "' || COALESCE(rec.label, 'a document') || '" a while back and haven''t drawn on it since. '
                 || 'Want me to let it fade, or keep it? Just tell me.',
-                'document_fade', 'retention');
+                'document_fade', 'retention',
+                jsonb_build_object('mode', 'web_inbox', 'content_hash', rec.content_hash));
             v_sent := v_sent + 1;
         END IF;
     END LOOP;
@@ -893,7 +894,8 @@ BEGIN
                     'A while back I fetched "' || COALESCE(rec.title, 'a web source')
                     || '" on my own and built ' || v_memory_count || ' memories from it, '
                     || 'but I haven''t drawn on it lately. Want me to let it fade, or keep it?',
-                    'document_fade', 'retention');
+                    'document_fade', 'retention',
+                    jsonb_build_object('mode', 'web_inbox', 'content_hash', rec.content_hash));
                 v_escalated := v_escalated + 1;
             END IF;
         ELSE

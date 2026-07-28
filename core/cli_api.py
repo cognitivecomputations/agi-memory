@@ -125,7 +125,12 @@ async def status_payload(
             payload["should_run_maintenance"] = None
 
         payload["pending_external_calls"] = 0
-        payload["pending_outbox_messages"] = 0
+        try:
+            payload["pending_outbox_messages"] = int(await conn.fetchval(
+                "SELECT count(*) FROM outbox_messages WHERE status IN ('pending', 'publishing')"
+            ))
+        except Exception:
+            payload["pending_outbox_messages"] = 0
 
         payload["embedding_service_url"] = await conn.fetchval("SELECT get_config_text('embedding.service_url')")
         payload["embedding_dimension"] = int(await conn.fetchval("SELECT embedding_dimension()"))

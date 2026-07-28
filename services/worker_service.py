@@ -83,6 +83,64 @@ def _result_has_work(result: Any) -> bool:
     return True
 
 
+async def channel_adapters_active(conn: asyncpg.Connection) -> bool:
+    """Should outbox messages be published to RabbitMQ at all?
+
+    Only when a channel adapter exists to consume them — with no adapter,
+    user-bound messages pile up in the broker forever with every status
+    surface green (#107). In a channels-less deployment the web_inbox tee IS
+    the delivery. Fail open: better a queued broker copy than a lost channel
+    delivery.
+    """
+    try:
+        return bool(await conn.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM channel_adapter_runtime WHERE configured OR running)"
+        ))
+    except Exception:
+        return True
+
+
+async def tee_outbox_to_web_inbox(conn: asyncpg.Connection, messages: list[dict]) -> int:
+    """Make dashboard delivery independent of the channel worker.
+
+    ChannelOutboxConsumer also tees RabbitMQ messages into web_inbox. This
+    local copy uses the same envelope id, so redelivery through RabbitMQ is
+    idempotent instead of duplicative.
+    """
+    if not messages:
+        return 0
+    enabled = await conn.fetchval(
+        "SELECT COALESCE(get_config_bool('channel.web_inbox.enabled'), TRUE)"
+    )
+    if not enabled:
+        return 0
+
+    delivered = 0
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        payload = msg.get("payload") if isinstance(msg.get("payload"), dict) else {}
+        delivery_info = payload.get("delivery") or msg.get("delivery")
+        if isinstance(delivery_info, dict) and delivery_info.get("mode") == "silent":
+            continue
+        body = {
+            "id": msg.get("message_id") or msg.get("id"),
+            "kind": msg.get("kind"),
+            "payload": payload,
+        }
+        if msg.get("delivery") is not None:
+            body["delivery"] = msg.get("delivery")
+        if msg.get("task_name") is not None:
+            body["task_name"] = msg.get("task_name")
+        web_id = await conn.fetchval(
+            "SELECT web_inbox_deliver($1::jsonb)",
+            json.dumps(body, default=str),
+        )
+        if web_id:
+            delivered += 1
+    return delivered
+
+
 def _worker_metadata() -> dict[str, Any]:
     return {
         "process_id": os.getpid(),
@@ -508,9 +566,17 @@ def create_heartbeat_handler(
     """
 
     async def _publish_outbox(messages: list[dict]) -> None:
-        if not messages or not bridge:
+        if not messages:
             return
-        await bridge.publish_outbox_payloads(messages)
+        async with pool.acquire() as conn:
+            # Deliver to the dashboard inbox first — heartbeat messages must
+            # not depend on the profile-gated channel worker to be seen (#107).
+            try:
+                await tee_outbox_to_web_inbox(conn, messages)
+            except Exception:
+                logger.warning("web_inbox tee failed for heartbeat outbox", exc_info=True)
+            if bridge and await channel_adapters_active(conn):
+                await bridge.publish_outbox_payloads(messages)
 
     async def handle_heartbeat(event: GatewayEvent) -> dict[str, Any] | None:
         payload = event.payload
@@ -719,44 +785,7 @@ class MaintenanceWorker:
             await self.bridge.publish_outbox_payloads(messages)
 
     async def _tee_outbox_to_web_inbox(self, conn: asyncpg.Connection, messages: list[dict]) -> int:
-        """Make dashboard delivery independent of the channel worker.
-
-        ChannelOutboxConsumer also tees RabbitMQ messages into web_inbox. This
-        local copy uses the same envelope id, so redelivery through RabbitMQ is
-        idempotent instead of duplicative.
-        """
-        if not messages:
-            return 0
-        enabled = await conn.fetchval(
-            "SELECT COALESCE(get_config_bool('channel.web_inbox.enabled'), TRUE)"
-        )
-        if not enabled:
-            return 0
-
-        delivered = 0
-        for msg in messages:
-            if not isinstance(msg, dict):
-                continue
-            payload = msg.get("payload") if isinstance(msg.get("payload"), dict) else {}
-            delivery_info = payload.get("delivery") or msg.get("delivery")
-            if isinstance(delivery_info, dict) and delivery_info.get("mode") == "silent":
-                continue
-            body = {
-                "id": msg.get("message_id") or msg.get("id"),
-                "kind": msg.get("kind"),
-                "payload": payload,
-            }
-            if msg.get("delivery") is not None:
-                body["delivery"] = msg.get("delivery")
-            if msg.get("task_name") is not None:
-                body["task_name"] = msg.get("task_name")
-            web_id = await conn.fetchval(
-                "SELECT web_inbox_deliver($1::jsonb)",
-                json.dumps(body, default=str),
-            )
-            if web_id:
-                delivered += 1
-        return delivered
+        return await tee_outbox_to_web_inbox(conn, messages)
 
     async def _run_inbox_poll(self) -> dict[str, Any]:
         if not self.bridge:
@@ -780,7 +809,20 @@ class MaintenanceWorker:
                 return {"skipped": True, "reason": "no_pending_outbox"}
             ids = [c["id"] for c in claimed]
             envelopes = [c["envelope"] for c in claimed]
-            published = await self.bridge.publish_outbox_payloads(envelopes)
+            # Tee to the dashboard inbox BEFORE the RabbitMQ hop: user-bound
+            # messages must not depend on the profile-gated channel worker to
+            # become visible (#107). Idempotent per envelope id, so the channel
+            # worker teeing the same message later is a no-op.
+            teed = await self._tee_outbox_to_web_inbox(conn, envelopes)
+            if await channel_adapters_active(conn):
+                published = await self.bridge.publish_outbox_payloads(envelopes)
+                broker = "published"
+            else:
+                # No adapter exists to consume the queue; the web_inbox tee
+                # above is the delivery. Skip the broker so messages don't
+                # accumulate unconsumed (#107).
+                published = len(ids)
+                broker = "skipped_no_adapters"
             if published > 0:
                 await conn.fetchval("SELECT mark_outbox_published($1::uuid[])", ids[:published])
             if published < len(ids):
@@ -789,6 +831,8 @@ class MaintenanceWorker:
                 "claimed": len(ids),
                 "published": int(published),
                 "requeued": max(len(ids) - int(published), 0),
+                "web_inbox": int(teed),
+                "broker": broker,
             }
 
     async def _run_scheduled_tasks(self) -> dict[str, Any]:

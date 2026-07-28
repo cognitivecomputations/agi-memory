@@ -206,6 +206,12 @@ type InboxMessage = {
   kind: string | null;
   intent: string | null;
   message: string;
+  // Full envelope payload; payload.delivery carries machine-readable
+  // correlation keys (request_id for resource requests, content_hash for
+  // document fade asks, connector source ids).
+  payload?: {
+    delivery?: { request_id?: string; content_hash?: string } & Record<string, unknown>;
+  } & Record<string, unknown>;
   delivered_at: string;
   read_at: string | null;
 };
@@ -793,18 +799,75 @@ export default function ChatPage() {
   }, [loadInbox]);
   useGatewayEvents(loadInbox);
 
-  // Reading is opening the panel: unread messages on screen get their
-  // receipt recorded (DB-side, so every window agrees).
-  useEffect(() => {
-    if (!showInbox) return;
-    const unreadIds = inbox.messages.filter((m) => !m.read_at).map((m) => m.id);
-    if (unreadIds.length === 0) return;
-    void fetch("/api/outbox", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ids: unreadIds }),
-    }).then(() => loadInbox());
-  }, [showInbox, inbox.messages, loadInbox]);
+  // Handling is explicit: each message is acknowledged, replied to, decided,
+  // or deleted by the user — opening the panel no longer marks anything read.
+  const ackInboxMessages = useCallback(
+    async (ids: string[]) => {
+      if (ids.length === 0) return;
+      try {
+        await fetch("/api/outbox", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ids }),
+        });
+      } finally {
+        void loadInbox();
+      }
+    },
+    [loadInbox]
+  );
+
+  const deleteInboxMessage = async (message: InboxMessage) => {
+    setDecideBusy(message.id);
+    try {
+      await fetch("/api/outbox", {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ids: [message.id] }),
+      });
+    } finally {
+      setDecideBusy(null);
+      void loadInbox();
+    }
+  };
+
+  // A document fade ask: 'approve' lets the memories fade permanently, 'keep'
+  // reinforces them. ref = content_hash when the message carries one, else
+  // the quoted label from the prose (resolve_document_fade matches both).
+  const decideFade = async (message: InboxMessage, decision: "approve" | "keep") => {
+    const ref =
+      message.payload?.delivery?.content_hash ||
+      message.message.match(/"([^"]+)"/)?.[1] ||
+      "";
+    if (!ref) {
+      setDecideNotice("Could not identify which document this ask refers to.");
+      return;
+    }
+    setDecideBusy(message.id);
+    setDecideNotice(null);
+    try {
+      const res = await fetch("/api/fade/decide", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ref, decision }),
+      });
+      const result = await res.json();
+      if (!res.ok) {
+        setDecideNotice(result.error ? `Fade decision failed: ${result.error}` : "Fade decision failed.");
+      } else {
+        setDecideNotice(
+          decision === "approve"
+            ? `"${result.label || ref}" will fade (${result.faded ?? 0} memories released).`
+            : `"${result.label || ref}" kept and reinforced.`
+        );
+        await ackInboxMessages([message.id]);
+      }
+    } catch (err: unknown) {
+      setDecideNotice(err instanceof Error ? err.message : "Fade decision failed.");
+    } finally {
+      setDecideBusy(null);
+    }
+  };
 
   const replyToInboxMessage = (message: InboxMessage) => {
     const quoted = message.message
@@ -812,6 +875,7 @@ export default function ChatPage() {
       .split("\n")
       .map((line) => `> ${line}`)
       .join("\n");
+    if (!message.read_at) void ackInboxMessages([message.id]);
     setShowInbox(false);
     setInput((current) => `${quoted}\n\n${current}`);
     textareaRef.current?.focus();
@@ -2214,14 +2278,29 @@ export default function ChatPage() {
               ) : null}
 
               <div>
-                <h3 className="text-xs font-semibold uppercase text-[var(--ink-soft)]">Messages</h3>
+                <div className="flex items-center justify-between">
+                  <h3 className="text-xs font-semibold uppercase text-[var(--ink-soft)]">Messages</h3>
+                  {inbox.messages.some((m) => !m.read_at) ? (
+                    <button
+                      type="button"
+                      onClick={() => ackInboxMessages(inbox.messages.filter((m) => !m.read_at).map((m) => m.id))}
+                      className="text-[10px] font-medium text-[var(--ink-soft)] underline-offset-2 hover:underline"
+                    >
+                      Mark all read
+                    </button>
+                  ) : null}
+                </div>
                 {inbox.messages.length === 0 ? (
                   <p className="mt-2 text-xs text-[var(--ink-soft)]">
                     Nothing yet. When {agentStatus.agent_name || "the agent"} reaches out on her own — from a heartbeat, a reminder, a request — it lands here.
                   </p>
                 ) : (
                   <div className="mt-2 space-y-3">
-                    {inbox.messages.map((message) => (
+                    {inbox.messages.map((message) => {
+                      const pendingRequest = message.payload?.delivery?.request_id
+                        ? inbox.pending_requests.find((r) => r.id === message.payload?.delivery?.request_id)
+                        : undefined;
+                      return (
                       <div key={message.id} className={`rounded-lg border p-3 ${message.read_at ? "border-[var(--outline)] bg-white" : "border-[var(--teal)]/50 bg-[var(--teal)]/5"}`}>
                         <div className="flex items-center justify-between gap-2">
                           <span className="text-xs font-semibold">{agentStatus.agent_name || "Agent"}</span>
@@ -2231,15 +2310,77 @@ export default function ChatPage() {
                           </span>
                         </div>
                         <p className="mt-2 whitespace-pre-wrap text-sm leading-6">{message.message}</p>
-                        <button
-                          type="button"
-                          onClick={() => replyToInboxMessage(message)}
-                          className="mt-2 rounded-md border border-[var(--outline)] px-2.5 py-1 text-xs font-medium text-[var(--foreground)] hover:bg-[var(--surface-strong)]"
-                        >
-                          Reply
-                        </button>
+                        <div className="mt-2 flex flex-wrap items-center gap-2">
+                          {message.intent === "document_fade" ? (
+                            <>
+                              <button
+                                type="button"
+                                disabled={decideBusy === message.id}
+                                onClick={() => decideFade(message, "keep")}
+                                className="rounded-md bg-[var(--teal)] px-2.5 py-1 text-xs font-semibold text-white hover:opacity-90 disabled:opacity-40"
+                              >
+                                Keep it
+                              </button>
+                              <button
+                                type="button"
+                                disabled={decideBusy === message.id}
+                                onClick={() => decideFade(message, "approve")}
+                                className="rounded-md border border-[var(--outline)] px-2.5 py-1 text-xs font-medium text-[var(--foreground)] hover:bg-[var(--surface-strong)] disabled:opacity-40"
+                              >
+                                Let it fade
+                              </button>
+                            </>
+                          ) : null}
+                          {pendingRequest ? (
+                            <>
+                              <button
+                                type="button"
+                                disabled={decideBusy === pendingRequest.id}
+                                onClick={() => decideRequest(pendingRequest, "granted")}
+                                className="flex items-center gap-1 rounded-md bg-[var(--teal)] px-2.5 py-1 text-xs font-semibold text-white hover:opacity-90 disabled:opacity-40"
+                              >
+                                <Check size={12} /> Grant
+                              </button>
+                              <button
+                                type="button"
+                                disabled={decideBusy === pendingRequest.id}
+                                onClick={() => decideRequest(pendingRequest, "denied")}
+                                className="flex items-center gap-1 rounded-md border border-[var(--outline)] px-2.5 py-1 text-xs font-medium text-[var(--foreground)] hover:bg-[var(--surface-strong)] disabled:opacity-40"
+                              >
+                                <X size={12} /> Deny
+                              </button>
+                            </>
+                          ) : null}
+                          <button
+                            type="button"
+                            onClick={() => replyToInboxMessage(message)}
+                            className="rounded-md border border-[var(--outline)] px-2.5 py-1 text-xs font-medium text-[var(--foreground)] hover:bg-[var(--surface-strong)]"
+                          >
+                            Reply
+                          </button>
+                          {!message.read_at ? (
+                            <button
+                              type="button"
+                              onClick={() => ackInboxMessages([message.id])}
+                              className="rounded-md border border-[var(--outline)] px-2.5 py-1 text-xs font-medium text-[var(--ink-soft)] hover:bg-[var(--surface-strong)]"
+                            >
+                              Acknowledge
+                            </button>
+                          ) : null}
+                          <button
+                            type="button"
+                            title="Delete message"
+                            aria-label="Delete message"
+                            disabled={decideBusy === message.id}
+                            onClick={() => deleteInboxMessage(message)}
+                            className="ml-auto flex h-6 w-6 items-center justify-center rounded-md text-[var(--ink-soft)] hover:bg-[var(--surface-strong)] disabled:opacity-40"
+                          >
+                            <Trash2 size={13} />
+                          </button>
+                        </div>
                       </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 )}
               </div>
