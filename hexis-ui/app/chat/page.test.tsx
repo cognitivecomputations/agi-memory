@@ -215,3 +215,80 @@ describe("ChatPage attachments", () => {
     });
   });
 });
+
+describe("ChatPage outbox replies", () => {
+  beforeEach(() => {
+    vi.stubGlobal("matchMedia", vi.fn(() => ({
+      matches: false,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    })));
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    sessionStorage.clear();
+  });
+
+  it("queues a reply for the next heartbeat without using the chat composer", async () => {
+    const replies: Record<string, unknown>[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith("/api/status")) {
+          return Response.json({
+            configured: true,
+            agent_name: "Samantha",
+            mood: "Ready",
+            valence: 0,
+          });
+        }
+        if (url.endsWith("/api/outbox/reply")) {
+          replies.push(JSON.parse(String(init?.body || "{}")));
+          return Response.json({ queued: true, marked_read: 1 });
+        }
+        if (url.endsWith("/api/outbox")) {
+          return Response.json({
+            unread: 1,
+            messages: [
+              {
+                id: "11111111-1111-4111-8111-111111111111",
+                kind: "user",
+                intent: "check_in",
+                message: "Should I prepare the report?",
+                delivered_at: "2026-07-28T12:00:00Z",
+                read_at: null,
+              },
+            ],
+            pending_requests: [],
+          });
+        }
+        return Response.json({});
+      }) as unknown as typeof fetch
+    );
+
+    render(<ChatPage />);
+
+    const composer = await screen.findByLabelText("Message Samantha");
+    fireEvent.click(await screen.findByRole("button", { name: /Show inbox/ }));
+    expect(await screen.findByText("Should I prepare the report?")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Reply" }));
+
+    const replyEditor = await screen.findByLabelText("Reply to Samantha");
+    fireEvent.change(replyEditor, { target: { value: "Yes, please do." } });
+    fireEvent.click(screen.getByRole("button", { name: "Send reply" }));
+
+    await waitFor(() => {
+      expect(replies).toEqual([
+        {
+          message_id: "11111111-1111-4111-8111-111111111111",
+          reply: "Yes, please do.",
+        },
+      ]);
+      expect(screen.getByText("Reply queued for Samantha's next heartbeat.")).toBeInTheDocument();
+    });
+    expect(composer).toHaveValue("");
+    expect(screen.getByRole("heading", { name: "Inbox" })).toBeInTheDocument();
+  });
+});

@@ -41,6 +41,7 @@ from core.agent_loop import AgentEvent, AgentEventData
 from core.auth.ui_flow import AuthFlowError, auth_flow_coordinator
 from core.cli_api import status_payload_rich
 from core.gateway import EventSource, Gateway
+from core.rabbitmq_bridge import RabbitMQBridge
 from core.tools import create_default_registry
 from services.chat import resolve_prompt_addenda, stream_chat_events
 
@@ -150,6 +151,13 @@ class ChatRequest(BaseModel):
     # turn's `done` event to keep one conversation as one session; omit and
     # the server mints one (returned in `done`).
     session_id: str | None = None
+
+
+class InboxReplyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    message_id: uuid.UUID
+    reply: str = Field(min_length=1, max_length=20_000)
 
 
 class IngestTextRequest(BaseModel):
@@ -733,6 +741,78 @@ async def status():
     except Exception as e:
         logger.error("Status failed: %s", e)
         return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/api/inbox/reply")
+async def reply_to_web_inbox(req: InboxReplyRequest):
+    """Queue a dashboard reply for the agent's next inbox poll/heartbeat."""
+    pool = _pool
+    if pool is None:
+        raise HTTPException(status_code=503, detail="Server not ready (no DB pool)")
+
+    reply = req.reply.strip()
+    if not reply:
+        raise HTTPException(status_code=422, detail="Reply cannot be empty")
+
+    async with pool.acquire() as conn:
+        source = await conn.fetchrow(
+            """
+            SELECT id, outbox_msg_id, kind, intent, message
+            FROM web_inbox
+            WHERE id = $1
+            """,
+            req.message_id,
+        )
+    if source is None:
+        raise HTTPException(status_code=404, detail="Outbox message not found")
+
+    inbox_message_id = uuid.uuid4()
+    content = (
+        "The user replied to a message you sent through your outbox.\n\n"
+        f"Your earlier message:\n{source['message']}\n\n"
+        f"User reply:\n{reply}"
+    )
+    envelope = {
+        "id": str(inbox_message_id),
+        "kind": "web_outbox_reply",
+        "content": content,
+        "reply": reply,
+        "source": "web_inbox",
+        "reply_to": {
+            "web_inbox_id": str(source["id"]),
+            "outbox_message_id": source["outbox_msg_id"],
+            "kind": source["kind"],
+            "intent": source["intent"],
+        },
+    }
+
+    bridge = RabbitMQBridge(pool)
+    await bridge.ensure_ready()
+    try:
+        await bridge.publish_inbox_payload(envelope)
+    except Exception as exc:
+        logger.error("Could not queue dashboard reply for %s: %s", req.message_id, exc)
+        raise HTTPException(
+            status_code=503,
+            detail=f"Reply was not queued because Hexis's inbox is unavailable: {exc}",
+        ) from exc
+
+    async with pool.acquire() as conn:
+        marked_read = int(
+            await conn.fetchval(
+                "SELECT mark_web_inbox_read(ARRAY[$1]::uuid[])",
+                req.message_id,
+            )
+            or 0
+        )
+
+    return {
+        "queued": True,
+        "inbox_message_id": str(inbox_message_id),
+        "reply_to": str(req.message_id),
+        "marked_read": marked_read,
+        "message": "Reply queued for the next heartbeat.",
+    }
 
 
 def _json_value(value: Any) -> Any:

@@ -92,6 +92,39 @@ class RabbitMQBridge:
 
         return published
 
+    async def publish_inbox_payload(self, body: dict[str, Any]) -> bool:
+        """Publish one durable user-to-agent message to Hexis's inbox.
+
+        Unlike the best-effort outbox batch publisher, this method lets
+        transport failures propagate so an interactive caller can tell the
+        user that their message was not queued.
+        """
+        vhost = self._vhost_path()
+        message_id = body.get("id") or body.get("message_id")
+        resp = await self._request(
+            "POST",
+            f"/api/exchanges/{vhost}/amq.default/publish",
+            payload={
+                "properties": {
+                    "content_type": "application/json",
+                    "delivery_mode": 2,
+                    **({"message_id": str(message_id)} if message_id else {}),
+                },
+                "routing_key": RABBITMQ_INBOX_QUEUE,
+                "payload": json.dumps(body, default=str),
+                "payload_encoding": "string",
+            },
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(f"inbox publish HTTP {resp.status_code}: {resp.text[:200]}")
+        try:
+            routed = bool(resp.json().get("routed"))
+        except Exception as exc:
+            raise RuntimeError(f"inbox publish returned invalid JSON: {resp.text[:200]}") from exc
+        if not routed:
+            raise RuntimeError(f"inbox message was not routed to {RABBITMQ_INBOX_QUEUE!r}")
+        return True
+
     async def poll_inbox_messages(self, max_messages: int = 10) -> int:
         if not self.pool:
             return 0

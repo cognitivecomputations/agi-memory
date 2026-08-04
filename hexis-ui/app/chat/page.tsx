@@ -726,6 +726,9 @@ export default function ChatPage() {
   const [decideBusy, setDecideBusy] = useState<string | null>(null);
   const [decideNotes, setDecideNotes] = useState<Record<string, string>>({});
   const [decideNotice, setDecideNotice] = useState<string | null>(null);
+  const [replyingTo, setReplyingTo] = useState<string | null>(null);
+  const [replyDraft, setReplyDraft] = useState("");
+  const [replyBusy, setReplyBusy] = useState(false);
   const [connectorActionBusy, setConnectorActionBusy] = useState<string | null>(null);
   const [activeConnectorSetup, setActiveConnectorSetup] = useState<{
     assistantId: string;
@@ -869,16 +872,53 @@ export default function ChatPage() {
     }
   };
 
-  const replyToInboxMessage = (message: InboxMessage) => {
-    const quoted = message.message
-      .slice(0, 400)
-      .split("\n")
-      .map((line) => `> ${line}`)
-      .join("\n");
-    if (!message.read_at) void ackInboxMessages([message.id]);
-    setShowInbox(false);
-    setInput((current) => `${quoted}\n\n${current}`);
-    textareaRef.current?.focus();
+  const startInboxReply = (message: InboxMessage) => {
+    setReplyingTo(message.id);
+    setReplyDraft("");
+    setDecideNotice(null);
+  };
+
+  const cancelInboxReply = () => {
+    if (replyBusy) return;
+    setReplyingTo(null);
+    setReplyDraft("");
+  };
+
+  const submitInboxReply = async (message: InboxMessage) => {
+    const reply = replyDraft.trim();
+    if (!reply) {
+      setDecideNotice("Write a reply before sending it.");
+      return;
+    }
+
+    setReplyBusy(true);
+    setDecideNotice(null);
+    try {
+      const res = await fetch("/api/outbox/reply", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message_id: message.id, reply }),
+      });
+      const result = await res.json();
+      if (!res.ok) {
+        const detail = result.error || result.detail || "Hexis's inbox did not accept the reply.";
+        setDecideNotice(`Reply was not queued: ${detail}`);
+        return;
+      }
+
+      setReplyingTo(null);
+      setReplyDraft("");
+      setDecideNotice(
+        `Reply queued for ${agentStatus.agent_name || "the agent"}'s next heartbeat.`
+      );
+      await loadInbox();
+    } catch (err: unknown) {
+      setDecideNotice(
+        `Reply was not queued: ${err instanceof Error ? err.message : "Hexis's inbox is unavailable."}`
+      );
+    } finally {
+      setReplyBusy(false);
+    }
   };
 
   const decideRequest = async (request: PendingRequest, decision: "granted" | "denied") => {
@@ -2353,7 +2393,8 @@ export default function ChatPage() {
                           ) : null}
                           <button
                             type="button"
-                            onClick={() => replyToInboxMessage(message)}
+                            disabled={replyBusy}
+                            onClick={() => startInboxReply(message)}
                             className="rounded-md border border-[var(--outline)] px-2.5 py-1 text-xs font-medium text-[var(--foreground)] hover:bg-[var(--surface-strong)]"
                           >
                             Reply
@@ -2378,6 +2419,50 @@ export default function ChatPage() {
                             <Trash2 size={13} />
                           </button>
                         </div>
+                        {replyingTo === message.id ? (
+                          <form
+                            className="mt-3 rounded-md border border-[var(--outline)] bg-white p-2"
+                            onSubmit={(event) => {
+                              event.preventDefault();
+                              void submitInboxReply(message);
+                            }}
+                          >
+                            <label
+                              htmlFor={`inbox-reply-${message.id}`}
+                              className="text-xs font-semibold text-[var(--foreground)]"
+                            >
+                              Reply to {agentStatus.agent_name || "the agent"}
+                            </label>
+                            <textarea
+                              id={`inbox-reply-${message.id}`}
+                              autoFocus
+                              rows={3}
+                              value={replyDraft}
+                              disabled={replyBusy}
+                              onChange={(event) => setReplyDraft(event.target.value)}
+                              placeholder="This will be processed at the next heartbeat"
+                              className="mt-2 w-full resize-y rounded-md border border-[var(--outline)] px-2 py-1.5 text-sm outline-none focus:border-[var(--teal)] disabled:opacity-60"
+                            />
+                            <div className="mt-2 flex justify-end gap-2">
+                              <button
+                                type="button"
+                                disabled={replyBusy}
+                                onClick={cancelInboxReply}
+                                className="rounded-md border border-[var(--outline)] px-2.5 py-1 text-xs font-medium text-[var(--ink-soft)] hover:bg-[var(--surface-strong)] disabled:opacity-40"
+                              >
+                                Cancel
+                              </button>
+                              <button
+                                type="submit"
+                                disabled={replyBusy || !replyDraft.trim()}
+                                className="flex items-center gap-1.5 rounded-md bg-[var(--foreground)] px-2.5 py-1 text-xs font-semibold text-white hover:bg-[var(--teal)] disabled:opacity-40"
+                              >
+                                {replyBusy ? <Spinner className="scale-75" /> : <Send size={12} />}
+                                Send reply
+                              </button>
+                            </div>
+                          </form>
+                        ) : null}
                       </div>
                       );
                     })}
