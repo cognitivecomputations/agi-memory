@@ -13,11 +13,14 @@ section: contributing
 
 ```bash
 git clone https://github.com/QuixiAI/Hexis.git && cd Hexis
-pip install -e .
+uv venv && source .venv/bin/activate
+uv pip install -e .
 cp .env.local .env   # edit with your API keys
 hexis up             # start services
 hexis doctor         # verify health
 ```
+
+No uv? A plain virtualenv works too: `python3 -m venv .venv && source .venv/bin/activate && pip install -e .`
 
 ## Coding Style
 

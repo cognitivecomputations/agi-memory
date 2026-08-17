@@ -75,15 +75,17 @@ Treat those statements as unverified.
 **Before you run anything**, you need:
 
 - [Docker Desktop](https://docs.docker.com/get-docker/) — installed **and running**
-- Python 3.10+
+- [uv](https://docs.astral.sh/uv/) — `curl -LsSf https://astral.sh/uv/install.sh | sh` (or `brew install uv`). It installs Hexis into its own isolated environment — no virtualenv to create or activate — and downloads Python 3.10+ automatically if your machine lacks it
 - The local embedding sidecar; `hexis init` starts the published `embeddinggemma` binary and downloads the ~300M-parameter model on first use
 - For the default path below: a **ChatGPT Plus/Pro subscription** (it authenticates via browser OAuth — no API key). No subscription? Use any provider under "Other providers."
 
 ```bash
-pip install hexis
+uv tool install hexis
 hexis init --character hexis --provider openai-codex --model gpt-5.2
 hexis chat
 ```
+
+Prefer another installer? `pipx install hexis` works the same way, and `pip install hexis` works inside an activated virtualenv (bare `pip install` fails on modern macOS/Linux Pythons) — see [Installation](docs/start/installation.md).
 
 `hexis init` opens a browser for login, starts the containers, pulls the embedding model, configures the character, and runs consent (the agent's recorded agreement to operate) -- all in one command.
 
@@ -93,6 +95,7 @@ hexis chat
 
 | Symptom | Likely cause | Fix |
 |---------|--------------|-----|
+| `hexis: command not found` after install | uv's tool directory isn't on PATH | `uv tool update-shell`, then open a new terminal |
 | `hexis init` stalls starting services | Docker daemon isn't running | Start Docker Desktop, re-run `hexis init` |
 | Embedding model pull fails | Local embedding sidecar isn't running | Start `embeddinggemma`, then re-run |
 | Browser login loops or model errors | No ChatGPT Plus/Pro on that account | Use another provider below, or `hexis auth` |
@@ -202,10 +205,13 @@ See [Quickstart](docs/start/quickstart.md) for setup and [Production](docs/opera
 
 ```bash
 git clone https://github.com/QuixiAI/Hexis.git && cd Hexis
-pip install -e .
+uv venv && source .venv/bin/activate
+uv pip install -e .
 cp .env.local .env
 hexis up
 ```
+
+No uv? A plain virtualenv works too: `python3 -m venv .venv && source .venv/bin/activate && pip install -e .`
 
 ## Testing
 

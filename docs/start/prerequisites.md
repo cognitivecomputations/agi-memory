@@ -16,8 +16,10 @@ What you need before installing Hexis.
 | Dependency | Version | Purpose |
 |------------|---------|---------|
 | [Docker Desktop](https://docs.docker.com/get-docker/) | 20.10+ | Runs PostgreSQL (the agent's brain) |
-| Python | 3.10+ | Runs the Hexis CLI and workers |
+| [uv](https://docs.astral.sh/uv/) | Current | Installs the Hexis CLI into an isolated environment; downloads Python 3.10+ automatically if missing |
 | Local embedding sidecar | Current | Generates embeddings for memory storage |
+
+Managing Python yourself instead of using uv? pipx or a virtualenv with Python 3.10+ works too — see [Installation](installation.md).
 
 ## Verify Installation
 
@@ -28,7 +30,7 @@ docker --version          # Docker version 20.10+
 docker info               # daemon is running (errors if not — start Docker Desktop)
 docker compose version    # Docker Compose v2+
 embeddinggemma --help
-python3 --version         # Python 3.10+
+uv --version              # or: python3 --version (3.10+) if managing Python yourself
 ```
 
 `hexis init` starts the local embedding sidecar and downloads the ~300M-parameter embedding model on first use. Set `EMBEDDING_SERVICE_URL` only if you are intentionally pointing Hexis at a different embedding service.
@@ -65,4 +67,4 @@ Hexis runs on macOS, Linux, and Windows (via WSL2). Docker Desktop handles the P
 
 ## Next Steps
 
-- [Installation](installation.md) -- install Hexis via pip or from source
+- [Installation](installation.md) -- install Hexis with uv, pipx, or pip, or from source

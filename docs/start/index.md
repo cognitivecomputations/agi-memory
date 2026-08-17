@@ -18,7 +18,7 @@ Get from zero to a running Hexis agent with persistent memory, identity, and an 
 | [What is Hexis?](what-is-hexis.md) | Plain-language what/why, and how it compares |
 | [Quickstart](quickstart.md) | 3-command setup for the impatient |
 | [Prerequisites](prerequisites.md) | What you need before installing |
-| [Installation](installation.md) | pip install, source checkout, .env setup |
+| [Installation](installation.md) | uv/pipx/pip install, source checkout, .env setup |
 | [First Agent](first-agent.md) | Walk through the init wizard |
 | [First Conversation](first-conversation.md) | Chat with your agent |
 | [Next Steps](next-steps.md) | Where to go from here |

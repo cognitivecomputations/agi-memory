@@ -9,7 +9,7 @@ section: reference
 
 # CLI Reference
 
-Complete reference for the `hexis` CLI. Install via `pip install hexis`.
+Complete reference for the `hexis` CLI. Install via `uv tool install hexis` (or `pipx install hexis`; plain `pip install hexis` works inside an activated virtualenv).
 
 ## Global Flags
 

@@ -6,13 +6,13 @@ Nothing is published manually.
 ## The user journey this protects
 
 ```bash
-pip install hexis   # gets CLI X.Y.Z
-hexis up            # pulls ghcr images tagged X.Y.Z — same commit as the CLI
-hexis upgrade       # updates the pip package, then pulls the new pinned images, then migrates
+uv tool install hexis   # gets CLI X.Y.Z
+hexis up                # pulls ghcr images tagged X.Y.Z — same commit as the CLI
+hexis upgrade           # updates the CLI package, then pulls the new pinned images, then migrates
 ```
 
 The CLI pins `HEXIS_IMAGE_TAG` to its own package version when driving
-`ops/docker-compose.runtime.yml`, so a pip release and its images are always
+`ops/docker-compose.runtime.yml`, so a PyPI release and its images are always
 the same code. `latest` means "newest release" and is only the fallback (e.g.
 installs from git where no version metadata exists).
 
