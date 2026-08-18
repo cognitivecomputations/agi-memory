@@ -1,4 +1,9 @@
 -- Hexis schema: indexes.
+-- Each baseline file runs as its own psql session at initdb, so it must pin
+-- its own search_path: under an ag_catalog-first cluster default, unqualified
+-- CREATEs would land Hexis objects in ag_catalog (the #77 fossil bug).
+SET search_path = public, ag_catalog, "$user";
+
 CREATE INDEX IF NOT EXISTS idx_memories_source_content_hash
     ON memories ((source_attribution->>'content_hash'))
     WHERE source_attribution->>'content_hash' IS NOT NULL;

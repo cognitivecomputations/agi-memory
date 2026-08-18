@@ -17,6 +17,11 @@
 -- effects (boosted memories, shifted mood, stronger instincts).
 -- ============================================================================
 
+-- Each baseline file runs as its own psql session at initdb, so it must pin
+-- its own search_path: under an ag_catalog-first cluster default, unqualified
+-- CREATEs would land Hexis objects in ag_catalog (the #77 fossil bug).
+SET search_path = public, ag_catalog, "$user";
+
 SET check_function_bodies = off;
 
 INSERT INTO config_defaults (key, value, description) VALUES

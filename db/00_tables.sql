@@ -4,6 +4,10 @@
 -- ============================================================================
 -- EXTENSIONS
 -- ============================================================================
+-- Pin the path before anything is created: each baseline file runs as its own
+-- psql session at initdb, and under an ag_catalog-first cluster default the
+-- extensions below would otherwise install into ag_catalog (#77).
+SET search_path = public, ag_catalog, "$user";
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS age;
 CREATE EXTENSION IF NOT EXISTS btree_gist;

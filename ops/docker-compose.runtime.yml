@@ -29,10 +29,13 @@ services:
       start_period: 30s
     ports:
       - "${HEXIS_BIND_ADDRESS:-127.0.0.1}:${POSTGRES_PORT:-43815}:5432"
+    # public FIRST: Hexis functions live in public and must shadow nothing;
+    # ag_catalog stays on the path so AGE (cypher, agtype) works unqualified.
+    # (ag_catalog-first caused stale shadow copies — migration 0043.)
     command:
       - postgres
       - -c
-      - search_path=ag_catalog,public
+      - search_path=public,ag_catalog
       - -c
       - app.embedding_dimension=${EMBEDDING_DIMENSION:-768}
       - -c

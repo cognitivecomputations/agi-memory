@@ -6,6 +6,11 @@
 -- ============================================================================
 
 -- Channel sessions: per-sender conversation state
+-- Each baseline file runs as its own psql session at initdb, so it must pin
+-- its own search_path: under an ag_catalog-first cluster default, unqualified
+-- CREATEs would land Hexis objects in ag_catalog (the #77 fossil bug).
+SET search_path = public, ag_catalog, "$user";
+
 CREATE TABLE IF NOT EXISTS channel_sessions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     channel_type TEXT NOT NULL,            -- 'discord', 'telegram', etc.

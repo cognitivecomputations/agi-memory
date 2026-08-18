@@ -8,6 +8,11 @@
 --
 -- Mirrored as db/migrations/0004_hmx_export_functions.sql for existing DBs.
 -- ============================================================================
+-- Each baseline file runs as its own psql session at initdb, so it must pin
+-- its own search_path: under an ag_catalog-first cluster default, unqualified
+-- CREATEs would land Hexis objects in ag_catalog (the #77 fossil bug).
+SET search_path = public, ag_catalog, "$user";
+
 SET check_function_bodies = off;
 
 -- Memories section: the non-protected memory types. Worldview and goal

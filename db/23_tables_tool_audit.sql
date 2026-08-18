@@ -6,6 +6,11 @@
 -- ============================================================================
 
 -- Tool executions: audit log for every tool call
+-- Each baseline file runs as its own psql session at initdb, so it must pin
+-- its own search_path: under an ag_catalog-first cluster default, unqualified
+-- CREATEs would land Hexis objects in ag_catalog (the #77 fossil bug).
+SET search_path = public, ag_catalog, "$user";
+
 CREATE TABLE IF NOT EXISTS tool_executions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     tool_name TEXT NOT NULL,

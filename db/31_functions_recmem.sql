@@ -1,5 +1,10 @@
 -- RecMem: recurrence-based memory consolidation.
 
+-- Each baseline file runs as its own psql session at initdb, so it must pin
+-- its own search_path: under an ag_catalog-first cluster default, unqualified
+-- CREATEs would land Hexis objects in ag_catalog (the #77 fossil bug).
+SET search_path = public, ag_catalog, "$user";
+
 INSERT INTO config_defaults (key, value, description) VALUES
     ('memory.history_browse_max', '200'::jsonb,
      'Row ceiling for keyword-less time-window browsing in search_history (preview-grain rows)')

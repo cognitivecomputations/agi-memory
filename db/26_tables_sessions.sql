@@ -6,6 +6,11 @@
 -- budget and stores results back here.
 -- =============================================================
 
+-- Each baseline file runs as its own psql session at initdb, so it must pin
+-- its own search_path: under an ag_catalog-first cluster default, unqualified
+-- CREATEs would land Hexis objects in ag_catalog (the #77 fossil bug).
+SET search_path = public, ag_catalog, "$user";
+
 CREATE TABLE IF NOT EXISTS sub_agent_sessions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     task TEXT NOT NULL,                          -- What the sub-agent should do

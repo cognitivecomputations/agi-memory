@@ -127,6 +127,89 @@ async def migrations_table_name(conn: asyncpg.Connection) -> str:
     return await _ensure_table(conn)
 
 
+async def _relocate_stranded_objects(conn: asyncpg.Connection) -> None:
+    """Move Hexis objects stranded in ag_catalog back to public (#77).
+
+    Extension-owned objects (AGE's own catalog, and any extension that was
+    installed under an ag_catalog-first search_path) stay put — they remain
+    resolvable via the path and belong to their extension. Only loose Hexis
+    tables/sequences/views and functions with no public counterpart move;
+    shadowing twins are handled by the eviction postcondition instead.
+    """
+
+    relations = await conn.fetch(
+        """
+        SELECT c.relname, c.relkind
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'ag_catalog'
+          AND c.relkind IN ('r', 'p', 'S', 'v', 'm')
+          AND NOT EXISTS (
+              SELECT 1 FROM pg_depend d
+              WHERE d.classid = 'pg_class'::regclass
+                AND d.objid = c.oid
+                AND d.deptype = 'e'
+          )
+        ORDER BY (c.relkind NOT IN ('r', 'p')), c.relname
+        """
+    )
+    for rel in relations:
+        name = rel["relname"]
+        if name == "schema_migrations":
+            continue  # _ensure_table owns that move
+        qualified = f'ag_catalog."{name}"'
+        # A table move drags its owned sequences/indexes along — re-check.
+        if await conn.fetchval("SELECT to_regclass($1) IS NULL", qualified):
+            continue
+        if not await conn.fetchval(
+            "SELECT to_regclass($1) IS NULL", f'public."{name}"'
+        ):
+            logger.warning(
+                "schema guard: ag_catalog.%s has a public namesake — not moved", name
+            )
+            continue
+        kind = {"S": "SEQUENCE", "v": "VIEW", "m": "MATERIALIZED VIEW"}.get(
+            rel["relkind"], "TABLE"
+        )
+        await conn.execute(f'ALTER {kind} {qualified} SET SCHEMA public')
+        logger.warning(
+            "schema guard: moved stranded ag_catalog.%s to public (#77)", name
+        )
+
+    functions = await conn.fetch(
+        """
+        SELECT p.proname,
+               pg_get_function_identity_arguments(p.oid) AS args,
+               p.prokind
+        FROM pg_proc p
+        JOIN pg_namespace n ON n.oid = p.pronamespace
+        WHERE n.nspname = 'ag_catalog'
+          AND p.prokind IN ('f', 'p')
+          AND NOT EXISTS (
+              SELECT 1 FROM pg_depend d
+              WHERE d.classid = 'pg_proc'::regclass
+                AND d.objid = p.oid
+                AND d.deptype = 'e'
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM pg_proc p2
+              JOIN pg_namespace n2 ON n2.oid = p2.pronamespace
+              WHERE n2.nspname = 'public' AND p2.proname = p.proname
+          )
+        """
+    )
+    for fn in functions:
+        kind = "PROCEDURE" if fn["prokind"] == "p" else "FUNCTION"
+        await conn.execute(
+            f'ALTER {kind} ag_catalog."{fn["proname"]}"({fn["args"]}) SET SCHEMA public'
+        )
+        logger.warning(
+            "schema guard: moved stranded ag_catalog.%s(%s) to public (#77)",
+            fn["proname"],
+            fn["args"],
+        )
+
+
 async def apply_pending_migrations(
     conn: asyncpg.Connection, *, migrations_dir: Path | None = None
 ) -> list[str]:
@@ -144,6 +227,13 @@ async def apply_pending_migrations(
     applied: list[str] = []
     try:
         table = await _ensure_table(conn)
+        # Precondition (#77 homecoming, general case): databases initialized
+        # under an ag_catalog-first cluster search_path landed some Hexis
+        # tables/functions in ag_catalog with no public copy at all. Later
+        # migrations look those objects up as public.<name> and crash, so the
+        # strays must come home BEFORE the pending loop runs — the runner is
+        # the only place ordered before every migration.
+        await _relocate_stranded_objects(conn)
         done = {r["version"] for r in await conn.fetch(f"SELECT version FROM {table}")}
         for path in files:
             version = path.stem  # e.g. "0001_hmx_enum_values"
