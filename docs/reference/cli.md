@@ -27,6 +27,7 @@ Complete reference for the `hexis` CLI. Install via `uv tool install hexis` (or 
 |---------|-------------|
 | `hexis up [--build] [--profile PROFILE]` | Start the default stack: DB, queue, heartbeat worker, and maintenance worker |
 | `hexis down` | Stop services |
+| `hexis uninstall [--purge\|--cli-only] [--yes]` | Remove Hexis; preserve brain data/config unless `--purge` is explicit |
 | `hexis ps` | Show running containers |
 | `hexis logs [-f] [services...]` | View/tail logs |
 | `hexis start` | Start heartbeat and maintenance workers manually if stopped |

@@ -210,6 +210,7 @@ _HELP_GROUPS = [
     ("Stack", [
         ("up", "Start the default stack"),
         ("down", "Stop the stack"),
+        ("uninstall", "Remove Hexis; keep brain data unless --purge is explicit"),
         ("upgrade", "Update + migrate the schema, keeping your data"),
         ("migrate", "Apply pending schema migrations (no data loss)"),
         ("backup", "Back up the database to a file"),
@@ -415,6 +416,26 @@ def build_parser() -> argparse.ArgumentParser:
 
     down = sub.add_parser("down", help="Stop the stack")
     down.set_defaults(func="down")
+
+    uninstall = sub.add_parser(
+        "uninstall",
+        help="Remove Hexis (preserves brain data and config by default)",
+    )
+    uninstall_mode = uninstall.add_mutually_exclusive_group()
+    uninstall_mode.add_argument(
+        "--purge",
+        action="store_true",
+        help="Also permanently delete Docker volumes and Hexis config/data",
+    )
+    uninstall_mode.add_argument(
+        "--cli-only",
+        action="store_true",
+        help="Remove only the CLI; leave Docker resources untouched",
+    )
+    uninstall.add_argument(
+        "--yes", "-y", action="store_true", help="Skip the confirmation prompt"
+    )
+    uninstall.set_defaults(func="uninstall")
 
     logs = sub.add_parser("logs", help="Show logs")
     logs.add_argument("--follow", "-f", action="store_true", help="Follow log output")
@@ -3676,6 +3697,117 @@ _LOCAL_EMBEDDING_PORT = 42666
 _LOCAL_EMBEDDING_LOG = Path.home() / ".hexis" / "embeddinggemma.log"
 
 
+def _local_embedding_pid_file() -> Path:
+    return _LOCAL_EMBEDDING_LOG.with_name("embeddinggemma.pid")
+
+
+def _record_local_embedding_process(proc: subprocess.Popen[Any]) -> None:
+    """Remember only processes this CLI actually launched.
+
+    The ownership record lets `hexis down` and `hexis uninstall` stop the
+    companion service without guessing about an ambient embeddinggemma process
+    that another application may own.
+    """
+    pid = getattr(proc, "pid", None)
+    if not isinstance(pid, int) or pid <= 0:
+        return
+    try:
+        pid_file = _local_embedding_pid_file()
+        pid_file.parent.mkdir(parents=True, exist_ok=True)
+        pid_file.write_text(f"{pid}\n", encoding="utf-8")
+    except OSError:
+        pass  # advisory ownership tracking must never block startup
+
+
+def _forget_local_embedding_process() -> None:
+    try:
+        _local_embedding_pid_file().unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _process_command(pid: int) -> str | None:
+    """Return a process command for PID-reuse protection (macOS/Linux)."""
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    command = (result.stdout or "").strip()
+    return command or None
+
+
+def _stop_owned_local_embedding_service() -> tuple[bool, str | None]:
+    """Stop the sidecar iff an ownership record still names that process.
+
+    Returns ``(stopped, note)``. A note explains any running service Hexis
+    deliberately left alone because ownership could not be verified.
+    """
+    import signal
+    import time
+
+    pid_file = _local_embedding_pid_file()
+    if not pid_file.exists():
+        if _port_ready(_LOCAL_EMBEDDING_PORT):
+            listener = _port_listener_summary(_LOCAL_EMBEDDING_PORT)
+            detail = f" ({listener})" if listener else ""
+            return False, (
+                f"An embedding service is still listening on port "
+                f"{_LOCAL_EMBEDDING_PORT}{detail}. Hexis could not verify that it "
+                "owns this process, so it was left running."
+            )
+        return False, None
+
+    try:
+        pid = int(pid_file.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        _forget_local_embedding_process()
+        return False, None
+
+    command = _process_command(pid)
+    if command is None:
+        _forget_local_embedding_process()
+        return False, (
+            f"Could not verify the saved embedding PID {pid}; it was left alone."
+            if _port_ready(_LOCAL_EMBEDDING_PORT)
+            else None
+        )
+    if Path(command).name.lower() != _LOCAL_EMBEDDING_COMMAND:
+        _forget_local_embedding_process()
+        return False, (
+            f"The saved embedding PID {pid} now belongs to another process "
+            f"({command}); it was left alone."
+        )
+
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        _forget_local_embedding_process()
+        return False, None
+    except OSError as exc:
+        return False, f"Could not stop embedding service PID {pid}: {exc}"
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if _process_command(pid) is None:
+            _forget_local_embedding_process()
+            return True, None
+        time.sleep(0.1)
+
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except OSError as exc:
+        return False, f"Could not force-stop embedding service PID {pid}: {exc}"
+    _forget_local_embedding_process()
+    return True, None
+
+
 def _port_listener_summary(port: int) -> str | None:
     """Best-effort process name(s) listening on a local TCP port."""
     lsof = shutil.which("lsof")
@@ -3863,6 +3995,7 @@ def _start_local_embedding_service(wait_seconds: float = 90.0) -> bool:
                 env=os.environ.copy(),
                 start_new_session=True,
             )
+            _record_local_embedding_process(proc)
     except Exception as exc:
         console.print(
             f"[warn]Couldn't start local embedding service: {exc}[/warn]\n"
@@ -3877,6 +4010,7 @@ def _start_local_embedding_service(wait_seconds: float = 90.0) -> bool:
             console.print(f"[ok]Embedding service is ready on port {_LOCAL_EMBEDDING_PORT}.[/ok]")
             return True
         if proc is not None and proc.poll() is not None:
+            _forget_local_embedding_process()
             tail = _tail_text(_LOCAL_EMBEDDING_LOG)
             tail_block = f"\n  Recent log:\n{tail}" if tail else ""
             console.print(
@@ -4200,6 +4334,231 @@ def _handle_ui_container(
         run_compose(compose_cmd, compose_file, stack_root, ["stop", "ui", "api"], env_file)
 
 
+def _path_is_within(path: Path, directory: Path) -> bool:
+    try:
+        path.relative_to(directory)
+        return True
+    except ValueError:
+        return False
+
+
+def _capture_path(command: list[str]) -> Path | None:
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    value = (result.stdout or "").strip()
+    if result.returncode != 0 or not value:
+        return None
+    return Path(value).expanduser().resolve()
+
+
+def _find_uninstall_program(name: str) -> str | None:
+    resolved = shutil.which(name)
+    if resolved:
+        return resolved
+
+    candidates: list[Path] = []
+    if name == "uv" and os.getenv("UV_INSTALL_DIR"):
+        candidates.append(Path(os.environ["UV_INSTALL_DIR"]) / "uv")
+    if os.getenv("XDG_BIN_HOME"):
+        candidates.append(Path(os.environ["XDG_BIN_HOME"]) / name)
+    candidates.append(Path.home() / ".local" / "bin" / name)
+    for candidate in candidates:
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
+
+
+def _package_uninstall_command() -> tuple[list[str], str]:
+    """Derive the owning tool from the running environment.
+
+    Calling pip inside a uv-tool or pipx environment would leave a broken tool
+    wrapper behind, so compare ``sys.prefix`` to each manager's live tool root
+    before falling back to this interpreter's pip.
+    """
+    prefix = Path(sys.prefix).resolve()
+
+    uv = _find_uninstall_program("uv")
+    if uv:
+        uv_tool_root = _capture_path([uv, "tool", "dir"])
+        if uv_tool_root and _path_is_within(prefix, uv_tool_root / "hexis"):
+            return [uv, "tool", "uninstall", "hexis"], "uv"
+
+    pipx = _find_uninstall_program("pipx")
+    if pipx:
+        pipx_root = _capture_path(
+            [pipx, "environment", "--value", "PIPX_LOCAL_VENVS"]
+        )
+        if pipx_root and _path_is_within(prefix, pipx_root / "hexis"):
+            return [pipx, "uninstall", "hexis"], "pipx"
+
+    return [sys.executable, "-m", "pip", "uninstall", "--yes", "hexis"], "pip"
+
+
+def _hexis_data_dir() -> Path:
+    from core.config import hexis_home
+
+    return hexis_home().expanduser()
+
+
+def _purge_hexis_data_dir(path: Path) -> tuple[bool, str | None]:
+    """Remove the explicitly selected Hexis data directory with guard rails."""
+    if not path.exists() and not path.is_symlink():
+        return True, None
+    if path.is_symlink():
+        return False, (
+            f"Refusing to purge symlinked Hexis data directory: {path}. "
+            "Remove that link or its target yourself after checking it."
+        )
+
+    resolved = path.resolve()
+    home = Path.home().resolve()
+    if resolved in {Path("/"), home} or len(resolved.parts) < 3:
+        return False, f"Refusing unsafe Hexis data path: {resolved}"
+    try:
+        shutil.rmtree(resolved)
+    except OSError as exc:
+        return False, f"Could not delete Hexis data at {resolved}: {exc}"
+    return True, None
+
+
+def _confirm_uninstall(*, purge: bool, cli_only: bool, data_dir: Path) -> bool:
+    print("Hexis uninstall\n")
+    print("This will:")
+    if cli_only:
+        print("  - remove the Hexis CLI installation")
+        print("  - leave all Docker containers, images, and volumes untouched")
+    else:
+        print("  - stop and remove Hexis containers and their network")
+        print("  - remove Hexis Docker images")
+        print("  - remove the Hexis CLI installation")
+    if purge:
+        print("  - PERMANENTLY DELETE the brain database volumes")
+        print(f"  - PERMANENTLY DELETE Hexis config, credentials, and backups at {data_dir}")
+        phrase = "uninstall and delete data"
+        print(
+            "\nThe default backup directory is inside the data being deleted. "
+            "If you may want this agent again, abort and run "
+            "`hexis backup --output <directory-outside-the-Hexis-data-dir>` first."
+        )
+    else:
+        print("\nYour brain database volumes and Hexis config will be preserved.")
+        print("Reinstall Hexis and run `hexis up` to use them again.")
+        phrase = "uninstall"
+    try:
+        answer = input(f"\nType '{phrase}' to confirm: ")
+    except (KeyboardInterrupt, EOFError):
+        print("\nAborted.")
+        return False
+    if answer.strip().lower() != phrase:
+        print("Aborted.")
+        return False
+    return True
+
+
+def _uninstall(
+    *,
+    compose_file: Path | None,
+    stack_root: Path,
+    env_file: Path | None,
+    is_source: bool,
+    purge: bool,
+    cli_only: bool,
+    yes: bool,
+) -> int:
+    data_dir = _hexis_data_dir()
+    uninstall_command, package_manager = _package_uninstall_command()
+
+    if not yes and not _confirm_uninstall(
+        purge=purge, cli_only=cli_only, data_dir=data_dir
+    ):
+        return 1
+
+    sidecar_note: str | None = None
+    if not cli_only:
+        if compose_file is None:
+            _print_err(
+                "Cannot find Hexis's Docker Compose file, so no software was removed. "
+                "Reinstall Hexis and retry, or use `hexis uninstall --cli-only` to "
+                "remove only the CLI while leaving Docker resources untouched."
+            )
+            return 1
+        try:
+            docker_bin = ensure_docker()
+            compose_cmd = ensure_compose(docker_bin)
+        except SystemExit:
+            _print_err(
+                "No software was removed. Start Docker and retry `hexis uninstall`, "
+                "or run `hexis uninstall --cli-only` if you intentionally want to "
+                "leave Docker resources untouched."
+            )
+            return 1
+
+        compose_args = ["down", "--remove-orphans", "--rmi", "all"]
+        if purge:
+            compose_args.append("--volumes")
+        print("Removing Hexis Docker resources...")
+        rc = run_compose(
+            compose_cmd, compose_file, stack_root, compose_args, env_file
+        )
+        if rc != 0:
+            _print_err(
+                "Docker cleanup failed, so the CLI was kept. Fix the Docker error "
+                "above and rerun `hexis uninstall`."
+            )
+            return rc
+
+        stopped_sidecar, sidecar_note = _stop_owned_local_embedding_service()
+        if stopped_sidecar:
+            print("Stopped the embedding service started by Hexis.")
+
+    if purge:
+        removed, error = _purge_hexis_data_dir(data_dir)
+        if not removed:
+            _print_err(f"{error} The CLI was kept so you can retry safely.")
+            return 1
+
+    source_note = (
+        f" The source checkout at {stack_root} was left in place."
+        if is_source
+        else ""
+    )
+    embedding_binary_retained = _local_embedding_binary() is not None
+    print(f"Uninstalling Hexis with {package_manager}...", flush=True)
+    rc = subprocess.run(uninstall_command).returncode
+    if rc != 0:
+        _print_err(
+            f"The stack was removed, but {package_manager} could not uninstall the "
+            f"CLI (exit {rc}). Retry manually with: {' '.join(uninstall_command)}"
+        )
+        return rc
+
+    print("\nHexis has been uninstalled." + source_note)
+    if purge:
+        print("The brain database volumes and Hexis data directory were deleted.")
+    elif cli_only:
+        print("Docker resources and all Hexis data were left untouched, as requested.")
+    else:
+        print(
+            f"Your brain database volumes and Hexis config at {data_dir} were preserved."
+        )
+        print("Reinstall Hexis and run `hexis up` to restore the agent.")
+    if sidecar_note:
+        print(f"\nNote: {sidecar_note}")
+    if embedding_binary_retained:
+        print(
+            "The standalone embeddinggemma binary and model cache were preserved "
+            "because other applications may use them."
+        )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     """Top-level guard: turn stack-down / unhandled errors into one actionable
     line instead of a raw traceback (Experience Bar #8, #4)."""
@@ -4480,6 +4839,17 @@ def _dispatch(argv: list[str] | None = None) -> int:
         }[func]
         return asyncio.run(handler(_get_dsn(args), args))
 
+    if func == "uninstall":
+        return _uninstall(
+            compose_file=compose_file,
+            stack_root=stack_root,
+            env_file=env_file,
+            is_source=is_source,
+            purge=args.purge,
+            cli_only=args.cli_only,
+            yes=args.yes,
+        )
+
     docker_cmds = {"up", "dev", "down", "ps", "logs", "start", "stop", "reset", "upgrade"}
     docker_bin: str | None = None
     compose_cmd: list[str] | None = None
@@ -4601,7 +4971,14 @@ def _dispatch(argv: list[str] | None = None) -> int:
         console.print("\n[dim]Stopped watching. The stack is still running; plain `hexis up` also rebuilds on demand.[/dim]")
         return rc
     if func == "down":
-        return run_compose(compose_cmd or [], compose_file, stack_root, ["down"], env_file)
+        rc = run_compose(compose_cmd or [], compose_file, stack_root, ["down"], env_file)
+        if rc == 0:
+            stopped_sidecar, sidecar_note = _stop_owned_local_embedding_service()
+            if stopped_sidecar:
+                print("Stopped the embedding service started by Hexis.")
+            if sidecar_note:
+                print(f"Note: {sidecar_note}")
+        return rc
     if func == "reset":
         from apps.cli_theme import console
         if not args.yes:

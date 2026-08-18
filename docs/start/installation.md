@@ -40,6 +40,35 @@ To update later: `uv tool upgrade hexis` (or use `hexis upgrade`, which also ref
 
 The CLI manages Docker containers, the database, and agent configuration.
 
+## Uninstall
+
+Use the CLI so the Python tool and Docker resources are handled together:
+
+```bash
+hexis uninstall
+```
+
+The default is reversible: Hexis stops and removes its containers, network, and
+images, then removes the CLI using the tool that installed it (`uv`, `pipx`, or
+`pip`). The brain's Docker volumes and `~/.hexis` configuration, credentials,
+skills, artifacts, and backups are preserved. Reinstall Hexis and run
+`hexis up` to use that data again.
+
+For a permanent clean removal:
+
+```bash
+hexis backup --output "$HOME/hexis-backups"  # optional; keep it outside ~/.hexis
+hexis uninstall --purge
+```
+
+`--purge` requires an explicit confirmation and permanently deletes the brain
+database volumes plus the Hexis data directory, including its default backups
+directory. The standalone
+`embeddinggemma` binary and its model cache are retained because other
+applications may use them. If Docker is unavailable and you intentionally want
+to remove only the CLI while leaving all Docker resources untouched, use
+`hexis uninstall --cli-only`.
+
 ## Install with pipx
 
 Already a pipx user? It gives you the same isolated-tool experience:

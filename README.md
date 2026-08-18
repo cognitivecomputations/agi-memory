@@ -24,13 +24,32 @@ This is both an engineering project and a philosophical experiment. For the phil
 
 > **[Full Documentation](docs/index.md)** · [What is Hexis?](docs/start/what-is-hexis.md) · [FAQ](docs/faq.md) · [Troubleshooting](docs/operations/troubleshooting.md)
 
-## Install
+## Install / Uninstall
+
+### Install
 
 ```bash
 curl -LsSf https://quixi.ai/hexis.sh | sh
 ```
 
-One command on macOS, Linux, or WSL2 — it installs the `hexis` CLI with everything it needs (no Python setup, no virtualenv) and is safe to re-run to upgrade. Then jump to [Quick Start](#quick-start). Other routes (uv, pipx, pip, source) are in [Installation](docs/start/installation.md).
+One command on macOS, Linux, or WSL2 — no Python setup or virtualenv needed. It is safe to re-run to upgrade.
+
+### Uninstall
+
+```bash
+hexis uninstall
+```
+
+This removes Hexis, its containers, and Docker images, but **preserves the brain database and `~/.hexis` configuration by default**. Reinstall and run `hexis up` to bring the agent back.
+
+To permanently delete the brain and all Hexis data:
+
+```bash
+hexis backup --output "$HOME/hexis-backups"  # optional; keep the backup outside ~/.hexis
+hexis uninstall --purge
+```
+
+The purge path requires explicit confirmation. See [Installation](docs/start/installation.md) for uv, pipx, pip, source installs, and complete uninstall behavior, or jump to [Quick Start](#quick-start).
 
 ## See It Happen
 
@@ -183,6 +202,7 @@ hexis status                  # agent status
 hexis doctor                  # health check
 hexis up                     # start services + background workers
 hexis down                    # stop services
+hexis uninstall               # remove Hexis; preserve brain data by default
 hexis ingest --input ./docs   # knowledge ingestion
 hexis docs search "query"     # search preserved source documents
 hexis desk list               # what's loaded as working material
