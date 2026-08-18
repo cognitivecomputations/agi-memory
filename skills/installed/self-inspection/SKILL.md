@@ -5,7 +5,7 @@ category: system
 requires:
   tools: [inspect_source, inspect_database_schema]
 contexts: [heartbeat, chat]
-bound_tools: [inspect_source, inspect_database_schema, inspect_config, review_recent_actions, review_recent_changes]
+bound_tools: [inspect_source, inspect_database_schema, inspect_config, review_recent_actions, review_recent_changes, self_repair]
 ---
 
 # Self Inspection
@@ -55,6 +55,11 @@ current checkout actually does, and what schema is running in PostgreSQL.
 - State when the running schema differs from baseline files or migrations.
 - Use `review_recent_changes` to see what changed about your own substrate —
   migrations, code rebuilds, prompt edits, and operator config decisions.
+- When tool calls, heartbeat steps, integrations, or memory retrieval have been
+  failing, use `self_repair` to list unresolved defect reports, diagnose one
+  with the source/schema evidence gathered here, and mark it resolved only
+  after verification. It records and reasons about defects; it never silently
+  edits source code.
 - Do not claim access to model weights, provider infrastructure, hardware, or
   secrets unless another explicit capability supplies that evidence.
 - Do not expose credentials, `.env` contents, or unrelated private files.

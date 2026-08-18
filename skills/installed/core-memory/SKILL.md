@@ -5,7 +5,7 @@ category: system
 requires:
   tools: [recall, search_history, remember]
 contexts: [heartbeat, chat]
-bound_tools: [recall, search_history, remember, add_evidence, belief_history, open_memory, search_documents, open_document, open_documents, load_documents, search_document_chunks, open_document_chunk, load_document_chunks, list_desk, open_desk_item, pin_desk_item, unpin_desk_item, clear_desk, sense_memory_availability, read_journal, write_journal, search_journal, manage_goals, manage_schedule, manage_backlog, list_document_fade_requests, resolve_document_fade, associate, trace_why, get_procedures, get_strategies]
+bound_tools: [recall, search_history, remember, add_evidence, belief_history, open_memory, search_documents, open_document, open_documents, load_documents, search_document_chunks, open_document_chunk, load_document_chunks, list_desk, open_desk_item, pin_desk_item, unpin_desk_item, clear_desk, sense_memory_availability, read_journal, write_journal, search_journal, manage_goals, manage_schedule, manage_responsibility, manage_backlog, list_document_fade_requests, resolve_document_fade, associate, trace_why, get_procedures, get_strategies]
 ---
 
 # Core Memory and Continuity
@@ -38,7 +38,7 @@ Use this skill for ordinary continuity: recalling relevant memories, opening exa
    (cleared items archive; sources stay in the cabinet).
 5. Use `remember` when a durable fact, event, preference, promise, or decision should persist.
 6. Use journal tools only for deliberate permanent entries, not ordinary memory.
-7. Use goal, schedule, or backlog tools when the user asks for ongoing commitments or work tracking.
+7. Use goal, schedule, or backlog tools when the user asks for ongoing commitments or work tracking. For durable watch-and-notify commitments that outlive the conversation ("let me know whenever X happens", "watch for email from Hope", recurring medication reminders), use `manage_responsibility`; use `manage_schedule` only for simple timed reminders that observe nothing.
 8. Use document approval tools when the user explicitly says to keep or let an ingested document fade.
 
 ## Quality Guidelines

@@ -1,11 +1,11 @@
 ---
 name: outreach
-description: Send messages to people on chat platforms (Discord, Slack, Telegram) on the user's behalf or your own initiative
+description: Send messages to people on chat platforms (Discord, Slack, Telegram, Signal) on the user's behalf or your own initiative
 category: communication
 requires:
   tools: [discord_send]
 contexts: [heartbeat, chat]
-bound_tools: [discord_send, slack_send, telegram_send, queue_user_message]
+bound_tools: [discord_send, slack_send, telegram_send, signal_send, queue_user_message]
 ---
 
 # Outreach
