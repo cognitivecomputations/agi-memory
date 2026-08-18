@@ -76,8 +76,7 @@ source = opened["chunks"][0]
 heading = " > ".join(source.get("heading_path") or [])
 final_answer = source["content"] + "\\n\\nSource: " + source.get("path", "") + " " + heading
 """
-            ),
-            final_var(),
+            ) + "\n" + final_var(),
         ],
     )
 
@@ -133,8 +132,7 @@ for item in desk[:2]:
 body = "\\n\\n".join(item.get("content", "") for item in opened)
 final_answer = body + "\\n\\nSource: " + spec.get("path", "")
 """
-            ),
-            final_var(),
+            ) + "\n" + final_var(),
         ],
     )
 
@@ -178,8 +176,7 @@ loaded = document_chunk_load_to_desk(
 )
 final_answer = "I loaded the source spec onto the desk for follow-up work."
 """
-                ),
-                final_var(),
+                ) + "\n" + final_var(),
             ],
         )
 
@@ -201,8 +198,7 @@ if picked is None:
 opened = desk_fetch(picked["desk_unit_id"], max_chars=1200)
 final_answer = opened.get("content", "") + "\\n\\nSource: existing RecMem desk item"
 """
-                ),
-                final_var(),
+                ) + "\n" + final_var(),
             ],
         )
     finally:
