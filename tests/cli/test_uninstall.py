@@ -352,8 +352,10 @@ def test_changed_owned_embedding_binary_is_preserved(monkeypatch, tmp_path):
 def test_embedding_cache_is_marked_only_when_created_after_start(
     monkeypatch, tmp_path
 ):
+    log_path = tmp_path / ".hexis" / "embeddinggemma.log"
     cache_root = tmp_path / "cache"
     cache_dir = cache_root / "embeddinggemma.c"
+    monkeypatch.setattr(hexis_cli, "_LOCAL_EMBEDDING_LOG", log_path)
     monkeypatch.setenv("XDG_CACHE_HOME", str(cache_root))
 
     assert (
