@@ -302,13 +302,15 @@ BEGIN
     -- 4. Modulate drives
     IF p_rpe > 0 THEN
         -- Positive RPE: satisfy curiosity + connection, reduce rest urgency
+        -- Floor at each drive's baseline, matching satisfy_drive(): reward can
+        -- calm a drive to rest, never push it below its resting level.
         UPDATE drives SET
-            current_level = GREATEST(0, current_level - abs_rpe * 0.15),
+            current_level = GREATEST(baseline, current_level - abs_rpe * 0.15),
             last_satisfied = CURRENT_TIMESTAMP
         WHERE name IN ('curiosity', 'connection');
 
         UPDATE drives SET
-            current_level = GREATEST(0, current_level - abs_rpe * 0.1)
+            current_level = GREATEST(baseline, current_level - abs_rpe * 0.1)
         WHERE name = 'rest';
     ELSE
         -- Negative RPE: increase rest drive, build coherence need

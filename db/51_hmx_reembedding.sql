@@ -205,7 +205,7 @@ DECLARE
     valid_ids UUID[];
     contents TEXT[];
     embeddings vector[];
-    embedding_model TEXT;
+    v_embedding_model TEXT;
     derivative_result JSONB;
     index INT;
     updated_count INT := 0;
@@ -230,7 +230,7 @@ BEGIN
             cardinality(valid_ids), cardinality(embeddings);
     END IF;
 
-    embedding_model := COALESCE(
+    v_embedding_model := COALESCE(
         (SELECT value #>> '{}' FROM config WHERE key = 'embedding.model_id'),
         'unknown'
     );
@@ -244,7 +244,7 @@ BEGIN
                 || jsonb_build_object(
                     'embedding_status', 'embedded',
                     'embedding_completed_at', CURRENT_TIMESTAMP,
-                    'embedding_model', embedding_model
+                    'embedding_model', v_embedding_model
                 ),
             updated_at = CURRENT_TIMESTAMP
         WHERE m.id = valid_ids[index]
