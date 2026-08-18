@@ -1,6 +1,6 @@
 <!--
 title: Installation
-summary: Install Hexis with uv (recommended), pipx, or pip, or from source; configure environment
+summary: Install Hexis with the install script (recommended), uv, pipx, or pip, or from source; configure environment
 read_when:
   - "You want to install Hexis"
   - "You need to set up your .env file"
@@ -10,7 +10,21 @@ section: start
 
 # Installation
 
-## Install with uv (Recommended)
+## Install Script (Recommended)
+
+```bash
+curl -LsSf https://quixi.ai/hexis.sh | sh
+```
+
+One command, works on a machine with nothing but curl and a shell. The script:
+
+1. Installs [uv](https://docs.astral.sh/uv/) if it isn't already present (uv downloads its own Python — no Python install needed)
+2. Runs `uv tool install hexis` to put the CLI in an isolated environment
+3. Tells you if PATH needs a new terminal, and whether Docker is ready
+
+It is safe to re-run: an existing install is upgraded to the latest release.
+
+## Install with uv
 
 ```bash
 uv tool install hexis

@@ -14,19 +14,18 @@ Get a running agent in 3 commands.
 ## Prerequisites
 
 - [Docker Desktop](https://docs.docker.com/get-docker/) -- installed **and running**
-- [uv](https://docs.astral.sh/uv/) -- `curl -LsSf https://astral.sh/uv/install.sh | sh` (or `brew install uv`). It installs Hexis into its own isolated environment (no virtualenv to activate) and downloads Python 3.10+ if your machine lacks it
 - Local embedding sidecar -- `hexis init` starts it and downloads the ~300M-parameter embedding model on first use
 - For the default command below: a **ChatGPT Plus/Pro subscription** (browser OAuth, no API key). Without one, pick any provider from [Other Providers](#other-providers) instead.
 
 ## 3-Command Setup
 
 ```bash
-uv tool install hexis
+curl -LsSf https://quixi.ai/hexis.sh | sh
 hexis init --character hexis --provider openai-codex --model gpt-5.2
 hexis chat
 ```
 
-If `hexis` isn't found after installing, run `uv tool update-shell` and open a new terminal. Prefer pipx or pip-in-a-virtualenv? See [Installation](installation.md).
+The install script sets up [uv](https://docs.astral.sh/uv/) if needed (uv brings its own Python), installs the `hexis` CLI into an isolated environment, and is safe to re-run (it upgrades). If `hexis` isn't found afterward, open a new terminal. Prefer `uv tool install hexis`, pipx, or pip-in-a-virtualenv? See [Installation](installation.md).
 
 `hexis init` opens a browser window for login, starts the containers, pulls the embedding model, configures the character, and runs consent (the agent's recorded agreement to operate) -- all in one command.
 

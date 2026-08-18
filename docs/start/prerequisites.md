@@ -16,7 +16,7 @@ What you need before installing Hexis.
 | Dependency | Version | Purpose |
 |------------|---------|---------|
 | [Docker Desktop](https://docs.docker.com/get-docker/) | 20.10+ | Runs PostgreSQL (the agent's brain) |
-| [uv](https://docs.astral.sh/uv/) | Current | Installs the Hexis CLI into an isolated environment; downloads Python 3.10+ automatically if missing |
+| [uv](https://docs.astral.sh/uv/) | Current | Installs the Hexis CLI into an isolated environment; downloads Python automatically if missing. The [install script](installation.md) sets it up for you |
 | Local embedding sidecar | Current | Generates embeddings for memory storage |
 
 Managing Python yourself instead of using uv? pipx or a virtualenv with Python 3.10+ works too — see [Installation](installation.md).
