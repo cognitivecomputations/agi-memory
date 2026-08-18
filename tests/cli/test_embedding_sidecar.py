@@ -104,6 +104,72 @@ def test_start_local_embedding_launches_installed_binary_directly(monkeypatch, t
     assert launched[0] == [str(binary)]
 
 
+def test_start_local_embedding_installs_missing_binary(monkeypatch, tmp_path):
+    from apps import hexis_cli
+
+    home = tmp_path
+    binary = home / ".local" / "bin" / "embeddinggemma"
+    log_path = tmp_path / "embeddinggemma.log"
+    installs: list[list[str]] = []
+    launched: list[list[str]] = []
+
+    class FakeResult:
+        returncode = 0
+
+    class FakeProc:
+        returncode = 0
+
+        def poll(self):
+            return None
+
+    def fake_run(args, **_kwargs):
+        installs.append(list(args))
+        binary.parent.mkdir(parents=True, exist_ok=True)
+        binary.write_text("#!/bin/sh\n", encoding="utf-8")
+        binary.chmod(0o755)
+        return FakeResult()
+
+    def fake_popen(args, **_kwargs):
+        launched.append(list(args))
+        return FakeProc()
+
+    port_checks = iter([False, True])
+
+    monkeypatch.setattr(hexis_cli.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(hexis_cli.Path, "home", staticmethod(lambda: home))
+    monkeypatch.setattr(hexis_cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(hexis_cli.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(hexis_cli, "_LOCAL_EMBEDDING_LOG", log_path)
+    monkeypatch.setattr(hexis_cli, "_port_ready", lambda _port: next(port_checks))
+
+    assert hexis_cli._start_local_embedding_service(wait_seconds=1) is True
+    assert installs == [["sh", "-c", hexis_cli._LOCAL_EMBEDDING_INSTALLER]]
+    assert launched == [[str(binary)]]
+
+
+def test_start_local_embedding_reports_failed_install(monkeypatch, tmp_path):
+    from apps import hexis_cli
+
+    home = tmp_path
+    launched: list[list[str]] = []
+
+    class FakeResult:
+        returncode = 1
+
+    monkeypatch.setattr(hexis_cli.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(hexis_cli.Path, "home", staticmethod(lambda: home))
+    monkeypatch.setattr(hexis_cli.subprocess, "run", lambda *_args, **_kwargs: FakeResult())
+    monkeypatch.setattr(
+        hexis_cli.subprocess,
+        "Popen",
+        lambda *args, **kwargs: launched.append(args) or None,
+    )
+    monkeypatch.setattr(hexis_cli, "_port_ready", lambda _port: False)
+
+    assert hexis_cli._start_local_embedding_service(wait_seconds=1) is False
+    assert launched == []
+
+
 def test_start_local_embedding_reports_early_exit(monkeypatch, tmp_path):
     from apps import hexis_cli
 

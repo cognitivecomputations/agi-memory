@@ -3761,6 +3761,53 @@ def _local_embedding_binary() -> Path | None:
     return None
 
 
+def _install_local_embedding_binary() -> Path | None:
+    """Install the published embeddinggemma binary, then resolve it."""
+    from apps.cli_theme import console
+
+    console.print(
+        f"[muted]Embedding service binary '{_LOCAL_EMBEDDING_COMMAND}' is not installed; "
+        "installing it now...[/muted]"
+    )
+    manual_fix = (
+        "  Install it manually, then run [accent]hexis up[/accent] again:\n"
+        f"    [accent]{_LOCAL_EMBEDDING_INSTALLER}[/accent]"
+    )
+    try:
+        result = subprocess.run(
+            ["sh", "-c", _LOCAL_EMBEDDING_INSTALLER],
+            stdin=subprocess.DEVNULL,
+            timeout=300,
+        )
+    except subprocess.TimeoutExpired:
+        console.print(
+            f"[warn]Installing {_LOCAL_EMBEDDING_COMMAND} timed out after 300 seconds.[/warn]\n"
+            + manual_fix
+        )
+        return None
+    except Exception as exc:
+        console.print(
+            f"[warn]Couldn't run the {_LOCAL_EMBEDDING_COMMAND} installer: {exc}[/warn]\n"
+            + manual_fix
+        )
+        return None
+    if result.returncode != 0:
+        console.print(
+            f"[warn]The {_LOCAL_EMBEDDING_COMMAND} installer exited with code {result.returncode}.[/warn]\n"
+            + manual_fix
+        )
+        return None
+
+    binary = _local_embedding_binary()
+    if binary is None:
+        console.print(
+            f"[warn]The installer finished, but '{_LOCAL_EMBEDDING_COMMAND}' still wasn't found.[/warn]\n"
+            "  Expected it on PATH or at "
+            f"[accent]{Path.home() / '.local' / 'bin' / _LOCAL_EMBEDDING_COMMAND}[/accent]."
+        )
+    return binary
+
+
 def _tail_text(path: Path, *, max_lines: int = 12) -> str:
     """Best-effort text tail for CLI diagnostics."""
     try:
@@ -3791,11 +3838,8 @@ def _start_local_embedding_service(wait_seconds: float = 90.0) -> bool:
 
     binary = _local_embedding_binary()
     if binary is None:
-        console.print(
-            f"[warn]Embedding service binary '{_LOCAL_EMBEDDING_COMMAND}' was not found on PATH.[/warn]\n"
-            "  Install the published binary, then run [accent]hexis up[/accent] again:\n"
-            f"    [accent]{_LOCAL_EMBEDDING_INSTALLER}[/accent]"
-        )
+        binary = _install_local_embedding_binary()
+    if binary is None:
         return False
     if not os.access(binary, os.X_OK):
         console.print(
