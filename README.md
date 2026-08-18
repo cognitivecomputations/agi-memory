@@ -49,7 +49,12 @@ hexis backup --output "$HOME/hexis-backups"  # optional; keep the backup outside
 hexis uninstall --purge
 ```
 
-The purge path requires explicit confirmation. See [Installation](docs/start/installation.md) for uv, pipx, pip, source installs, and complete uninstall behavior, or jump to [Quick Start](#quick-start).
+The purge path requires explicit confirmation and also removes the
+`embeddinggemma` binary/model cache when Hexis has an ownership record proving
+it created them. Unowned or changed shared assets are never guessed at and
+deleted. See [Installation](docs/start/installation.md) for uv, pipx, pip,
+source installs, and complete uninstall behavior, or jump to
+[Quick Start](#quick-start).
 
 ## See It Happen
 

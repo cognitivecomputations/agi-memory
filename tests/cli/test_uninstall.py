@@ -84,6 +84,10 @@ def _patch_successful_uninstall(monkeypatch, tmp_path):
         "_stop_owned_local_embedding_service",
         lambda: (True, None),
     )
+    monkeypatch.setattr(hexis_cli, "_port_ready", lambda _port: False)
+    monkeypatch.setattr(
+        hexis_cli, "_purge_owned_local_embedding_assets", lambda: ([], [])
+    )
     monkeypatch.setattr(hexis_cli, "_local_embedding_binary", lambda: None)
     monkeypatch.setattr(
         hexis_cli.subprocess,
@@ -233,8 +237,164 @@ def test_unowned_embedding_service_is_left_running(monkeypatch, tmp_path):
         "_port_listener_summary",
         lambda _port: "embeddinggemma (pid 1234)",
     )
+    monkeypatch.setattr(
+        hexis_cli, "_legacy_owned_local_embedding_pid", lambda: None
+    )
 
     stopped, note = hexis_cli._stop_owned_local_embedding_service()
 
     assert stopped is False
     assert "left running" in (note or "")
+
+
+def test_legacy_embedding_service_is_verified_by_hexis_log(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        hexis_cli, "_LOCAL_EMBEDDING_LOG", tmp_path / "embeddinggemma.log"
+    )
+    monkeypatch.setattr(
+        hexis_cli, "_port_listener_pids", lambda _port: [1234, 5678]
+    )
+    monkeypatch.setattr(
+        hexis_cli,
+        "_process_command",
+        lambda pid: "/tmp/embeddinggemma" if pid == 1234 else "/tmp/other",
+    )
+    monkeypatch.setattr(
+        hexis_cli, "_process_uses_hexis_embedding_log", lambda pid: pid == 1234
+    )
+
+    assert hexis_cli._legacy_owned_local_embedding_pid() == 1234
+
+
+def test_legacy_embedding_log_verification_requires_both_output_streams(
+    monkeypatch, tmp_path
+):
+    log_path = tmp_path / "embeddinggemma.log"
+
+    class LsofResult:
+        stdout = f"p1234\nf1\nn{log_path} (deleted)\nf2\nn{log_path} (deleted)\n"
+
+    monkeypatch.setattr(hexis_cli, "_LOCAL_EMBEDDING_LOG", log_path)
+    monkeypatch.setattr(hexis_cli.shutil, "which", lambda _name: "/usr/bin/lsof")
+    monkeypatch.setattr(
+        hexis_cli.subprocess, "run", lambda _command, **_kwargs: LsofResult()
+    )
+
+    assert hexis_cli._process_uses_hexis_embedding_log(1234) is True
+
+
+def test_legacy_verified_embedding_service_is_stopped(monkeypatch, tmp_path):
+    log_path = tmp_path / "embeddinggemma.log"
+    commands = iter(["/tmp/embeddinggemma", None])
+    signals: list[tuple[int, int]] = []
+    monkeypatch.setattr(hexis_cli, "_LOCAL_EMBEDDING_LOG", log_path)
+    monkeypatch.setattr(
+        hexis_cli, "_legacy_owned_local_embedding_pid", lambda: 1234
+    )
+    monkeypatch.setattr(hexis_cli, "_process_command", lambda _pid: next(commands))
+    monkeypatch.setattr(
+        hexis_cli.os, "kill", lambda pid, sig: signals.append((pid, sig))
+    )
+
+    stopped, note = hexis_cli._stop_owned_local_embedding_service()
+
+    assert stopped is True
+    assert note is None
+    assert signals and signals[0][0] == 1234
+
+
+def test_owned_embedding_binary_and_cache_are_purged(monkeypatch, tmp_path):
+    log_path = tmp_path / ".hexis" / "embeddinggemma.log"
+    binary = tmp_path / "bin" / "embeddinggemma"
+    binary.parent.mkdir()
+    binary.write_bytes(b"hexis-installed-binary")
+    cache_root = tmp_path / "cache"
+    cache_dir = cache_root / "embeddinggemma.c"
+    cache_dir.mkdir(parents=True)
+    (cache_dir / "model.gguf").write_bytes(b"model")
+    monkeypatch.setattr(hexis_cli, "_LOCAL_EMBEDDING_LOG", log_path)
+    monkeypatch.setenv("XDG_CACHE_HOME", str(cache_root))
+
+    assert hexis_cli._record_owned_local_embedding_binary(binary) is True
+    assert (
+        hexis_cli._mark_local_embedding_cache_if_created(
+            existed_before_start=False
+        )
+        is True
+    )
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "different-cache"))
+    removed, notes = hexis_cli._purge_owned_local_embedding_assets()
+
+    assert notes == []
+    assert binary in removed
+    assert cache_dir.resolve() in removed
+    assert not binary.exists()
+    assert not cache_dir.exists()
+
+
+def test_changed_owned_embedding_binary_is_preserved(monkeypatch, tmp_path):
+    log_path = tmp_path / ".hexis" / "embeddinggemma.log"
+    binary = tmp_path / "bin" / "embeddinggemma"
+    binary.parent.mkdir()
+    binary.write_bytes(b"original")
+    monkeypatch.setattr(hexis_cli, "_LOCAL_EMBEDDING_LOG", log_path)
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    assert hexis_cli._record_owned_local_embedding_binary(binary) is True
+    binary.write_bytes(b"replaced-by-someone-else")
+
+    removed, notes = hexis_cli._purge_owned_local_embedding_assets()
+
+    assert removed == []
+    assert binary.exists()
+    assert any("changed" in note for note in notes)
+
+
+def test_embedding_cache_is_marked_only_when_created_after_start(
+    monkeypatch, tmp_path
+):
+    cache_root = tmp_path / "cache"
+    cache_dir = cache_root / "embeddinggemma.c"
+    monkeypatch.setenv("XDG_CACHE_HOME", str(cache_root))
+
+    assert (
+        hexis_cli._mark_local_embedding_cache_if_created(
+            existed_before_start=False
+        )
+        is None
+    )
+    assert not cache_dir.exists()
+
+    cache_dir.mkdir(parents=True)
+    assert (
+        hexis_cli._mark_local_embedding_cache_if_created(
+            existed_before_start=False
+        )
+        is True
+    )
+    assert (cache_dir / hexis_cli._LOCAL_EMBEDDING_CACHE_MARKER).is_file()
+
+
+def test_embedding_cache_with_changed_ownership_marker_is_preserved(
+    monkeypatch, tmp_path
+):
+    log_path = tmp_path / ".hexis" / "embeddinggemma.log"
+    cache_root = tmp_path / "cache"
+    cache_dir = cache_root / "embeddinggemma.c"
+    cache_dir.mkdir(parents=True)
+    monkeypatch.setattr(hexis_cli, "_LOCAL_EMBEDDING_LOG", log_path)
+    monkeypatch.setenv("XDG_CACHE_HOME", str(cache_root))
+    assert (
+        hexis_cli._mark_local_embedding_cache_if_created(
+            existed_before_start=False
+        )
+        is True
+    )
+    (cache_dir / hexis_cli._LOCAL_EMBEDDING_CACHE_MARKER).write_text(
+        '{"owner":"someone-else","token":"changed"}\n', encoding="utf-8"
+    )
+
+    removed, notes = hexis_cli._purge_owned_local_embedding_assets()
+
+    assert removed == []
+    assert cache_dir.exists()
+    assert any("ownership marker" in note for note in notes)

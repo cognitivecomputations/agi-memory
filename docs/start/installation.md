@@ -63,10 +63,11 @@ hexis uninstall --purge
 
 `--purge` requires an explicit confirmation and permanently deletes the brain
 database volumes plus the Hexis data directory, including its default backups
-directory. The standalone
-`embeddinggemma` binary and its model cache are retained because other
-applications may use them. If Docker is unavailable and you intentionally want
-to remove only the CLI while leaving all Docker resources untouched, use
+directory. It also removes the standalone `embeddinggemma` binary and model
+cache when durable ownership records prove Hexis created them. A legacy,
+changed, or independently started companion is surfaced and retained rather
+than guessed at and deleted. If Docker is unavailable and you intentionally
+want to remove only the CLI while leaving all Docker resources untouched, use
 `hexis uninstall --cli-only`.
 
 ## Install with pipx

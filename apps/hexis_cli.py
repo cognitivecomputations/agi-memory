@@ -425,7 +425,7 @@ def build_parser() -> argparse.ArgumentParser:
     uninstall_mode.add_argument(
         "--purge",
         action="store_true",
-        help="Also permanently delete Docker volumes and Hexis config/data",
+        help="Also delete Docker volumes, Hexis data, and owned embedding assets",
     )
     uninstall_mode.add_argument(
         "--cli-only",
@@ -3695,13 +3695,205 @@ _LOCAL_EMBEDDING_COMMAND = "embeddinggemma"
 _LOCAL_EMBEDDING_INSTALLER = "curl -fsSL https://raw.githubusercontent.com/QuixiAI/embeddinggemma.c/main/install.sh | sh"
 _LOCAL_EMBEDDING_PORT = 42666
 _LOCAL_EMBEDDING_LOG = Path.home() / ".hexis" / "embeddinggemma.log"
+_LOCAL_EMBEDDING_CACHE_MARKER = ".hexis-owned"
+
+
+def _local_embedding_ownership_file() -> Path:
+    return _LOCAL_EMBEDDING_LOG.with_name("embeddinggemma-owned.json")
+
+
+def _local_embedding_cache_dir() -> Path:
+    cache_root = os.environ.get("XDG_CACHE_HOME")
+    if cache_root:
+        return Path(cache_root).expanduser() / "embeddinggemma.c"
+    return Path.home() / ".cache" / "embeddinggemma.c"
+
+
+def _file_sha256(path: Path) -> str | None:
+    import hashlib
+
+    try:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def _read_local_embedding_ownership() -> dict[str, Any] | None:
+    ownership_file = _local_embedding_ownership_file()
+    if not ownership_file.is_file():
+        return {}
+    try:
+        record = json.loads(ownership_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(record, dict) or record.get("version") != 1:
+        return None
+    return record
+
+
+def _write_local_embedding_ownership(record: dict[str, Any]) -> bool:
+    ownership_file = _local_embedding_ownership_file()
+    temporary_file = ownership_file.with_name(
+        f".{ownership_file.name}.{os.getpid()}.{os.urandom(6).hex()}.tmp"
+    )
+    try:
+        ownership_file.parent.mkdir(parents=True, exist_ok=True)
+        temporary_file.write_text(
+            json.dumps(record, indent=2) + "\n", encoding="utf-8"
+        )
+        os.replace(temporary_file, ownership_file)
+        return True
+    except OSError:
+        try:
+            temporary_file.unlink(missing_ok=True)
+        except OSError:
+            return False
+        return False
+
+
+def _record_owned_local_embedding_binary(binary: Path) -> bool:
+    """Record proof that Hexis installed this exact companion binary."""
+    digest = _file_sha256(binary)
+    if not digest:
+        return False
+    record = _read_local_embedding_ownership()
+    if record is None:
+        return False
+    record.update(
+        {
+            "version": 1,
+            "binary_path": str(binary.resolve()),
+            "binary_sha256": digest,
+        }
+    )
+    return _write_local_embedding_ownership(record)
+
+
+def _mark_local_embedding_cache_if_created(
+    *, existed_before_start: bool
+) -> bool | None:
+    """Mark a cache only when it appeared after Hexis launched the sidecar."""
+    if existed_before_start:
+        return None
+    cache_dir = _local_embedding_cache_dir()
+    if not cache_dir.is_dir() or cache_dir.is_symlink():
+        return None
+    resolved_cache = cache_dir.resolve()
+    marker_file = cache_dir / _LOCAL_EMBEDDING_CACHE_MARKER
+    try:
+        if marker_file.is_file():
+            marker = json.loads(marker_file.read_text(encoding="utf-8"))
+            marker_token = marker.get("token") if isinstance(marker, dict) else None
+            if (
+                not isinstance(marker, dict)
+                or marker.get("owner") != "hexis"
+                or not isinstance(marker_token, str)
+            ):
+                return False
+        else:
+            marker_token = os.urandom(16).hex()
+            marker_file.write_text(
+                json.dumps({"owner": "hexis", "token": marker_token}) + "\n",
+                encoding="utf-8",
+            )
+    except (OSError, json.JSONDecodeError):
+        return False
+
+    record = _read_local_embedding_ownership()
+    if record is None:
+        return False
+    if (
+        record.get("cache_path") == str(resolved_cache)
+        and record.get("cache_marker") == marker_token
+    ):
+        return True
+    record.update(
+        {
+            "version": 1,
+            "cache_path": str(resolved_cache),
+            "cache_marker": marker_token,
+        }
+    )
+    return _write_local_embedding_ownership(record)
+
+
+def _purge_owned_local_embedding_assets() -> tuple[list[Path], list[str]]:
+    """Delete only companion assets carrying durable Hexis ownership proof."""
+    removed: list[Path] = []
+    notes: list[str] = []
+
+    ownership_file = _local_embedding_ownership_file()
+    record = _read_local_embedding_ownership()
+    if record is None:
+        notes.append(
+            f"Could not read embedding ownership record {ownership_file}; "
+            "the binary and model cache were left alone."
+        )
+        return removed, notes
+
+    binary_value = record.get("binary_path")
+    expected_digest = record.get("binary_sha256")
+    if isinstance(binary_value, str) and isinstance(expected_digest, str):
+        binary = Path(binary_value).expanduser()
+        actual_digest = _file_sha256(binary)
+        if actual_digest == expected_digest:
+            try:
+                binary.unlink(missing_ok=True)
+                removed.append(binary)
+            except OSError as exc:
+                notes.append(f"Could not remove owned embedding binary {binary}: {exc}")
+        elif binary.exists():
+            notes.append(
+                f"The embedding binary at {binary} changed after Hexis installed it, "
+                "so it was left alone."
+            )
+
+    cache_value = record.get("cache_path")
+    expected_marker = record.get("cache_marker")
+    if isinstance(cache_value, str) and isinstance(expected_marker, str):
+        cache_dir = Path(cache_value).expanduser()
+        cache_marker = cache_dir / _LOCAL_EMBEDDING_CACHE_MARKER
+        try:
+            marker = json.loads(cache_marker.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            marker = None
+        marker_matches = (
+            isinstance(marker, dict)
+            and marker.get("owner") == "hexis"
+            and marker.get("token") == expected_marker
+        )
+        cache_root = cache_dir.parent.resolve()
+        resolved_cache = cache_dir.resolve()
+        if not marker_matches and cache_dir.exists():
+            notes.append(
+                f"The ownership marker for embedding cache {cache_dir} changed or "
+                "disappeared, so the cache was left alone."
+            )
+        elif marker_matches and (
+            cache_dir.is_symlink()
+            or resolved_cache.name != "embeddinggemma.c"
+            or not _path_is_within(resolved_cache, cache_root)
+        ):
+            notes.append(f"Refusing unsafe owned embedding cache path: {cache_dir}")
+        elif marker_matches:
+            try:
+                shutil.rmtree(resolved_cache)
+                removed.append(resolved_cache)
+            except OSError as exc:
+                notes.append(f"Could not remove owned embedding cache {resolved_cache}: {exc}")
+
+    return removed, notes
 
 
 def _local_embedding_pid_file() -> Path:
     return _LOCAL_EMBEDDING_LOG.with_name("embeddinggemma.pid")
 
 
-def _record_local_embedding_process(proc: subprocess.Popen[Any]) -> None:
+def _record_local_embedding_process(proc: subprocess.Popen[Any]) -> bool:
     """Remember only processes this CLI actually launched.
 
     The ownership record lets `hexis down` and `hexis uninstall` stop the
@@ -3710,13 +3902,14 @@ def _record_local_embedding_process(proc: subprocess.Popen[Any]) -> None:
     """
     pid = getattr(proc, "pid", None)
     if not isinstance(pid, int) or pid <= 0:
-        return
+        return False
     try:
         pid_file = _local_embedding_pid_file()
         pid_file.parent.mkdir(parents=True, exist_ok=True)
         pid_file.write_text(f"{pid}\n", encoding="utf-8")
+        return True
     except OSError:
-        pass  # advisory ownership tracking must never block startup
+        return False
 
 
 def _forget_local_embedding_process() -> None:
@@ -3741,6 +3934,72 @@ def _process_command(pid: int) -> str | None:
     return command or None
 
 
+def _port_listener_pids(port: int) -> list[int]:
+    lsof = shutil.which("lsof")
+    if not lsof:
+        return []
+    try:
+        result = subprocess.run(
+            [lsof, "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-Fp"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    pids: list[int] = []
+    for line in (result.stdout or "").splitlines():
+        if line.startswith("p") and line[1:].isdigit():
+            pid = int(line[1:])
+            if pid not in pids:
+                pids.append(pid)
+    return pids
+
+
+def _process_uses_hexis_embedding_log(pid: int) -> bool:
+    """Verify that both process output streams target Hexis's private log."""
+    lsof = shutil.which("lsof")
+    if not lsof:
+        return False
+    try:
+        result = subprocess.run(
+            [lsof, "-nP", "-a", "-p", str(pid), "-d", "1,2", "-Fn"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+    expected_log = str(_LOCAL_EMBEDDING_LOG.resolve())
+    paths_by_fd: dict[str, str] = {}
+    current_fd: str | None = None
+    for line in (result.stdout or "").splitlines():
+        if line in {"f1", "f2"}:
+            current_fd = line[1:]
+        elif current_fd and line.startswith("n"):
+            path = line[1:]
+            if path.endswith(" (deleted)"):
+                path = path[: -len(" (deleted)")]
+            paths_by_fd[current_fd] = path
+            current_fd = None
+    return paths_by_fd == {"1": expected_log, "2": expected_log}
+
+
+def _legacy_owned_local_embedding_pid() -> int | None:
+    """Recover pre-PID-file ownership from the exact Hexis launch contract."""
+    matches: list[int] = []
+    for pid in _port_listener_pids(_LOCAL_EMBEDDING_PORT):
+        command = _process_command(pid)
+        if (
+            command
+            and Path(command).name.lower() == _LOCAL_EMBEDDING_COMMAND
+            and _process_uses_hexis_embedding_log(pid)
+        ):
+            matches.append(pid)
+    return matches[0] if len(matches) == 1 else None
+
+
 def _stop_owned_local_embedding_service() -> tuple[bool, str | None]:
     """Stop the sidecar iff an ownership record still names that process.
 
@@ -3752,21 +4011,23 @@ def _stop_owned_local_embedding_service() -> tuple[bool, str | None]:
 
     pid_file = _local_embedding_pid_file()
     if not pid_file.exists():
-        if _port_ready(_LOCAL_EMBEDDING_PORT):
-            listener = _port_listener_summary(_LOCAL_EMBEDDING_PORT)
-            detail = f" ({listener})" if listener else ""
-            return False, (
-                f"An embedding service is still listening on port "
-                f"{_LOCAL_EMBEDDING_PORT}{detail}. Hexis could not verify that it "
-                "owns this process, so it was left running."
-            )
-        return False, None
-
-    try:
-        pid = int(pid_file.read_text(encoding="utf-8").strip())
-    except (OSError, ValueError):
-        _forget_local_embedding_process()
-        return False, None
+        pid = _legacy_owned_local_embedding_pid()
+        if pid is None:
+            if _port_ready(_LOCAL_EMBEDDING_PORT):
+                listener = _port_listener_summary(_LOCAL_EMBEDDING_PORT)
+                detail = f" ({listener})" if listener else ""
+                return False, (
+                    f"An embedding service is still listening on port "
+                    f"{_LOCAL_EMBEDDING_PORT}{detail}. Hexis could not verify that it "
+                    "owns this process, so it was left running."
+                )
+            return False, None
+    else:
+        try:
+            pid = int(pid_file.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            _forget_local_embedding_process()
+            return False, None
 
     command = _process_command(pid)
     if command is None:
@@ -3937,6 +4198,12 @@ def _install_local_embedding_binary() -> Path | None:
             "  Expected it on PATH or at "
             f"[accent]{Path.home() / '.local' / 'bin' / _LOCAL_EMBEDDING_COMMAND}[/accent]."
         )
+    elif not _record_owned_local_embedding_binary(binary):
+        console.print(
+            f"[warn]Installed {binary}, but could not record that Hexis owns it.[/warn]\n"
+            "  Hexis will leave this binary alone during uninstall rather than risk "
+            "deleting a shared executable."
+        )
     return binary
 
 
@@ -3985,6 +4252,7 @@ def _start_local_embedding_service(wait_seconds: float = 90.0) -> bool:
     console.print(f"[muted]Starting local embedding service: {binary}[/muted]")
     proc: subprocess.Popen[Any] | None = None
     launch_detail = str(binary)
+    cache_existed_before_start = _local_embedding_cache_dir().exists()
     try:
         with _LOCAL_EMBEDDING_LOG.open("ab") as log_f:
             proc = subprocess.Popen(
@@ -3995,7 +4263,7 @@ def _start_local_embedding_service(wait_seconds: float = 90.0) -> bool:
                 env=os.environ.copy(),
                 start_new_session=True,
             )
-            _record_local_embedding_process(proc)
+            process_ownership_recorded = _record_local_embedding_process(proc)
     except Exception as exc:
         console.print(
             f"[warn]Couldn't start local embedding service: {exc}[/warn]\n"
@@ -4003,9 +4271,29 @@ def _start_local_embedding_service(wait_seconds: float = 90.0) -> bool:
         )
         return False
 
+    if not process_ownership_recorded:
+        console.print(
+            "[warn]The embedding service started, but Hexis could not save its "
+            "process ownership record.[/warn]\n"
+            "  Hexis will leave this process running during uninstall rather than "
+            "risk stopping another application's service."
+        )
+
     console.print(f"[muted]Waiting for embedding service on port {_LOCAL_EMBEDDING_PORT}...[/muted]")
     deadline = _time.monotonic() + wait_seconds
+    cache_ownership_warning_shown = False
     while _time.monotonic() < deadline:
+        cache_ownership_recorded = _mark_local_embedding_cache_if_created(
+            existed_before_start=cache_existed_before_start
+        )
+        if cache_ownership_recorded is False and not cache_ownership_warning_shown:
+            console.print(
+                "[warn]Hexis could not save ownership proof for the embedding model "
+                "cache.[/warn]\n"
+                "  The cache will be preserved during uninstall rather than risk "
+                "deleting shared model data."
+            )
+            cache_ownership_warning_shown = True
         if _port_ready(_LOCAL_EMBEDDING_PORT):
             console.print(f"[ok]Embedding service is ready on port {_LOCAL_EMBEDDING_PORT}.[/ok]")
             return True
@@ -4022,6 +4310,16 @@ def _start_local_embedding_service(wait_seconds: float = 90.0) -> bool:
             return False
         _time.sleep(0.5)
 
+    cache_ownership_recorded = _mark_local_embedding_cache_if_created(
+        existed_before_start=cache_existed_before_start
+    )
+    if cache_ownership_recorded is False and not cache_ownership_warning_shown:
+        console.print(
+            "[warn]Hexis could not save ownership proof for the embedding model "
+            "cache.[/warn]\n"
+            "  The cache will be preserved during uninstall rather than risk "
+            "deleting shared model data."
+        )
     tail = _tail_text(_LOCAL_EMBEDDING_LOG)
     tail_block = f"\n  Recent log:\n{tail}" if tail else ""
     console.print(
@@ -4441,6 +4739,7 @@ def _confirm_uninstall(*, purge: bool, cli_only: bool, data_dir: Path) -> bool:
     if purge:
         print("  - PERMANENTLY DELETE the brain database volumes")
         print(f"  - PERMANENTLY DELETE Hexis config, credentials, and backups at {data_dir}")
+        print("  - delete embeddinggemma assets that Hexis can prove it created")
         phrase = "uninstall and delete data"
         print(
             "\nThe default backup directory is inside the data being deleted. "
@@ -4481,6 +4780,7 @@ def _uninstall(
         return 1
 
     sidecar_note: str | None = None
+    embedding_cleanup_notes: list[str] = []
     if not cli_only:
         if compose_file is None:
             _print_err(
@@ -4519,6 +4819,16 @@ def _uninstall(
             print("Stopped the embedding service started by Hexis.")
 
     if purge:
+        if _port_ready(_LOCAL_EMBEDDING_PORT):
+            embedding_cleanup_notes.append(
+                "Owned embedding assets were left in place because an unowned "
+                f"service is still using port {_LOCAL_EMBEDDING_PORT}."
+            )
+        else:
+            removed_assets, asset_notes = _purge_owned_local_embedding_assets()
+            embedding_cleanup_notes.extend(asset_notes)
+            for asset in removed_assets:
+                print(f"Removed Hexis-created embedding asset: {asset}")
         removed, error = _purge_hexis_data_dir(data_dir)
         if not removed:
             _print_err(f"{error} The CLI was kept so you can retry safely.")
@@ -4551,11 +4861,19 @@ def _uninstall(
         print("Reinstall Hexis and run `hexis up` to restore the agent.")
     if sidecar_note:
         print(f"\nNote: {sidecar_note}")
+    for note in embedding_cleanup_notes:
+        print(f"Note: {note}")
     if embedding_binary_retained:
-        print(
-            "The standalone embeddinggemma binary and model cache were preserved "
-            "because other applications may use them."
-        )
+        if purge:
+            print(
+                "An embeddinggemma binary remains because Hexis could not prove it "
+                "was safe to delete."
+            )
+        else:
+            print(
+                "The standalone embeddinggemma binary and model cache were preserved; "
+                "`hexis uninstall --purge` removes assets Hexis can prove it created."
+            )
     return 0
 
 
