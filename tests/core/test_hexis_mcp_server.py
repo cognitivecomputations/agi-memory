@@ -10,6 +10,13 @@ import pytest
 from apps.hexis_mcp_server import _dispatch_server_tool, _list_server_tools
 from core.tools import ToolContext
 
+
+def _is_error(result) -> bool:
+    """CallToolResult grew snake_case attributes (isError -> is_error) in newer
+    mcp SDKs; accept both so the suite runs against either generation."""
+    return result.is_error if hasattr(result, "is_error") else result.isError
+
+
 pytestmark = [pytest.mark.asyncio(loop_scope="session")]
 
 
@@ -84,7 +91,7 @@ async def test_mcp_legacy_dispatch_requires_compat_flag(monkeypatch):
 
     result = await _dispatch_server_tool(client, _Registry(), set(), "get_health", {})
 
-    assert result.isError is False
+    assert _is_error(result) is False
     assert json.loads(result.content[0].text) == {"score": 0.9, "status": "healthy"}
     client.get_health.assert_awaited_once_with()
 
@@ -97,7 +104,7 @@ async def test_mcp_registry_dispatch_refreshes_before_list_and_uses_mcp_context(
         AsyncMock(), registry, known_names, "session_list", {"limit": 2}
     )
 
-    assert result.isError is False
+    assert _is_error(result) is False
     assert result.content[0].text == '{"registry":true}'
     assert known_names == {"recall", "session_list"}
     arguments = registry.execute.await_args.args
@@ -112,7 +119,7 @@ async def test_mcp_unknown_tool_sets_protocol_error_flag():
         AsyncMock(), _Registry(), set(), "does_not_exist", {}
     )
 
-    assert result.isError is True
+    assert _is_error(result) is True
     assert "Unknown tool 'does_not_exist'" in result.content[0].text
 
 
@@ -123,5 +130,5 @@ async def test_mcp_registry_failure_sets_protocol_error_flag():
         AsyncMock(), registry, {"session_list"}, "session_list", {}
     )
 
-    assert result.isError is True
+    assert _is_error(result) is True
     assert result.content[0].text == "Error: policy denied"

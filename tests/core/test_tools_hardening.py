@@ -88,6 +88,7 @@ def test_web_url_private_ip_validation():
 async def test_web_search_uses_keyless_fallback_without_tavily(monkeypatch):
     class FakeResponse:
         status_code = 200
+        headers: dict = {}
         text = """
         <html><body>
           <a class="result-link" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fprofile&amp;rut=x">
@@ -96,6 +97,7 @@ async def test_web_search_uses_keyless_fallback_without_tavily(monkeypatch):
           <td class="result-snippet">Useful search snippet.</td>
         </body></html>
         """
+        content = text.encode("utf-8")
 
     class FakeClient:
         def __init__(self, **kwargs):
@@ -107,7 +109,8 @@ async def test_web_search_uses_keyless_fallback_without_tavily(monkeypatch):
         async def __aexit__(self, *_exc):
             return False
 
-        async def get(self, url, *, params):
+        async def request(self, method, url, *, params=None, **_kwargs):
+            assert method == "GET"
             assert url == "https://lite.duckduckgo.com/lite/"
             assert params == {"q": "example query"}
             return FakeResponse()
@@ -147,7 +150,9 @@ async def test_web_search_falls_back_to_bing_when_duckduckgo_is_empty(monkeypatc
     class FakeResponse:
         def __init__(self, text):
             self.status_code = 200
+            self.headers: dict = {}
             self.text = text
+            self.content = text.encode("utf-8")
 
     class FakeClient:
         def __init__(self, **kwargs):
@@ -159,7 +164,8 @@ async def test_web_search_falls_back_to_bing_when_duckduckgo_is_empty(monkeypatc
         async def __aexit__(self, *_exc):
             return False
 
-        async def get(self, url, *, params):
+        async def request(self, method, url, *, params=None, **_kwargs):
+            assert method == "GET"
             if url == "https://lite.duckduckgo.com/lite/":
                 assert params == {"q": "example query"}
                 return FakeResponse("<html><body>no results</body></html>")

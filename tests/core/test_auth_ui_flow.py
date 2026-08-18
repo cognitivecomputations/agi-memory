@@ -175,7 +175,7 @@ async def test_validate_returns_reauthentication_action_when_refresh_fails():
         ),
     ):
         with pytest.raises(AuthFlowError, match="Use Authenticate again"):
-            await coordinator.validate("anthropic")
+            await coordinator.validate("chutes")
 
 
 async def test_callback_listener_can_be_cancelled_without_waiting_for_timeout():
