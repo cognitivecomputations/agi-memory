@@ -24,6 +24,14 @@ This is both an engineering project and a philosophical experiment. For the phil
 
 > **[Full Documentation](docs/index.md)** · [What is Hexis?](docs/start/what-is-hexis.md) · [FAQ](docs/faq.md) · [Troubleshooting](docs/operations/troubleshooting.md)
 
+## Install
+
+```bash
+curl -LsSf https://quixi.ai/hexis.sh | sh
+```
+
+One command on macOS, Linux, or WSL2 — it installs the `hexis` CLI with everything it needs (no Python setup, no virtualenv) and is safe to re-run to upgrade. Then jump to [Quick Start](#quick-start). Other routes (uv, pipx, pip, source) are in [Installation](docs/start/installation.md).
+
 ## See It Happen
 
 Beliefs are living things here, not rows. Tell the agent something, show it evidence, and watch its confidence move — every change audited, every number real (this is captured output):
@@ -84,7 +92,7 @@ hexis init --character hexis --provider openai-codex --model gpt-5.2
 hexis chat
 ```
 
-The install script sets up [uv](https://docs.astral.sh/uv/) if you don't have it (uv brings its own Python — no Python install needed) and puts the `hexis` CLI in an isolated environment, with no virtualenv to create or activate. Safe to re-run; it upgrades an existing install. Already have uv? `uv tool install hexis` does the same thing. Prefer pipx or pip? See [Installation](docs/start/installation.md).
+The install script handles everything — it sets up [uv](https://docs.astral.sh/uv/) if needed, brings its own Python, and puts the `hexis` CLI in an isolated environment. Already installed? It's safe to re-run; it upgrades. Other install routes are in [Installation](docs/start/installation.md).
 
 `hexis init` opens a browser for login, starts the containers, pulls the embedding model, configures the character, and runs consent (the agent's recorded agreement to operate) -- all in one command.
 
