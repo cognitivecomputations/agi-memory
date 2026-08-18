@@ -5732,7 +5732,7 @@ async def test_recall_memories_filtered_filters_type_and_importance(db_pool, ens
             high_semantic_id = await conn.fetchval(
                 """
                 INSERT INTO memories (type, content, embedding, importance, metadata)
-                VALUES ('semantic'::memory_type, $1, (get_embedding(ARRAY[$2]))[1], 0.8,
+                VALUES ('semantic'::memory_type, $1, (get_embedding(ARRAY[$2]))[1], 0.9,
                         jsonb_build_object('emotional_valence', 0.4))
                 RETURNING id
                 """,
@@ -5758,11 +5758,16 @@ async def test_recall_memories_filtered_filters_type_and_importance(db_pool, ens
                 query_text,
             )
 
+            # A deep limit: this module's shared DB holds many embedded
+            # memories whose composite scores (strength/boost/temporal) sit
+            # near an exact-match's, so a shallow pool can squeeze out the
+            # inserted row. The type/importance FILTERS under test
+            # discriminate identically at any limit.
             rows = await conn.fetch(
                 """
                 SELECT * FROM recall_memories_filtered(
                     $1,
-                    5,
+                    20,
                     ARRAY['semantic']::memory_type[],
                     0.5
                 )
