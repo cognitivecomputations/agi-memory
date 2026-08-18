@@ -21,16 +21,19 @@ def _coerce_json(value):
 
 
 async def _stub_get_embedding(conn):
+    # Constant vectors (as in test_ingest_routing): every text is maximally
+    # similar, so recall visibility is decided by status/filters/ranking —
+    # what these tests actually exercise — not by hash-vector luck. One-hot
+    # hash vectors made query-vs-content similarity 0, which the unified
+    # ranker's min-score floor correctly rejects.
     await conn.execute(
         """
         CREATE OR REPLACE FUNCTION get_embedding(text_contents TEXT[])
         RETURNS vector[] AS $$
-            SELECT COALESCE(array_agg((
-                array_fill(0.0::float, ARRAY[(abs(hashtext(t)) % 256)]) ||
-                ARRAY[1.0::float] ||
-                array_fill(0.0::float, ARRAY[embedding_dimension() - 1 - (abs(hashtext(t)) % 256)])
-            )::vector), ARRAY[]::vector[])
-            FROM unnest(text_contents) t
+            SELECT COALESCE(
+                array_agg(array_fill(0.2::float, ARRAY[embedding_dimension()])::vector),
+                ARRAY[]::vector[]
+            ) FROM unnest(text_contents)
         $$ LANGUAGE sql;
         """
     )

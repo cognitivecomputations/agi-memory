@@ -19,10 +19,22 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import struct
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 DIM = int(os.getenv("EMBEDDING_DIMENSION", "768"))
+
+# ``get_embedding()`` prefixes documents with "search_document: " while the
+# recall ranker prefixes queries with "search_query: " (ensure_embedding_prefix).
+# A real embedding model treats those task prefixes as near-transparent — the
+# same text embeds to nearly the same point in either role. Hash the RAW text
+# so this fake behaves the same way; otherwise a stored memory and a recall
+# query for the identical text would get unrelated vectors.
+_TASK_PREFIX = re.compile(
+    r"^\s*(search_document|search_query|clustering|classification)\s*:\s*",
+    re.IGNORECASE,
+)
 
 
 def _vector(text: str) -> list[float]:
@@ -32,6 +44,7 @@ def _vector(text: str) -> list[float]:
     against hand-authored ``array_fill(positive, ...)`` vectors: those tests are
     about strength/fidelity ordering, not semantic embedding polarity.
     """
+    text = _TASK_PREFIX.sub("", text)
     out: list[float] = []
     counter = 0
     while len(out) < DIM:
