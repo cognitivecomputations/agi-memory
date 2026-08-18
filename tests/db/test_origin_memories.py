@@ -199,6 +199,9 @@ async def test_origin_facts_are_recallable_with_source(db_pool):
         try:
             await _stub_get_embedding(conn)
             await _enable_and_seed(conn)
+            # Writes are pending until the embedding pass runs (async, 0129).
+            from tests.utils import embed_pending_memories
+            await embed_pending_memories(conn)
             recalled = _coerce_json(
                 await conn.fetchval(
                     "SELECT execute_memory_tool('recall', $1::jsonb)",

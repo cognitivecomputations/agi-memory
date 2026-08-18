@@ -90,6 +90,9 @@ async def test_extracted_fact_becomes_recallable_memory(db_pool):
                 result = await run_conscious_extraction_step(conn)
 
             assert result["created"] == 1
+            # Embed the new memory before recalling it (async, 0129).
+            from tests.utils import embed_pending_memories
+            await embed_pending_memories(conn)
             # The fact is retrievable as knowledge in a "fresh session"
             # (recall knows nothing about the conversation that produced it).
             recalled = _coerce_json(

@@ -3,7 +3,7 @@ from uuid import uuid4
 
 import pytest
 
-from tests.utils import _coerce_json, get_test_identifier
+from tests.utils import _coerce_json, embed_pending_memories, get_test_identifier
 
 pytestmark = [pytest.mark.asyncio(loop_scope="session"), pytest.mark.db]
 
@@ -158,6 +158,9 @@ async def test_get_subconscious_and_chat_contexts(db_pool, ensure_embedding_serv
                 """,
                 f"recent {query_text}",
             )
+
+            # Writes are pending until the embedding pass runs (async, 0129).
+            await embed_pending_memories(conn)
 
             subconscious = _coerce_json(
                 await conn.fetchval(

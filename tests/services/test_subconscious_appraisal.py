@@ -223,7 +223,7 @@ async def test_streaming_chat_runs_subconscious_once_before_multi_iteration_loop
     )
     observed = {"energy_budget": "unset", "iterations": 0}
 
-    async def fake_agent_stream(self, _user_message, history=None):
+    async def fake_agent_stream(self, _user_message, history=None, user_content=None):
         observed["energy_budget"] = self.config.energy_budget
         for iteration in range(1, 4):
             observed["iterations"] += 1
@@ -279,7 +279,7 @@ async def test_streaming_chat_injects_continuity_into_appraisal_and_prompt(db_po
     )
     captured: dict[str, str] = {}
 
-    async def fake_agent_stream(self, user_message, history=None):
+    async def fake_agent_stream(self, user_message, history=None, user_content=None):
         captured["user_message"] = user_message
         yield AgentEventData(
             event=AgentEvent.LOOP_END,
@@ -336,7 +336,7 @@ async def test_nonstreaming_chat_injects_continuity_into_appraisal_and_prompt(db
     )
     captured: dict[str, str] = {}
 
-    async def fake_agent_run(self, user_message, history=None):
+    async def fake_agent_run(self, user_message, history=None, user_content=None):
         captured["user_message"] = user_message
         return AgentLoopResult(
             text="I remember the last exchange.",

@@ -128,6 +128,11 @@ async def test_ingest_persist_extractions_atomic_pass(db_pool):
             # intensity 0.7 -> half the config base decay (vivid band).
             assert abs(row["decay_rate"] - 0.005) < 1e-9
 
+            # Embed the new memory so the re-ingest below can find and
+            # corroborate it instead of creating a duplicate (async, 0129).
+            from tests.utils import embed_pending_memories
+            await embed_pending_memories(conn)
+
             # Re-ingesting the same fact corroborates instead of duplicating.
             again_raw = await conn.fetchval(
                 "SELECT ingest_persist_extractions($1::jsonb, $2::jsonb, NULL, 0.7, $3::jsonb)",

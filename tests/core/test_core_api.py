@@ -3,7 +3,7 @@ import os
 
 import pytest
 
-from tests.utils import get_test_identifier, _db_dsn
+from tests.utils import embed_pending_memories, get_test_identifier, _db_dsn
 
 pytestmark = [pytest.mark.asyncio(loop_scope="session"), pytest.mark.core]
 
@@ -110,6 +110,9 @@ async def test_api_hydrate_returns_context(cognitive_memory_client, db_pool):
 
     mid = await cognitive_memory_client.remember(content, type=MemoryType.SEMANTIC, importance=0.7)
     try:
+        # Writes are pending until the embedding pass runs (async, 0129).
+        async with db_pool.acquire() as conn:
+            await embed_pending_memories(conn)
         # Use a larger limit because the embedding model may not strongly encode
         # random suffixes, making many "Hydrate memory ..." entries near-ties.
         ctx = await cognitive_memory_client.hydrate(content, include_goals=True, memory_limit=50)
@@ -328,20 +331,32 @@ async def test_api_ingestion_receipts_roundtrip(cognitive_memory_client):
     assert receipts[content_hash] == mid
 
 
-async def test_api_sync_wrapper_basic(ensure_embedding_service):
+async def test_api_sync_wrapper_basic(db_pool, ensure_embedding_service):
     from core.cognitive_memory_api import CognitiveMemorySync, MemoryType
 
     dsn = _db_dsn()
+    test_id = get_test_identifier("api_sync")
 
-    def _run():
+    def _remember():
         mem = CognitiveMemorySync.connect(dsn, min_size=1, max_size=2)
         try:
-            test_id = get_test_identifier("api_sync")
             mid = mem.remember(f"Sync memory {test_id}", type=MemoryType.SEMANTIC, importance=0.6)
             assert mid is not None
+        finally:
+            mem.close()
+
+    await asyncio.to_thread(_remember)
+
+    # Writes are pending until the embedding pass runs (async, 0129).
+    async with db_pool.acquire() as conn:
+        await embed_pending_memories(conn)
+
+    def _recall():
+        mem = CognitiveMemorySync.connect(dsn, min_size=1, max_size=2)
+        try:
             result = mem.recall(f"Sync memory {test_id}", limit=50)
             assert any(test_id in m.content for m in result.memories)
         finally:
             mem.close()
 
-    await asyncio.to_thread(_run)
+    await asyncio.to_thread(_recall)

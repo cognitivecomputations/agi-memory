@@ -97,3 +97,22 @@ async def _restore_embedding_retry_config(
             original_retry_interval_seconds,
         )
     # Phase 7 (ReduceScopeCreep): embedding_config removed - using unified config only
+
+
+async def embed_pending_memories(conn, max_batches: int = 20) -> int:
+    """Run the durable-memory embedding pass until the queue is drained.
+
+    Memory writes leave embedding_status='pending' (async embedding, 0129);
+    the maintenance worker embeds them later. Tests that assert on vectors or
+    vector recall run the same pass the worker runs, on their own connection —
+    so an in-transaction get_embedding stub applies to it too.
+    """
+    from services.memory_embeddings import run_memory_embed_step
+
+    total = 0
+    for _ in range(max_batches):
+        result = await run_memory_embed_step(conn)
+        if result.get("skipped"):
+            break
+        total += int(result.get("embedded", 0))
+    return total

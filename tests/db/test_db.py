@@ -19,6 +19,7 @@ from tenacity import (
 
 from tests.utils import (
     _coerce_json,
+    embed_pending_memories,
     get_test_identifier,
 )
 
@@ -3874,6 +3875,9 @@ async def test_create_memory_with_auto_embedding(db_pool, ensure_embedding_servi
 
         assert memory_id is not None, "Should create memory with auto-embedding"
 
+        # Writes are pending until the embedding pass runs (async, 0129).
+        await embed_pending_memories(conn)
+
         # Verify memory was created with embedding
         memory_data = await conn.fetchrow("""
             SELECT content, embedding, type FROM memories WHERE id = $1
@@ -6874,9 +6878,12 @@ async def test_hnsw_index_usage_memories(db_pool):
                     VALUES ('semantic'::memory_type, $1, array_fill(0.5::float, ARRAY[embedding_dimension()])::vector)
                 """, f'HNSW test memory {i}')
 
+            # The HNSW index is partial (0129): it only covers embedded rows, so
+            # the query must carry the matching predicate — as recall does.
             plan = await conn.fetch("""
                 EXPLAIN (FORMAT JSON)
                 SELECT id FROM memories
+                WHERE embedding IS NOT NULL AND embedding_status = 'embedded'
                 ORDER BY embedding <=> array_fill(0.5::float, ARRAY[embedding_dimension()])::vector
                 LIMIT 5
             """)
@@ -7171,6 +7178,9 @@ async def test_create_memory_generates_embedding(db_pool, ensure_embedding_servi
         memory_id = await conn.fetchval("""
             SELECT create_memory('semantic'::memory_type, $1, 0.8)
         """, content)
+
+        # Writes are pending until the embedding pass runs (async, 0129).
+        await embed_pending_memories(conn)
 
         # Verify embedding was generated and stored
         embedding = await conn.fetchval("""
@@ -7695,6 +7705,9 @@ async def test_full_memory_lifecycle_with_embeddings(db_pool, ensure_embedding_s
 
         assert memory_id is not None
 
+        # Writes are pending until the embedding pass runs (async, 0129).
+        await embed_pending_memories(conn)
+
         # 2. Verify embedding was generated and cached
         content_hash = await conn.fetchval(
             "SELECT encode(sha256($1::text::bytea), 'hex')",
@@ -7992,7 +8005,14 @@ async def test_run_heartbeat_respects_pause(db_pool, apply_heartbeat_migration):
         hb_id = await conn.fetchval("SELECT run_heartbeat()")
         assert hb_id is None
 
-        await conn.execute("UPDATE heartbeat_state SET is_paused = FALSE, last_heartbeat_at = NULL WHERE id = 1")
+        # Clear any active heartbeat a prior test left behind — 0194 makes
+        # run_heartbeat skip while one is active, and this test is about pause.
+        await conn.execute("""
+            UPDATE heartbeat_state
+            SET is_paused = FALSE, last_heartbeat_at = NULL,
+                active_heartbeat_id = NULL, active_heartbeat_number = NULL
+            WHERE id = 1
+        """)
         hb_payload = _coerce_json(await conn.fetchval("SELECT run_heartbeat()"))
         assert hb_payload.get("heartbeat_id") is not None
 
@@ -8263,6 +8283,8 @@ async def test_check_boundaries_embedding_match(db_pool, ensure_embedding_servic
         )
 
         try:
+            # Writes are pending until the embedding pass runs (async, 0129).
+            await embed_pending_memories(conn)
             rows = await conn.fetch(
                 "SELECT boundary_name, similarity FROM check_boundaries($1) WHERE boundary_name = $2",
                 trigger_text,
