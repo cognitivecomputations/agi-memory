@@ -32,7 +32,8 @@ async def _stub(conn):
     )
 
 
-async def _seed(conn, content, *, mem_type="semantic", axis=None, metadata=None):
+async def _seed(conn, content, *, mem_type="semantic", axis=None, metadata=None,
+                importance=0.5):
     """Seed a memory on the embedding axis of `axis` (defaults to content).
     Axis text is embedded in prefixed search form so it matches recall."""
     return await conn.fetchval(
@@ -40,10 +41,11 @@ async def _seed(conn, content, *, mem_type="semantic", axis=None, metadata=None)
         INSERT INTO memories (type, content, embedding, importance, trust_level, status, metadata)
         VALUES ($1::memory_type, $2,
                 (get_embedding(ARRAY[ensure_embedding_prefix($3, 'search_query')]))[1],
-                0.5, 0.8, 'active', COALESCE($4::jsonb, '{}'::jsonb))
+                $5, 0.8, 'active', COALESCE($4::jsonb, '{}'::jsonb))
         RETURNING id
         """,
         mem_type, content, axis or content, json.dumps(metadata) if metadata else None,
+        importance,
     )
 
 
@@ -55,10 +57,14 @@ async def test_targets_rank_on_home_turf_and_knowledge_is_reachable(db_pool):
         await tr.start()
         try:
             await _stub(conn)
-            sem = await _seed(conn, f"semantic target {m}", axis=q)
-            epi = await _seed(conn, f"episodic target {m}", mem_type="episodic", axis=q)
-            world = await _seed(conn, f"worldview target {m}", mem_type="worldview", axis=q)
-            proc = await _seed(conn, f"procedural target {m}", mem_type="procedural", axis=q)
+            # Targets get a strictly higher importance than distractors: the
+            # stub's hash-position vectors can collide (~1/770 per distractor,
+            # random test ids), and a similarity tie would hand top-1 to an
+            # arbitrary row. Strength breaks the tie toward the target.
+            sem = await _seed(conn, f"semantic target {m}", axis=q, importance=0.6)
+            epi = await _seed(conn, f"episodic target {m}", mem_type="episodic", axis=q, importance=0.6)
+            world = await _seed(conn, f"worldview target {m}", mem_type="worldview", axis=q, importance=0.6)
+            proc = await _seed(conn, f"procedural target {m}", mem_type="procedural", axis=q, importance=0.6)
             for i in range(4):
                 await _seed(conn, f"distractor {i} {m}", axis=f"unrelated axis {i} {m}")
 
@@ -85,7 +91,9 @@ async def test_association_expansion_reaches_off_axis_neighbors(db_pool):
         await tr.start()
         try:
             await _stub(conn)
-            seed_mem = await _seed(conn, f"on-axis seed {m}", axis=q)
+            # Same tie-break as above: a hash collision must not let the
+            # neighbor tie the on-axis seed's similarity and flip line 109.
+            seed_mem = await _seed(conn, f"on-axis seed {m}", axis=q, importance=0.6)
             neighbor = await _seed(conn, f"off-axis neighbor {m}", axis=f"totally different axis {m}")
             await _seed(conn, f"off-axis distractor {m}", axis=f"third axis {m}")
             await conn.execute(
