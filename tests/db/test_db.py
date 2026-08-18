@@ -5556,12 +5556,13 @@ async def test_fast_recall_only_active_memories(db_pool, ensure_embedding_servic
 async def test_fast_recall_source_attribution(db_pool, ensure_embedding_service):
     """Test fast_recall correctly attributes retrieval sources"""
     async with db_pool.acquire() as conn:
-        # The source field should be one of: 'vector', 'association', 'temporal', 'fallback'
+        # The source field must be one of the unified ranker's channels
+        # (graph = typed memory-edge adjacency, added with memory_edges).
         results = await conn.fetch("""
             SELECT source FROM fast_recall('test query', 5)
         """)
 
-        valid_sources = {'vector', 'association', 'temporal', 'fallback'}
+        valid_sources = {'vector', 'association', 'temporal', 'graph', 'fallback'}
         for result in results:
             assert result['source'] in valid_sources, f"Invalid source: {result['source']}"
 
@@ -5769,7 +5770,21 @@ async def test_recall_memories_filtered_filters_type_and_importance(db_pool, ens
                 query_text,
             )
             ids = {str(row["memory_id"]) for row in rows}
-            assert str(high_semantic_id) in ids
+            diag = [dict(r) for r in await conn.fetch(
+                """
+                SELECT id, embedding_status,
+                       round((1 - (embedding <=> (get_embedding(
+                           ARRAY[ensure_embedding_prefix($1, 'search_query')]))[1]))::numeric, 4) AS sim
+                FROM memories WHERE id = ANY($2::uuid[])
+                """,
+                query_text,
+                [high_semantic_id, low_semantic_id, episodic_id],
+            )]
+            fr = [dict(r) for r in await conn.fetch(
+                "SELECT memory_id, round(score::numeric, 3) AS score, source FROM fast_recall($1, 10)",
+                query_text,
+            )]
+            assert str(high_semantic_id) in ids, f"inserted={diag} fast_recall={fr}"
             assert str(low_semantic_id) not in ids
             assert str(episodic_id) not in ids
             if rows:
