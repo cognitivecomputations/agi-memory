@@ -73,11 +73,11 @@ async def _load_google_antigravity(conn, cfg: dict[str, Any]) -> None:
 
 
 async def _load_anthropic_credentials(conn, cfg: dict[str, Any]) -> None:
-    """Resolve Anthropic credentials from all available sources.
+    """Resolve Anthropic credentials from Hexis's stored setup token.
 
-    Priority: Hexis PKCE OAuth > Claude Code creds > setup token > env API key.
+    Priority: setup token > env API key (the latter via normalize_llm_config).
     """
-    from core.auth.anthropic_oauth import resolve_anthropic_token
+    from core.auth.anthropic_setup_token import resolve_anthropic_token
 
     token, auth_mode = await resolve_anthropic_token()
     if token:

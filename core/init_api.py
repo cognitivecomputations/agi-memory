@@ -289,9 +289,9 @@ async def run_consent_flow(
 
     messages, sign_consent_tool = build_consent_request()
 
-    # Call LLM. Pass auth_mode so OAuth/setup-token providers (e.g. Anthropic
-    # via Claude Pro/Max) route to the Bearer HTTP client instead of the SDK
-    # api-key path.
+    # Call LLM. Pass auth_mode so setup-token providers (e.g. Anthropic via a
+    # Claude Code setup token) route to the Bearer HTTP client instead of the
+    # SDK api-key path.
     result = await chat_completion(
         provider=llm_config["provider"],
         model=llm_config["model"],

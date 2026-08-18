@@ -50,14 +50,12 @@ def register_auth_subparsers(
     oai.set_defaults(func="auth_openai_codex")
 
     # ── Anthropic ─────────────────────────────────────────────────
-    ant = auth_sub.add_parser("anthropic", parents=[db_parent], help="Anthropic Claude (OAuth / setup-token)")
+    ant = auth_sub.add_parser("anthropic", parents=[db_parent], help="Anthropic Claude (setup-token)")
     ant_sub = ant.add_subparsers(dest="anthropic_command")
-    _al_login = ant_sub.add_parser("login", parents=[db_parent], help="Login via browser OAuth (PKCE)")
-    _al_login.set_defaults(func="auth_anthropic_login")
     _st = ant_sub.add_parser("setup-token", parents=[db_parent], help="Paste a setup token")
     _st.add_argument("--token", default=None, help="Token value (prompted if omitted)")
     _st.set_defaults(func="auth_anthropic_setup_token")
-    _as = ant_sub.add_parser("status", parents=[db_parent], help="Show OAuth / setup-token status")
+    _as = ant_sub.add_parser("status", parents=[db_parent], help="Show setup-token status")
     _as.add_argument("--json", action="store_true", help="Output JSON")
     _as.set_defaults(func="auth_anthropic_status")
     _al = ant_sub.add_parser("logout", parents=[db_parent], help="Delete stored credentials")
@@ -173,8 +171,6 @@ def dispatch_auth_command(func: str, args: Any, dsn: str) -> int | None:
     # ── Anthropic ──
     if func == "auth_anthropic":
         return asyncio.run(_anthropic_status(dsn, ws, as_json=False))
-    if func == "auth_anthropic_login":
-        return asyncio.run(_anthropic_oauth_login(dsn, ws))
     if func == "auth_anthropic_setup_token":
         return asyncio.run(_anthropic_setup_token(dsn, ws, getattr(args, "token", None)))
     if func == "auth_anthropic_status":
@@ -538,82 +534,16 @@ async def _anthropic_setup_token(dsn: str, wait_seconds: int, token: str | None)
     return 0
 
 
-async def _anthropic_oauth_login(dsn: str, wait_seconds: int) -> int:
-    import webbrowser
-
-    from apps.cli_theme import console
-    from core.auth import create_state, generate_pkce
-    from core.auth.anthropic_oauth import (
-        build_authorize_url,
-        exchange_authorization_code,
-        parse_authorization_input,
-        save_credentials,
-    )
-
-    verifier, challenge = generate_pkce()
-    state = create_state()
-    auth_url = build_authorize_url(challenge=challenge, state=state)
-
-    console.print("\n[bold]Anthropic Claude OAuth (PKCE)[/bold]")
-    console.print("Authorize Hexis with your Claude Pro/Max subscription.\n")
-    console.print(f"[dim]{auth_url}[/dim]\n")
-
-    try:
-        webbrowser.open(auth_url)
-        console.print("  (Browser opened automatically)")
-    except Exception:
-        pass
-
-    console.print("\nAfter authorizing, you'll see a code. Paste it below.\n")
-    try:
-        pasted = input("Authorization code: ").strip()
-    except (KeyboardInterrupt, EOFError):
-        console.print("\n[dim]Aborted.[/dim]")
-        return 1
-
-    if not pasted:
-        _print_err("No code entered.")
-        return 1
-
-    parsed_code, parsed_state = parse_authorization_input(pasted)
-    if parsed_state and parsed_state != state:
-        _print_err("State mismatch — possible CSRF. Try again.")
-        return 1
-    if not parsed_code:
-        _print_err("Missing authorization code.")
-        return 1
-
-    console.print("[accent]Exchanging code for tokens...[/accent]")
-    creds = await exchange_authorization_code(
-        code=parsed_code, verifier=verifier, state=parsed_state or state,
-    )
-
-    save_credentials(creds)
-    expires_sec = max(0, int((creds.expires_ms - int(time.time() * 1000)) / 1000))
-    console.print(f"[ok]Logged in.[/ok] expires_in~{expires_sec}s")
-    return 0
-
-
 async def _anthropic_status(dsn: str, wait_seconds: int, *, as_json: bool) -> int:
-    from core.auth.anthropic_oauth import load_credentials as load_oauth
-    from core.auth.anthropic_oauth import read_claude_code_credentials
-    from core.auth.anthropic_setup_token import load_credentials as load_setup
+    from core.auth.anthropic_setup_token import (
+        load_credentials as load_setup,
+        read_claude_code_credentials,
+    )
 
-    oauth_creds = load_oauth()
     cc_creds = read_claude_code_credentials()
     setup_creds = load_setup()
 
     sources: list[dict[str, Any]] = []
-
-    if oauth_creds:
-        now = int(time.time() * 1000)
-        expires_in_s = int((oauth_creds.expires_ms - now) / 1000)
-        sources.append({
-            "type": "oauth_pkce",
-            "configured": True,
-            "expires_in_seconds": expires_in_s,
-            "source": oauth_creds.source,
-        })
 
     if cc_creds:
         expires_at = cc_creds.get("expiresAt", 0)
@@ -625,7 +555,7 @@ async def _anthropic_status(dsn: str, wait_seconds: int, *, as_json: bool) -> in
             "type": "claude_code",
             "configured": False,
             "used_by_runtime": False,
-            "note": "detected but not used — run `hexis auth anthropic login`",
+            "note": "detected but not used — run `hexis auth anthropic setup-token`",
             "expires_in_seconds": expires_in_s,
             "source": cc_creds.get("source", "unknown"),
             "token_preview": cc_creds.get("accessToken", "")[-6:],
@@ -647,17 +577,15 @@ async def _anthropic_status(dsn: str, wait_seconds: int, *, as_json: bool) -> in
         return 0
 
     # "configured" for Hexis means a source the runtime actually uses.
-    usable = bool(oauth_creds or setup_creds)
+    usable = bool(setup_creds)
     if as_json:
         sys.stdout.write(json.dumps({"configured": usable, "sources": sources}, indent=2, sort_keys=True) + "\n")
     else:
         if not usable:
-            sys.stdout.write("Anthropic: not logged in to Hexis. Run `hexis auth anthropic login`.\n")
+            sys.stdout.write("Anthropic: no setup token stored. Run `hexis auth anthropic setup-token`.\n")
         for src in sources:
             t = src["type"]
-            if t == "oauth_pkce":
-                sys.stdout.write(f"  OAuth PKCE: expires_in={src['expires_in_seconds']}s\n")
-            elif t == "claude_code":
+            if t == "claude_code":
                 exp = f" expires_in={src['expires_in_seconds']}s" if src.get("expires_in_seconds") is not None else ""
                 sys.stdout.write(f"  Claude Code: detected but NOT used by Hexis ({src['source']}{exp})\n")
             elif t == "setup_token":
@@ -667,12 +595,12 @@ async def _anthropic_status(dsn: str, wait_seconds: int, *, as_json: bool) -> in
 
 async def _anthropic_logout(dsn: str, wait_seconds: int, yes: bool) -> int:
     from apps.cli_theme import console
-    from core.auth.anthropic_oauth import delete_credentials as delete_oauth
     from core.auth.anthropic_setup_token import delete_credentials as delete_setup
+    from core.auth.store import delete_auth
 
     if not yes:
         try:
-            answer = input("Delete stored Anthropic credentials (OAuth + setup token)? Type 'yes' to confirm: ").strip().lower()
+            answer = input("Delete stored Anthropic credentials (setup token)? Type 'yes' to confirm: ").strip().lower()
         except (KeyboardInterrupt, EOFError):
             console.print("\n[dim]Aborted.[/dim]")
             return 1
@@ -680,8 +608,9 @@ async def _anthropic_logout(dsn: str, wait_seconds: int, yes: bool) -> int:
             console.print("[dim]Aborted.[/dim]")
             return 1
 
-    delete_oauth()
     delete_setup()
+    # Also clear any credential left behind by the removed OAuth login flow.
+    delete_auth("oauth.anthropic")
     console.print("[ok]Deleted Anthropic credentials.[/ok]")
     return 0
 

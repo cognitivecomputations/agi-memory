@@ -19,7 +19,6 @@ const TIMEOUT_MS = 12000;
 const PROVIDER_SLUG: Record<string, string> = {
   openai: "openai",
   anthropic: "anthropic",
-  "anthropic-oauth": "anthropic",
   grok: "xai",
   gemini: "google",
   chutes: "chutes",

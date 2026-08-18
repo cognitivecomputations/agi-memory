@@ -188,21 +188,24 @@ def test_commands_are_well_formed():
     assert "/help" in names and "/recall" in names and "/quit" in names
 
 
-# ── Anthropic OAuth provider wiring ───────────────────────────────────────────
+# ── Anthropic provider wiring ─────────────────────────────────────────────────
 
-def test_anthropic_oauth_provider_registered():
+def test_anthropic_oauth_provider_not_offered():
+    """The Anthropic browser-OAuth flow was removed (the endpoint rejects it).
+
+    Only API-key Anthropic remains a wizard option; subscription auth goes
+    through `hexis auth anthropic setup-token`.
+    """
     from apps.tui import model_catalog
     from apps.tui.init_screens import (
         _DEFAULT_MODELS, _OAUTH_PROVIDERS, _PROVIDER_ENV_VARS,
         _PROVIDER_OPTIONS, _persisted_provider,
     )
-    # wizard-only alias maps to the real "anthropic" id for the LLM layer
-    assert _persisted_provider("anthropic-oauth") == "anthropic"
     assert _persisted_provider("openai") == "openai"
-    # registered as an OAuth provider option with a claude default + no env key
-    assert ("Claude Pro/Max (Anthropic OAuth)", "anthropic-oauth") in _PROVIDER_OPTIONS
-    assert "anthropic-oauth" in _OAUTH_PROVIDERS
-    assert _PROVIDER_ENV_VARS["anthropic-oauth"] == ""
-    assert _DEFAULT_MODELS["anthropic-oauth"].startswith("claude-")
-    # model dropdown resolves to the anthropic catalog
-    assert model_catalog.PROVIDER_SLUG["anthropic-oauth"] == "anthropic"
+    assert "anthropic-oauth" not in _OAUTH_PROVIDERS
+    assert "anthropic-oauth" not in _DEFAULT_MODELS
+    assert "anthropic-oauth" not in _PROVIDER_ENV_VARS
+    assert "anthropic-oauth" not in model_catalog.PROVIDER_SLUG
+    assert not any(pid == "anthropic-oauth" for _, pid in _PROVIDER_OPTIONS)
+    # API-key Anthropic is still offered
+    assert ("Anthropic (API key)", "anthropic") in _PROVIDER_OPTIONS

@@ -9,7 +9,7 @@ from typing import Any
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.screen import ModalScreen, Screen
+from textual.screen import Screen
 from textual.widgets import (
     Button,
     DataTable,
@@ -49,7 +49,6 @@ def _plain(text: str, token: str = "text") -> Text:
 
 _DEFAULT_MODELS: dict[str, str] = {
     "anthropic": "claude-sonnet-4-20250514",
-    "anthropic-oauth": "claude-sonnet-5",
     "openai": "gpt-4o",
     "openai-codex": "gpt-5.2",
     "grok": "grok-3",
@@ -64,7 +63,6 @@ _DEFAULT_MODELS: dict[str, str] = {
 
 _PROVIDER_ENV_VARS: dict[str, str] = {
     "anthropic": "ANTHROPIC_API_KEY",
-    "anthropic-oauth": "",
     "openai": "OPENAI_API_KEY",
     "openai-codex": "",
     "grok": "XAI_API_KEY",
@@ -80,7 +78,6 @@ _PROVIDER_ENV_VARS: dict[str, str] = {
 _PROVIDER_OPTIONS: list[tuple[str, str]] = [
     ("OpenAI Codex (ChatGPT OAuth)", "openai-codex"),
     ("OpenAI Platform (API key)", "openai"),
-    ("Claude Pro/Max (Anthropic OAuth)", "anthropic-oauth"),
     ("Anthropic (API key)", "anthropic"),
     ("Grok (xAI)", "grok"),
     ("Gemini", "gemini"),
@@ -94,7 +91,6 @@ _PROVIDER_OPTIONS: list[tuple[str, str]] = [
 
 _OAUTH_PROVIDERS: set[str] = {
     "openai-codex",
-    "anthropic-oauth",
     "chutes",
     "github-copilot",
     "qwen-portal",
@@ -105,20 +101,14 @@ _OAUTH_PROVIDERS: set[str] = {
 
 
 def _persisted_provider(provider: str) -> str:
-    """Map a wizard-only provider alias to the id the LLM layer understands.
-
-    ``anthropic-oauth`` is a UI convenience; it persists as ``anthropic`` with
-    an empty api_key so ``load_llm_config`` auto-resolves the OAuth/Claude Code
-    token at runtime.
-    """
-    return "anthropic" if provider == "anthropic-oauth" else provider
+    """Map a wizard-only provider alias to the id the LLM layer understands."""
+    return provider
 
 
 def _normalize_provider(raw: str) -> str:
     val = (raw or "").strip().lower()
     aliases = {
         "openai_codex": "openai-codex",
-        "anthropic_oauth": "anthropic-oauth",
         "github_copilot": "github-copilot",
         "qwen_portal": "qwen-portal",
         "minimax_portal": "minimax-portal",
@@ -174,119 +164,6 @@ class ReconfigureScreen(Screen):
             self.app.switch_screen(LLMConfigScreen())
         elif event.button.id == "keep":
             self.app.exit(0)
-
-
-# ── Anthropic OAuth login (inline, in-wizard) ────────────────────────────────
-
-class AnthropicLoginScreen(ModalScreen[bool]):
-    """In-wizard Claude Pro/Max login (Anthropic OAuth PKCE).
-
-    Opens the browser to the authorize URL, the user pastes the code Anthropic
-    shows, and we exchange it for a token saved to Hexis's own store. Dismisses
-    True on success, False on cancel.
-    """
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._verifier = ""
-        self._state = ""
-        self._auth_url = ""
-
-    def compose(self) -> ComposeResult:
-        with Vertical(classes="dialog-box", id="anthropic-login-box"):
-            yield Label("Claude Pro/Max Login", classes="dialog-title")
-            yield Static(
-                Text(
-                    "A browser window is opening. Authorize with your Claude "
-                    "Pro/Max subscription, copy the code Anthropic shows you, "
-                    "and paste it below. This replaces any existing Hexis "
-                    "Anthropic login.",
-                    style=Style(color=COLORS["text"]),
-                ),
-                classes="dialog-body",
-            )
-            yield Static("", id="anthropic-login-url", classes="hint")
-            yield Input(placeholder="Paste the authorization code (code#state)",
-                        id="anthropic-code")
-            yield Static("", id="anthropic-login-status", classes="hint")
-            with Horizontal(classes="dialog-buttons"):
-                yield Button("Reopen Browser", id="reopen", classes="muted")
-                yield Button("Submit", id="submit", classes="primary")
-                yield Button("Cancel", id="cancel", classes="muted")
-
-    def on_mount(self) -> None:
-        from core.auth import create_state, generate_pkce
-        from core.auth.anthropic_oauth import build_authorize_url
-
-        self._verifier, challenge = generate_pkce()
-        self._state = create_state()
-        self._auth_url = build_authorize_url(challenge=challenge, state=self._state)
-        self._open_browser()
-        self.query_one("#anthropic-login-url", Static).update(
-            Text(f"If the browser didn't open, visit:\n{self._auth_url}",
-                 style=Style(color=COLORS["dim"]))
-        )
-        self.query_one("#anthropic-code", Input).focus()
-
-    def _open_browser(self) -> None:
-        import webbrowser
-        try:
-            webbrowser.open(self._auth_url)
-        except Exception:
-            pass
-
-    def _set_status(self, text: str, token: str) -> None:
-        self.query_one("#anthropic-login-status", Static).update(
-            Text(text, style=Style(color=COLORS[token]))
-        )
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "cancel":
-            self.dismiss(False)
-        elif event.button.id == "reopen":
-            self._open_browser()
-        elif event.button.id == "submit":
-            self._submit()
-
-    def on_input_submitted(self, event: Input.Submitted) -> None:
-        if event.input.id == "anthropic-code":
-            self._submit()
-
-    def _submit(self) -> None:
-        pasted = self.query_one("#anthropic-code", Input).value.strip()
-        if not pasted:
-            self._set_status("Paste the authorization code first.", "warn")
-            return
-        self.query_one("#submit", Button).disabled = True
-        self._set_status("Exchanging code for a token…", "dim")
-        self.run_worker(self._exchange(pasted), name="anthropic-exchange",
-                        exclusive=True, exit_on_error=False)
-
-    async def _exchange(self, pasted: str) -> None:
-        from core.auth.anthropic_oauth import (
-            exchange_authorization_code,
-            parse_authorization_input,
-            save_credentials,
-        )
-
-        code, pasted_state = parse_authorization_input(pasted)
-        if pasted_state and pasted_state != self._state:
-            raise RuntimeError("State mismatch — reopen the browser and try again.")
-        if not code:
-            raise RuntimeError("Missing authorization code.")
-        creds = await exchange_authorization_code(
-            code=code, verifier=self._verifier, state=pasted_state or self._state,
-        )
-        save_credentials(creds)
-
-    async def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
-        if event.worker.name != "anthropic-exchange":
-            return
-        if event.state == WorkerState.SUCCESS:
-            self.dismiss(True)
-        elif event.state == WorkerState.ERROR:
-            self.query_one("#submit", Button).disabled = False
-            self._set_status(f"Login failed: {event.worker.error}", "danger")
 
 
 # ── 1. LLM Config ───────────────────────────────────────────────────────────
@@ -386,11 +263,6 @@ class LLMConfigScreen(Screen):
             key_input.disabled = True
             if provider == "openai-codex":
                 help_text.update("Next opens browser OAuth for ChatGPT Plus/Pro.")
-            elif provider == "anthropic-oauth":
-                help_text.update(
-                    "Uses your Claude Pro/Max subscription via Hexis's own "
-                    "login. Run `hexis auth anthropic login` first if needed."
-                )
             else:
                 help_text.update("Next runs provider OAuth/device-code login.")
         else:
@@ -537,29 +409,11 @@ class LLMConfigScreen(Screen):
         save_openai_codex_credentials(creds)
         await ensure_fresh_openai_codex_credentials(skew_seconds=0)
 
-    async def _login_anthropic_oauth(self) -> None:
-        """Always run the Claude Pro/Max login, overwriting any existing token.
-
-        `hexis init` should just log the user in fresh whether or not a
-        credential already exists — never silently reuse a stale one. The login
-        runs inline (browser + paste code) and saves to Hexis's OWN store
-        (``~/.hexis/auth/``), overwriting the previous token. Called from the
-        auth worker, so ``push_screen_wait`` is valid here.
-        """
-        from core.auth.anthropic_oauth import load_credentials
-
-        ok = await self.app.push_screen_wait(AnthropicLoginScreen())
-        if not ok or not load_credentials():
-            raise RuntimeError("Claude Pro/Max login was cancelled or did not complete.")
-
     async def _ensure_provider_auth(self, provider: str) -> None:
         if provider not in _OAUTH_PROVIDERS:
             return
         if provider == "openai-codex":
             await self._ensure_openai_codex_login()
-            return
-        if provider == "anthropic-oauth":
-            await self._login_anthropic_oauth()
             return
 
         from apps.hexis_init import _ensure_oauth_login

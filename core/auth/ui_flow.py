@@ -22,7 +22,6 @@ from core.auth.callback_server import run_callback_server
 
 SUPPORTED_PROVIDERS = {
     "openai-codex",
-    "anthropic",
     "chutes",
     "github-copilot",
     "qwen-portal",
@@ -211,10 +210,6 @@ class AuthFlowCoordinator:
             )
 
             redirect_uri = OPENAI_CODEX_REDIRECT_URI
-            authorization_url = build_authorize_url(challenge=challenge, state=state)
-        elif provider == "anthropic":
-            from core.auth.anthropic_oauth import build_authorize_url
-
             authorization_url = build_authorize_url(challenge=challenge, state=state)
         elif provider == "chutes":
             from core.auth.chutes import build_authorize_url
@@ -422,18 +417,6 @@ class AuthFlowCoordinator:
                     code=code, verifier=session.verifier
                 )
                 save_openai_codex_credentials(creds)
-            elif session.provider == "anthropic":
-                from core.auth.anthropic_oauth import (
-                    exchange_authorization_code,
-                    save_credentials,
-                )
-
-                creds = await exchange_authorization_code(
-                    code=code,
-                    verifier=session.verifier,
-                    state=session.state or "",
-                )
-                save_credentials(creds)
             elif session.provider == "chutes":
                 from core.auth.chutes import exchange_code, save_credentials
 
@@ -564,8 +547,6 @@ class AuthFlowCoordinator:
 
 def _canonical_provider(provider: str) -> str:
     value = (provider or "").strip().lower()
-    if value == "anthropic-oauth":
-        value = "anthropic"
     if value not in SUPPORTED_PROVIDERS:
         raise AuthFlowError(f"Unsupported OAuth provider: {provider or 'missing'}")
     return value
@@ -601,10 +582,7 @@ def _normalize_domain(value: str) -> str:
 def _parse_authorization_input(
     provider: str, value: str
 ) -> tuple[str | None, str | None]:
-    if provider == "anthropic":
-        from core.auth.anthropic_oauth import parse_authorization_input
-    else:
-        from core.auth.openai_codex import parse_authorization_input
+    from core.auth.openai_codex import parse_authorization_input
     return parse_authorization_input(value)
 
 
@@ -613,11 +591,6 @@ def _load_credentials(provider: str) -> Any:
         from core.auth.openai_codex import load_openai_codex_credentials
 
         return load_openai_codex_credentials()
-    if provider == "anthropic":
-        from core.auth.anthropic_oauth import load_credentials
-
-        return load_credentials()
-
     import importlib
 
     module = importlib.import_module(
@@ -643,7 +616,6 @@ async def _ensure_fresh_credentials(provider: str) -> Any:
 
     module = importlib.import_module(
         {
-            "anthropic": "core.auth.anthropic_oauth",
             "chutes": "core.auth.chutes",
             "github-copilot": "core.auth.github_copilot",
             "qwen-portal": "core.auth.qwen_portal",

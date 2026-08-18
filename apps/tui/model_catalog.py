@@ -27,7 +27,6 @@ PROVIDER_SLUG: dict[str, str] = {
     "openai": "openai",
     "openai-codex": "openai",
     "anthropic": "anthropic",
-    "anthropic-oauth": "anthropic",
     "grok": "xai",
     "gemini": "google",
     "chutes": "chutes",

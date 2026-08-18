@@ -52,7 +52,6 @@ const stagePrompt: Record<InitStage, string> = {
 
 type LlmProvider =
   | "openai-codex"
-  | "anthropic-oauth"
   | "openai"
   | "anthropic"
   | "grok"
@@ -192,13 +191,6 @@ const providerMeta: Record<LlmProvider, ProviderMeta> = {
     apiKeyRequired: false,
     oauth: true,
   },
-  "anthropic-oauth": {
-    label: "Claude Pro/Max (Anthropic OAuth)",
-    endpoint: "",
-    apiKeyLabel: "OAuth",
-    apiKeyRequired: false,
-    oauth: true,
-  },
   openai: {
     label: "OpenAI",
     endpoint: "https://api.openai.com/v1",
@@ -280,10 +272,7 @@ const providerMeta: Record<LlmProvider, ProviderMeta> = {
 
 const providerOrder = Object.keys(providerMeta) as LlmProvider[];
 
-// ``anthropic-oauth`` is a wizard-only alias; it persists as ``anthropic`` with
-// an empty key so the LLM layer auto-resolves the OAuth token at runtime.
-const persistedProvider = (provider: LlmProvider): string =>
-  provider === "anthropic-oauth" ? "anthropic" : provider;
+const persistedProvider = (provider: LlmProvider): string => provider;
 
 const defaultLlmConfig = (provider: LlmProvider): LlmConfig => ({
   provider,

@@ -345,22 +345,20 @@ async def _run_init_noninteractive(args: argparse.Namespace) -> int:
         else:
             provider = "openai-codex"
     provider = _normalize_provider_name(provider)
-    # "anthropic-oauth" is a wizard alias; the LLM layer knows "anthropic".
-    persist_provider = "anthropic" if provider == "anthropic-oauth" else provider
+    persist_provider = provider
 
-    _no_key_needed = _OAUTH_PROVIDERS | {"anthropic-oauth"}
-    if provider not in _no_key_needed and not args.api_key:
-        err_console.print(f"[fail]--api-key required for provider '{provider}'[/fail]")
+    # The Anthropic browser-OAuth (Claude Pro/Max) login was removed — the
+    # endpoint no longer accepts it. Point straight at the working paths.
+    if provider == "anthropic-oauth":
+        err_console.print(
+            "[fail]Anthropic OAuth login is no longer supported. Use "
+            "`hexis auth anthropic setup-token` then `--provider anthropic`, "
+            "or pass an Anthropic API key.[/fail]")
         return 1
 
-    # OAuth providers can't do a browser login non-interactively — require the
-    # user to have logged in already, and fail fast with the exact command.
-    if provider == "anthropic-oauth":
-        from core.auth.anthropic_oauth import load_credentials as _load_ant
-        if not _load_ant():
-            err_console.print("[fail]Not logged in to Anthropic (Claude Pro/Max). "
-                              "Run `hexis auth anthropic login` first, then re-run init.[/fail]")
-            return 1
+    if provider not in _OAUTH_PROVIDERS and not args.api_key:
+        err_console.print(f"[fail]--api-key required for provider '{provider}'[/fail]")
+        return 1
 
     # 2. Resolve model — derive from the live catalog (not a stale hard-code).
     model = args.model
@@ -613,7 +611,6 @@ async def _configure_llm(conn: Any, *, dsn: str, wait_seconds: int) -> dict[str,
     from apps.cli_prompts import select_value
 
     _PROVIDER_MENU = [
-        ("Claude Pro/Max — Anthropic OAuth subscription (no API key)", "anthropic-oauth"),
         ("OpenAI Codex — ChatGPT Plus/Pro OAuth (no API key)", "openai-codex"),
         ("OpenAI — API key", "openai"),
         ("Anthropic — API key", "anthropic"),
@@ -651,11 +648,9 @@ async def _configure_llm(conn: Any, *, dsn: str, wait_seconds: int) -> dict[str,
     else:
         model = _prompt("Model", default=default_model, required=True)
 
-    # OAuth providers need no endpoint / API key. "anthropic-oauth" is a
-    # wizard-only alias: the LLM layer only knows "anthropic" (with no api_key it
-    # auto-resolves the OAuth token at runtime).
-    is_oauth = provider in _OAUTH_PROVIDERS or provider == "anthropic-oauth"
-    persist_provider = "anthropic" if provider == "anthropic-oauth" else provider
+    # OAuth providers need no endpoint / API key.
+    is_oauth = provider in _OAUTH_PROVIDERS
+    persist_provider = provider
 
     if is_oauth:
         endpoint = ""
@@ -713,20 +708,8 @@ async def _configure_llm(conn: Any, *, dsn: str, wait_seconds: int) -> dict[str,
 
     console.print(f"\n[ok]\u2714[/ok] Models saved: [bold]{persist_provider}/{model}[/bold]")
 
-    # Anthropic OAuth (Claude Pro/Max): log in now so the token is in Hexis's
-    # own store before consent. Always runs (overwrites any existing token).
-    if provider == "anthropic-oauth":
-        console.print("\n[accent]Log in with your Claude Pro/Max subscription:[/accent]")
-        from apps.cli_auth import _anthropic_oauth_login
-        rc = await _anthropic_oauth_login(dsn, wait_seconds)
-        if rc != 0:
-            err_console.print(
-                "[warn]\u26a0[/warn] Login didn't complete. Run "
-                "`hexis auth anthropic login` in a terminal, then re-run `hexis init`."
-            )
-
     # Resolve credentials for the consent flow (runs OAuth login for the
-    # loader-based OAuth providers; Anthropic is handled just above).
+    # loader-based OAuth providers).
     resolved = await _load_llm_config_for_consent(
         conn,
         dsn=dsn,

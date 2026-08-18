@@ -12,11 +12,11 @@ describe("OAuthControl", () => {
     const onAuthenticated = vi.fn();
     const fetchMock = vi.spyOn(globalThis, "fetch");
     fetchMock
-      .mockResolvedValueOnce(jsonResponse({ provider: "anthropic", configured: false }))
+      .mockResolvedValueOnce(jsonResponse({ provider: "openai-codex", configured: false }))
       .mockResolvedValueOnce(
         jsonResponse({
           session_id: "session-1",
-          provider: "anthropic",
+          provider: "openai-codex",
           flow: "authorization_code",
           status: "awaiting_code",
           expires_in_seconds: 600,
@@ -27,12 +27,12 @@ describe("OAuthControl", () => {
       .mockResolvedValueOnce(
         jsonResponse({
           session_id: "session-1",
-          provider: "anthropic",
+          provider: "openai-codex",
           flow: "authorization_code",
           status: "complete",
           expires_in_seconds: 590,
           credential: {
-            provider: "anthropic",
+            provider: "openai-codex",
             configured: true,
             email: "person@example.test",
           },
@@ -41,8 +41,8 @@ describe("OAuthControl", () => {
 
     render(
       <OAuthControl
-        provider="anthropic"
-        label="Claude Pro/Max"
+        provider="openai-codex"
+        label="OpenAI Codex"
         refreshKey={0}
         onAuthenticated={onAuthenticated}
       />
@@ -59,7 +59,7 @@ describe("OAuthControl", () => {
     fireEvent.click(screen.getByRole("button", { name: "Complete authorization" }));
 
     expect(await screen.findByText("Authorization complete.")).toBeVisible();
-    await waitFor(() => expect(onAuthenticated).toHaveBeenCalledWith("anthropic"));
+    await waitFor(() => expect(onAuthenticated).toHaveBeenCalledWith("openai-codex"));
     expect(fetchMock.mock.calls[2][0]).toBe("/api/init/auth/complete");
   });
 
