@@ -20,7 +20,7 @@ import copy
 import json
 import secrets
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from functools import lru_cache
 from importlib.resources import files
 from typing import Any, Iterable
@@ -529,7 +529,7 @@ def build_envelope(
     if redaction_policy not in REDACTION_POLICIES:
         raise HmxPolicyError(f"unknown redaction_policy: {redaction_policy!r}")
 
-    stamp = (exported_at or datetime.now(UTC)).isoformat().replace("+00:00", "Z")
+    stamp = (exported_at or datetime.now(timezone.utc)).isoformat().replace("+00:00", "Z")
     return {
         "hmx_version": HMX_VERSION,
         "export_id": export_id or new_export_id(),
@@ -1982,7 +1982,7 @@ async def stage_hmx(conn, data: dict[str, Any]) -> HmxStagingResult:
     records = _exchange_records(data)
     source = data.get("source") or {}
     export_id = str(data["export_id"])
-    imported_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    imported_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     local_context = await load_source_context(conn)
     duplicate_refs = set(forecast.duplicate_refs)
     unsupported = {"raw_units", "config", "in_flight_work", "audit_records"}
@@ -2063,7 +2063,7 @@ async def load_analysis_hmx(conn, data: dict[str, Any]) -> HmxAnalysisResult:
     records = _exchange_records(data)
     source = data.get("source") or {}
     export_id = str(data["export_id"])
-    imported_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    imported_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     local_context = await load_source_context(conn)
     counts: dict[str, int] = {}
     analysis_ids: list[str] = []
@@ -2198,7 +2198,7 @@ async def import_hmx(
     }
     source = data.get("source") or {}
     export_id = str(data["export_id"])
-    imported_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    imported_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     local_context = await load_source_context(conn)
 
     memory_records, record_warnings = _validated_records(
@@ -2743,7 +2743,7 @@ async def modify_staged_import(
         )
         modification = {
             "instance_id": local_instance_id,
-            "modified_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            "modified_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "modification_kind": modification_kind,
             "rationale": rationale,
         }

@@ -8,7 +8,7 @@ import json
 import sys
 import time
 from dataclasses import asdict
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -96,7 +96,7 @@ def _timestamp(value: str | None, flag: str) -> datetime | None:
             f"{flag} must be an ISO 8601 date or timestamp; got {value!r}"
         ) from exc
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=UTC)
+        parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed
 
 

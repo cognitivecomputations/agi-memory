@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from core.memory_exchange import HmxPolicyError
@@ -57,7 +57,7 @@ def _timestamp(value: Any, name: str) -> datetime | None:
         parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except ValueError as exc:
         raise HmxPolicyError(f"{name} must be an ISO 8601 date or timestamp") from exc
-    return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed
+    return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed
 
 
 class ProtectedReplacementListHandler(ToolHandler):

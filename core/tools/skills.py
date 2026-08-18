@@ -12,7 +12,7 @@ import json
 import re
 import tempfile
 import uuid
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -755,7 +755,7 @@ def _render_skill_markdown(
     created_at: str | None = None,
     evidence_provenance: dict[str, Any] | None = None,
 ) -> str:
-    now = datetime.now(UTC).isoformat()
+    now = datetime.now(timezone.utc).isoformat()
     metadata = [
         "---",
         f"name: {json.dumps(name)}",

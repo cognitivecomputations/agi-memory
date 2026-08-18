@@ -10,7 +10,7 @@ import logging
 import re
 import uuid
 from dataclasses import asdict, dataclass, field, replace
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any, Mapping, Sequence
 
 from core.digest import audit_record_digest_v1, protected_section_digest_v1
@@ -121,7 +121,7 @@ def _coerce_json(value: Any) -> Any:
 
 
 def _iso_now() -> str:
-    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _audit_source(envelope: Mapping[str, Any]) -> dict[str, Any]:
@@ -883,7 +883,7 @@ def _iso_value(value: Any) -> str | None:
     if value is None:
         return None
     if isinstance(value, datetime):
-        return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+        return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
     return str(value)
 
 
@@ -1760,7 +1760,7 @@ async def import_audit_records(
     inserted = 0
     duplicates = 0
     conflicts: list[dict[str, Any]] = []
-    imported_at = datetime.now(UTC)
+    imported_at = datetime.now(timezone.utc)
 
     for record in records:
         result = await store_audit_record(
