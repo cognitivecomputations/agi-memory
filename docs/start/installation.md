@@ -107,7 +107,9 @@ mise run setup
 mise run docker:check
 ```
 
-`docker:check` uses whichever Docker daemon is active. On macOS without Docker Desktop, install and start the optional Colima runtime with `mise run docker:colima`, then rerun the check.
+`mise run setup` links the Mise-managed Compose binary into Docker's user plugin directory only when `docker compose` is otherwise unavailable; it never replaces an existing plugin. `docker:check` then verifies Compose through the standard `docker compose` command and uses whichever Docker daemon is active.
+
+On macOS 13 or newer without Docker Desktop, install and start the optional VZ/VirtioFS Colima runtime with `mise run docker:colima`, then rerun the check. On older macOS releases, use Docker Desktop or configure a compatible Docker daemon manually.
 
 ### Without Mise
 
