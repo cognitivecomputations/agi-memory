@@ -59,6 +59,25 @@ Problem?
 
 ## Common Issues
 
+### Upgrade Keeps Re-installing the Same Version
+
+**Symptoms**: `hexis upgrade` pulls the images you already had; `hexis --version` doesn't change. On hexis ≤ 1.0.11 the dashboard also fails with a Prisma `libssl.so.1.1` error (a packaging bug in those UI images).
+
+Image tags are pinned to the CLI's own version, so the stack can only move when the CLI package moves. Versions up to 1.0.11 could not update themselves when installed with uv or pipx (their tool venvs ship no `pip`), and quietly continued with the old version.
+
+**Fixes**:
+- Move the package with the tool that installed it, then upgrade the stack:
+
+```bash
+uv tool install --force hexis     # uv installs (the default)
+# or: pipx install --force hexis  # pipx installs
+# or: pip install -U hexis        # plain pip / virtualenv installs
+
+hexis upgrade
+```
+
+- From 1.0.13 on, `hexis upgrade` detects the install method and does this itself — and stops loudly with the exact command if the package still can't move.
+
 ### Database Connection Errors
 
 **Symptoms**: `connection refused`, `could not connect to server`

@@ -36,7 +36,7 @@ Don't have uv? It's a one-liner: `curl -LsSf https://astral.sh/uv/install.sh | s
 
 If `hexis` isn't found afterward, uv's tool directory isn't on your PATH yet — run `uv tool update-shell` and open a new terminal.
 
-To update later: `uv tool upgrade hexis` (or use `hexis upgrade`, which also refreshes the Docker images and migrates the database).
+To update later: `hexis upgrade` — it updates the CLI package itself (via uv, pipx, or pip, whichever installed it), then refreshes the Docker images and migrates the database. To move just the CLI package by hand: `uv tool install --force hexis`.
 
 The CLI manages Docker containers, the database, and agent configuration.
 

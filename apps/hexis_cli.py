@@ -28,6 +28,123 @@ def _print_err(msg: str) -> None:
     sys.stderr.write(msg + "\n")
 
 
+def _pypi_latest() -> str | None:
+    """Newest hexis release on PyPI, or None when the lookup fails (offline,
+    proxy, PyPI outage). Callers must treat None as "unknown", never "current"."""
+    try:
+        import urllib.request
+
+        with urllib.request.urlopen(
+            "https://pypi.org/pypi/hexis/json", timeout=10
+        ) as resp:
+            return json.load(resp)["info"]["version"] or None
+    except Exception:
+        return None
+
+
+def _is_newer(candidate: str, current: str) -> bool:
+    """True when candidate is a strictly newer X.Y.Z release than current.
+
+    Unparseable versions compare as not-newer: this gates upgrade nagging and
+    hard failures, so unknown must never masquerade as an available update.
+    """
+
+    def parse(v: str) -> tuple[int, ...] | None:
+        try:
+            return tuple(int(part) for part in v.strip().split("."))
+        except ValueError:
+            return None
+
+    a, b = parse(candidate), parse(current)
+    if a is None or b is None:
+        return False
+    return a > b
+
+
+def _installed_via() -> str:
+    """How this CLI was installed: 'uv', 'pipx', or 'pip'.
+
+    uv and pipx manage the tool venv themselves and leave a marker file at the
+    venv root. Raw `python -m pip` inside those venvs is the wrong upgrade
+    path: uv tool venvs ship no pip module at all, and pipx keeps its own
+    metadata that a bare pip upgrade bypasses.
+    """
+    prefix = Path(sys.prefix)
+    if (prefix / "uv-receipt.toml").exists():
+        return "uv"
+    if (prefix / "pipx_metadata.json").exists():
+        return "pipx"
+    return "pip"
+
+
+def _self_update_hint(installer: str) -> str:
+    """The command a user runs by hand to move the hexis package.
+
+    uv and pipx use `install --force` rather than `upgrade`: their upgrade
+    commands honor the version pin recorded at install time, so a pinned
+    install "upgrades" to itself with exit code 0.
+    """
+    return {
+        "uv": "uv tool install --force hexis",
+        "pipx": "pipx install --force hexis",
+        "pip": "pip install --upgrade hexis",
+    }[installer]
+
+
+def _run_self_update(console: Any, installer: str) -> str:
+    """Try to upgrade the hexis package in place; return the version installed
+    afterwards (== _ver when nothing moved). Prints its own diagnostics."""
+    if installer == "uv":
+        uv = shutil.which("uv")
+        cmd = [uv, "tool", "install", "--force", "hexis"] if uv else None
+    elif installer == "pipx":
+        pipx = shutil.which("pipx")
+        cmd = [pipx, "install", "--force", "hexis"] if pipx else None
+    else:
+        # -I: ignore PYTHONPATH and cwd, so stray hexis metadata on either
+        # can't make pip think a different version is already installed.
+        cmd = [sys.executable, "-I", "-m", "pip", "install", "--upgrade", "hexis"]
+    if cmd is None:
+        console.print(
+            f"[warn]⚠ hexis was installed with {installer}, but the "
+            f"[accent]{installer}[/accent] command is not on PATH.[/warn]"
+        )
+        return _ver
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        stderr = proc.stderr or ""
+        if installer == "pip" and "externally-managed-environment" in stderr:
+            # PEP 668 distro Python: hexis is already installed in this
+            # environment, so upgrading it in place mirrors the user's own
+            # original install choice. Say so out loud, then retry.
+            console.print(
+                "[warn]This Python is marked externally managed; upgrading the "
+                "already-installed hexis package with --break-system-packages.[/warn]"
+            )
+            proc = subprocess.run(
+                cmd + ["--break-system-packages"], capture_output=True, text=True
+            )
+        if proc.returncode != 0:
+            tail = "\n".join((proc.stderr or proc.stdout or "").splitlines()[-4:])
+            console.print(f"[warn]⚠ Self-update failed:[/warn]\n{tail}")
+            return _ver
+    # -I (isolated mode): `python -c` otherwise puts the cwd on sys.path, so
+    # running `hexis upgrade` from a directory holding stale hexis metadata
+    # (an old egg-info, a checkout) would report that version instead of the
+    # one actually installed in this environment.
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            "from importlib.metadata import version; print(version('hexis'))",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    return (probe.stdout or "").strip() or _ver
+
+
 def _find_compose_file(start: Path | None = None) -> tuple[Path | None, bool]:
     """Find compose file. Returns (path, is_source_checkout).
 
@@ -5337,30 +5454,39 @@ def _dispatch(argv: list[str] | None = None) -> int:
             # Packaged install: images are pinned to the CLI's own version
             # (see _compose_env), so the package must move first — then the
             # fresh CLI pulls the images published from its release commit.
-            console.print("[accent]Updating the hexis package...[/accent]")
-            prc = subprocess.run(
-                [sys.executable, "-m", "pip", "install", "--upgrade", "hexis"],
-            ).returncode
-            if prc != 0:
-                console.print(
-                    "[warn]⚠ Could not self-update via pip[/warn] — if hexis was installed "
-                    "with pipx or uv, run [accent]pipx upgrade hexis[/accent] or "
-                    "[accent]uv tool upgrade hexis[/accent], then re-run "
-                    "[accent]hexis upgrade[/accent]. Continuing with the current version."
-                )
+            latest = _pypi_latest()
+            if latest and not _is_newer(latest, _ver):
+                console.print(f"[ok]hexis {_ver} is the newest release.[/ok]")
             else:
-                probe = subprocess.run(
-                    [sys.executable, "-c",
-                     "from importlib.metadata import version; print(version('hexis'))"],
-                    capture_output=True, text=True,
+                installer = _installed_via()
+                console.print(
+                    f"[accent]Updating the hexis package[/accent] (installed via {installer})..."
                 )
-                new_ver = (probe.stdout or "").strip()
-                if new_ver and new_ver != _ver:
-                    console.print(f"[ok]hexis {_ver} → {new_ver}[/ok] — handing off to the new version...")
+                new_ver = _run_self_update(console, installer)
+                if new_ver != _ver:
+                    console.print(
+                        f"[ok]hexis {_ver} → {new_ver}[/ok] — handing off to the new version..."
+                    )
                     rerun = subprocess.run(
                         [sys.executable, sys.argv[0], "upgrade", "--no-self-update"],
                     )
                     return rerun.returncode
+                if latest:
+                    # A newer release exists and the package did not move.
+                    # Pulling images now would re-install the OLD version's
+                    # stack while printing success — fail loud with the exact
+                    # way out instead.
+                    console.print(
+                        f"[fail]✗ hexis is still {_ver}; {latest} is available "
+                        f"but the self-update did not take effect.[/fail]\n"
+                        f"Run [accent]{_self_update_hint(installer)}[/accent] and then "
+                        f"[accent]hexis upgrade[/accent] again."
+                    )
+                    return 1
+                console.print(
+                    f"[warn]⚠ Could not check PyPI for a newer release — "
+                    f"continuing with hexis {_ver}.[/warn]"
+                )
         console.print("[accent]Updating the stack (your data is preserved)...[/accent]")
         if is_source:
             run_compose(compose_cmd or [], compose_file, stack_root, ["build"], env_file)

@@ -130,6 +130,7 @@ The install script handles everything — it sets up [uv](https://docs.astral.sh
 | `hexis init` stalls starting services | Docker daemon isn't running | Start Docker Desktop, re-run `hexis init` |
 | Embedding model pull fails | Local embedding sidecar isn't running | Start `embeddinggemma`, then re-run |
 | Browser login loops or model errors | No ChatGPT Plus/Pro on that account | Use another provider below, or `hexis auth` |
+| Dashboard fails with a Prisma `libssl` error, or `hexis upgrade` keeps re-installing the same version | hexis ≤ 1.0.11 (broken UI image + self-update that couldn't move uv/pipx installs) | `uv tool install --force hexis` (or `pipx install --force hexis` / `pip install -U hexis`), then `hexis upgrade` |
 | Anything else | — | `hexis doctor`, then [Troubleshooting](docs/operations/troubleshooting.md) |
 
 **Other providers:**
