@@ -11,6 +11,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
 from getpass import getpass
 from pathlib import Path
@@ -219,8 +220,57 @@ def _write_env_var(env_path: Path, key: str, value: str) -> None:
     env_path.write_text("\n".join(lines) + "\n")
 
 
+# Services the agent cannot live without, used only if compose cannot be asked.
+_FALLBACK_STACK_SERVICES = ("db", "heartbeat_worker", "maintenance_worker")
+
+
+def _default_stack_services(
+    compose_cmd: list[str], compose_file: Path, stack_root: Path, env_file: Path | None
+) -> list[str]:
+    """The services a bare `up -d` starts — compose's default profile.
+
+    Read from the compose file rather than hardcoded: the always-on set is
+    whatever is declared without a `profiles:` key, and that list grows.
+    """
+    from apps.hexis_cli import _run_compose_capture
+
+    rc, out = _run_compose_capture(
+        compose_cmd, compose_file, stack_root, ["config", "--services"], env_file
+    )
+    services: list[str] = []
+    if rc == 0:
+        for line in out.splitlines():
+            name = line.strip()
+            # compose merges warnings into this stream; service names are bare
+            # single tokens, so anything else is noise.
+            if name and " " not in name and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name):
+                services.append(name)
+    return services or list(_FALLBACK_STACK_SERVICES)
+
+
+def _dsn_is_local(dsn: str) -> bool:
+    """Does this DSN point at a database this machine hosts?
+
+    Starting the local stack for someone pointed at a Postgres they run
+    elsewhere would be a surprise, so the auto-start stays local-only.
+    """
+    from urllib.parse import urlparse
+
+    try:
+        host = (urlparse(dsn).hostname or "").lower()
+    except ValueError:
+        return False
+    return host in ("", "localhost", "127.0.0.1", "::1", "host.docker.internal", "db")
+
+
 def _ensure_stack_running(args: argparse.Namespace) -> Path:
-    """Start Docker stack if needed. Returns stack_root."""
+    """Start the Docker stack if any of it is missing. Returns stack_root.
+
+    "The database is up" is not the same as "the stack is up": the heartbeat
+    and maintenance workers are what make the agent autonomous, and an init
+    that returned early on a database-only stack left an agent that never woke
+    up on its own. Every service in the default profile has to be running.
+    """
     from apps.hexis_cli import (
         _find_compose_file,
         _stack_root_from_compose,
@@ -241,16 +291,24 @@ def _ensure_stack_running(args: argparse.Namespace) -> Path:
     compose_cmd = ensure_compose(docker_bin)
     env_file = resolve_env_file(stack_root)
 
-    # Check if db service is already running
-    rc, out = _run_compose_capture(compose_cmd, compose_file, stack_root, ["ps", "--services", "--filter", "status=running"], env_file)
-    if rc == 0 and "db" in out.split():
+    expected = _default_stack_services(compose_cmd, compose_file, stack_root, env_file)
+    rc, out = _run_compose_capture(
+        compose_cmd, compose_file, stack_root,
+        ["ps", "--services", "--filter", "status=running"], env_file,
+    )
+    running = set(out.split()) if rc == 0 else set()
+    missing = [name for name in expected if name not in running]
+    if not missing:
         console.print("[ok]\u2714[/ok] Docker stack already running")
         return stack_root
 
-    console.print("[muted]Starting Docker stack...[/muted]")
-    if not is_source:
-        # pip install path: pull images first
-        run_compose(compose_cmd, compose_file, stack_root, ["pull"], env_file)
+    if running:
+        console.print(f"[muted]Starting {', '.join(missing)}...[/muted]")
+    else:
+        console.print("[muted]Starting Docker stack...[/muted]")
+        if not is_source:
+            # pip install path: pull images first
+            run_compose(compose_cmd, compose_file, stack_root, ["pull"], env_file)
     rc = run_compose(compose_cmd, compose_file, stack_root, ["up", "-d"], env_file)
     if rc != 0:
         err_console.print("[fail]Failed to start Docker stack.[/fail]")
@@ -1220,8 +1278,9 @@ async def _run_init(dsn: str, *, wait_seconds: int) -> int:
             f"[key]User:[/key]   {user_name}",
             title="What's set up",
         ))
-        console.print("[muted]Change anything later with `hexis init`. "
-                      "`hexis up` keeps the heartbeat and memory maintenance workers running.[/muted]")
+        console.print("[muted]Change anything later with `hexis init`. The heartbeat and "
+                      "memory maintenance workers run in the background — `hexis status` "
+                      "shows them, `hexis stop` pauses them.[/muted]")
         console.print("[muted]Hexis runs on your machine and sends no telemetry.[/muted]")
         return 0
 
@@ -1295,10 +1354,13 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
     # Interactive mode (original flow)
-    if args.dsn:
-        dsn = args.dsn
-    else:
-        dsn = agent_api.db_dsn_from_env()
+    dsn = args.dsn or agent_api.db_dsn_from_env()
+
+    # Same guarantee the flagged path gives: init leaves a stack that can run
+    # the agent — the database *and* the heartbeat/maintenance loops. Skipped
+    # for a database this machine does not host, or with --no-docker.
+    if not args.no_docker and not args.dsn and _dsn_is_local(dsn):
+        _ensure_stack_running(args)
 
     try:
         rc = asyncio.run(_run_init(dsn, wait_seconds=args.wait_seconds))
