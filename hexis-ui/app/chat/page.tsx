@@ -8,8 +8,6 @@ import {
   EyeOff,
   Check,
   ExternalLink,
-  FileText,
-  Image as ImageIcon,
   Inbox,
   Lock,
   LockOpen,
@@ -33,23 +31,30 @@ import { Spinner } from "../components/ui/spinner";
 import { normalizeMessagePresentation } from "../../lib/message-presentation";
 import type { MessagePresentation } from "../../lib/message-presentation";
 import { isImageAttachmentFile, normalizeUploadFile } from "./attachment-helpers";
+import { AttachmentCard, type AttachmentKind } from "./attachment-card";
 import { MessagePresentationView } from "./message-presentation";
 
 type ChatMessage = {
   id: string;
   role: "user" | "assistant";
   content: string;
-  attachments?: ChatImageAttachment[];
+  attachments?: ChatAttachmentView[];
   presentation?: MessagePresentation;
   ui?: ChatUiArtifact[];
 };
 
-type ChatImageAttachment = {
+// What a message draws for the files that came with it. Images carry a data
+// URL and render inline; everything else draws as a card. A conversation
+// reloaded from the database has the descriptors but no data URLs, so both
+// forms have to stand on their own.
+type ChatAttachmentView = {
   id: string;
   name: string;
   mimeType: string;
-  dataUrl: string;
-  byteSize: number;
+  kind: AttachmentKind;
+  byteSize?: number;
+  dataUrl?: string;
+  note?: string;
 };
 
 type ChatVisualAttachmentPayload = {
@@ -57,6 +62,16 @@ type ChatVisualAttachmentPayload = {
   mime_type: string;
   data_url: string;
   byte_size: number;
+};
+
+// Travels with the turn so the stored message remembers what came with it.
+type ChatAttachmentPayload = {
+  name: string;
+  mime_type?: string;
+  byte_size?: number;
+  kind?: AttachmentKind;
+  artifact_id?: string;
+  sensitivity?: "private";
 };
 
 type ConnectorSetupCapabilityOption = {
@@ -154,9 +169,9 @@ type PastedAttachment = {
   sensitivity: "private" | null;
 };
 
-// A dropped/picked file; on send it uploads to POST /api/ingest/file, which
-// preserves the original bytes as a source artifact and runs the standard
-// ingestion pipeline in the background (PDF, DOCX, XLSX, ...).
+// A dropped/picked file. Attaching it preserves the original bytes and reads
+// its text right away (POST /api/attachments) so the agent can discuss the
+// file in the same turn; sending the message is what commits it to memory.
 type FileAttachment = {
   id: string;
   file: File;
@@ -164,6 +179,17 @@ type FileAttachment = {
   size: number;
   mimeType: string;
   sensitivity: "private" | null;
+  status: "preparing" | "ready" | "error";
+  kind: AttachmentKind;
+  // Object URL for image previews in the composer; revoked when the chip goes.
+  previewUrl: string | null;
+  artifactId: string | null;
+  text: string;
+  textTruncated: boolean;
+  // Set when the text could not be read in time (audio, video, oversized,
+  // slow OCR): the agent is told plainly rather than left to guess.
+  unreadReason: string | null;
+  error: string | null;
 };
 
 type SearchConfigProvider = "tavily" | "brave" | "searxng" | "auto";
@@ -254,13 +280,73 @@ function attachmentAddendum(attachment: PastedAttachment): string {
   const body = attachment.content.slice(0, ATTACHMENT_PROMPT_CHARS);
   return [
     `----- ATTACHED DOCUMENT: ${attachment.title} -----`,
-    "The user attached this document to their message. It is also being ingested into your durable memory (recall or open_memory can retrieve it later).",
+    "The user attached this to their message. Its text is below — you have read it, so answer from it directly.",
     "",
     body,
-    truncated
-      ? "\n[Document truncated here for the live turn — the full text is in memory via ingestion.]"
+    truncated ? "\n[Text truncated here; ask if you need a part that is not shown.]" : "",
+  ].join("\n");
+}
+
+// A file the user attached but whose text is not in hand this turn. The agent
+// is told exactly that, so it says so instead of guessing at the contents.
+function unreadFileNote(attachment: FileAttachment): string {
+  const reason = attachment.unreadReason;
+  if (reason === "audio" || reason === "video") {
+    const medium = reason === "audio" ? "audio" : "video";
+    return `The user attached this ${medium} file. You have not heard it — its transcript is not available in this turn. Say so plainly rather than guessing at its contents.`;
+  }
+  if (reason === "too_large" || reason === "timeout") {
+    return "The user attached this file, but it was too large to read within this turn. You have not read it — say so plainly rather than guessing at its contents.";
+  }
+  if (reason === "empty") {
+    return "The user attached this file, but no text could be pulled out of it (it may be scanned images with no text layer). Say so plainly rather than guessing at its contents.";
+  }
+  const detail = attachment.error ? ` (${attachment.error})` : "";
+  return `The user attached this file, but it could not be opened${detail}. You have not read it — say so plainly rather than guessing at its contents.`;
+}
+
+function fileAttachmentAddendum(attachment: FileAttachment): string {
+  if (!attachment.text) {
+    return [`----- ATTACHED FILE: ${attachment.name} -----`, unreadFileNote(attachment)].join("\n");
+  }
+  return [
+    `----- ATTACHED FILE: ${attachment.name} -----`,
+    "The user attached this file to their message. Its text is below — you have read it, so answer from it directly.",
+    "",
+    attachment.text,
+    attachment.textTruncated
+      ? "\n[Text truncated here; ask if you need a part that is not shown.]"
       : "",
   ].join("\n");
+}
+
+// What the chip says under the file name once it has been read. Silence means
+// "nothing to add" — the type label stands on its own.
+function composerAttachmentNote(attachment: FileAttachment): string | null {
+  if (attachment.status !== "ready") return null;
+  switch (attachment.unreadReason) {
+    case "audio":
+      return "Audio — not transcribed in this message";
+    case "video":
+      return "Video — not transcribed in this message";
+    case "too_large":
+    case "timeout":
+      return "Too large to read in this message";
+    case "empty":
+      return "No text found in this file";
+    case "error":
+      return attachment.error || "Could not be read";
+    default:
+      return null;
+  }
+}
+
+// A send with files and no words still needs a message: the file names, plainly.
+function attachmentOnlyMessage(attachments: { name: string }[]): string {
+  const names = attachments.map((attachment) => attachment.name).filter(Boolean);
+  if (names.length === 0) return "";
+  if (names.length === 1) return `Shared ${names[0]}.`;
+  return `Shared ${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}.`;
 }
 
 function imageAttachmentAddendum(attachment: FileAttachment, liveVisual: boolean): string {
@@ -268,9 +354,30 @@ function imageAttachmentAddendum(attachment: FileAttachment, liveVisual: boolean
     `----- ATTACHED IMAGE: ${attachment.name} -----`,
     liveVisual
       ? "The user attached this image to their message. You can inspect the image directly in this turn; do not reduce it to text extraction or assume it is only a text document."
-      : "The user attached this image to their message. It was too large to include as live visual context; the original file is preserved in the filing cabinet.",
-    "The original image is also preserved as a source artifact. Text extraction may run in the background when applicable, but the visual attachment is primary.",
+      : "The user attached this image to their message. It was too large to show you here, so you have not seen it — say so plainly rather than guessing at its contents.",
   ].join("\n");
+}
+
+// A local preview for image chips. jsdom (and any environment without the
+// object-URL API) simply gets the type icon instead.
+function objectUrlFor(file: File): string | null {
+  if (!isImageAttachmentFile(file)) return null;
+  if (typeof URL === "undefined" || typeof URL.createObjectURL !== "function") return null;
+  try {
+    return URL.createObjectURL(file);
+  } catch {
+    return null;
+  }
+}
+
+function releaseObjectUrl(url: string | null | undefined) {
+  if (!url) return;
+  if (typeof URL === "undefined" || typeof URL.revokeObjectURL !== "function") return;
+  try {
+    URL.revokeObjectURL(url);
+  } catch {
+    // Nothing to release.
+  }
 }
 
 async function fileToDataUrl(file: File): Promise<string> {
@@ -678,6 +785,36 @@ function uiArtifactKey(ui: ChatUiArtifact): string {
   return `${ui.kind}:${ui.connector_id}:${ui.attempt_id || ui.status || "setup"}`;
 }
 
+function isAttachmentKind(value: unknown): value is AttachmentKind {
+  return value === "image" || value === "audio" || value === "video" || value === "document";
+}
+
+// Stored messages carry their attachments as descriptors, so a reloaded
+// conversation still shows what came with each message.
+function attachmentViewsFromMetadata(value: unknown): ChatAttachmentView[] | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const raw = (value as Record<string, unknown>).attachments;
+  if (!Array.isArray(raw)) return undefined;
+  const views: ChatAttachmentView[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const record = item as Record<string, unknown>;
+    const name = typeof record.name === "string" ? record.name.trim() : "";
+    if (!name) continue;
+    views.push({
+      id:
+        typeof record.artifact_id === "string" && record.artifact_id
+          ? record.artifact_id
+          : `${name}:${views.length}`,
+      name,
+      mimeType: typeof record.mime_type === "string" ? record.mime_type : "",
+      kind: isAttachmentKind(record.kind) ? record.kind : "document",
+      byteSize: typeof record.byte_size === "number" ? record.byte_size : undefined,
+    });
+  }
+  return views.length > 0 ? views : undefined;
+}
+
 function dbMessagesToChatMessages(value: unknown): ChatMessage[] | null {
   if (!Array.isArray(value)) return null;
   const messages: ChatMessage[] = [];
@@ -691,6 +828,7 @@ function dbMessagesToChatMessages(value: unknown): ChatMessage[] | null {
         id: typeof record.message_id === "string" ? record.message_id : crypto.randomUUID(),
         role,
         content,
+        attachments: attachmentViewsFromMetadata(record.metadata),
       });
     }
   }
@@ -747,6 +885,9 @@ export default function ChatPage() {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   const inboxBadgeCount = inbox.unread + inbox.pending_requests.length;
+  // Sending while a file is still being read would hand the agent a message
+  // about a document it cannot see; the composer waits the extra beat.
+  const attachmentsPreparing = fileAttachments.some((item) => item.status === "preparing");
 
   const historyPayload = useMemo(
     () =>
@@ -1369,25 +1510,88 @@ export default function ChatPage() {
     );
   };
 
+  // Attaching a file reads it immediately: the original is preserved and its
+  // text comes back before the message is even sent, so the agent can answer
+  // a question about the file in the same turn it arrives.
+  const prepareFileAttachment = async (attachment: FileAttachment) => {
+    const patch = (update: Partial<FileAttachment>) => {
+      setFileAttachments((prev) =>
+        prev.map((item) => (item.id === attachment.id ? { ...item, ...update } : item))
+      );
+    };
+    try {
+      const form = new FormData();
+      form.append("file", attachment.file, attachment.name);
+      const res = await fetch("/api/attachments", { method: "POST", body: form });
+      if (!res.ok) {
+        const detail = (await res.text()).slice(0, 200);
+        patch({ status: "error", error: `Upload failed (${res.status})` });
+        appendLog({
+          id: crypto.randomUUID(),
+          category: "error",
+          title: "Attachment error",
+          detail: `File "${attachment.name}" failed (${res.status}): ${detail}`,
+          ts: Date.now(),
+        });
+        return;
+      }
+      const payload = (await res.json()) as {
+        artifact_id?: string;
+        kind?: string;
+        text?: string;
+        truncated?: boolean;
+        reason?: string | null;
+        error?: string | null;
+      };
+      patch({
+        status: "ready",
+        artifactId: typeof payload.artifact_id === "string" ? payload.artifact_id : null,
+        kind: isAttachmentKind(payload.kind) ? payload.kind : attachment.kind,
+        text: typeof payload.text === "string" ? payload.text : "",
+        textTruncated: payload.truncated === true,
+        unreadReason: typeof payload.reason === "string" ? payload.reason : null,
+        error: typeof payload.error === "string" ? payload.error : null,
+      });
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      patch({ status: "error", error: "Could not reach the server" });
+      appendLog({
+        id: crypto.randomUUID(),
+        category: "error",
+        title: "Attachment error",
+        detail: `File "${attachment.name}": ${detail}`,
+        ts: Date.now(),
+      });
+    }
+  };
+
   const addFiles = (files: FileList | File[] | null, source: "picker" | "drop" | "paste" = "picker") => {
     if (!files) return;
     const items = Array.from(files).filter((file) => file.size > 0);
     if (!items.length) return;
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-    setFileAttachments((prev) => [
-      ...prev,
-      ...items.map((file, index) => {
-        const uploadFile = normalizeUploadFile(file, `${source === "paste" ? "pasted-image" : "attachment"}-${timestamp}-${index + 1}`);
-        return {
-          id: crypto.randomUUID(),
-          file: uploadFile,
-          name: uploadFile.name,
-          size: uploadFile.size,
-          mimeType: uploadFile.type,
-          sensitivity: null as "private" | null,
-        };
-      }),
-    ]);
+    const added = items.map((file, index) => {
+      const uploadFile = normalizeUploadFile(file, `${source === "paste" ? "pasted-image" : "attachment"}-${timestamp}-${index + 1}`);
+      const attachment: FileAttachment = {
+        id: crypto.randomUUID(),
+        file: uploadFile,
+        name: uploadFile.name,
+        size: uploadFile.size,
+        mimeType: uploadFile.type,
+        sensitivity: null,
+        status: "preparing",
+        kind: isImageAttachmentFile(uploadFile) ? "image" : "document",
+        previewUrl: objectUrlFor(uploadFile),
+        artifactId: null,
+        text: "",
+        textTruncated: false,
+        unreadReason: null,
+        error: null,
+      };
+      return attachment;
+    });
+    setFileAttachments((prev) => [...prev, ...added]);
+    for (const attachment of added) void prepareFileAttachment(attachment);
   };
 
   const handleComposerDrop = (event: React.DragEvent<HTMLDivElement>) => {
@@ -1397,7 +1601,13 @@ export default function ChatPage() {
   };
 
   const removeFileAttachment = (id: string) => {
-    setFileAttachments((prev) => prev.filter((attachment) => attachment.id !== id));
+    setFileAttachments((prev) =>
+      prev.filter((attachment) => {
+        if (attachment.id !== id) return true;
+        releaseObjectUrl(attachment.previewUrl);
+        return false;
+      })
+    );
   };
 
   const toggleFileAttachmentPrivacy = (id: string) => {
@@ -1412,107 +1622,116 @@ export default function ChatPage() {
 
   const handleSend = async () => {
     if ((!input.trim() && attachments.length === 0 && fileAttachments.length === 0) || sending) return;
+    if (attachmentsPreparing) return;
 
-    // Attachments ingest as documents (durable) AND ride the turn's prompt
-    // addenda (immediate sight); the visible message carries only a note.
+    // Attached files were already preserved and read when they were attached;
+    // sending is what commits them to memory and hands their text to the turn.
     const toIngest = attachments;
     setAttachments([]);
     const filesToUpload = fileAttachments;
     setFileAttachments([]);
+    for (const attachment of filesToUpload) releaseObjectUrl(attachment.previewUrl);
     const attachmentAddenda = toIngest.map(attachmentAddendum);
-    const ingestNotes: string[] = [];
     const visualAttachments: ChatVisualAttachmentPayload[] = [];
-    const visibleImageAttachments: ChatImageAttachment[] = [];
+    const messageAttachments: ChatAttachmentView[] = [];
+    const attachmentPayload: ChatAttachmentPayload[] = [];
 
     for (const attachment of filesToUpload) {
-      if (!isImageAttachmentFile(attachment.file) || attachment.size > INLINE_IMAGE_MAX_BYTES) {
-        continue;
-      }
-      try {
-        const dataUrl = await fileToDataUrl(attachment.file);
-        visualAttachments.push({
-          name: attachment.name,
-          mime_type: attachment.mimeType || attachment.file.type || "image/png",
-          data_url: dataUrl,
-          byte_size: attachment.size,
-        });
-        visibleImageAttachments.push({
-          id: attachment.id,
-          name: attachment.name,
-          mimeType: attachment.mimeType || attachment.file.type || "image/png",
-          dataUrl,
-          byteSize: attachment.size,
-        });
-      } catch (err) {
-        appendLog({
-          id: crypto.randomUUID(),
-          category: "error",
-          title: "Image preview error",
-          detail: `Image "${attachment.name}" could not be prepared for the live turn: ${err instanceof Error ? err.message : String(err)}`,
-          ts: Date.now(),
-        });
-      }
-    }
-
-    // Dropped files upload as original bytes: preserved as source artifacts
-    // first, then ingested by a durable background job.
-    for (const attachment of filesToUpload) {
-      try {
-        const form = new FormData();
-        form.append("file", attachment.file, attachment.name);
-        form.append("mode", "fast");
-        if (attachment.sensitivity) form.append("sensitivity", attachment.sensitivity);
-        const res = await fetch("/api/ingest/file", { method: "POST", body: form });
-        if (res.ok) {
-          const isImage = isImageAttachmentFile(attachment.file);
-          const liveVisual = visualAttachments.some((item) => item.name === attachment.name);
-          ingestNotes.push(
-            isImage
-              ? `[Attached image "${attachment.name}" (${formatBytes(attachment.size)}) — ${
-                  liveVisual ? "visible in this turn; " : "too large for live visual context; "
-                }original preserved in the filing cabinet${
-                  attachment.sensitivity === "private" ? " as private (kept out of group conversations and exports)" : ""
-                }.]`
-              : `[Attached file "${attachment.name}" (${formatBytes(attachment.size)}) — original preserved, being ingested into memory${
-                  attachment.sensitivity === "private" ? " as private (kept out of group conversations and exports)" : ""
-                }. Search it later with search_documents / search_document_chunks.]`
-          );
-          attachmentAddenda.push(
-            isImage
-              ? imageAttachmentAddendum(attachment, liveVisual)
-              : [
-                  `----- ATTACHED FILE: ${attachment.name} -----`,
-                  "The user attached this file to their message. Its original bytes are preserved and it is being ingested in the background — the text is not inlined here.",
-                  "Once ingestion completes (usually under a minute), search_documents / search_document_chunks will find it and open_document can read the extracted content.",
-                ].join("\n")
-          );
-        } else {
-          const detail = await res.text();
-          ingestNotes.push(
-            `[Attached file "${attachment.name}" could not be uploaded: ${res.status}]`
-          );
+      const isImage = isImageAttachmentFile(attachment.file);
+      let dataUrl: string | null = null;
+      if (isImage && attachment.size <= INLINE_IMAGE_MAX_BYTES) {
+        try {
+          dataUrl = await fileToDataUrl(attachment.file);
+          visualAttachments.push({
+            name: attachment.name,
+            mime_type: attachment.mimeType || attachment.file.type || "image/png",
+            data_url: dataUrl,
+            byte_size: attachment.size,
+          });
+        } catch (err) {
+          dataUrl = null;
           appendLog({
             id: crypto.randomUUID(),
             category: "error",
-            title: "Upload error",
-            detail: `File "${attachment.name}" failed (${res.status}): ${detail.slice(0, 200)}`,
+            title: "Image preview error",
+            detail: `Image "${attachment.name}" could not be prepared for the live turn: ${err instanceof Error ? err.message : String(err)}`,
+            ts: Date.now(),
+          });
+        }
+      }
+
+      messageAttachments.push({
+        id: attachment.id,
+        name: attachment.name,
+        mimeType: attachment.mimeType || attachment.file.type || "",
+        kind: attachment.kind,
+        byteSize: attachment.size,
+        ...(dataUrl ? { dataUrl } : {}),
+      });
+      attachmentPayload.push({
+        name: attachment.name,
+        mime_type: attachment.mimeType || attachment.file.type || undefined,
+        byte_size: attachment.size,
+        kind: attachment.kind,
+        artifact_id: attachment.artifactId ?? undefined,
+        sensitivity: attachment.sensitivity ?? undefined,
+      });
+      attachmentAddenda.push(
+        isImage
+          ? imageAttachmentAddendum(attachment, dataUrl !== null)
+          : fileAttachmentAddendum(attachment)
+      );
+    }
+
+    // Commit the preserved originals to durable memory now that the message is
+    // actually being sent. Failures are the agent's to report, never silent.
+    for (const attachment of filesToUpload) {
+      if (!attachment.artifactId) continue;
+      try {
+        const res = await fetch(`/api/attachments/${attachment.artifactId}/ingest`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            filename: attachment.name,
+            mode: "fast",
+            sensitivity: attachment.sensitivity ?? undefined,
+          }),
+        });
+        if (!res.ok) {
+          const detail = await res.text();
+          appendLog({
+            id: crypto.randomUUID(),
+            category: "error",
+            title: "Attachment error",
+            detail: `File "${attachment.name}" was read but not filed (${res.status}): ${detail.slice(0, 200)}`,
             ts: Date.now(),
           });
         }
       } catch (err) {
-        ingestNotes.push(
-          `[Attached file "${attachment.name}" could not be uploaded: network error]`
-        );
         appendLog({
           id: crypto.randomUUID(),
           category: "error",
-          title: "Upload error",
-          detail: `File "${attachment.name}": ${err instanceof Error ? err.message : String(err)}`,
+          title: "Attachment error",
+          detail: `File "${attachment.name}" was read but not filed: ${err instanceof Error ? err.message : String(err)}`,
           ts: Date.now(),
         });
       }
     }
+
     for (const attachment of toIngest) {
+      attachmentPayload.push({
+        name: attachment.title,
+        mime_type: "text/plain",
+        kind: "document",
+        sensitivity: attachment.sensitivity ?? undefined,
+      });
+      messageAttachments.push({
+        id: attachment.id,
+        name: attachment.title,
+        mimeType: "text/plain",
+        kind: "document",
+        note: `Pasted text · ${attachment.wordCount.toLocaleString()} words`,
+      });
       try {
         const res = await fetch("/api/ingest", {
           method: "POST",
@@ -1524,45 +1743,35 @@ export default function ChatPage() {
             sensitivity: attachment.sensitivity ?? undefined,
           }),
         });
-        if (res.ok) {
-          ingestNotes.push(
-            `[Attached document "${attachment.title}" (${attachment.wordCount} words) — being ingested into memory${
-              attachment.sensitivity === "private" ? " as private (kept out of group conversations and exports)" : ""
-            }]`
-          );
-        } else {
+        if (!res.ok) {
           const detail = await res.text();
-          ingestNotes.push(
-            `[Attached document "${attachment.title}" could not be ingested: ${res.status}]`
-          );
           appendLog({
             id: crypto.randomUUID(),
             category: "error",
-            title: "Ingest error",
-            detail: `Attachment "${attachment.title}" failed (${res.status}): ${detail.slice(0, 200)}`,
+            title: "Attachment error",
+            detail: `Pasted text "${attachment.title}" was not filed (${res.status}): ${detail.slice(0, 200)}`,
             ts: Date.now(),
           });
         }
       } catch (err) {
-        ingestNotes.push(
-          `[Attached document "${attachment.title}" could not be ingested: network error]`
-        );
         appendLog({
           id: crypto.randomUUID(),
           category: "error",
-          title: "Ingest error",
-          detail: `Attachment "${attachment.title}": ${err instanceof Error ? err.message : String(err)}`,
+          title: "Attachment error",
+          detail: `Pasted text "${attachment.title}" was not filed: ${err instanceof Error ? err.message : String(err)}`,
           ts: Date.now(),
         });
       }
     }
 
-    const messageText = [input.trim(), ...ingestNotes].filter(Boolean).join("\n\n");
+    // The message reads as the user wrote it. A send with files and no words
+    // still needs something to stand as the turn, so the file names do.
+    const messageText = input.trim() || attachmentOnlyMessage(messageAttachments);
     const userMessage: ChatMessage = {
       id: crypto.randomUUID(),
       role: "user",
       content: messageText,
-      attachments: visibleImageAttachments,
+      attachments: messageAttachments.length > 0 ? messageAttachments : undefined,
     };
     const assistantMessage: ChatMessage = {
       id: crypto.randomUUID(),
@@ -1594,6 +1803,7 @@ export default function ChatPage() {
         message: string;
         prompt_addenda: string[];
         visual_attachments?: ChatVisualAttachmentPayload[];
+        attachments?: ChatAttachmentPayload[];
         session_id?: string | null;
         history?: { role: string; content: string }[];
       } = {
@@ -1603,6 +1813,9 @@ export default function ChatPage() {
       };
       if (visualAttachments.length > 0) {
         chatBody.visual_attachments = visualAttachments;
+      }
+      if (attachmentPayload.length > 0) {
+        chatBody.attachments = attachmentPayload;
       }
       if (!currentSessionId && historyPayload.length > 0) {
         chatBody.history = historyPayload;
@@ -2052,7 +2265,7 @@ export default function ChatPage() {
                   {message.role === "assistant" ? (
                     agentStatus.portrait_url ? <Image src={agentStatus.portrait_url} alt="" width={32} height={32} unoptimized className="mt-1 h-8 w-8 flex-none rounded-md object-cover" /> : <div className="mt-1 flex h-8 w-8 flex-none items-center justify-center rounded-md bg-[var(--surface-strong)] text-xs font-semibold">H</div>
                   ) : null}
-                  <div className={`max-w-[85%] text-sm leading-6 ${message.role === "user" ? "rounded-lg bg-[var(--foreground)] px-4 py-3 text-white" : "min-w-0 flex-1 py-1 text-[var(--foreground)]"}`}>
+                  <div className={`max-w-[85%] text-sm leading-6 ${message.role === "user" ? "flex flex-col items-end gap-2" : "min-w-0 flex-1 py-1 text-[var(--foreground)]"}`}>
                     {message.role === "assistant" ? (
                       <div className="space-y-3">
                         {message.presentation ? (
@@ -2074,24 +2287,35 @@ export default function ChatPage() {
                         ))}
                       </div>
                     ) : (
-                      <div className="space-y-3">
-                        {message.attachments?.length ? (
-                          <div className="grid gap-2">
-                            {message.attachments.map((attachment) => (
-                              <Image
-                                key={attachment.id}
-                                src={attachment.dataUrl}
-                                alt={attachment.name}
-                                width={360}
-                                height={240}
-                                unoptimized
-                                className="max-h-72 w-full rounded-md object-contain"
-                              />
-                            ))}
+                      <>
+                        {message.attachments?.map((attachment) =>
+                          attachment.kind === "image" && attachment.dataUrl ? (
+                            <Image
+                              key={attachment.id}
+                              src={attachment.dataUrl}
+                              alt={attachment.name}
+                              width={360}
+                              height={240}
+                              unoptimized
+                              className="max-h-72 rounded-lg border border-[var(--outline)] object-contain"
+                            />
+                          ) : (
+                            <AttachmentCard
+                              key={attachment.id}
+                              name={attachment.name}
+                              mimeType={attachment.mimeType}
+                              kind={attachment.kind}
+                              note={attachment.note}
+                              detail={attachment.byteSize ? formatBytes(attachment.byteSize) : null}
+                            />
+                          )
+                        )}
+                        {message.content ? (
+                          <div className="rounded-lg bg-[var(--foreground)] px-4 py-3 text-white">
+                            <p className="whitespace-pre-wrap">{message.content}</p>
                           </div>
                         ) : null}
-                        {message.content ? <p className="whitespace-pre-wrap">{message.content}</p> : null}
-                      </div>
+                      </>
                     )}
                   </div>
                 </div>
@@ -2120,91 +2344,99 @@ export default function ChatPage() {
                 </button>
               </div>
             ) : null}
-            {fileAttachments.length > 0 ? (
+            {fileAttachments.length > 0 || attachments.length > 0 ? (
               <div className="mx-auto mb-2 flex max-w-3xl flex-wrap gap-2">
                 {fileAttachments.map((attachment) => (
-                  <span key={attachment.id} className="flex items-center gap-2 rounded-md border border-[var(--outline)] bg-[#f5f7f5] px-2 py-1 text-xs">
-                    {isImageAttachmentFile(attachment.file) ? (
-                      <ImageIcon size={13} className="flex-none text-[var(--teal)]" />
-                    ) : (
-                      <Paperclip size={13} className="flex-none text-[var(--teal)]" />
-                    )}
-                    <span className="max-w-56 truncate font-medium">{attachment.name}</span>
-                    <span className="text-[var(--ink-soft)]">{formatBytes(attachment.size)}</span>
-                    <button
-                      type="button"
-                      aria-label={
-                        attachment.sensitivity === "private"
-                          ? `Make file ${attachment.name} shareable`
-                          : `Mark file ${attachment.name} private`
-                      }
-                      title={
-                        attachment.sensitivity === "private"
-                          ? "Private: kept out of group conversations and exports. Click to make shareable."
-                          : "Shareable. Click to keep out of group conversations and exports."
-                      }
-                      onClick={() => toggleFileAttachmentPrivacy(attachment.id)}
-                      className={`flex flex-none items-center gap-1 rounded p-0.5 ${
-                        attachment.sensitivity === "private"
-                          ? "text-[var(--teal)]"
-                          : "text-[var(--ink-soft)] hover:bg-[var(--outline)] hover:text-[var(--foreground)]"
-                      }`}
-                    >
-                      {attachment.sensitivity === "private" ? <Lock size={12} /> : <LockOpen size={12} />}
-                      {attachment.sensitivity === "private" ? <span className="font-medium">Private</span> : null}
-                    </button>
-                    <button
-                      type="button"
-                      aria-label={`Remove file ${attachment.name}`}
-                      title="Remove"
-                      onClick={() => removeFileAttachment(attachment.id)}
-                      className="flex-none rounded p-0.5 text-[var(--ink-soft)] hover:bg-[var(--outline)] hover:text-[var(--foreground)]"
-                    >
-                      <X size={12} />
-                    </button>
-                  </span>
+                  <AttachmentCard
+                    key={attachment.id}
+                    name={attachment.name}
+                    mimeType={attachment.mimeType}
+                    kind={attachment.kind}
+                    status={attachment.status}
+                    note={
+                      attachment.status === "error"
+                        ? attachment.error || "Could not be read"
+                        : composerAttachmentNote(attachment)
+                    }
+                    detail={formatBytes(attachment.size)}
+                    thumbnailUrl={attachment.previewUrl}
+                    actions={
+                      <>
+                        <button
+                          type="button"
+                          aria-label={
+                            attachment.sensitivity === "private"
+                              ? `Make file ${attachment.name} shareable`
+                              : `Mark file ${attachment.name} private`
+                          }
+                          title={
+                            attachment.sensitivity === "private"
+                              ? "Private: kept out of group conversations and exports. Click to make shareable."
+                              : "Shareable. Click to keep out of group conversations and exports."
+                          }
+                          onClick={() => toggleFileAttachmentPrivacy(attachment.id)}
+                          className={`flex flex-none items-center rounded p-1 ${
+                            attachment.sensitivity === "private"
+                              ? "text-[var(--teal)]"
+                              : "text-[var(--ink-soft)] hover:bg-[var(--surface-strong)] hover:text-[var(--foreground)]"
+                          }`}
+                        >
+                          {attachment.sensitivity === "private" ? <Lock size={14} /> : <LockOpen size={14} />}
+                        </button>
+                        <button
+                          type="button"
+                          aria-label={`Remove file ${attachment.name}`}
+                          title="Remove"
+                          onClick={() => removeFileAttachment(attachment.id)}
+                          className="flex-none rounded p-1 text-[var(--ink-soft)] hover:bg-[var(--surface-strong)] hover:text-[var(--foreground)]"
+                        >
+                          <X size={14} />
+                        </button>
+                      </>
+                    }
+                  />
                 ))}
-              </div>
-            ) : null}
-            {attachments.length > 0 ? (
-              <div className="mx-auto mb-2 flex max-w-3xl flex-wrap gap-2">
                 {attachments.map((attachment) => (
-                  <span key={attachment.id} className="flex items-center gap-2 rounded-md border border-[var(--outline)] bg-[#f5f7f5] px-2 py-1 text-xs">
-                    <FileText size={13} className="flex-none text-[var(--teal)]" />
-                    <span className="max-w-56 truncate font-medium">{attachment.title}</span>
-                    <span className="text-[var(--ink-soft)]">{attachment.wordCount.toLocaleString()} words</span>
-                    <button
-                      type="button"
-                      aria-label={
-                        attachment.sensitivity === "private"
-                          ? `Make attachment ${attachment.title} shareable`
-                          : `Mark attachment ${attachment.title} private`
-                      }
-                      title={
-                        attachment.sensitivity === "private"
-                          ? "Private: kept out of group conversations and exports. Click to make shareable."
-                          : "Shareable. Click to keep out of group conversations and exports."
-                      }
-                      onClick={() => toggleAttachmentPrivacy(attachment.id)}
-                      className={`flex flex-none items-center gap-1 rounded p-0.5 ${
-                        attachment.sensitivity === "private"
-                          ? "text-[var(--teal)]"
-                          : "text-[var(--ink-soft)] hover:bg-[var(--outline)] hover:text-[var(--foreground)]"
-                      }`}
-                    >
-                      {attachment.sensitivity === "private" ? <Lock size={12} /> : <LockOpen size={12} />}
-                      {attachment.sensitivity === "private" ? <span className="font-medium">Private</span> : null}
-                    </button>
-                    <button
-                      type="button"
-                      aria-label={`Remove attachment ${attachment.title}`}
-                      title="Remove"
-                      onClick={() => removeAttachment(attachment.id)}
-                      className="flex-none rounded p-0.5 text-[var(--ink-soft)] hover:bg-[var(--outline)] hover:text-[var(--foreground)]"
-                    >
-                      <X size={12} />
-                    </button>
-                  </span>
+                  <AttachmentCard
+                    key={attachment.id}
+                    name={attachment.title}
+                    kind="document"
+                    note={`Pasted text · ${attachment.wordCount.toLocaleString()} words`}
+                    actions={
+                      <>
+                        <button
+                          type="button"
+                          aria-label={
+                            attachment.sensitivity === "private"
+                              ? `Make attachment ${attachment.title} shareable`
+                              : `Mark attachment ${attachment.title} private`
+                          }
+                          title={
+                            attachment.sensitivity === "private"
+                              ? "Private: kept out of group conversations and exports. Click to make shareable."
+                              : "Shareable. Click to keep out of group conversations and exports."
+                          }
+                          onClick={() => toggleAttachmentPrivacy(attachment.id)}
+                          className={`flex flex-none items-center rounded p-1 ${
+                            attachment.sensitivity === "private"
+                              ? "text-[var(--teal)]"
+                              : "text-[var(--ink-soft)] hover:bg-[var(--surface-strong)] hover:text-[var(--foreground)]"
+                          }`}
+                        >
+                          {attachment.sensitivity === "private" ? <Lock size={14} /> : <LockOpen size={14} />}
+                        </button>
+                        <button
+                          type="button"
+                          aria-label={`Remove attachment ${attachment.title}`}
+                          title="Remove"
+                          onClick={() => removeAttachment(attachment.id)}
+                          className="flex-none rounded p-1 text-[var(--ink-soft)] hover:bg-[var(--surface-strong)] hover:text-[var(--foreground)]"
+                        >
+                          <X size={14} />
+                        </button>
+                      </>
+                    }
+                  />
                 ))}
               </div>
             ) : null}
@@ -2242,7 +2474,7 @@ export default function ChatPage() {
                 onPaste={handlePaste}
                 rows={1}
               />
-              <button type="button" aria-label="Send message" title="Send" onClick={handleSend} disabled={sending || (!input.trim() && attachments.length === 0 && fileAttachments.length === 0)} className="flex h-10 w-10 flex-none items-center justify-center rounded-md bg-[var(--foreground)] text-white hover:bg-[var(--teal)] disabled:opacity-35">
+              <button type="button" aria-label="Send message" title={attachmentsPreparing ? "Reading the attached file..." : "Send"} onClick={handleSend} disabled={sending || attachmentsPreparing || (!input.trim() && attachments.length === 0 && fileAttachments.length === 0)} className="flex h-10 w-10 flex-none items-center justify-center rounded-md bg-[var(--foreground)] text-white hover:bg-[var(--teal)] disabled:opacity-35">
                 <Send size={17} />
               </button>
             </div>
