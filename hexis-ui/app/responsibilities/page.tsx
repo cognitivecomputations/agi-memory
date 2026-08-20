@@ -12,7 +12,7 @@ import {
   Watch,
   type LucideIcon,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
 import { Badge } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
@@ -120,13 +120,17 @@ export default function ResponsibilitiesPage() {
       const data = (await response.json()) as ResponsibilitiesPayload;
       setPayload(data);
       setError(null);
-      if (!selectedId && data.responsibilities.length) setSelectedId(data.responsibilities[0].id);
+      setSelectedId((current) =>
+        current && data.responsibilities.some((item) => item.id === current)
+          ? current
+          : data.responsibilities[0]?.id ?? null
+      );
     } catch (requestError: unknown) {
       setError(requestError instanceof Error ? requestError.message : "Failed to load responsibilities.");
     } finally {
       setLoading(false);
     }
-  }, [filter, selectedId]);
+  }, [filter]);
 
   const fetchDetail = useCallback(async (id: string | null) => {
     if (!id) {
@@ -156,10 +160,8 @@ export default function ResponsibilitiesPage() {
   }, [fetchDetail, selectedId]);
 
   const responsibilities = payload?.responsibilities || [];
-  const selected = useMemo(
-    () => responsibilities.find((item) => item.id === selectedId) || detail?.responsibility || null,
-    [detail?.responsibility, responsibilities, selectedId]
-  );
+  const selected =
+    responsibilities.find((item) => item.id === selectedId) || detail?.responsibility || null;
 
   const runAction = async (action: string, args: JsonRecord = {}) => {
     const key = `${action}:${String(args.responsibility_id || args.title || "new")}`;
@@ -480,15 +482,13 @@ function ResponsibilityCard({
 }) {
   const blocked = item.status === "blocked";
   return (
-    <button
-      type="button"
-      onClick={onSelect}
+    <div
       className={`w-full rounded-md border bg-white p-4 text-left transition ${
         selected ? "border-[var(--teal)] shadow-sm" : "border-[var(--outline)] hover:border-[var(--teal)]/50"
       }`}
     >
       <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
-        <div className="min-w-0">
+        <button type="button" onClick={onSelect} className="min-w-0 flex-1 text-left">
           <div className="flex flex-wrap items-center gap-2">
             <span className="font-semibold">{item.title}</span>
             <StatusBadge status={item.status} />
@@ -504,8 +504,8 @@ function ResponsibilityCard({
             <span>fired {shortDateTime(item.last_fired_at)}</span>
             {blocked && item.last_error ? <span className="text-red-700">{item.last_error}</span> : null}
           </div>
-        </div>
-        <div className="flex shrink-0 flex-wrap gap-2" onClick={(event) => event.stopPropagation()}>
+        </button>
+        <div className="flex shrink-0 flex-wrap gap-2">
           <IconButton label="Check now" disabled={Boolean(busy)} onClick={() => onAction("evaluate_now")}>
             <RefreshCw size={15} />
           </IconButton>
@@ -523,7 +523,7 @@ function ResponsibilityCard({
           </IconButton>
         </div>
       </div>
-    </button>
+    </div>
   );
 }
 

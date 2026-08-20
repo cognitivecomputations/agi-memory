@@ -92,3 +92,20 @@ export function mergeIngestJobs(
     .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))
     .slice(0, limit);
 }
+
+export function retainActiveTrackedJobIds(
+  current: string[],
+  missingIds: ReadonlySet<string>,
+  exactById: ReadonlyMap<string, Pick<IngestJob, "status">>
+): string[] {
+  const next = current.filter((id) => {
+    if (missingIds.has(id)) return false;
+    const job = exactById.get(id);
+    return job ? isActiveIngestJob(job) : true;
+  });
+
+  // React compares state by reference. Preserve it when polling found no
+  // changes so consumers cannot accidentally turn a fetch effect into a
+  // render/fetch feedback loop.
+  return next.length === current.length ? current : next;
+}
