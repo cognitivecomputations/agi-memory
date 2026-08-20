@@ -96,6 +96,21 @@ Note that `hexis` is then only on PATH while that virtualenv is active.
 
 For development or contributing:
 
+### With Mise
+
+The repository's [`mise.toml`](../../mise.toml) provides Python, uv, Bun, the Docker CLI, and Docker Compose. Install [Mise](https://mise.jdx.dev/getting-started.html), then run:
+
+```bash
+git clone https://github.com/QuixiAI/Hexis.git && cd Hexis
+mise install
+mise run setup
+mise run docker:check
+```
+
+`docker:check` uses whichever Docker daemon is active. On macOS without Docker Desktop, install and start the optional Colima runtime with `mise run docker:colima`, then rerun the check.
+
+### Without Mise
+
 ```bash
 git clone https://github.com/QuixiAI/Hexis.git && cd Hexis
 uv venv && source .venv/bin/activate

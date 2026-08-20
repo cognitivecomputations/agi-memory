@@ -106,7 +106,7 @@ Treat those statements as unverified.
 
 **Before you run anything**, you need:
 
-- [Docker Desktop](https://docs.docker.com/get-docker/) — installed **and running**
+- A running Docker daemon with Compose — [Docker Desktop](https://docs.docker.com/get-docker/), or Docker CLI + [Colima](https://github.com/abiosoft/colima) on macOS
 - The local embedding sidecar; `hexis init` starts the published `embeddinggemma` binary and downloads the ~300M-parameter model on first use
 - For the default path below: a **ChatGPT Plus/Pro subscription** (it authenticates via browser OAuth — no API key). No subscription? Use any provider under "Other providers."
 
@@ -127,7 +127,7 @@ The install script handles everything — it sets up [uv](https://docs.astral.sh
 | Symptom | Likely cause | Fix |
 |---------|--------------|-----|
 | `hexis: command not found` after install | uv's tool directory isn't on PATH | `uv tool update-shell`, then open a new terminal |
-| `hexis init` stalls starting services | Docker daemon isn't running | Start Docker Desktop, re-run `hexis init` |
+| `hexis init` stalls starting services | Docker daemon isn't running | Start Docker Desktop or Colima, then re-run `hexis init` |
 | Embedding model pull fails | Local embedding sidecar isn't running | Start `embeddinggemma`, then re-run |
 | Browser login loops or model errors | No ChatGPT Plus/Pro on that account | Use another provider below, or `hexis auth` |
 | Anything else | — | `hexis doctor`, then [Troubleshooting](docs/operations/troubleshooting.md) |
