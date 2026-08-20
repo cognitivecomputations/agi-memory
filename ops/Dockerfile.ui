@@ -1,4 +1,9 @@
 FROM node:20-slim AS builder
+# Prisma needs openssl present to detect the right query-engine target
+# (without it, generate silently falls back to the openssl-1.1.x engine).
+RUN apt-get update -y \
+    && apt-get install -y --no-install-recommends openssl \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY hexis-ui/package.json hexis-ui/bun.lock* ./
 RUN npm install --legacy-peer-deps --ignore-scripts
@@ -10,6 +15,10 @@ ENV HEXIS_CHARACTERS_DIR=/characters
 RUN npx prisma generate && npm run build
 
 FROM node:20-slim
+# libssl is required at runtime by the Prisma query engine.
+RUN apt-get update -y \
+    && apt-get install -y --no-install-recommends openssl \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 ENV NODE_ENV=production
 ENV HEXIS_PROMPTS_DIR=/services/prompts

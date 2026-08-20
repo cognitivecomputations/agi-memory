@@ -1,5 +1,8 @@
 generator client {
-  provider = "prisma-client-js"
+  provider      = "prisma-client-js"
+  // "native" covers local dev; the Debian target matches the node:20-slim
+  // (bookworm / OpenSSL 3) runtime image so the right engine always ships.
+  binaryTargets = ["native", "debian-openssl-3.0.x"]
 }
 
 datasource db {
