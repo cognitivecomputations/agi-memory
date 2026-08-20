@@ -2,8 +2,8 @@
 
 Flow: [LLM Config] → [Choose Path] → [Express | Character | Custom] → [Consent] → [Done]
 
-Non-interactive mode: pass --api-key (and optionally --character, --provider, --model)
-to skip the wizard and configure everything from CLI flags.
+Non-interactive mode: pass provider/model flags with either --api-key or
+--api-key-env to skip the wizard and configure everything from CLI flags.
 """
 from __future__ import annotations
 
@@ -40,6 +40,7 @@ from apps.cli_theme import console, err_console, heading, make_panel, make_table
 _PROVIDER_ENV_VARS: dict[str, str] = {
     "anthropic": "ANTHROPIC_API_KEY",
     "openai": "OPENAI_API_KEY",
+    "openai_compatible": "OPENAI_API_KEY",
     "openai-codex": "",
     "grok": "XAI_API_KEY",
     "gemini": "GEMINI_API_KEY",
@@ -84,6 +85,77 @@ def _normalize_provider_name(provider: str | None) -> str:
         "google_antigravity": "google-antigravity",
     }
     return _ALIASES.get(raw, raw)
+
+
+def _resolve_noninteractive_provider(args: argparse.Namespace) -> str:
+    """Resolve a provider only from values the user explicitly selected."""
+    provider = _normalize_provider_name(args.provider)
+    if provider:
+        return provider
+    if args.endpoint:
+        return "openai_compatible"
+    if args.api_key:
+        return detect_provider(args.api_key)
+    if args.api_key_env:
+        api_key = os.getenv(args.api_key_env)
+        if not api_key:
+            raise ValueError(
+                f"Environment variable {args.api_key_env} is not set. "
+                "Add it to .env, then re-run init."
+            )
+        return detect_provider(api_key)
+    return "openai-codex"
+
+
+def _resolve_noninteractive_endpoint(
+    args: argparse.Namespace,
+    provider: str,
+) -> tuple[str, str]:
+    """Return the endpoint and its visible source label."""
+    endpoint = (args.endpoint or "").strip()
+    source = "--endpoint" if endpoint else ""
+    if not endpoint and provider == "openai_compatible":
+        endpoint = os.getenv("OPENAI_BASE_URL", "").strip()
+        source = "OPENAI_BASE_URL" if endpoint else ""
+    if provider == "openai_compatible" and not endpoint:
+        raise ValueError(
+            "An OpenAI-compatible endpoint is required. Pass --endpoint URL "
+            "or set OPENAI_BASE_URL in .env."
+        )
+    return endpoint, source
+
+
+def _resolve_noninteractive_api_key_env(
+    args: argparse.Namespace,
+    provider: str,
+) -> str:
+    """Choose a credential env var without silently consuming ambient keys."""
+    if provider in _OAUTH_PROVIDERS:
+        return ""
+
+    api_key_env = (args.api_key_env or _PROVIDER_ENV_VARS.get(provider, "")).strip()
+    if args.api_key:
+        if not api_key_env:
+            raise ValueError(
+                f"No default API key variable is known for provider '{provider}'. "
+                "Use --api-key-env NAME instead."
+            )
+        return api_key_env
+
+    if not args.api_key_env:
+        suggestion = (
+            f" --api-key-env {api_key_env}" if api_key_env else " --api-key-env NAME"
+        )
+        raise ValueError(
+            f"API key configuration is required for provider '{provider}'. "
+            f"Set the key in .env and pass{suggestion}, or pass --api-key."
+        )
+    if not os.getenv(api_key_env):
+        raise ValueError(
+            f"Environment variable {api_key_env} is not set. "
+            "Add it to .env, then re-run init."
+        )
+    return api_key_env
 
 
 async def _ensure_oauth_login(
@@ -338,13 +410,7 @@ def _ensure_embedding_model() -> None:
 async def _run_init_noninteractive(args: argparse.Namespace) -> int:
     """Non-interactive init: configure from CLI flags, start stack, apply config."""
     # 1. Detect provider
-    provider = _normalize_provider_name(args.provider)
-    if not provider:
-        if args.api_key:
-            provider = detect_provider(args.api_key)
-        else:
-            provider = "openai-codex"
-    provider = _normalize_provider_name(provider)
+    provider = _resolve_noninteractive_provider(args)
     persist_provider = provider
 
     # The Anthropic browser-OAuth (Claude Pro/Max) login was removed — the
@@ -354,10 +420,6 @@ async def _run_init_noninteractive(args: argparse.Namespace) -> int:
             "[fail]Anthropic OAuth login is no longer supported. Use "
             "`hexis auth anthropic setup-token` then `--provider anthropic`, "
             "or pass an Anthropic API key.[/fail]")
-        return 1
-
-    if provider not in _OAUTH_PROVIDERS and not args.api_key:
-        err_console.print(f"[fail]--api-key required for provider '{provider}'[/fail]")
         return 1
 
     # 2. Resolve model — derive from the live catalog (not a stale hard-code).
@@ -372,13 +434,23 @@ async def _run_init_noninteractive(args: argparse.Namespace) -> int:
         if not model:
             err_console.print(f"[fail]Could not determine a default model for '{provider}'. Pass --model.[/fail]")
             return 1
-    api_key_env = "" if provider in _no_key_needed else _PROVIDER_ENV_VARS.get(provider, "")
+    endpoint, endpoint_source = _resolve_noninteractive_endpoint(args, provider)
+    api_key_env = _resolve_noninteractive_api_key_env(args, provider)
 
-    console.print(make_panel(
-        f"[key]Provider:[/key] {persist_provider}\n"
-        f"[key]Model:[/key]    {model}",
-        title="Non-Interactive Init",
-    ))
+    config_summary = (
+        f"[key]Provider:[/key]  {persist_provider}\n"
+        f"[key]Model:[/key]     {model}"
+    )
+    if endpoint:
+        config_summary += (
+            f"\n[key]Endpoint:[/key]  {endpoint} "
+            f"[muted]({endpoint_source})[/muted]"
+        )
+    if api_key_env:
+        config_summary += (
+            f"\n[key]API key:[/key]   {api_key_env} environment variable"
+        )
+    console.print(make_panel(config_summary, title="Non-Interactive Init"))
 
     # 3. Write API key to .env + set os.environ
     if args.api_key and api_key_env:
@@ -415,7 +487,7 @@ async def _run_init_noninteractive(args: argparse.Namespace) -> int:
         heartbeat_config = {
             "provider": persist_provider,
             "model": model,
-            "endpoint": "",
+            "endpoint": endpoint,
             "api_key_env": api_key_env,
         }
         subconscious_config = heartbeat_config.copy()
@@ -1261,13 +1333,29 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dsn", default=None, help="Postgres DSN; defaults to POSTGRES_* env vars")
     p.add_argument("--wait-seconds", type=int, default=int(os.getenv("POSTGRES_WAIT_SECONDS", "30")))
 
-    # Non-interactive mode flags (any of --api-key, --provider, --character triggers it)
-    p.add_argument("--api-key", default=None,
-                    help="API key (auto-detects provider; triggers non-interactive mode)")
+    # Supplying any of these flags selects non-interactive mode in main().
+    credential_source = p.add_mutually_exclusive_group()
+    credential_source.add_argument(
+        "--api-key",
+        default=None,
+        help="API key (auto-detects provider; writes the key to .env)",
+    )
+    credential_source.add_argument(
+        "--api-key-env",
+        default=None,
+        metavar="NAME",
+        help="Read the API key from this environment variable (keeps secrets out of shell history)",
+    )
     p.add_argument("--provider", default=None,
                     help="LLM provider (auto-detected from --api-key if omitted)")
     p.add_argument("--model", default=None,
                     help="LLM model (defaults per provider)")
+    p.add_argument(
+        "--endpoint",
+        default=None,
+        metavar="URL",
+        help="LLM base URL (defaults to OPENAI_BASE_URL for openai_compatible)",
+    )
     p.add_argument("--character", default=None,
                     help="Character card name (e.g. 'hexis', 'jarvis'). Omit for express defaults")
     p.add_argument("--name", default=None,
@@ -1284,7 +1372,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
     # Non-interactive mode if any of these flags are present
-    if args.api_key or args.provider or args.character:
+    if args.api_key or args.api_key_env or args.endpoint or args.provider or args.character:
         try:
             return asyncio.run(_run_init_noninteractive(args))
         except KeyboardInterrupt:

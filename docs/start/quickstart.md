@@ -60,14 +60,18 @@ hexis init --character jarvis --api-key sk-...
 # Anthropic
 hexis init --provider anthropic --model claude-sonnet-4-20250514 --api-key sk-ant-...
 
-# Local OpenAI-compatible endpoint
-hexis init --provider openai_compatible --model local-model --character hexis
+# Custom OpenAI-compatible endpoint
+# Set OPENAI_BASE_URL and OPENAI_API_KEY in .env first (see .env.example).
+hexis init --provider openai_compatible --model your-model-id --character hexis \
+  --api-key-env OPENAI_API_KEY
 
 # Express defaults (no character card)
 hexis init --api-key sk-ant-...
 ```
 
-`hexis init` auto-detects the provider from API key prefixes. For all supported providers, see [Auth Providers](../integrations/auth/index.md).
+`hexis init` auto-detects the provider from API key prefixes. `--api-key-env`
+reads a named variable from `.env`, keeping the key out of shell history. For
+all supported providers, see [Auth Providers](../integrations/auth/index.md).
 
 ## Verify It Worked
 

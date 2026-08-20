@@ -142,8 +142,10 @@ hexis init --character jarvis --provider github-copilot --model gpt-4o
 # Chutes (free inference)
 hexis init --character hexis --provider chutes --model deepseek-ai/DeepSeek-V3-0324
 
-# Local OpenAI-compatible endpoint
-hexis init --provider openai_compatible --model local-model --character hexis
+# Custom OpenAI-compatible endpoint
+# First set OPENAI_BASE_URL and OPENAI_API_KEY in .env (see .env.example).
+hexis init --provider openai_compatible --model your-model-id --character hexis \
+  --api-key-env OPENAI_API_KEY
 
 # API-key providers (auto-detect from prefix)
 hexis init --character jarvis --api-key sk-...
@@ -240,7 +242,7 @@ See [Quickstart](docs/start/quickstart.md) for setup and [Production](docs/opera
 git clone https://github.com/QuixiAI/Hexis.git && cd Hexis
 uv venv && source .venv/bin/activate
 uv pip install -e .
-cp .env.local .env
+cp .env.example .env   # edit with your settings; never commit .env
 hexis up
 ```
 

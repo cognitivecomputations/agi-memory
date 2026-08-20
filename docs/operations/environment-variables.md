@@ -35,13 +35,15 @@ All environment variables used by Hexis, configured via `.env`.
 | `EMBEDDING_MODEL_ID` | `embeddinggemma:300m-qat-q4_0` | Model identifier |
 | `EMBEDDING_DIMENSION` | `768` | Vector dimension |
 
-## LLM API Keys
+## LLM Providers
 
 | Variable | Description |
 |----------|-------------|
-| `OPENAI_API_KEY` | OpenAI Platform API key |
+| `OPENAI_API_KEY` | OpenAI Platform or OpenAI-compatible API key |
+| `OPENAI_BASE_URL` | Base URL for `openai_compatible`; used as the `hexis init` endpoint default only when that provider is selected |
 | `ANTHROPIC_API_KEY` | Anthropic API key |
-| `GROK_API_KEY` | Grok API key |
+| `GEMINI_API_KEY` | Google Gemini API key |
+| `XAI_API_KEY` | xAI Grok API key |
 
 These are only needed for API-key providers. OAuth providers store credentials in the database.
 

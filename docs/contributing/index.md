@@ -15,7 +15,7 @@ section: contributing
 git clone https://github.com/QuixiAI/Hexis.git && cd Hexis
 uv venv && source .venv/bin/activate
 uv pip install -e .
-cp .env.local .env   # edit with your API keys
+cp .env.example .env   # edit with your settings; never commit .env
 hexis up             # start services
 hexis doctor         # verify health
 ```
