@@ -337,6 +337,97 @@ async def _generic_logout(dsn: str, wait_seconds: int, provider: str, yes: bool)
 # OpenAI Codex handlers (migrated from hexis_cli.py)
 # ---------------------------------------------------------------------------
 
+def _wait_for_callback_or_paste(
+    *,
+    port: int,
+    callback_path: str,
+    timeout_seconds: int,
+    expected_state: str | None,
+    console: Any,
+    bind_host: str = "127.0.0.1",
+) -> str | None:
+    """Wait for the OAuth redirect while ALSO accepting a pasted redirect URL.
+
+    On WSL (and some VPN/firewall setups) the browser finishes the sign-in
+    but can never reach the local callback server — the user is left staring
+    at "This site can't be reached" with the answer sitting in the address
+    bar. Reading stdin concurrently means pasting that URL works immediately
+    instead of only after the callback timeout expires.
+
+    Returns the authorization code, or None on timeout. KeyboardInterrupt
+    propagates to the caller. Falls back to a plain callback wait when stdin
+    isn't an interactive POSIX tty.
+    """
+    import os
+    import select
+    import threading
+
+    from core.auth.callback_server import run_callback_server
+    from core.auth.openai_codex import parse_authorization_input
+
+    interactive = (
+        os.name == "posix"
+        and sys.stdin is not None
+        and sys.stdin.isatty()
+        and hasattr(select, "select")
+    )
+    if not interactive:
+        result = run_callback_server(
+            port=port,
+            callback_path=callback_path,
+            timeout_seconds=timeout_seconds,
+            expected_state=expected_state,
+            bind_host=bind_host,
+        )
+        return (result or {}).get("code")
+
+    holder: dict[str, str] = {}
+    done = threading.Event()
+    cancel = threading.Event()
+
+    def _serve() -> None:
+        result = run_callback_server(
+            port=port,
+            callback_path=callback_path,
+            timeout_seconds=timeout_seconds,
+            expected_state=expected_state,
+            cancel_event=cancel,
+            bind_host=bind_host,
+        )
+        if result:
+            holder.update(result)
+        done.set()
+
+    thread = threading.Thread(target=_serve, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + max(5, timeout_seconds)
+    try:
+        while time.monotonic() < deadline and not done.is_set():
+            ready, _, _ = select.select([sys.stdin], [], [], 0.2)
+            if not ready:
+                continue
+            line = sys.stdin.readline().strip()
+            if not line:
+                continue
+            code, pasted_state = parse_authorization_input(line)
+            if pasted_state and expected_state and pasted_state != expected_state:
+                console.print(
+                    "[warn]State mismatch — paste the redirect URL from THIS "
+                    "login attempt.[/warn]"
+                )
+                continue
+            if code:
+                return code
+            console.print(
+                "[warn]No authorization code in that paste — copy the full "
+                "redirect URL from the browser's address bar.[/warn]"
+            )
+    finally:
+        cancel.set()
+        done.wait(timeout=2.0)
+    return holder.get("code")
+
+
 async def _openai_codex_login(
     dsn: str,
     wait_seconds: int,
@@ -345,10 +436,9 @@ async def _openai_codex_login(
     allow_manual_fallback: bool = True,
 ) -> int:
     import socket
-    import webbrowser
 
     from apps.cli_theme import console
-    from core.auth.callback_server import run_callback_server
+    from core.browser import is_wsl, open_url
     from core.auth.openai_codex import (
         OPENAI_CODEX_REDIRECT_URI,
         build_authorize_url,
@@ -402,24 +492,36 @@ async def _openai_codex_login(
         return 1
     else:
         console.print("1. A browser window should open. Sign in to ChatGPT and approve.")
-        console.print("2. If the callback page fails to load, copy the browser URL and paste it here.\n")
+        console.print(
+            "2. If the final page shows [bold]This site can't be reached[/bold] "
+            "(common on WSL), the sign-in still worked — copy the full "
+            "localhost:1455/... URL from the address bar and paste it here, "
+            "then press Enter.\n"
+        )
         console.print(f"[dim]{auth_url}[/dim]\n")
 
-        if not no_open:
-            try:
-                webbrowser.open(auth_url)
-            except Exception:
-                pass
+        if not no_open and not open_url(auth_url):
+            console.print(
+                "[warn]Could not open a browser automatically — open the URL "
+                "above yourself.[/warn]"
+            )
 
-        # Try callback server
-        result = run_callback_server(
-            port=1455,
-            callback_path="/auth/callback",
-            timeout_seconds=timeout_seconds,
-            expected_state=state,
-        )
-
-        code: str | None = result.get("code") if result else None
+        console.print("[dim]Waiting for the browser callback (or a pasted URL)...[/dim]")
+        try:
+            code = _wait_for_callback_or_paste(
+                port=1455,
+                callback_path="/auth/callback",
+                timeout_seconds=timeout_seconds,
+                expected_state=state,
+                console=console,
+                # The WSL2 localhost relay picks up wildcard binds far more
+                # reliably than 127.0.0.1-only ones; the server is
+                # state-validated and lives only for the timeout window.
+                bind_host="0.0.0.0" if is_wsl() else "127.0.0.1",
+            )
+        except KeyboardInterrupt:
+            console.print("\n[dim]Aborted.[/dim]")
+            return 1
 
         if not code and not allow_manual_fallback:
             _print_err(
@@ -429,6 +531,12 @@ async def _openai_codex_login(
             return 1
 
         if not code:
+            console.print(
+                "[warn]No callback arrived before the timeout. If the browser "
+                "finished on an unreachable localhost page, authentication "
+                "succeeded anyway — only the redirect could not reach this "
+                "terminal.[/warn]"
+            )
             try:
                 pasted = input("Paste the authorization code (or full redirect URL): ").strip()
             except (KeyboardInterrupt, EOFError):
@@ -621,12 +729,11 @@ async def _anthropic_logout(dsn: str, wait_seconds: int, yes: bool) -> int:
 
 async def _chutes_login(dsn: str, wait_seconds: int, args: Any) -> int:
     import os
-    import webbrowser
 
     from apps.cli_theme import console
     from core.auth import create_state, generate_pkce
-    from core.auth.callback_server import run_callback_server
     from core.auth.chutes import exchange_code, save_credentials
+    from core.browser import is_wsl, open_url
 
     client_id = getattr(args, "client_id", None) or os.getenv("CHUTES_CLIENT_ID", "")
     if not client_id:
@@ -661,16 +768,24 @@ async def _chutes_login(dsn: str, wait_seconds: int, args: Any) -> int:
         port = parsed_uri.port or 80
         path = parsed_uri.path or "/auth/callback"
 
-        if not no_open:
-            try:
-                webbrowser.open(auth_url)
-            except Exception:
-                pass
+        if not no_open and not open_url(auth_url):
+            console.print(
+                "[warn]Could not open a browser automatically — open the URL "
+                "above yourself.[/warn]"
+            )
 
-        result = run_callback_server(
-            port=port, callback_path=path, timeout_seconds=timeout_seconds, expected_state=state,
-        )
-        code = result.get("code") if result else None
+        try:
+            code = _wait_for_callback_or_paste(
+                port=port,
+                callback_path=path,
+                timeout_seconds=timeout_seconds,
+                expected_state=state,
+                console=console,
+                bind_host="0.0.0.0" if is_wsl() else "127.0.0.1",
+            )
+        except KeyboardInterrupt:
+            console.print("\n[dim]Aborted.[/dim]")
+            return 1
 
     if not code and non_interactive:
         _print_err(
@@ -712,7 +827,7 @@ async def _chutes_login(dsn: str, wait_seconds: int, args: Any) -> int:
 # ---------------------------------------------------------------------------
 
 async def _github_copilot_login(dsn: str, wait_seconds: int, args: Any) -> int:
-    import webbrowser
+    from core.browser import open_url
 
     from apps.cli_theme import console
     from core.auth.github_copilot import (
@@ -732,7 +847,7 @@ async def _github_copilot_login(dsn: str, wait_seconds: int, args: Any) -> int:
     console.print(f"2. Enter code: [bold]{device.user_code}[/bold]\n")
 
     try:
-        webbrowser.open(device.verification_uri)
+        open_url(device.verification_uri)
     except Exception:
         pass
 
@@ -754,7 +869,7 @@ async def _github_copilot_login(dsn: str, wait_seconds: int, args: Any) -> int:
 # ---------------------------------------------------------------------------
 
 async def _qwen_portal_login(dsn: str, wait_seconds: int, args: Any) -> int:
-    import webbrowser
+    from core.browser import open_url
 
     from apps.cli_theme import console
     from core.auth.qwen_portal import poll_for_token, save_credentials, start_device_flow
@@ -769,7 +884,7 @@ async def _qwen_portal_login(dsn: str, wait_seconds: int, args: Any) -> int:
     console.print()
 
     try:
-        webbrowser.open(uri)
+        open_url(uri)
     except Exception:
         pass
 
@@ -786,7 +901,7 @@ async def _qwen_portal_login(dsn: str, wait_seconds: int, args: Any) -> int:
 # ---------------------------------------------------------------------------
 
 async def _minimax_portal_login(dsn: str, wait_seconds: int, args: Any) -> int:
-    import webbrowser
+    from core.browser import open_url
 
     from apps.cli_theme import console
     from core.auth.minimax_portal import poll_for_token, save_credentials, start_user_code_flow
@@ -799,7 +914,7 @@ async def _minimax_portal_login(dsn: str, wait_seconds: int, args: Any) -> int:
     console.print(f"2. Enter code: [bold]{user_code_resp.user_code}[/bold]\n")
 
     try:
-        webbrowser.open(user_code_resp.verification_uri)
+        open_url(user_code_resp.verification_uri)
     except Exception:
         pass
 
@@ -819,7 +934,7 @@ async def _minimax_portal_login(dsn: str, wait_seconds: int, args: Any) -> int:
 # ---------------------------------------------------------------------------
 
 async def _google_gemini_cli_login(dsn: str, wait_seconds: int, args: Any) -> int:
-    import webbrowser
+    from core.browser import open_url
 
     from apps.cli_theme import console
     from core.auth import create_state, generate_pkce
@@ -847,7 +962,7 @@ async def _google_gemini_cli_login(dsn: str, wait_seconds: int, args: Any) -> in
     if not manual:
         if not no_open:
             try:
-                webbrowser.open(auth_url)
+                open_url(auth_url)
             except Exception:
                 pass
         result = run_callback_server(
@@ -893,7 +1008,7 @@ async def _google_gemini_cli_login(dsn: str, wait_seconds: int, args: Any) -> in
 # ---------------------------------------------------------------------------
 
 async def _google_antigravity_login(dsn: str, wait_seconds: int, args: Any) -> int:
-    import webbrowser
+    from core.browser import open_url
 
     from apps.cli_theme import console
     from core.auth import create_state, generate_pkce
@@ -921,7 +1036,7 @@ async def _google_antigravity_login(dsn: str, wait_seconds: int, args: Any) -> i
     if not manual:
         if not no_open:
             try:
-                webbrowser.open(auth_url)
+                open_url(auth_url)
             except Exception:
                 pass
         result = run_callback_server(

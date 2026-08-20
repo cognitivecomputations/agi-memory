@@ -18,11 +18,18 @@ def run_callback_server(
     expected_state: str | None = None,
     extract_params: list[str] | None = None,
     cancel_event: threading.Event | None = None,
+    bind_host: str = "127.0.0.1",
 ) -> dict[str, str] | None:
     """Start a local HTTP server, wait for a callback, return extracted params.
 
     Returns a dict of extracted query params, or ``None`` on timeout or bind
     failure.  The server is always shut down before returning.
+
+    ``bind_host`` widens the bind under WSL: the WSL2 localhost relay that
+    forwards Windows-browser requests into the VM picks up wildcard binds
+    far more reliably than 127.0.0.1-only ones. The handler still validates
+    the callback path and OAuth state, and the server lives only for
+    ``timeout_seconds``.
     """
     if extract_params is None:
         extract_params = ["code", "state"]
@@ -83,7 +90,7 @@ def run_callback_server(
 
     server: TCPServer | None = None
     try:
-        server = TCPServer(("127.0.0.1", port), Handler)
+        server = TCPServer((bind_host, port), Handler)
     except OSError:
         return None
 

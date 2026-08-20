@@ -4471,7 +4471,7 @@ def _handle_ui(
     import time
     import urllib.error
     import urllib.request
-    import webbrowser
+    from core.browser import open_url
     from urllib.parse import urlparse
 
     ui_dir = stack_root / "hexis-ui"
@@ -4607,7 +4607,7 @@ def _handle_ui(
     if not no_open:
         def _open_browser():
             if _wait_port_ready(port):
-                webbrowser.open(chat_url)
+                open_url(chat_url)
         t = threading.Thread(target=_open_browser, daemon=True)
         t.start()
 
@@ -4696,7 +4696,7 @@ def _handle_ui_container(
 ) -> int:
     """Start the UI via the containerized service (pip install path)."""
     import threading
-    import webbrowser
+    from core.browser import open_url
 
     from apps.cli_theme import console
 
@@ -4737,7 +4737,7 @@ def _handle_ui_container(
     if not no_open:
         def _open_browser():
             if _wait_port_ready(port):
-                webbrowser.open(f"http://localhost:{port}")
+                open_url(f"http://localhost:{port}")
         t = threading.Thread(target=_open_browser, daemon=True)
         t.start()
 
@@ -5541,14 +5541,14 @@ def _dispatch(argv: list[str] | None = None) -> int:
         compose_cmd_ui = ensure_compose(docker_bin)
         return _handle_ui_container(compose_cmd_ui, compose_file, stack_root, env_file, args.port, args.no_open)
     if func == "open":
-        import webbrowser
+        from core.browser import open_url
         if not _port_ready(args.port):
             _print_err(
                 f"Nothing is listening on http://localhost:{args.port}. "
                 "Start the dashboard first with `hexis ui`."
             )
             return 1
-        webbrowser.open(f"http://localhost:{args.port}")
+        open_url(f"http://localhost:{args.port}")
         return 0
     if func == "start":
         return run_compose(

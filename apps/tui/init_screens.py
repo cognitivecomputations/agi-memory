@@ -362,7 +362,7 @@ class LLMConfigScreen(Screen):
 
     async def _ensure_openai_codex_login(self) -> None:
         import socket
-        import webbrowser
+        from core.browser import open_url
 
         from core.auth.callback_server import run_callback_server
         from core.auth.openai_codex import (
@@ -387,7 +387,7 @@ class LLMConfigScreen(Screen):
         state = create_state()
         auth_url = build_authorize_url(challenge=challenge, state=state)
         try:
-            webbrowser.open(auth_url)
+            open_url(auth_url)
         except Exception:
             pass
 
