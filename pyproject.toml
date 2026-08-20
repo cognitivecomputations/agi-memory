@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hexis"
-version = "1.0.11"
+version = "1.0.12"
 description = "Persistent memory and identity for AI — a Postgres-native cognitive architecture."
 readme = "README.md"
 license = "MIT"
