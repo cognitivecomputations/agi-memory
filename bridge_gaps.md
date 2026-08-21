@@ -941,10 +941,135 @@ ship in halves — a purpose gate without a budget still floods, a budget withou
 switch is not something to point at anyone's colleagues, and a disclaimer promising an
 opt-out that is not wired is worse than sending nothing at all.
 
+## 11. Mining Alex's fork
+
+**Added 2026-08-21.** `~/hexis-alex` (`Lazarus-AI/hexis-pro`) is a private fork with
+**140 services to this tree's 35, 530 `db/*.sql` to 98, and 79 tool modules to 52.**
+Alex has agreed that anything outside his proprietary architecture may be merged into
+the OSS tree.
+
+### 11.1 The boundary
+
+Off-limits is the RCR-derived architecture and its subsystems: **human model /
+endpoint profile** (`sigma_model`, capacity C, operating posture), **allocentric
+engine** (agent modelling, feedforward cancellation, residual), **validation and
+outcome tracking** (decision-episode review, information-determined action),
+**agency window detector** (K estimation, timing gate), **fragility monitor**
+(rolling `R_eff`, `F(t)`, correlation collapse), and the **environmental channel
+processor** (N-channel ingest, `R_eff` estimation).
+
+Everything else is fair game, including borderline cases. Only the named subsystems
+and their concepts are excluded.
+
+`clearwing_*` is out too, for a different reason: `docs/clearwing_hexis_fork.md`
+states that *"Hexis does not push ClearWing changes to open-source upstream."* It is a
+separate Lazarus product with its own MIT-attribution boundary, unrelated to the
+architecture above.
+
+### 11.2 The mechanical test — run it on every candidate
+
+The fence is not a directory. `tool_sigma_gate.py` shows `sigma_model` threaded into
+tool gating itself, so a module that looks generic can still drag proprietary
+subsystems across an import. Every candidate gets grepped before it is touched:
+
+```bash
+grep -nE 'sigma_model|sigma_axes|agency_window|allocentric|branchial|independence_engine|fragility|operator_model|prediction_journal|guardian_|R_eff|r_eff|k_scheduler|hyperspace' services/<candidate>.py
+```
+
+Clean → port. Hits → port the idea, strip the dependency, keep Alex's file as the
+spec rather than the source.
+
+### 11.3 The three buckets
+
+Applying that test across all 105 fork-only services:
+
+- **70 port freely** — no reference to any excluded subsystem.
+- **19 port after stripping deps** — the idea is wanted, the imports are not.
+- **20 are the thing itself** — excluded by definition.
+
+```
+PORT AFTER STRIPPING: agent_acquisition_dispatcher calibration_digest co_design_loop
+  code_cognition comms_salience constructor_controller deliberation
+  deliberation_evidence_budget deliberation_runtime_budget epistemic_hygiene
+  known_unknowns local_taxonomy memory_architect memory_architect_reviews
+  off_band_context personal_hexis_ingest tool_channel_registry watchdog worker_identity
+
+EXCLUDE: agency_window branchial_cohesion endpoint_allocentric
+  evidence_channel_acquisition evidence_fragility external_signal_router guardian_*
+  hyperspace_projection independence_engine(_shadow) k_scheduler operator_model
+  prediction_journal sigma_axes sigma_model tool_sigma_gate  (+ all clearwing_*)
+```
+
+### 11.4 What to take first, and what it closes
+
+Ranked by the gap it closes in this plan, not by size:
+
+| From the fork | Closes | Size |
+|---|---|---|
+| **`operator_approval.py` + `approval_slack_actions.py`** — approval escalation Slack → iMessage, Block Kit approve/deny | **§11.5 — the fail-open approval gate.** The single highest-value item in the fork. | 173 py + 1,181 sql |
+| **`capability_probe.py`** — per-worker × per-tool reachability probe | **Tier 0, already solved.** This measures continuously what §0 discovered by hand. | 791 py, no sql |
+| **`tool_surface_audit.py`** — immutable tool-surface decision audit | **Tier 0 §0.6** instrumentation, verbatim | 182 py |
+| **`heartbeat_intent_classifier.py`** — "replaces the keyword-based pre-allocator" with intent → action families | **§9.6** and Tier 0's lexical disease, already cured in the heartbeat | — |
+| **`inbound_disposition.py`** — operator detection, trigger words, allowlists, drop rules, all in PL/pgSQL | **§10** purpose gate, inbound side | 394 py + 584 sql |
+| **`memory_supersessions.py`** — supersession lineage promoted into a side-table | **`positioning.md` §4.3** bitemporal | 161 py + 261 sql |
+| **`belief_propagation.py`** — belief-update LISTEN/NOTIFY over SQL triggers | **§4.2** contradiction-as-event, the plumbing half | 191 py + 513 sql |
+| **`operator_policy_corrections.py`** — SQL-owned correction ledger | **§4.5** learning with a diff | — |
+| **`skill_registry.py` + `skill_lineage.py` + `skill_loader_progressive.py`** | Tier 0 skill machinery; progressive loading speaks to 36-of-150 | — |
+| **`runtime_budget.py`** + the deliberation budget pair | the money/compute budget gap | — |
+| **`voice_notes.py` + `local_audio_analysis.py`** | **§5.1** transcribe, already built | — |
+| **`retention.py`, `scene_consolidation.py`, `incubation.py`** | **§4.6** forgetting well, plus spontaneous recall | — |
+| **`watchdog.py`** *(strip first)* — independent runtime-failure detector and recoverer | "knowing when it is blind" — but imports five excluded subsystems | — |
+| **`deliberation.py`** *(strip first)* — adversarial conjecture-attack-verdict | would finally give the dormant `run_council` a reason to exist | — |
+| **`epistemic_hygiene.py`** *(strip first)* — steel-man prompts, unreinforced-belief flagging | **§4.1** provenance and trust variance | — |
+
+### 11.5 The gap this exists to close
+
+`core/agent_loop.py:550` reads:
+
+```python
+if spec and spec.requires_approval and cfg.on_approval:
+```
+
+**When `on_approval` is `None` the check is skipped and the tool runs.**
+`apps/cli_chat.py:461` is the only caller in this tree that supplies one — the
+heartbeat (`services/heartbeat_agentic.py:88`) does not, and neither does the API chat
+path (`services/chat.py:301`).
+
+**51 of 150 tools are marked `requires_approval`** — including `slack_send`,
+`telegram_send`, `email_send`, `gmail_send`, `gmail_delete`, `twitter_x_post`,
+`shell`, and `write_file`. Every one of them executes unattended today with the flag
+set and nothing reading it.
+
+Two fixes, and both are wanted:
+
+1. **Fail closed.** Absent a callback, an approval-required tool refuses and files a
+   request rather than proceeding. *One line, today.*
+2. **Give it a callback worth having** — Alex's Slack → iMessage escalation, so
+   approval is answerable from a phone instead of only from a terminal.
+
+This is the fifth instance in this plan of one pathology: **a mechanism that exists
+with nothing enforcing it.** Dead heartbeat actions (§9.1), tools bound to no
+reachable skill (Tier 0), outbound tools that would slip the gate (§10.5.2), a
+cooldown config referenced by no code (§10), and now an approval flag nobody reads.
+Every one of them should end with an assertion, not a comment.
+
+### 11.6 What a port actually costs
+
+Alex's tree is database-as-brain taken further than this one — most services are thin
+async wrappers over PL/pgSQL that holds the real logic. `inbound_disposition` is 394
+lines of Python over 584 lines of SQL; `belief_propagation` is 191 over 513;
+`operator_approval` is 173 over 1,181.
+
+**So a port is rarely a file copy.** It is a Python module, one or more `db/*.sql`
+files, a migration to bring an existing database forward, and a check that the SQL
+does not reference tables this tree lacks. Budget **1–3 days per subsystem**, not an
+afternoon — and prefer taking few things properly over many things partially.
+
 # Sequencing
 
 | # | Item | Effort | Unblocks |
 |---|------|--------|----------|
+| −1 | **Approval gate fails closed (§11.5)** | **~1h** | **51 tools stop firing unattended** |
 | 0 | **Tier 0 — reachability (§0.1–0.6)** | **~2d** | **turns on capability already built** |
 | 1 | Wave A everyday skills (§4) | ~2d | visible value immediately, no new code |
 | 2 | Automation suggestions (§1) | ~2d | the agent starts proposing |
@@ -965,6 +1090,8 @@ opt-out that is not wired is worse than sending nothing at all.
 | 16 | Action/tool gate reconciliation (§9.6) | ~2d | after Tier 0 |
 | 17 | Goal origin flag (§10.4) | ~1d | prerequisite for the permission slip |
 | 18 | Contact points + purpose gate + STOP (§10) | ~10d | outbound to third parties becomes safe |
+| 19 | Port `operator_approval` + Slack actions (§11.4) | ~2d | approval answerable from a phone |
+| 20 | Port `capability_probe` + `tool_surface_audit` (§11.4) | ~3d | Tier 0 becomes continuously measured |
 
 Tier 0 comes before all of it: shipping new skills (item 1) into a selector that
 will not activate them is building on sand.
