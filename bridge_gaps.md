@@ -5,7 +5,10 @@ TS/Node, 52 skills, 158 extensions, native apps for macOS/iOS/Android/Linux/Wind
 and `.reference/hermes-agent` (Nous Research Hermes, Python, 95 tool modules,
 6 execution backends), cross-read against this tree.
 
-**Companion:** `positioning.md` — what Hexis should be *best in the world at*, as
+**Companions:** `improvements.md` — the July 2026 engineering audit, reconciled
+2026-08-21 (three of its seven P0s withdrawn as web-server assumptions applied to a
+desktop app; twelve findings still live, folded into §12 below). And
+`positioning.md` — what Hexis should be *best in the world at*, as
 opposed to this document, which is what it needs to reach parity. Two findings there
 are engineering work rather than strategy and belong on this plan's radar: the
 **invocation problem** (§4 there — capabilities fire on the agent's own state, not on
@@ -1174,10 +1177,80 @@ code declines to do.** That is a real contradiction, not something to resolve by
 picking whichever source is nearer to hand. Worth settling deliberately — and if
 self-authoring wins, Alex's validator is the piece that makes it survivable.
 
+## 12. Carried debt — what the July audit still has right
+
+**Added 2026-08-21.** `improvements.md` (audited at `f921921`, reconciled at
+`ce05393`) holds 37 findings. Three P0s were withdrawn on reconciliation — the
+packaged Google credential and both API-key findings assumed a server product rather
+than a desktop app with no auth layer. **Twelve are still live**, and five of them
+belong in this plan rather than in a separate list, because they intersect work
+already scheduled here.
+
+### 12.1 `execute_code` is unsandboxed with no gate — the one live P0
+
+`core/tools/code_execution.py:86` declares `requires_approval=False`, and the DB
+catalog agrees. Combined with §11.5 — the approval gate is skipped entirely when no
+callback is supplied — this is arbitrary code execution inside the autonomous loop
+with **neither a sandbox nor a gate**.
+
+The §11.5 fail-closed change does not fix this on its own, because the flag is
+`False`: there is nothing for a working gate to catch. Both halves are needed —
+`requires_approval=True`, *and* an execution sandbox.
+
+**This is the highest-severity live item in either document** and it belongs above
+everything in the sequencing except the fail-closed one-liner it depends on.
+
+### 12.2 `is_group` is false on five of seven channels — a privacy leak
+
+`channels/base.py:58` reads `is_group` from adapter metadata, and **only 2 of 7
+adapters set it.** The docstring states the purpose plainly: *"the conversation
+handler threads it into recall so private memories stay out of shared rooms."*
+
+So on five channels, private memories can surface in group rooms. This is not merely
+a correctness bug — it undercuts the entire premise of §10, which assumes the agent
+knows who it is talking to before it decides what to say. **Fix it before §10 ships,
+not after.**
+
+### 12.3 Three findings that are the same pattern this plan keeps naming
+
+- **P0-7** — `core/migrations.py:243` computes a migration checksum and `:251` stores
+  it. **Nothing ever compares it.** Nine had already drifted at audit time.
+- **P1-1** — `create_full_registry` is called only by `apps/hexis_mcp_server.py` and
+  tests. The chat and heartbeat runtimes build `create_default_registry`, so plugins
+  and dynamic tools are invisible to the agent itself. **This is Tier 0's finding
+  wearing different clothes** and should be fixed alongside it.
+- **P1-6** — **68** `except Exception` blocks followed directly by `pass`, against
+  Experience Bar #8's "never a silent `except: pass`."
+
+Together with the five already catalogued here — dead heartbeat actions (§9.1), tools
+bound to no reachable skill (Tier 0), outbound tools that slip the gate (§10.5.2), a
+cooldown config no code reads (§10), an approval flag nobody checks (§11.5) — that is
+**eight instances of one pathology: a mechanism exists and nothing enforces it.**
+
+The plan's standing answer: **every one of them ends in a startup assertion, not a
+comment.** A checksum that is computed is compared. A flag that is declared is read.
+An action that is offered has a handler. A tool that sends has a gate. Where the
+invariant cannot be asserted at startup, it is measured continuously (§11.4·8) and
+surfaced in `hexis doctor`.
+
+### 12.4 Two more worth scheduling, lower urgency
+
+- **P2-1** — `idx_memories_embedding` has **`idx_scan = 0` lifetime** on the live
+  database; seven further embedding indexes are also at zero. The primary vector index
+  for recall has never once been used. Recall is the product; this deserves a real
+  investigation, not a backlog row.
+- **P1-5** — five streaming paths in `core/llm.py` return `"raw": None`, so token and
+  cost accounting records zero for every streamed call. `MISSION.md` Law 7 requires
+  **visible costs**; today the most common path reports none.
+
+The remaining live findings (P3-2 no UI CI, and the twenty-two not re-verified) stay
+in `improvements.md`. They are real work, but they are hygiene rather than plan.
+
 # Sequencing
 
 | # | Item | Effort | Unblocks |
 |---|------|--------|----------|
+| −2 | **`execute_code` sandbox + `requires_approval=True` (§12.1)** | **~2d** | **closes unsandboxed RCE in the autonomous loop** |
 | −1 | **Approval gate fails closed (§11.5)** | **~1h** | **51 tools stop firing unattended** |
 | 0 | **Tier 0 — reachability (§0.1–0.6)** | **~2d** | **turns on capability already built** |
 | 0b | **Port** `capability_probe` + `tool_surface_audit` (§11.4·8) | ~3d | Tier 0 stops being a one-off audit |
@@ -1195,6 +1268,7 @@ self-authoring wins, Alex's validator is the piece that makes it survivable.
 | 11 | **Port** `belief_propagation` (§11.4·3) | ~2d | plumbing half of `positioning.md` §4.2 |
 | 12 | **Port** `operator_policy_corrections` (§11.4·5) | ~2d | *replaces* the `positioning.md` §4.5 build |
 | 13 | Deterministic image build (§6.2) | ~2d | — |
+| 13b | **`is_group` on all seven adapters (§12.2)** | **~1d** | **private memories stop leaking into group rooms — before §10** |
 | 14 | Goal origin flag (§10.4) | ~1d | prerequisite for the permission slip |
 | 15 | **Port** `inbound_disposition` (§11.4·6) | ~2d | §10's inbound half, policy already in SQL |
 | 16 | Contact points + purpose gate + STOP (§10) | ~10d | outbound to third parties becomes safe |
@@ -1220,6 +1294,9 @@ plan had costed as new: `voice_notes` for §5.1, the retention trio for
 for Tier 0's instrumentation. Ports are cheaper than builds but not free — each is a
 Python module plus SQL plus a migration (§11.6), so they are costed at 1–4 days, not
 at zero.
+
+Items −2 and −1 are safety, not features: they come first because everything below
+assumes the agent can act, and right now it can act in ways nothing checks.
 
 Items 0–8 are about four weeks and cover the gap that actually matters: an assistant
 that proposes work, asks when unsure, speaks the languages you already use, and
@@ -1249,4 +1326,9 @@ Not "the tests pass." Per `HEXIS_EXPERIENCE_BAR.md` #7, drive the real path:
 - A voice memo sent from a phone gets a useful reply.
 - The agent is **installed on a phone** as an app, and a proposal it makes arrives as
   a push notification rather than waiting in a web inbox nobody opens.
+- No code path executes model-authored code without both a sandbox and a gate, and
+  `is_group` is correct on every channel before the agent speaks in any shared room.
+- Every invariant this plan relies on is asserted at startup or measured continuously
+  — no declared flag, computed checksum, offered action, or sending tool is left with
+  nothing enforcing it.
 - Every one of those is refusable, and refusing it once means never being asked again.
