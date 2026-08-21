@@ -1,6 +1,6 @@
 from contextlib import asynccontextmanager
 import asyncio
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -63,18 +63,23 @@ class _RememberMem:
 
     async def record_chat_session_turn(self, *args, **kwargs):
         self.record_chat_session_turn_calls.append((args, kwargs))
-        return {"session": {"session_id": kwargs.get("session_id")}, "history": {"messages": []}}
+        return {
+            "session": {"session_id": kwargs.get("session_id")},
+            "history": {"messages": []},
+        }
 
 
 async def test_remember_conversation_calls_record_chat_session_turn_for_uuid():
     mem = _RememberMem()
     session_id = str(uuid4())
     turn_id = str(uuid4())
-    receipts = [{
-        "name": "remember",
-        "success": True,
-        "result": {"memory_id": str(uuid4())},
-    }]
+    receipts = [
+        {
+            "name": "remember",
+            "success": True,
+            "result": {"memory_id": str(uuid4())},
+        }
+    ]
 
     await chat_mod._remember_conversation(  # noqa: SLF001
         mem,
@@ -88,7 +93,10 @@ async def test_remember_conversation_calls_record_chat_session_turn_for_uuid():
     )
 
     assert len(mem.record_chat_session_turn_calls) == 1
-    assert mem.record_chat_session_turn_calls[0][0][0] == "remember this important preference"
+    assert (
+        mem.record_chat_session_turn_calls[0][0][0]
+        == "remember this important preference"
+    )
     assert mem.record_chat_session_turn_calls[0][1]["session_id"] == session_id
     assert mem.record_chat_session_turn_calls[0][1]["surface"] == "cli"
     context = mem.record_chat_session_turn_calls[0][1]["context"]
@@ -105,16 +113,53 @@ async def test_message_history_rehydrates_authoritative_action_receipts():
         "result": {"memory_id": memory_id, "reused": False},
     }
 
-    history = chat_mod._message_history_only([{  # noqa: SLF001
-        "role": "assistant",
-        "content": "Stored it.",
-        "metadata": {"action_receipts": [receipt]},
-    }])
+    history = chat_mod._message_history_only(
+        [
+            {  # noqa: SLF001
+                "role": "assistant",
+                "content": "Stored it.",
+                "metadata": {"action_receipts": [receipt]},
+            }
+        ]
+    )
 
     assert history[0]["metadata"]["action_receipts"] == [receipt]
     assert history[1]["role"] == "system"
     assert "Authoritative prior-action evidence" in history[1]["content"]
     assert memory_id in history[1]["content"]
+
+
+async def test_turn_id_survives_without_action_receipts():
+    mem = _RememberMem()
+    turn_id = str(uuid4())
+
+    await chat_mod._remember_conversation(  # noqa: SLF001
+        mem,
+        user_message="hello",
+        assistant_message="Hello.",
+        session_id=str(uuid4()),
+        agent_turn_id=turn_id,
+    )
+
+    context = mem.record_chat_session_turn_calls[0][1]["context"]
+    assert context["assistant_metadata"] == {"agent_turn_id": turn_id}
+
+    history = chat_mod._message_history_only(  # noqa: SLF001
+        [
+            {
+                "role": "assistant",
+                "content": "Hello.",
+                "metadata": {"agent_turn_id": turn_id},
+            }
+        ]
+    )
+    assert history == [
+        {
+            "role": "assistant",
+            "content": "Hello.",
+            "metadata": {"agent_turn_id": turn_id},
+        }
+    ]
 
 
 async def test_remember_conversation_falls_back_for_non_uuid_session():
@@ -129,7 +174,10 @@ async def test_remember_conversation_falls_back_for_non_uuid_session():
     )
 
     assert len(mem.record_chat_turn_memory_calls) == 1
-    assert mem.record_chat_turn_memory_calls[0][0][0] == "remember this important preference"
+    assert (
+        mem.record_chat_turn_memory_calls[0][0][0]
+        == "remember this important preference"
+    )
 
 
 async def test_chat_turn_basic_flow(monkeypatch, db_pool):
@@ -177,6 +225,7 @@ async def test_chat_turn_basic_flow(monkeypatch, db_pool):
 
     monkeypatch.setattr(chat_mod.CognitiveMemory, "connect", fake_connect)
     monkeypatch.setattr("core.agent_loop.chat_completion", fake_chat_completion)
+
     async def fake_agent_profile(_dsn=None, **_kwargs):
         return {}
 
@@ -191,10 +240,11 @@ async def test_chat_turn_basic_flow(monkeypatch, db_pool):
     )
 
     assert result["assistant"] == "hello there"
-    assert result["history"][-2:] == [
-        {"role": "user", "content": "hi"},
-        {"role": "assistant", "content": "hello there"},
-    ]
+    assert result["history"][-2] == {"role": "user", "content": "hi"}
+    assistant_history = result["history"][-1]
+    assert assistant_history["role"] == "assistant"
+    assert assistant_history["content"] == "hello there"
+    UUID(assistant_history["metadata"]["agent_turn_id"])
 
 
 async def test_chat_turn_tool_loop(monkeypatch, db_pool):
@@ -232,7 +282,12 @@ async def test_chat_turn_tool_loop(monkeypatch, db_pool):
         yield mem
 
     responses = [
-        {"content": "", "tool_calls": [{"id": "tool-1", "name": "recall", "arguments": {"query": "x"}}]},
+        {
+            "content": "",
+            "tool_calls": [
+                {"id": "tool-1", "name": "recall", "arguments": {"query": "x"}}
+            ],
+        },
         {"content": "final response", "tool_calls": []},
     ]
 
@@ -241,6 +296,7 @@ async def test_chat_turn_tool_loop(monkeypatch, db_pool):
 
     monkeypatch.setattr(chat_mod.CognitiveMemory, "connect", fake_connect)
     monkeypatch.setattr("core.agent_loop.chat_completion", fake_chat_completion)
+
     async def fake_agent_profile(_dsn=None, **_kwargs):
         return {}
 
@@ -265,8 +321,13 @@ async def test_chat_turn_hydrates_db_session_history_before_agent(monkeypatch, d
             "INSERT INTO config (key, value, description) VALUES ('chat.use_rlm', 'false', 'test override') "
             "ON CONFLICT (key) DO UPDATE SET value = 'false'"
         )
-        await conn.fetchval("SELECT append_chat_message($1::uuid, 'user', 'db says alpha')", session_id)
-        await conn.fetchval("SELECT append_chat_message($1::uuid, 'assistant', 'db says beta')", session_id)
+        await conn.fetchval(
+            "SELECT append_chat_message($1::uuid, 'user', 'db says alpha')", session_id
+        )
+        await conn.fetchval(
+            "SELECT append_chat_message($1::uuid, 'assistant', 'db says beta')",
+            session_id,
+        )
 
     captured: dict[str, object] = {}
 
@@ -371,7 +432,9 @@ async def test_stream_chat_turn_skips_memory_for_partial_timeout(monkeypatch):
     assert "".join(chunks) == "partial\n\n[Response timed out before completion.]"
 
 
-async def test_stream_chat_events_keeps_token_streaming_when_rlm_streaming_disabled(monkeypatch):
+async def test_stream_chat_events_keeps_token_streaming_when_rlm_streaming_disabled(
+    monkeypatch,
+):
     seen: dict[str, bool] = {}
 
     async def fake_agent_profile(*_args, **_kwargs):
@@ -406,10 +469,12 @@ async def test_stream_chat_events_keeps_token_streaming_when_rlm_streaming_disab
             history=[],
             llm_config={"provider": "openai", "model": "gpt-4o"},
             dsn="postgresql://unused",
-            pool=_ConfigPool({
-                "chat.use_rlm": True,
-                "rlm.chat.streaming_enabled": False,
-            }),
+            pool=_ConfigPool(
+                {
+                    "chat.use_rlm": True,
+                    "rlm.chat.streaming_enabled": False,
+                }
+            ),
         )
     ]
 
@@ -442,7 +507,10 @@ async def test_stream_chat_events_persists_successful_tool_receipt(monkeypatch):
                 "turn_id": turn_id,
                 "call_id": "remember-1",
                 "tool_name": "remember",
-                "arguments": {"content": "preserve the lighthouse agreement", "type": "semantic"},
+                "arguments": {
+                    "content": "preserve the lighthouse agreement",
+                    "type": "semantic",
+                },
                 "success": True,
                 "output": {"memory_id": memory_id, "type": "semantic", "reused": False},
                 "energy_spent": 1,

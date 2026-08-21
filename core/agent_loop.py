@@ -258,18 +258,26 @@ class AgentLoop:
             {"role": "system", "content": self.config.system_prompt},
         ]
         messages.extend(history or [])
-        messages.append({"role": "user", "content": user_content if user_content is not None else user_message})
+        messages.append(
+            {
+                "role": "user",
+                "content": user_content if user_content is not None else user_message,
+            }
+        )
 
         tools = await self._load_tools_for_turn()
         # Fail loud: turn state is authoritative, so a failed start must surface
         # rather than silently degrading to a Python-only loop.
         await self._start_turn(user_message, messages)
 
-        await self._emit(AgentEvent.LOOP_START, {
-            "tool_context": self.config.tool_context.value,
-            "energy_budget": self.config.energy_budget,
-            "tool_count": len(tools),
-        })
+        await self._emit(
+            AgentEvent.LOOP_START,
+            {
+                "tool_context": self.config.tool_context.value,
+                "energy_budget": self.config.energy_budget,
+                "tool_count": len(tools),
+            },
+        )
 
         try:
             result = await asyncio.wait_for(
@@ -280,12 +288,15 @@ class AgentLoop:
             result = self._make_result(await self._get_messages(), "timeout")
             result.timed_out = True
 
-        await self._emit(AgentEvent.LOOP_END, {
-            "stopped_reason": result.stopped_reason,
-            "iterations": result.iterations,
-            "energy_spent": result.energy_spent,
-            "timed_out": result.timed_out,
-        })
+        await self._emit(
+            AgentEvent.LOOP_END,
+            {
+                "stopped_reason": result.stopped_reason,
+                "iterations": result.iterations,
+                "energy_spent": result.energy_spent,
+                "timed_out": result.timed_out,
+            },
+        )
         # The DB message log is authoritative for the final transcript.
         result.messages = await self._get_messages()
         await self._enforce_action_claims(result)
@@ -317,7 +328,9 @@ class AgentLoop:
         self._streaming = True
 
         # Run loop in background task
-        task = asyncio.create_task(self.run(user_message, history, user_content=user_content))
+        task = asyncio.create_task(
+            self.run(user_message, history, user_content=user_content)
+        )
 
         # Signal completion via sentinel
         def _on_done(_: asyncio.Task) -> None:  # type: ignore[type-arg]
@@ -371,20 +384,27 @@ class AgentLoop:
                 expose_unbound = False
                 try:
                     async with self.config.pool.acquire() as conn:
-                        expose_unbound = bool(await conn.fetchval(
-                            "SELECT COALESCE(get_config_bool('mcp.expose_unbound'), FALSE)"
-                        ))
+                        expose_unbound = bool(
+                            await conn.fetchval(
+                                "SELECT COALESCE(get_config_bool('mcp.expose_unbound'), FALSE)"
+                            )
+                        )
                 except Exception:
-                    logger.debug("mcp.expose_unbound lookup failed; hiding unbound MCP tools", exc_info=True)
+                    logger.debug(
+                        "mcp.expose_unbound lookup failed; hiding unbound MCP tools",
+                        exc_info=True,
+                    )
                 if not expose_unbound:
                     tools = [
-                        spec for spec in tools
-                        if not spec.get("function", {}).get("name", "").startswith("mcp_")
+                        spec
+                        for spec in tools
+                        if not spec.get("function", {})
+                        .get("name", "")
+                        .startswith("mcp_")
                     ]
             return tools
         return [
-            spec for spec in tools
-            if spec.get("function", {}).get("name") in allowed
+            spec for spec in tools if spec.get("function", {}).get("name") in allowed
         ]
 
     async def _llm_call(
@@ -402,25 +422,32 @@ class AgentLoop:
         llm = cfg.llm_config
 
         model_messages = _model_safe_messages(messages)
-        await self._emit(AgentEvent.LLM_REQUEST, {
-            "iteration": self._iteration_count,
-            "provider": llm.get("provider"),
-            "model": llm.get("model"),
-            "messages": _trace_safe_messages(model_messages),
-            "tools": [
-                spec.get("function", {}).get("name", "unknown")
-                for spec in (tools or [])
-            ],
-            "temperature": cfg.temperature,
-            "max_tokens": cfg.max_tokens,
-        })
+        await self._emit(
+            AgentEvent.LLM_REQUEST,
+            {
+                "iteration": self._iteration_count,
+                "provider": llm.get("provider"),
+                "model": llm.get("model"),
+                "messages": _trace_safe_messages(model_messages),
+                "tools": [
+                    spec.get("function", {}).get("name", "unknown")
+                    for spec in (tools or [])
+                ],
+                "temperature": cfg.temperature,
+                "max_tokens": cfg.max_tokens,
+            },
+        )
 
         if self._streaming:
+
             async def _on_text_delta(token: str) -> None:
-                await self._emit(AgentEvent.TEXT_DELTA, {
-                    "text": token,
-                    "iteration": self._iteration_count,
-                })
+                await self._emit(
+                    AgentEvent.TEXT_DELTA,
+                    {
+                        "text": token,
+                        "iteration": self._iteration_count,
+                    },
+                )
 
             result = await stream_chat_completion(
                 provider=llm["provider"],
@@ -450,23 +477,28 @@ class AgentLoop:
         # Record API usage (fire-and-forget)
         source = "heartbeat" if cfg.heartbeat_id else "chat"
         session_key = cfg.session_id or cfg.heartbeat_id
-        asyncio.ensure_future(record_llm_usage(
-            provider=llm["provider"],
-            model=llm["model"],
-            raw_response=result.get("raw"),
-            operation="stream" if self._streaming else "chat",
-            session_key=session_key,
-            source=source,
-            pool=cfg.pool,
-        ))
+        asyncio.ensure_future(
+            record_llm_usage(
+                provider=llm["provider"],
+                model=llm["model"],
+                raw_response=result.get("raw"),
+                operation="stream" if self._streaming else "chat",
+                session_key=session_key,
+                source=source,
+                pool=cfg.pool,
+            )
+        )
 
-        await self._emit(AgentEvent.LLM_RESPONSE, {
-            "iteration": self._iteration_count,
-            "provider": llm.get("provider"),
-            "model": llm.get("model"),
-            "content": result.get("content") or "",
-            "tool_calls": result.get("tool_calls") or [],
-        })
+        await self._emit(
+            AgentEvent.LLM_RESPONSE,
+            {
+                "iteration": self._iteration_count,
+                "provider": llm.get("provider"),
+                "model": llm.get("model"),
+                "content": result.get("content") or "",
+                "tool_calls": result.get("tool_calls") or [],
+            },
+        )
 
         return result
 
@@ -489,15 +521,20 @@ class AgentLoop:
             if db_step.get("action") == "stop":
                 reason = db_step.get("reason") or "completed"
                 if reason == "energy":
-                    await self._emit(AgentEvent.ENERGY_EXHAUSTED, {
-                        "budget": cfg.energy_budget,
-                        "spent": self._energy_spent,
-                    })
+                    await self._emit(
+                        AgentEvent.ENERGY_EXHAUSTED,
+                        {
+                            "budget": cfg.energy_budget,
+                            "spent": self._energy_spent,
+                        },
+                    )
                 return self._make_result(await self._get_messages(), reason)
 
             # DB owns iteration/energy budgets; trust its decision above and use
             # the message log it hands back for this LLM call (no parallel list).
-            self._iteration_count = int(db_step.get("iteration", self._iteration_count + 1))
+            self._iteration_count = int(
+                db_step.get("iteration", self._iteration_count + 1)
+            )
             messages = db_step.get("messages")
             if messages is None:
                 messages = await self._get_messages()
@@ -506,8 +543,13 @@ class AgentLoop:
             try:
                 response = await self._llm_call(messages, tools)
             except Exception as e:
-                logger.error("LLM call failed at iteration %d: %s", self._iteration_count, e)
-                await self._emit(AgentEvent.ERROR, {"error": str(e), "iteration": self._iteration_count})
+                logger.error(
+                    "LLM call failed at iteration %d: %s", self._iteration_count, e
+                )
+                await self._emit(
+                    AgentEvent.ERROR,
+                    {"error": str(e), "iteration": self._iteration_count},
+                )
                 return self._make_result(await self._get_messages(), "error")
 
             text = response.get("content", "") or ""
@@ -522,7 +564,10 @@ class AgentLoop:
                 # Only emit per-iteration TEXT_DELTA in non-streaming mode
                 # (streaming mode emits per-token via the callback)
                 if not self._streaming:
-                    await self._emit(AgentEvent.TEXT_DELTA, {"text": text, "iteration": self._iteration_count})
+                    await self._emit(
+                        AgentEvent.TEXT_DELTA,
+                        {"text": text, "iteration": self._iteration_count},
+                    )
 
             if not tool_calls:
                 if (
@@ -530,10 +575,13 @@ class AgentLoop:
                     and self._continuations_used < cfg.max_continuations
                 ):
                     self._continuations_used += 1
-                    await self._emit(AgentEvent.CONTINUATION, {
-                        "continuation_number": self._continuations_used,
-                        "max_continuations": cfg.max_continuations,
-                    })
+                    await self._emit(
+                        AgentEvent.CONTINUATION,
+                        {
+                            "continuation_number": self._continuations_used,
+                            "max_continuations": cfg.max_continuations,
+                        },
+                    )
                     await self._append_user_message(cfg.continuation_prompt)
                     continue
                 return self._make_result(await self._get_messages(), "completed")
@@ -546,116 +594,155 @@ class AgentLoop:
                 arguments = call.get("arguments", {})
                 call_id = call.get("id") or str(uuid.uuid4())
 
-                if cfg.allowed_tool_names is not None and tool_name not in cfg.allowed_tool_names:
-                    await self._record_tool_result(call_id, {
-                        "tool_name": tool_name,
-                        "arguments": arguments,
-                        "success": False,
-                        "error": "tool not available in the active skill set",
-                        "energy_spent": 0,
-                        "model_output": (
-                            f"Tool '{tool_name}' is not available. Use list_skills/use_skill "
-                            "to activate the relevant skill first."
-                        ),
-                    })
-                    self._tool_calls_made.append({
-                        "id": call_id,
-                        "name": tool_name,
-                        "arguments": arguments,
-                        "success": False,
-                        "error": "not_available_in_active_skills",
-                        "energy_spent": 0,
-                    })
+                if (
+                    cfg.allowed_tool_names is not None
+                    and tool_name not in cfg.allowed_tool_names
+                ):
+                    await self._record_tool_result(
+                        call_id,
+                        {
+                            "tool_name": tool_name,
+                            "arguments": arguments,
+                            "success": False,
+                            "error": "tool not available in the active skill set",
+                            "energy_spent": 0,
+                            "model_output": (
+                                f"Tool '{tool_name}' is not available. Use list_skills/use_skill "
+                                "to activate the relevant skill first."
+                            ),
+                        },
+                    )
+                    self._tool_calls_made.append(
+                        {
+                            "id": call_id,
+                            "name": tool_name,
+                            "arguments": arguments,
+                            "success": False,
+                            "error": "not_available_in_active_skills",
+                            "energy_spent": 0,
+                        }
+                    )
                     continue
 
                 # Check approval via callback
                 spec = cfg.registry.get_spec(tool_name)
                 if spec and spec.requires_approval and cfg.on_approval:
-                    await self._emit(AgentEvent.APPROVAL_REQUEST, {
-                        "tool_name": tool_name,
-                        "arguments": arguments,
-                    })
+                    await self._emit(
+                        AgentEvent.APPROVAL_REQUEST,
+                        {
+                            "tool_name": tool_name,
+                            "arguments": arguments,
+                        },
+                    )
                     try:
                         approved = await cfg.on_approval(tool_name, arguments)
                     except Exception:
                         approved = False
 
                     if not approved:
-                        await self._record_tool_result(call_id, {
-                            "tool_name": tool_name,
-                            "arguments": arguments,
-                            "success": False,
-                            "error": "denied",
-                            "energy_spent": 0,
-                            "model_output": f"Tool call '{tool_name}' was denied by the user.",
-                        })
-                        self._tool_calls_made.append({
-                            "id": call_id,
-                            "name": tool_name,
-                            "arguments": arguments,
-                            "success": False,
-                            "denied": True,
-                            "energy_spent": 0,
-                        })
+                        await self._record_tool_result(
+                            call_id,
+                            {
+                                "tool_name": tool_name,
+                                "arguments": arguments,
+                                "success": False,
+                                "error": "denied",
+                                "energy_spent": 0,
+                                "model_output": f"Tool call '{tool_name}' was denied by the user.",
+                            },
+                        )
+                        self._tool_calls_made.append(
+                            {
+                                "id": call_id,
+                                "name": tool_name,
+                                "arguments": arguments,
+                                "success": False,
+                                "denied": True,
+                                "energy_spent": 0,
+                            }
+                        )
                         continue
 
                 # Build execution context
                 exec_ctx = await self._build_exec_context(call_id)
 
-                await self._emit(AgentEvent.TOOL_START, {
-                    "tool_name": tool_name,
-                    "arguments": arguments,
-                    "iteration": self._iteration_count,
-                })
+                await self._emit(
+                    AgentEvent.TOOL_START,
+                    {
+                        "tool_name": tool_name,
+                        "arguments": arguments,
+                        "iteration": self._iteration_count,
+                    },
+                )
 
                 # Execute tool via registry (policy + hooks + audit)
                 result = await cfg.registry.execute(tool_name, arguments, exec_ctx)
                 # DB appends the tool message and sums energy into runtime_state;
                 # read the authoritative running total back from it.
-                applied = await self._record_tool_result(call_id, {
-                    "tool_name": tool_name,
-                    "arguments": arguments,
-                    "success": result.success,
-                    "output": result.output,
-                    "display_output": result.display_output,
-                    "model_output": result.to_model_output(),
-                    "error": result.error,
-                    "error_type": result.error_type.value if result.error_type else None,
-                    "energy_spent": result.energy_spent,
-                    "duration_seconds": result.duration_seconds,
-                })
-                self._energy_spent = int(applied.get("energy_spent", self._energy_spent + result.energy_spent))
+                applied = await self._record_tool_result(
+                    call_id,
+                    {
+                        "tool_name": tool_name,
+                        "arguments": arguments,
+                        "success": result.success,
+                        "output": result.output,
+                        "display_output": result.display_output,
+                        "model_output": result.to_model_output(),
+                        "error": result.error,
+                        "error_type": (
+                            result.error_type.value if result.error_type else None
+                        ),
+                        "energy_spent": result.energy_spent,
+                        "duration_seconds": result.duration_seconds,
+                    },
+                )
+                self._energy_spent = int(
+                    applied.get(
+                        "energy_spent", self._energy_spent + result.energy_spent
+                    )
+                )
 
-                await self._emit(AgentEvent.TOOL_RESULT, {
-                    "call_id": call_id,
-                    "tool_name": tool_name,
-                    "arguments": arguments,
-                    "success": result.success,
-                    "energy_spent": result.energy_spent,
-                    "total_energy_spent": self._energy_spent,
-                    "duration": result.duration_seconds,
-                    "error": result.error,
-                    "output": result.output,
-                    "display_output": result.display_output,
-                })
+                await self._emit(
+                    AgentEvent.TOOL_RESULT,
+                    {
+                        "call_id": call_id,
+                        "tool_name": tool_name,
+                        "arguments": arguments,
+                        "success": result.success,
+                        "energy_spent": result.energy_spent,
+                        "total_energy_spent": self._energy_spent,
+                        "duration": result.duration_seconds,
+                        "error": result.error,
+                        "output": result.output,
+                        "display_output": result.display_output,
+                    },
+                )
 
-                self._tool_calls_made.append({
-                    "id": call_id,
-                    "name": tool_name,
-                    "arguments": arguments,
-                    "success": result.success,
-                    "energy_spent": result.energy_spent,
-                    "error": result.error,
-                })
-                self._tool_results.append({
-                    "id": call_id,
-                    "name": tool_name,
-                    "arguments": arguments,
-                    "success": result.success,
-                    "output": result.output,
-                })
+                self._tool_calls_made.append(
+                    {
+                        "id": call_id,
+                        "name": tool_name,
+                        "arguments": arguments,
+                        "success": result.success,
+                        "energy_spent": result.energy_spent,
+                        "error": result.error,
+                    }
+                )
+                self._tool_results.append(
+                    {
+                        "id": call_id,
+                        "name": tool_name,
+                        "arguments": arguments,
+                        "success": result.success,
+                        "output": result.output,
+                    }
+                )
 
-                if result.success and tool_name == "use_skill" and cfg.allowed_tool_names is not None:
+                if (
+                    result.success
+                    and tool_name == "use_skill"
+                    and cfg.allowed_tool_names is not None
+                ):
                     output = result.output if isinstance(result.output, dict) else {}
                     newly_bound = {
                         str(name)
@@ -667,7 +754,9 @@ class AgentLoop:
                         tools = await self._load_tools_for_turn()
 
         # Should not reach here, but safety net
-        return self._make_result(await self._get_messages(), "completed")  # pragma: no cover
+        return self._make_result(
+            await self._get_messages(), "completed"
+        )  # pragma: no cover
 
     # ------------------------------------------------------------------
     # Planned loop (Gap 1: plan → execute → verify)
@@ -717,7 +806,10 @@ class AgentLoop:
             self._visible_text_parts.append(plan_text)
             self._plan_text = plan_text
             if not self._streaming:
-                await self._emit(AgentEvent.TEXT_DELTA, {"text": plan_text, "iteration": self._iteration_count})
+                await self._emit(
+                    AgentEvent.TEXT_DELTA,
+                    {"text": plan_text, "iteration": self._iteration_count},
+                )
 
         # Record the plan as an assistant message (no tool calls) in the DB.
         await self._apply_llm_result(response)
@@ -801,7 +893,9 @@ class AgentLoop:
         except Exception:
             return None
 
-    async def _start_turn(self, user_message: str, messages: list[dict[str, Any]]) -> None:
+    async def _start_turn(
+        self, user_message: str, messages: list[dict[str, Any]]
+    ) -> None:
         """Open a DB-owned turn. Fails loud — the turn state is authoritative,
         so a failed start must surface instead of degrading to a Python loop."""
         async with self.config.pool.acquire() as conn:
@@ -810,13 +904,15 @@ class AgentLoop:
                 self.config.tool_context.value,
                 user_message,
                 self._session_uuid_or_none(),
-                json.dumps({
-                    "messages": messages,
-                    "energy_budget": self.config.energy_budget,
-                    "max_iterations": self.config.max_iterations,
-                    "max_continuations": self.config.max_continuations,
-                    "heartbeat_id": self.config.heartbeat_id,
-                }),
+                json.dumps(
+                    {
+                        "messages": messages,
+                        "energy_budget": self.config.energy_budget,
+                        "max_iterations": self.config.max_iterations,
+                        "max_continuations": self.config.max_continuations,
+                        "heartbeat_id": self.config.heartbeat_id,
+                    }
+                ),
             )
         payload = json.loads(raw) if isinstance(raw, str) else raw
         if not (isinstance(payload, dict) and payload.get("turn_id")):
@@ -847,7 +943,9 @@ class AgentLoop:
         async with self.config.pool.acquire() as conn:
             await conn.fetchval(
                 "SELECT append_agent_message($1::uuid, $2::text, $3::text)",
-                self._turn_id, "user", content,
+                self._turn_id,
+                "user",
+                content,
             )
 
     async def _apply_llm_result(self, response: dict[str, Any]) -> None:
@@ -859,13 +957,17 @@ class AgentLoop:
             await conn.fetchval(
                 "SELECT apply_agent_llm_result($1::uuid, $2::jsonb)",
                 self._turn_id,
-                json.dumps({
-                    "content": response.get("content", "") or "",
-                    "tool_calls": openai_tool_calls,
-                }),
+                json.dumps(
+                    {
+                        "content": response.get("content", "") or "",
+                        "tool_calls": openai_tool_calls,
+                    }
+                ),
             )
 
-    async def _record_tool_result(self, call_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    async def _record_tool_result(
+        self, call_id: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
         """Append a tool result to the DB log; return the DB's running state
         (incl. the authoritative total energy_spent)."""
         async with self.config.pool.acquire() as conn:
@@ -925,11 +1027,16 @@ class AgentLoop:
             result.text += correction
             result.visible_text = (result.visible_text or text) + correction
             self._last_text = result.text
-            await self._emit(AgentEvent.TEXT_DELTA, {"text": correction, "correction": True})
-            await self._emit(AgentEvent.CLAIM_FLAGGED, {
-                "findings": findings,
-                "verifier_used": verifier_used,
-            })
+            await self._emit(
+                AgentEvent.TEXT_DELTA, {"text": correction, "correction": True}
+            )
+            await self._emit(
+                AgentEvent.CLAIM_FLAGGED,
+                {
+                    "findings": findings,
+                    "verifier_used": verifier_used,
+                },
+            )
         except Exception:
             logger.warning(
                 "action-claim guardrail failed for turn %s; reply left unmodified",
@@ -953,13 +1060,45 @@ class AgentLoop:
                 from core.llm_config import load_llm_config
                 from core.llm_json import chat_json
 
-                llm_config = await load_llm_config(conn, "llm.guardrails", fallback_key="llm.subconscious")
+                llm_config = await load_llm_config(
+                    conn, "llm.guardrails", fallback_key="llm.subconscious"
+                )
                 system = await conn.fetchval(
                     "SELECT content FROM prompt_modules WHERE key = 'action_claim_verify'"
                 )
+                prior_raw = await conn.fetchval(
+                    """
+                    SELECT COALESCE(jsonb_agg(receipt), '[]'::jsonb)
+                    FROM agent_turns turn_state
+                    CROSS JOIN LATERAL jsonb_array_elements(
+                        COALESCE(turn_state.messages, '[]'::jsonb)
+                    ) message
+                    CROSS JOIN LATERAL jsonb_array_elements(
+                        CASE
+                            WHEN jsonb_typeof(
+                                message#>'{metadata,action_receipts}'
+                            ) = 'array'
+                                THEN message#>'{metadata,action_receipts}'
+                            ELSE '[]'::jsonb
+                        END
+                    ) receipt
+                    WHERE turn_state.id = $1::uuid
+                      AND message->>'role' = 'assistant'
+                      AND COALESCE((receipt->>'success')::boolean, FALSE)
+                    """,
+                    self._turn_id,
+                )
             except Exception:
-                logger.warning("action-claim verifier setup failed; keeping heuristic findings", exc_info=True)
+                logger.warning(
+                    "action-claim verifier setup failed; keeping heuristic findings",
+                    exc_info=True,
+                )
                 return findings
+        prior_receipts = (
+            json.loads(prior_raw) if isinstance(prior_raw, str) else prior_raw
+        )
+        if not isinstance(prior_receipts, list):
+            prior_receipts = []
         payload = {
             "final_text": text[:12000],
             "flagged": findings,
@@ -968,6 +1107,7 @@ class AgentLoop:
                 for c in self._tool_calls_made
                 if c.get("success")
             ],
+            "prior_action_receipts": prior_receipts,
         }
         try:
             doc, _raw = await chat_json(
@@ -978,7 +1118,10 @@ class AgentLoop:
                 ],
             )
         except Exception:
-            logger.warning("action-claim LLM verifier failed; keeping heuristic findings", exc_info=True)
+            logger.warning(
+                "action-claim LLM verifier failed; keeping heuristic findings",
+                exc_info=True,
+            )
             return findings
         confirmed = doc.get("confirmed") if isinstance(doc, dict) else None
         if isinstance(confirmed, list):
@@ -991,11 +1134,13 @@ class AgentLoop:
             kept = list(findings)
         for extra in (doc.get("additional") or []) if isinstance(doc, dict) else []:
             if isinstance(extra, dict) and extra.get("sentence"):
-                kept.append({
-                    "kind": extra.get("kind", "action"),
-                    "sentence": str(extra["sentence"])[:300],
-                    "source": "llm_verifier",
-                })
+                kept.append(
+                    {
+                        "kind": extra.get("kind", "action"),
+                        "sentence": str(extra["sentence"])[:300],
+                        "source": "llm_verifier",
+                    }
+                )
         return kept
 
     async def _finish_turn(self, result: AgentLoopResult) -> None:
@@ -1006,20 +1151,26 @@ class AgentLoop:
                 await conn.fetchval(
                     "SELECT finish_agent_turn($1::uuid, $2::jsonb)",
                     self._turn_id,
-                    json.dumps({
-                        "status": "completed",
-                        "stopped_reason": result.stopped_reason,
-                        "text": result.text,
-                        "visible_text": result.visible_text,
-                        "iterations": result.iterations,
-                        "energy_spent": result.energy_spent,
-                        "timed_out": result.timed_out,
-                    }),
+                    json.dumps(
+                        {
+                            "status": "completed",
+                            "stopped_reason": result.stopped_reason,
+                            "text": result.text,
+                            "visible_text": result.visible_text,
+                            "iterations": result.iterations,
+                            "energy_spent": result.energy_spent,
+                            "timed_out": result.timed_out,
+                        }
+                    ),
                 )
         except Exception:
-            logger.warning("finish_agent_turn failed for turn %s", self._turn_id, exc_info=True)
+            logger.warning(
+                "finish_agent_turn failed for turn %s", self._turn_id, exc_info=True
+            )
 
-    async def _emit(self, event: AgentEvent, data: dict[str, Any] | None = None) -> None:
+    async def _emit(
+        self, event: AgentEvent, data: dict[str, Any] | None = None
+    ) -> None:
         """Emit an event via the configured callback."""
         event_data = dict(data or {})
         if self._turn_id:
@@ -1037,14 +1188,18 @@ class AgentLoop:
                 logger.debug("DB agent event record failed", exc_info=True)
         if self.config.on_event:
             try:
-                await self.config.on_event(AgentEventData(
-                    event=event,
-                    data=event_data,
-                ))
+                await self.config.on_event(
+                    AgentEventData(
+                        event=event,
+                        data=event_data,
+                    )
+                )
             except Exception:
                 logger.debug("Event callback failed for %s", event, exc_info=True)
 
-    def _make_result(self, messages: list[dict[str, Any]] | None, stopped_reason: str) -> AgentLoopResult:
+    def _make_result(
+        self, messages: list[dict[str, Any]] | None, stopped_reason: str
+    ) -> AgentLoopResult:
         """Build an AgentLoopResult from current state."""
         return AgentLoopResult(
             text=self._last_text,

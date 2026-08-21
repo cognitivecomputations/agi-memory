@@ -51,7 +51,10 @@ class TestRecallThroughDbDispatcher:
         marker = get_test_identifier("hybridrecall")
         try:
             remembered = await RememberHandler().execute(
-                {"content": f"The zephyr protocol codename is {marker}", "type": "semantic"},
+                {
+                    "content": f"The zephyr protocol codename is {marker}",
+                    "type": "semantic",
+                },
                 _ctx(db_pool),
             )
             assert remembered.success, remembered.error
@@ -98,9 +101,13 @@ class TestSearchHistoryTouch:
             assert row["last_accessed"] is not None
         finally:
             async with db_pool.acquire() as conn:
-                await conn.execute("DELETE FROM subconscious_units WHERE id = $1::uuid", unit_id)
+                await conn.execute(
+                    "DELETE FROM subconscious_units WHERE id = $1::uuid", unit_id
+                )
 
-    async def test_structured_filters_use_structured_query(self, db_pool, ensure_embedding_service):
+    async def test_structured_filters_use_structured_query(
+        self, db_pool, ensure_embedding_service
+    ):
         marker = get_test_identifier("structuredrecall")
         kind = f"web_{marker}"
         try:
@@ -169,7 +176,9 @@ class TestQueueUserMessage:
 
 
 class TestProvenanceTooling:
-    async def test_remember_handler_passes_session_context_for_idempotency(self, db_pool):
+    async def test_remember_handler_passes_session_context_for_idempotency(
+        self, db_pool, ensure_embedding_service
+    ):
         marker = get_test_identifier("rememberreceipt")
         context = _ctx(db_pool)
         context.session_id = str(uuid4())
@@ -246,15 +255,25 @@ class TestSourceDocumentTools:
                     content_hash,
                     f"/tmp/{marker}.txt",
                     content,
-                    json.dumps({"kind": "document", "ref": content_hash, "content_hash": content_hash}),
+                    json.dumps(
+                        {
+                            "kind": "document",
+                            "ref": content_hash,
+                            "content_hash": content_hash,
+                        }
+                    ),
                 )
 
-            result = await SearchDocumentsHandler().execute({"query": f"arclight {marker}"}, _ctx(db_pool))
+            result = await SearchDocumentsHandler().execute(
+                {"query": f"arclight {marker}"}, _ctx(db_pool)
+            )
             assert result.success, result.error
             assert result.output["count"] == 1
             doc_id = result.output["documents"][0]["document_id"]
 
-            opened = await OpenDocumentHandler().execute({"document_id": doc_id}, _ctx(db_pool))
+            opened = await OpenDocumentHandler().execute(
+                {"document_id": doc_id}, _ctx(db_pool)
+            )
             assert opened.success, opened.error
             assert opened.output["content"] == content
             assert opened.output["truncated"] is False
@@ -294,7 +313,9 @@ class TestSourceDocumentTools:
                     "DELETE FROM subconscious_units WHERE metadata#>>'{recmem,content_hash}' = $1",
                     content_hash,
                 )
-                await conn.execute("DELETE FROM source_documents WHERE content_hash = $1", content_hash)
+                await conn.execute(
+                    "DELETE FROM source_documents WHERE content_hash = $1", content_hash
+                )
 
     async def test_document_handlers_registered(self):
         from core.tools.memory import create_memory_tools

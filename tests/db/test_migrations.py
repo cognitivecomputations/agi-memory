@@ -4,6 +4,7 @@ database with real data evolves to the new schema WITHOUT a wipe."""
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from uuid import uuid4
@@ -90,6 +91,10 @@ Never say you stored, saved, created, filed, scheduled, or sent something unless
                 "UPDATE prompt_modules SET content = $1 WHERE key = 'conversation'",
                 legacy_prompt,
             )
+            await conn.execute(
+                "UPDATE prompt_modules SET content = 'legacy current-turn verifier' "
+                "WHERE key = 'action_claim_verify'"
+            )
 
             await conn.execute(migration)
 
@@ -99,10 +104,50 @@ Never say you stored, saved, created, filed, scheduled, or sent something unless
             assert await conn.fetchval(
                 "SELECT to_regprocedure('public._execute_memory_tool_dispatch(text,jsonb)') IS NOT NULL"
             )
+            session_id = str(uuid4())
+            memory_content = f"migration routing {uuid4().hex}"
+            existing_id = await conn.fetchval(
+                """
+                INSERT INTO memories (
+                    type, content, embedding, importance, trust_level, status, metadata
+                )
+                VALUES (
+                    'episodic', $1,
+                    array_fill(0.1, ARRAY[embedding_dimension()])::vector,
+                    0.5, 0.8, 'active',
+                    jsonb_build_object(
+                        'tool_write', jsonb_build_object('session_id', $2::text)
+                    )
+                )
+                RETURNING id
+                """,
+                memory_content,
+                session_id,
+            )
+            routed = await conn.fetchval(
+                "SELECT execute_memory_tool('remember', $1::jsonb)",
+                json.dumps(
+                    {
+                        "content": memory_content,
+                        "type": "episodic",
+                        "_execution_context": {"session_id": session_id},
+                    }
+                ),
+            )
+            routed = json.loads(routed) if isinstance(routed, str) else routed
+            assert routed["success"] is True, routed
+            assert routed["output"]["reused"] is True
+            assert routed["output"]["memory_id"] == str(existing_id)
             conversation_prompt = await conn.fetchval(
                 "SELECT content FROM prompt_modules WHERE key = 'conversation'"
             )
-            assert "durable prior-action receipts as the authority" in conversation_prompt
+            assert (
+                "durable prior-action receipts as the authority" in conversation_prompt
+            )
+            verifier_prompt = await conn.fetchval(
+                "SELECT content FROM prompt_modules WHERE key = 'action_claim_verify'"
+            )
+            assert "prior_action_receipts" in verifier_prompt
         finally:
             await tr.rollback()
 

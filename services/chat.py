@@ -5,14 +5,26 @@ import json
 from typing import Any, AsyncIterator, Awaitable, Callable
 from uuid import UUID
 
-from core.agent_api import db_dsn_from_env, get_agent_profile_context, pool_sizes_from_env
+from core.agent_api import (
+    db_dsn_from_env,
+    get_agent_profile_context,
+    pool_sizes_from_env,
+)
 from core.agent_loop import AgentEvent, AgentEventData
 from core.cognitive_memory_api import CognitiveMemory
 from core.llm import normalize_llm_config
 from core.llm_config import load_llm_config
-from core.tools import create_default_registry, ToolContext, ToolExecutionContext, ToolRegistry
+from core.tools import (
+    create_default_registry,
+    ToolContext,
+    ToolExecutionContext,
+    ToolRegistry,
+)
 from services.agent import run_agent, stream_agent
-from services.connector_setup import detect_connector_setup_intent, run_connector_setup_intent
+from services.connector_setup import (
+    detect_connector_setup_intent,
+    run_connector_setup_intent,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -63,8 +75,12 @@ async def _build_system_prompt(
     is_group: bool = False,
 ) -> str:
     from services.agent import build_system_prompt
+
     return await build_system_prompt(
-        "chat", registry, agent_profile, is_group=is_group,
+        "chat",
+        registry,
+        agent_profile,
+        is_group=is_group,
     )
 
 
@@ -104,10 +120,7 @@ def _bounded_receipt_value(value: Any, *, depth: int = 0) -> Any:
     if depth >= 2:
         return str(value)[:_MAX_ACTION_RECEIPT_TEXT]
     if isinstance(value, list):
-        return [
-            _bounded_receipt_value(item, depth=depth + 1)
-            for item in value[:8]
-        ]
+        return [_bounded_receipt_value(item, depth=depth + 1) for item in value[:8]]
     if isinstance(value, dict):
         return {
             str(key)[:80]: _bounded_receipt_value(item, depth=depth + 1)
@@ -122,7 +135,12 @@ def _receipt_subset(value: Any, allowed_keys: set[str]) -> dict[str, Any]:
     selected: dict[str, Any] = {}
     for raw_key, raw_value in value.items():
         key = str(raw_key)
-        if key in allowed_keys or key == "id" or key.endswith("_id") or key.endswith("_ids"):
+        if (
+            key in allowed_keys
+            or key == "id"
+            or key.endswith("_id")
+            or key.endswith("_ids")
+        ):
             selected[key] = _bounded_receipt_value(raw_value)
         if len(selected) >= 16:
             break
@@ -224,19 +242,30 @@ def _message_history_only(messages: list[dict[str, Any]]) -> list[dict[str, Any]
         if role in {"system", "user", "assistant"} and isinstance(content, str):
             message: dict[str, Any] = {"role": role, "content": content}
             receipts = _stored_action_receipts(item)
-            if receipts:
-                message["metadata"] = {"action_receipts": receipts}
-                if isinstance(metadata, dict) and metadata.get("agent_turn_id"):
-                    message["metadata"]["agent_turn_id"] = metadata["agent_turn_id"]
+            raw_turn_id = (
+                metadata.get("agent_turn_id") if isinstance(metadata, dict) else None
+            )
+            agent_turn_id = _uuid_text_or_none(
+                str(raw_turn_id) if raw_turn_id else None
+            )
+            if receipts or agent_turn_id:
+                message_metadata: dict[str, Any] = {}
+                if receipts:
+                    message_metadata["action_receipts"] = receipts
+                if agent_turn_id:
+                    message_metadata["agent_turn_id"] = agent_turn_id
+                message["metadata"] = message_metadata
             normalized.append(message)
             if receipts and index in receipt_indexes:
-                normalized.append({
-                    "role": "system",
-                    "content": _render_action_receipt_evidence(receipts),
-                    "metadata": {
-                        "hexis_internal": "action_receipt_evidence",
-                    },
-                })
+                normalized.append(
+                    {
+                        "role": "system",
+                        "content": _render_action_receipt_evidence(receipts),
+                        "metadata": {
+                            "hexis_internal": "action_receipt_evidence",
+                        },
+                    }
+                )
     return normalized
 
 
@@ -252,10 +281,17 @@ async def _hydrate_chat_history(
         async with pool.acquire() as conn:
             raw = await conn.fetchval("SELECT hydrate_chat_session($1::uuid)", parsed)
         payload = json.loads(raw) if isinstance(raw, str) else raw
-        if isinstance(payload, dict) and isinstance(payload.get("messages"), list) and payload["messages"]:
+        if (
+            isinstance(payload, dict)
+            and isinstance(payload.get("messages"), list)
+            and payload["messages"]
+        ):
             return _message_history_only(payload["messages"])
     except Exception:
-        logger.debug("DB chat-session hydration failed; falling back to caller history", exc_info=True)
+        logger.debug(
+            "DB chat-session hydration failed; falling back to caller history",
+            exc_info=True,
+        )
     return _message_history_only(fallback_history or [])
 
 
@@ -269,12 +305,18 @@ async def resolve_prompt_addenda(pool: Any, addenda: list[str] | None) -> list[s
         if module_key:
             try:
                 async with pool.acquire() as conn:
-                    rendered = await conn.fetchval("SELECT render_prompt($1)", module_key)
+                    rendered = await conn.fetchval(
+                        "SELECT render_prompt($1)", module_key
+                    )
                 if rendered:
                     resolved.append(str(rendered).strip())
                 continue
             except Exception:
-                logger.warning("Prompt addendum module %r failed to render", module_key, exc_info=True)
+                logger.warning(
+                    "Prompt addendum module %r failed to render",
+                    module_key,
+                    exc_info=True,
+                )
                 continue
         resolved.append(text)
     return resolved
@@ -303,11 +345,13 @@ async def _remember_conversation(
     # (#81); the DB snapshots current state when the appraisal is absent.
     if emotional_state:
         context["emotional_state"] = emotional_state
-    if action_receipts:
-        assistant_metadata: dict[str, Any] = {
-            "action_receipts": action_receipts[:_MAX_ACTION_RECEIPTS_PER_TURN],
-        }
-        parsed_turn = _uuid_text_or_none(agent_turn_id)
+    parsed_turn = _uuid_text_or_none(agent_turn_id)
+    if action_receipts or parsed_turn:
+        assistant_metadata: dict[str, Any] = {}
+        if action_receipts:
+            assistant_metadata["action_receipts"] = action_receipts[
+                :_MAX_ACTION_RECEIPTS_PER_TURN
+            ]
         if parsed_turn:
             assistant_metadata["agent_turn_id"] = parsed_turn
         context["assistant_metadata"] = assistant_metadata
@@ -431,13 +475,16 @@ async def chat_turn(
         use_rlm = False
         try:
             async with pool.acquire() as _conn:
-                use_rlm_raw = await _conn.fetchval("SELECT get_config_bool('chat.use_rlm')")
+                use_rlm_raw = await _conn.fetchval(
+                    "SELECT get_config_bool('chat.use_rlm')"
+                )
                 use_rlm = bool(use_rlm_raw)
         except Exception:
             use_rlm = False
 
         if use_rlm and not visual_attachments:
             from services.hexis_rlm import run_chat_turn
+
             result = await run_chat_turn(
                 user_message=user_message,
                 history=history,
@@ -462,7 +509,9 @@ async def chat_turn(
                 surface=surface,
             )
             await _apply_chat_energy_effects(pool, surface=surface)
-            new_history = await _hydrate_after_persist(mem_client, session_id, fallback_history)
+            new_history = await _hydrate_after_persist(
+                mem_client, session_id, fallback_history
+            )
             return {"assistant": assistant_text, "history": new_history}
 
         registry = create_default_registry(pool)
@@ -491,11 +540,14 @@ async def chat_turn(
             "role": "assistant",
             "content": assistant_text,
         }
-        if action_receipts:
-            assistant_history["metadata"] = {
-                "action_receipts": action_receipts,
-                "agent_turn_id": agent_turn_id,
-            }
+        parsed_agent_turn_id = _uuid_text_or_none(agent_turn_id)
+        if action_receipts or parsed_agent_turn_id:
+            assistant_metadata: dict[str, Any] = {}
+            if action_receipts:
+                assistant_metadata["action_receipts"] = action_receipts
+            if parsed_agent_turn_id:
+                assistant_metadata["agent_turn_id"] = parsed_agent_turn_id
+            assistant_history["metadata"] = assistant_metadata
 
         fallback_history = [
             *history,
@@ -519,7 +571,9 @@ async def chat_turn(
             tool_energy_spent=getattr(loop_result, "energy_spent", 0),
             surface=surface,
         )
-        new_history = await _hydrate_after_persist(mem_client, session_id, fallback_history)
+        new_history = await _hydrate_after_persist(
+            mem_client, session_id, fallback_history
+        )
         return {"assistant": assistant_text, "history": new_history}
     finally:
         if own_pool:
@@ -643,7 +697,9 @@ async def stream_chat_events(
 
         history = await _hydrate_chat_history(pool, session_id, history)
 
-        setup_intent = await detect_connector_setup_intent(pool, user_message, session_id=session_id)
+        setup_intent = await detect_connector_setup_intent(
+            pool, user_message, session_id=session_id
+        )
         if setup_intent:
             registry = create_default_registry(pool)
             source_channel = "web" if surface == "api" else surface
@@ -704,10 +760,14 @@ async def stream_chat_events(
         rlm_streaming_enabled = False
         try:
             async with pool.acquire() as conn:
-                use_rlm_raw = await conn.fetchval("SELECT get_config_bool('chat.use_rlm')")
-                rlm_streaming_enabled = bool(await conn.fetchval(
-                    "SELECT COALESCE(get_config_bool('rlm.chat.streaming_enabled'), false)"
-                ))
+                use_rlm_raw = await conn.fetchval(
+                    "SELECT get_config_bool('chat.use_rlm')"
+                )
+                rlm_streaming_enabled = bool(
+                    await conn.fetchval(
+                        "SELECT COALESCE(get_config_bool('rlm.chat.streaming_enabled'), false)"
+                    )
+                )
                 use_rlm = bool(use_rlm_raw) and rlm_streaming_enabled
                 if visual_attachments:
                     use_rlm = False
@@ -717,7 +777,9 @@ async def stream_chat_events(
                         "using token-streaming AgentLoop for this streaming request"
                     )
                 if use_rlm and llm_config is None:
-                    llm_config = await load_llm_config(conn, "llm.chat", fallback_key="llm")
+                    llm_config = await load_llm_config(
+                        conn, "llm.chat", fallback_key="llm"
+                    )
         except Exception:
             use_rlm = False
 
@@ -766,7 +828,9 @@ async def stream_chat_events(
                             "result": persisted,
                         },
                     )
-                    energy_result = await _apply_chat_energy_effects(pool, surface=surface)
+                    energy_result = await _apply_chat_energy_effects(
+                        pool, surface=surface
+                    )
                     if energy_result:
                         yield AgentEventData(
                             event=AgentEvent.PHASE_CHANGE,
@@ -832,19 +896,27 @@ async def stream_chat_events(
                     and isinstance(event.data.get("output"), dict)
                 ):
                     output = event.data["output"]
-                    signals = output.get("signals") if isinstance(output, dict) else None
-                    emotion = signals.get("emotional_state") if isinstance(signals, dict) else None
+                    signals = (
+                        output.get("signals") if isinstance(output, dict) else None
+                    )
+                    emotion = (
+                        signals.get("emotional_state")
+                        if isinstance(signals, dict)
+                        else None
+                    )
                     if isinstance(emotion, dict):
                         appraisal_affect = emotion
             elif event.event == AgentEvent.TOOL_RESULT:
-                completed_tool_calls.append({
-                    "id": event.data.get("call_id"),
-                    "name": event.data.get("tool_name"),
-                    "arguments": event.data.get("arguments"),
-                    "success": event.data.get("success") is True,
-                    "output": event.data.get("output"),
-                    "turn_id": event_turn_id or agent_turn_id,
-                })
+                completed_tool_calls.append(
+                    {
+                        "id": event.data.get("call_id"),
+                        "name": event.data.get("tool_name"),
+                        "arguments": event.data.get("arguments"),
+                        "success": event.data.get("success") is True,
+                        "output": event.data.get("output"),
+                        "turn_id": event_turn_id or agent_turn_id,
+                    }
+                )
                 try:
                     tool_energy_spent += int(event.data.get("energy_spent") or 0)
                 except Exception:

@@ -23,6 +23,9 @@ CREATE INDEX idx_memories_content ON memories USING GIN (content gin_trgm_ops);
 CREATE INDEX idx_memories_content_fts ON memories USING GIN (to_tsvector('english', content));
 CREATE INDEX idx_memories_importance ON memories (importance DESC) WHERE status = 'active';
 CREATE INDEX idx_memories_created ON memories (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_memories_tool_write_session_created
+    ON memories ((metadata#>>'{tool_write,session_id}'), created_at DESC)
+    WHERE status = 'active' AND metadata ? 'tool_write';
 CREATE INDEX idx_memories_last_accessed ON memories (last_accessed DESC NULLS LAST);
 CREATE INDEX idx_memories_updated ON memories (updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_memory_reinforcement_events_memory_created

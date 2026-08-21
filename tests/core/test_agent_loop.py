@@ -87,7 +87,9 @@ def _tool_response(
     return {"content": text, "tool_calls": tool_calls, "raw": None}
 
 
-def _tool_call(name: str, arguments: dict[str, Any], call_id: str | None = None) -> dict[str, Any]:
+def _tool_call(
+    name: str, arguments: dict[str, Any], call_id: str | None = None
+) -> dict[str, Any]:
     return {
         "id": call_id or f"call_{uuid.uuid4().hex[:8]}",
         "name": name,
@@ -114,15 +116,19 @@ def _mock_registry(
         if spec_map:
             return spec_map.get(name)
         return None
+
     registry.get_spec = MagicMock(side_effect=_get_spec)
 
     # execute returns ToolResult
     execute_results = execute_results or {}
 
-    async def _execute(name: str, arguments: dict, context: ToolExecutionContext) -> ToolResult:
+    async def _execute(
+        name: str, arguments: dict, context: ToolExecutionContext
+    ) -> ToolResult:
         if name in execute_results:
             return execute_results[name]
         return ToolResult.success_result({"echo": name, "args": arguments})
+
     registry.execute = AsyncMock(side_effect=_execute)
 
     # get_config returns ToolsConfig
@@ -209,13 +215,24 @@ class TestToolCalls:
         recall_result = ToolResult.success_result({"memories": ["Python is great"]})
         recall_result.energy_spent = 1
         registry = _mock_registry(
-            tool_specs=[{"type": "function", "function": {"name": "recall", "description": "Recall", "parameters": {}}}],
+            tool_specs=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "recall",
+                        "description": "Recall",
+                        "parameters": {},
+                    },
+                }
+            ],
             execute_results={"recall": recall_result},
         )
 
         # First call: tool call; Second call: text response
         mock_llm.side_effect = [
-            _tool_response("Let me search.", [_tool_call("recall", {"query": "Python"})]),
+            _tool_response(
+                "Let me search.", [_tool_call("recall", {"query": "Python"})]
+            ),
             _text_response("Python is great!"),
         ]
 
@@ -242,10 +259,13 @@ class TestToolCalls:
         )
 
         mock_llm.side_effect = [
-            _tool_response("Searching...", [
-                _tool_call("recall", {"query": "test"}),
-                _tool_call("web_search", {"query": "test"}),
-            ]),
+            _tool_response(
+                "Searching...",
+                [
+                    _tool_call("recall", {"query": "test"}),
+                    _tool_call("web_search", {"query": "test"}),
+                ],
+            ),
             _text_response("Here's what I found."),
         ]
 
@@ -312,23 +332,32 @@ class TestToolCalls:
         ]
         registry = _mock_registry(
             tool_specs=all_specs,
-            spec_map={"use_skill": use_skill_spec, "list_skills": list_skills_spec, "web_search": web_search_spec},
+            spec_map={
+                "use_skill": use_skill_spec,
+                "list_skills": list_skills_spec,
+                "web_search": web_search_spec,
+            },
             execute_results={
-                "use_skill": ToolResult.success_result({"name": "research", "bound_tools": ["web_search"]}),
+                "use_skill": ToolResult.success_result(
+                    {"name": "research", "bound_tools": ["web_search"]}
+                ),
                 "web_search": ToolResult.success_result({"results": ["found"]}),
             },
         )
         seen_tool_names: list[list[str]] = []
 
         async def _llm(**kwargs):
-            seen_tool_names.append([
-                spec["function"]["name"]
-                for spec in (kwargs.get("tools") or [])
-            ])
+            seen_tool_names.append(
+                [spec["function"]["name"] for spec in (kwargs.get("tools") or [])]
+            )
             if len(seen_tool_names) == 1:
-                return _tool_response("Need research.", [_tool_call("use_skill", {"name": "research"})])
+                return _tool_response(
+                    "Need research.", [_tool_call("use_skill", {"name": "research"})]
+                )
             if len(seen_tool_names) == 2:
-                return _tool_response("Searching.", [_tool_call("web_search", {"query": "postgres age"})])
+                return _tool_response(
+                    "Searching.", [_tool_call("web_search", {"query": "postgres age"})]
+                )
             return _text_response("Done.")
 
         mock_llm.side_effect = _llm
@@ -342,12 +371,17 @@ class TestToolCalls:
         assert result.text == "Done."
         assert seen_tool_names[0] == ["list_skills", "use_skill"]
         assert "web_search" in seen_tool_names[1]
-        assert [c["name"] for c in result.tool_calls_made] == ["use_skill", "web_search"]
+        assert [c["name"] for c in result.tool_calls_made] == [
+            "use_skill",
+            "web_search",
+        ]
 
     @patch("core.agent_loop.chat_completion")
     async def test_self_correction(self, mock_llm):
         """Tool returns error, LLM sees it and adjusts approach."""
-        fail_result = ToolResult.error_result("File not found", ToolErrorType.FILE_NOT_FOUND)
+        fail_result = ToolResult.error_result(
+            "File not found", ToolErrorType.FILE_NOT_FOUND
+        )
         fail_result.energy_spent = 1
         ok_result = ToolResult.success_result("content of file.txt")
         ok_result.energy_spent = 1
@@ -365,8 +399,12 @@ class TestToolCalls:
         registry.execute = AsyncMock(side_effect=_execute)
 
         mock_llm.side_effect = [
-            _tool_response("Reading file.", [_tool_call("read_file", {"path": "/bad/path"})]),
-            _tool_response("Trying again.", [_tool_call("read_file", {"path": "/good/path"})]),
+            _tool_response(
+                "Reading file.", [_tool_call("read_file", {"path": "/bad/path"})]
+            ),
+            _tool_response(
+                "Trying again.", [_tool_call("read_file", {"path": "/good/path"})]
+            ),
             _text_response("Found the file content."),
         ]
 
@@ -572,6 +610,7 @@ class TestApproval:
     @patch("core.agent_loop.chat_completion")
     async def test_approval_denied(self, mock_llm):
         """When approval is denied, tool is not executed and denial message is sent to LLM."""
+
         async def _deny(name: str, args: dict) -> bool:
             return False
 
@@ -585,7 +624,10 @@ class TestApproval:
         registry = _mock_registry(spec_map={"dangerous_tool": spec})
 
         mock_llm.side_effect = [
-            _tool_response("Running.", [_tool_call("dangerous_tool", {"cmd": "rm -rf /"}, call_id="call_1")]),
+            _tool_response(
+                "Running.",
+                [_tool_call("dangerous_tool", {"cmd": "rm -rf /"}, call_id="call_1")],
+            ),
             _text_response("OK, I won't do that."),
         ]
 
@@ -772,12 +814,12 @@ class TestEvents:
             AgentEvent.LOOP_START,
             AgentEvent.LLM_REQUEST,
             AgentEvent.LLM_RESPONSE,
-            AgentEvent.TEXT_DELTA,   # "Searching."
+            AgentEvent.TEXT_DELTA,  # "Searching."
             AgentEvent.TOOL_START,
             AgentEvent.TOOL_RESULT,
             AgentEvent.LLM_REQUEST,
             AgentEvent.LLM_RESPONSE,
-            AgentEvent.TEXT_DELTA,   # "Here you go."
+            AgentEvent.TEXT_DELTA,  # "Here you go."
             AgentEvent.LOOP_END,
         ]
 
@@ -794,7 +836,9 @@ class TestEvents:
         registry = _mock_registry(execute_results={"recall": tool_result})
 
         mock_llm.side_effect = [
-            _tool_response("", [_tool_call("recall", {"query": "test"}, call_id="call_abc")]),
+            _tool_response(
+                "", [_tool_call("recall", {"query": "test"}, call_id="call_abc")]
+            ),
             _text_response("Done."),
         ]
 
@@ -816,6 +860,7 @@ class TestEvents:
     @patch("core.agent_loop.chat_completion")
     async def test_event_callback_error_does_not_crash(self, mock_llm):
         """If event callback raises, loop continues."""
+
         async def _bad_callback(e: AgentEventData) -> None:
             raise RuntimeError("callback error")
 
@@ -837,6 +882,7 @@ class TestStreaming:
     @patch("core.agent_loop.stream_chat_completion")
     async def test_stream_yields_events(self, mock_stream_llm):
         """stream() yields AgentEventData objects."""
+
         async def _fake_stream(**kwargs):
             cb = kwargs.get("on_text_delta")
             if cb:
@@ -859,6 +905,7 @@ class TestStreaming:
     @patch("core.agent_loop.stream_chat_completion")
     async def test_stream_text_delta_content(self, mock_stream_llm):
         """TEXT_DELTA events contain the text content."""
+
         # Simulate stream_chat_completion calling on_text_delta per-token
         async def _fake_stream(**kwargs):
             cb = kwargs.get("on_text_delta")
@@ -936,12 +983,16 @@ class TestErrorHandling:
     @patch("core.agent_loop.chat_completion")
     async def test_tool_error_visible_to_llm(self, mock_llm):
         """Tool execution error is sent back to LLM as tool message."""
-        fail_result = ToolResult.error_result("Permission denied", ToolErrorType.PERMISSION_DENIED)
+        fail_result = ToolResult.error_result(
+            "Permission denied", ToolErrorType.PERMISSION_DENIED
+        )
         fail_result.energy_spent = 1
         registry = _mock_registry(execute_results={"write_file": fail_result})
 
         mock_llm.side_effect = [
-            _tool_response("Writing.", [_tool_call("write_file", {"path": "/x"}, call_id="call_1")]),
+            _tool_response(
+                "Writing.", [_tool_call("write_file", {"path": "/x"}, call_id="call_1")]
+            ),
             _text_response("Failed to write."),
         ]
 
@@ -979,11 +1030,13 @@ class TestMessageFormat:
     async def test_provider_messages_strip_internal_receipt_metadata(self, mock_llm):
         mock_llm.return_value = _text_response("Understood.")
         receipt = {"name": "remember", "success": True}
-        history = [{
-            "role": "assistant",
-            "content": "Stored it.",
-            "metadata": {"action_receipts": [receipt]},
-        }]
+        history = [
+            {
+                "role": "assistant",
+                "content": "Stored it.",
+                "metadata": {"action_receipts": [receipt]},
+            }
+        ]
 
         result = await AgentLoop(_make_config()).run("Continue", history=history)
 
@@ -1003,7 +1056,9 @@ class TestMessageFormat:
 
         call_id = "call_test123"
         mock_llm.side_effect = [
-            _tool_response("Using tool.", [_tool_call("tool", {"x": 1}, call_id=call_id)]),
+            _tool_response(
+                "Using tool.", [_tool_call("tool", {"x": 1}, call_id=call_id)]
+            ),
             _text_response("Done."),
         ]
 
@@ -1012,7 +1067,11 @@ class TestMessageFormat:
         result = await agent.run("Test")
 
         # Find the assistant message with tool_calls
-        assistant_msgs = [m for m in result.messages if m.get("role") == "assistant" and m.get("tool_calls")]
+        assistant_msgs = [
+            m
+            for m in result.messages
+            if m.get("role") == "assistant" and m.get("tool_calls")
+        ]
         assert len(assistant_msgs) == 1
 
         tc = assistant_msgs[0]["tool_calls"][0]
@@ -1025,21 +1084,25 @@ class TestMessageFormat:
 
     def test_to_openai_tool_call_serializes_arguments(self):
         """_to_openai_tool_call converts dict arguments to JSON string."""
-        result = _to_openai_tool_call({
-            "id": "call_1",
-            "name": "test",
-            "arguments": {"key": "value"},
-        })
+        result = _to_openai_tool_call(
+            {
+                "id": "call_1",
+                "name": "test",
+                "arguments": {"key": "value"},
+            }
+        )
         assert result["function"]["arguments"] == '{"key": "value"}'
         assert result["type"] == "function"
 
     def test_to_openai_tool_call_preserves_string_arguments(self):
         """If arguments is already a string, preserve it."""
-        result = _to_openai_tool_call({
-            "id": "call_1",
-            "name": "test",
-            "arguments": '{"key": "value"}',
-        })
+        result = _to_openai_tool_call(
+            {
+                "id": "call_1",
+                "name": "test",
+                "arguments": '{"key": "value"}',
+            }
+        )
         assert result["function"]["arguments"] == '{"key": "value"}'
 
     def test_to_openai_tool_call_generates_id(self):
@@ -1251,8 +1314,8 @@ class TestContinuationNudge:
     async def test_nudge_injects_prompt_and_continues(self, mock_llm):
         """Continuation nudge injects prompt as user message and re-enters loop."""
         mock_llm.side_effect = [
-            _text_response("I'm done."),   # First: no tool calls → nudge
-            _text_response("Verified."),    # Second: after nudge, responds again
+            _text_response("I'm done."),  # First: no tool calls → nudge
+            _text_response("Verified."),  # Second: after nudge, responds again
         ]
 
         config = _make_config(
@@ -1278,7 +1341,9 @@ class TestContinuationNudge:
 
         mock_llm.side_effect = [
             _text_response("I think I'm done."),  # No tools → nudge
-            _tool_response("Let me verify.", [_tool_call("run_test", {})]),  # After nudge: tool
+            _tool_response(
+                "Let me verify.", [_tool_call("run_test", {})]
+            ),  # After nudge: tool
             _text_response("Tests pass, all good."),  # Final response
         ]
 
@@ -1574,8 +1639,8 @@ class TestPlanningPhases:
         """Plan phase calls LLM with tools=None and stores plan_text."""
         mock_llm.side_effect = [
             _text_response("Plan: 1. Search 2. Summarize"),  # Plan phase (no tools)
-            _text_response("Executing the plan."),            # Execute phase
-            _text_response("All looks good."),                # Verify phase
+            _text_response("Executing the plan."),  # Execute phase
+            _text_response("All looks good."),  # Verify phase
         ]
 
         config = _make_config(enable_planning=True)
@@ -1598,15 +1663,21 @@ class TestPlanningPhases:
         tool_result.energy_spent = 1
         fix_result = ToolResult.success_result("fixed")
         fix_result.energy_spent = 1
-        registry = _mock_registry(execute_results={"run_test": tool_result, "fix_code": fix_result})
+        registry = _mock_registry(
+            execute_results={"run_test": tool_result, "fix_code": fix_result}
+        )
 
         mock_llm.side_effect = [
-            _text_response("Plan: run tests then fix."),                      # Plan
-            _text_response("Done writing code."),                              # Execute: text only
+            _text_response("Plan: run tests then fix."),  # Plan
+            _text_response("Done writing code."),  # Execute: text only
             # Verify phase:
-            _tool_response("Let me check.", [_tool_call("run_test", {})]),     # Verify: calls tool
-            _tool_response("Fixing.", [_tool_call("fix_code", {})]),           # Verify: calls fix
-            _text_response("All tests pass now."),                             # Verify: done
+            _tool_response(
+                "Let me check.", [_tool_call("run_test", {})]
+            ),  # Verify: calls tool
+            _tool_response(
+                "Fixing.", [_tool_call("fix_code", {})]
+            ),  # Verify: calls fix
+            _text_response("All tests pass now."),  # Verify: done
         ]
 
         config = _make_config(registry=registry, enable_planning=True)
@@ -1621,9 +1692,9 @@ class TestPlanningPhases:
     async def test_verify_text_only_completes(self, mock_llm):
         """If verify phase LLM produces text only, loop completes normally."""
         mock_llm.side_effect = [
-            _text_response("Plan: just say hello."),   # Plan
-            _text_response("Hello!"),                   # Execute
-            _text_response("Looks correct."),           # Verify: text only
+            _text_response("Plan: just say hello."),  # Plan
+            _text_response("Hello!"),  # Execute
+            _text_response("Looks correct."),  # Verify: text only
         ]
 
         config = _make_config(enable_planning=True)
@@ -1654,8 +1725,8 @@ class TestPlanningPhases:
         registry = _mock_registry(execute_results={"tool": tool_result})
 
         mock_llm.side_effect = [
-            _text_response("Plan: use expensive tool."),               # Plan
-            _tool_response("Go", [_tool_call("tool", {})]),            # Execute: spends 10
+            _text_response("Plan: use expensive tool."),  # Plan
+            _tool_response("Go", [_tool_call("tool", {})]),  # Execute: spends 10
             # Energy check: 10 >= 10 -> energy exhausted, skip verify
         ]
 
@@ -1724,10 +1795,12 @@ class TestPlanningPhases:
         registry = _mock_registry(execute_results={"write_file": tool_result})
 
         mock_llm.side_effect = [
-            _text_response("Plan: write config file."),                              # Plan
-            _tool_response("Writing.", [_tool_call("write_file", {"path": "/x"})]),  # Execute: tool
-            _text_response("File written."),                                          # Execute: done
-            _text_response("File exists, looks good."),                               # Verify
+            _text_response("Plan: write config file."),  # Plan
+            _tool_response(
+                "Writing.", [_tool_call("write_file", {"path": "/x"})]
+            ),  # Execute: tool
+            _text_response("File written."),  # Execute: done
+            _text_response("File exists, looks good."),  # Verify
         ]
 
         config = _make_config(registry=registry, enable_planning=True)
@@ -1769,7 +1842,8 @@ class TestActionClaimGuardrail:
         assert flagged[0].data["findings"][0]["kind"] == "memory_write"
         # The correction rides TEXT_DELTA so streaming clients see it inline.
         corrections = [
-            e for e in events
+            e
+            for e in events
             if e.event == AgentEvent.TEXT_DELTA and e.data.get("correction")
         ]
         assert len(corrections) == 1
@@ -1841,15 +1915,39 @@ class TestActionClaimGuardrail:
         mock_chat_json.return_value = ({"confirmed": [], "additional": []}, "{}")
         config = _make_config()
         agent = AgentLoop(config)
+        prior_receipt = {
+            "name": "remember",
+            "success": True,
+            "arguments": {"content": "a prior fact"},
+            "result": {"memory_id": str(uuid.uuid4())},
+        }
         async with _DB_POOL.acquire() as conn:
             await conn.execute(
                 "UPDATE config SET value = 'true'::jsonb WHERE key = 'guardrails.action_claims.llm_verifier_enabled'"
             )
         try:
-            with patch("core.llm_config.load_llm_config", new_callable=AsyncMock) as mock_cfg:
-                mock_cfg.return_value = {"provider": "openai", "model": "test", "api_key": "k"}
-                result = await agent.run("Please remember this")
+            with patch(
+                "core.llm_config.load_llm_config", new_callable=AsyncMock
+            ) as mock_cfg:
+                mock_cfg.return_value = {
+                    "provider": "openai",
+                    "model": "test",
+                    "api_key": "k",
+                }
+                result = await agent.run(
+                    "Please remember this",
+                    history=[
+                        {
+                            "role": "assistant",
+                            "content": "I stored an earlier fact.",
+                            "metadata": {"action_receipts": [prior_receipt]},
+                        }
+                    ],
+                )
             assert "[Correction]" not in result.text
+            verifier_messages = mock_chat_json.await_args.kwargs["messages"]
+            payload = json.loads(verifier_messages[1]["content"])
+            assert payload["prior_action_receipts"] == [prior_receipt]
         finally:
             async with _DB_POOL.acquire() as conn:
                 await conn.execute(

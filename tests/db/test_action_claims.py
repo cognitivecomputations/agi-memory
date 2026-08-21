@@ -2,6 +2,7 @@
 prose claims of actions with no matching successful tool call in the turn,
 and stay quiet when the claim is supported, negated, or merely future tense.
 """
+
 from __future__ import annotations
 
 import json
@@ -27,19 +28,23 @@ async def _start_turn(conn, messages: list[dict] | None = None) -> str:
     return started["turn_id"]
 
 
-async def _apply_call(conn, turn_id: str, name: str, arguments: dict, success: bool = True):
+async def _apply_call(
+    conn, turn_id: str, name: str, arguments: dict, success: bool = True
+):
     await conn.fetchval(
         "SELECT apply_agent_tool_result($1::uuid, $2::text, $3::jsonb)",
         turn_id,
         f"call-{name}",
-        json.dumps({
-            "tool_name": name,
-            "arguments": arguments,
-            "success": success,
-            "energy_spent": 1,
-            "model_output": "ok" if success else None,
-            "error": None if success else "boom",
-        }),
+        json.dumps(
+            {
+                "tool_name": name,
+                "arguments": arguments,
+                "success": success,
+                "energy_spent": 1,
+                "model_output": "ok" if success else None,
+                "error": None if success else "boom",
+            }
+        ),
     )
 
 
@@ -63,7 +68,9 @@ async def test_memory_claim_without_call_is_flagged(db_pool):
         await tr.start()
         try:
             turn_id = await _start_turn(conn)
-            report = await _detect(conn, turn_id, "I've stored that as a memory for next time.")
+            report = await _detect(
+                conn, turn_id, "I've stored that as a memory for next time."
+            )
             assert _kinds(report) == ["memory_write"]
         finally:
             await tr.rollback()
@@ -76,7 +83,9 @@ async def test_memory_claim_with_successful_remember_is_clean(db_pool):
         try:
             turn_id = await _start_turn(conn)
             await _apply_call(conn, turn_id, "remember", {"content": "a fact"})
-            report = await _detect(conn, turn_id, "I've stored that as a memory for next time.")
+            report = await _detect(
+                conn, turn_id, "I've stored that as a memory for next time."
+            )
             assert report["flagged"] == []
             assert report["successful_tool_calls"] == 1
         finally:
@@ -89,8 +98,12 @@ async def test_failed_tool_call_does_not_satisfy_claim(db_pool):
         await tr.start()
         try:
             turn_id = await _start_turn(conn)
-            await _apply_call(conn, turn_id, "remember", {"content": "a fact"}, success=False)
-            report = await _detect(conn, turn_id, "I've stored that as a memory for next time.")
+            await _apply_call(
+                conn, turn_id, "remember", {"content": "a fact"}, success=False
+            )
+            report = await _detect(
+                conn, turn_id, "I've stored that as a memory for next time."
+            )
             assert _kinds(report) == ["memory_write"]
         finally:
             await tr.rollback()
@@ -120,7 +133,9 @@ async def test_source_claim_requires_matching_path(db_pool):
         try:
             turn_id = await _start_turn(conn)
             await _apply_call(
-                conn, turn_id, "inspect_source",
+                conn,
+                turn_id,
+                "inspect_source",
                 {"action": "read", "path": "services/prompts/philosophy.md"},
             )
             # Claim about a file that was actually read: clean.
@@ -143,7 +158,9 @@ async def test_mcp_wildcard_satisfies_external_send(db_pool):
         await tr.start()
         try:
             turn_id = await _start_turn(conn)
-            await _apply_call(conn, turn_id, "mcp_github_create_issue", {"title": "bug"})
+            await _apply_call(
+                conn, turn_id, "mcp_github_create_issue", {"title": "bug"}
+            )
             report = await _detect(conn, turn_id, "I've filed the issue on GitHub.")
             assert report["flagged"] == []
         finally:
@@ -167,15 +184,19 @@ async def test_fabricated_uuid_is_flagged_unless_grounded(db_pool):
                 "SELECT apply_agent_tool_result($1::uuid, $2::text, $3::jsonb)",
                 turn_id,
                 "call-grounded",
-                json.dumps({
-                    "tool_name": "remember",
-                    "arguments": {"content": "y"},
-                    "success": True,
-                    "energy_spent": 1,
-                    "model_output": f"stored with id {grounded}",
-                }),
+                json.dumps(
+                    {
+                        "tool_name": "remember",
+                        "arguments": {"content": "y"},
+                        "success": True,
+                        "energy_spent": 1,
+                        "model_output": f"stored with id {grounded}",
+                    }
+                ),
             )
-            report2 = await _detect(conn, turn_id, f"I've stored it as memory {grounded}.")
+            report2 = await _detect(
+                conn, turn_id, f"I've stored it as memory {grounded}."
+            )
             assert report2["flagged"] == []
         finally:
             await tr.rollback()
@@ -251,11 +272,16 @@ async def test_historical_action_claim_requires_durable_receipt(db_pool):
             )
             assert _kinds(unsupported) == ["memory_write"]
 
-            supported_turn = await _start_turn(conn, [{
-                "role": "assistant",
-                "content": "Stored it.",
-                "metadata": {"action_receipts": [receipt]},
-            }])
+            supported_turn = await _start_turn(
+                conn,
+                [
+                    {
+                        "role": "assistant",
+                        "content": "Stored it.",
+                        "metadata": {"action_receipts": [receipt]},
+                    }
+                ],
+            )
             supported = await _detect(
                 conn,
                 supported_turn,
@@ -281,8 +307,12 @@ async def test_negative_search_claims_require_a_search(db_pool):
             )
             assert _kinds(unbacked) == ["search_negative"]
 
-            await _apply_call(conn, turn_id, "inspect_source",
-                              {"action": "search", "query": "philosophy"})
+            await _apply_call(
+                conn,
+                turn_id,
+                "inspect_source",
+                {"action": "search", "query": "philosophy"},
+            )
             backed = await _detect(
                 conn,
                 turn_id,
@@ -303,12 +333,19 @@ async def test_correction_claim_requires_revision_not_just_any_write(db_pool):
             claim = "I've corrected that attribution in my memory."
 
             turn_id = await _start_turn(conn)
-            await _apply_call(conn, turn_id, "remember", {"content": "a new unrelated note"})
+            await _apply_call(
+                conn, turn_id, "remember", {"content": "a new unrelated note"}
+            )
             report = await _detect(conn, turn_id, claim)
             assert "memory_correction" in _kinds(report)
 
             turn_id = await _start_turn(conn)
-            await _apply_call(conn, turn_id, "add_evidence", {"memory_id": "x", "stance": "contradicts"})
+            await _apply_call(
+                conn,
+                turn_id,
+                "add_evidence",
+                {"memory_id": "x", "stance": "contradicts"},
+            )
             report = await _detect(conn, turn_id, claim)
             assert "memory_correction" not in _kinds(report)
         finally:

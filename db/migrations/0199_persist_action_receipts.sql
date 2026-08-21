@@ -9,6 +9,10 @@ INSERT INTO config_defaults (key, value, description) VALUES
      'How long remember reuses an equivalent tool-created memory within one chat session')
 ON CONFLICT (key) DO NOTHING;
 
+CREATE INDEX IF NOT EXISTS idx_memories_tool_write_session_created
+    ON memories ((metadata#>>'{tool_write,session_id}'), created_at DESC)
+    WHERE status = 'active' AND metadata ? 'tool_write';
+
 CREATE OR REPLACE FUNCTION execute_remember_tool(
     p_args JSONB
 ) RETURNS JSONB
@@ -380,3 +384,50 @@ evidence. Unsupported action claims are detected and corrected publicly.$new$
     ),
     updated_at = CURRENT_TIMESTAMP
 WHERE key = 'conversation';
+
+UPDATE prompt_modules
+SET content = $pm$# Action-Claim Verifier
+
+You audit one finished assistant turn for unsupported action claims: statements that the assistant *performed* an action (stored a memory, created a goal or task, scheduled something, sent a message, filed an issue, read a specific source file) when no matching execution evidence exists.
+
+You receive a JSON payload:
+
+- `final_text`: the assistant's final reply.
+- `flagged`: heuristic findings, each `{kind, sentence, expected_tools}` — candidates, possibly false positives.
+- `successful_tool_calls`: the tool calls that actually succeeded this turn, each `{name, arguments}`.
+- `prior_action_receipts`: durable evidence of successful actions in earlier turns, each with a tool `name` and bounded `arguments` / `result` details.
+
+## Rules
+
+- A claim about a completed action this turn requires a matching `successful_tool_calls` entry.
+- A claim about an earlier completed action requires a matching `prior_action_receipts` entry. A prior receipt does not prove that an action was performed again this turn.
+- NOT violations: statements of intent or futurity ("I will store this", "let me check"), capability statements ("I can send email"), quoting or paraphrasing someone else, hypotheticals, and honest negations ("I have not saved this").
+- Judge `flagged` entries first: confirm only real violations. Then scan `final_text` once for clear violations the heuristics missed (paraphrased claims like "that's now in my long-term memory").
+- When uncertain, do NOT confirm. False accusations are worse than misses.
+
+## Output
+
+Strict JSON only, no prose:
+
+```json
+{"confirmed": [0, 2], "additional": [{"kind": "memory_write", "sentence": "..."}]}
+```
+
+- `confirmed`: indices into `flagged` that are real violations.
+- `additional`: violations you found that were not flagged (empty array if none).
+$pm$,
+    updated_at = CURRENT_TIMESTAMP
+WHERE key = 'action_claim_verify';
+
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM prompt_modules
+        WHERE key = 'conversation'
+          AND content NOT LIKE '%durable prior-action receipts as the authority%'
+    ) THEN
+        RAISE WARNING '0199 could not refresh the conversation action-receipt guidance; preserve any customized prompt and update it manually';
+    END IF;
+END;
+$$;
