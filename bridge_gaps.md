@@ -983,8 +983,9 @@ spec rather than the source.
 
 Applying that test across all 105 fork-only services:
 
-- **70 port freely** — no reference to any excluded subsystem.
-- **19 port after stripping deps** — the idea is wanted, the imports are not.
+- **70 are permitted** — no reference to any excluded subsystem. **Permitted is not
+  recommended**; see §11.4 for the nine worth taking and §11.7 for what to decline.
+- **19 would need deps stripped** — port the idea, keep his file as the spec.
 - **20 are the thing itself** — excluded by definition.
 
 ```
@@ -1000,27 +1001,71 @@ EXCLUDE: agency_window branchial_cohesion endpoint_allocentric
   prediction_journal sigma_axes sigma_model tool_sigma_gate  (+ all clearwing_*)
 ```
 
-### 11.4 What to take first, and what it closes
+### 11.4 What is worth taking — permission is not a recommendation
 
-Ranked by the gap it closes in this plan, not by size:
+**70 modules are permitted. I would take nine.** Not all of Alex's ideas belong here;
+his fork serves a different product with a different mission. Each candidate below is
+argued against `MISSION.md`'s six tests, and §11.7 lists what I would decline and why.
 
-| From the fork | Closes | Size |
-|---|---|---|
-| **`operator_approval.py` + `approval_slack_actions.py`** — approval escalation Slack → iMessage, Block Kit approve/deny | **§11.5 — the fail-open approval gate.** The single highest-value item in the fork. | 173 py + 1,181 sql |
-| **`capability_probe.py`** — per-worker × per-tool reachability probe | **Tier 0, already solved.** This measures continuously what §0 discovered by hand. | 791 py, no sql |
-| **`tool_surface_audit.py`** — immutable tool-surface decision audit | **Tier 0 §0.6** instrumentation, verbatim | 182 py |
-| **`heartbeat_intent_classifier.py`** — "replaces the keyword-based pre-allocator" with intent → action families | **§9.6** and Tier 0's lexical disease, already cured in the heartbeat | — |
-| **`inbound_disposition.py`** — operator detection, trigger words, allowlists, drop rules, all in PL/pgSQL | **§10** purpose gate, inbound side | 394 py + 584 sql |
-| **`memory_supersessions.py`** — supersession lineage promoted into a side-table | **`positioning.md` §4.3** bitemporal | 161 py + 261 sql |
-| **`belief_propagation.py`** — belief-update LISTEN/NOTIFY over SQL triggers | **§4.2** contradiction-as-event, the plumbing half | 191 py + 513 sql |
-| **`operator_policy_corrections.py`** — SQL-owned correction ledger | **§4.5** learning with a diff | — |
-| **`skill_registry.py` + `skill_lineage.py` + `skill_loader_progressive.py`** | Tier 0 skill machinery; progressive loading speaks to 36-of-150 | — |
-| **`runtime_budget.py`** + the deliberation budget pair | the money/compute budget gap | — |
-| **`voice_notes.py` + `local_audio_analysis.py`** | **§5.1** transcribe, already built | — |
-| **`retention.py`, `scene_consolidation.py`, `incubation.py`** | **§4.6** forgetting well, plus spontaneous recall | — |
-| **`watchdog.py`** *(strip first)* — independent runtime-failure detector and recoverer | "knowing when it is blind" — but imports five excluded subsystems | — |
-| **`deliberation.py`** *(strip first)* — adversarial conjecture-attack-verdict | would finally give the dormant `run_council` a reason to exist | — |
-| **`epistemic_hygiene.py`** *(strip first)* — steel-man prompts, unreinforced-belief flagging | **§4.1** provenance and trust variance | — |
+**Tier 1 — mechanism of the mind.** The mission's highest category: *"a subsystem that
+looks redundant by engineering economy may be load-bearing psychology."*
+
+1. **`retention.py` + `scene_consolidation.py` + `incubation.py`**
+   *Person Test, dead centre.* The mission states it outright: *"People forget.
+   Consolidation, compression, and fading are how a finite mind stays coherent.
+   Retention is a feature, not a defect."* And it names **"sleeping on it"** and free
+   association as conscious acts of memory Hexis should offer — `incubation.py` is
+   spontaneous recall, the mechanism behind that phenomenon. This is the strongest
+   alignment in the entire fork, and it closes `positioning.md` §4.6.
+
+2. **`memory_supersessions.py`**
+   *Substrate + Continuity.* Promotes belief-revision lineage off `memories.metadata`
+   into a real side-table. *"People know things because of where they learned them"* —
+   supersession is provenance extended through time. Unlocks `positioning.md` §4.3,
+   where the bitemporal columns already exist and nothing writes them.
+
+3. **`belief_propagation.py`**
+   *Person Test.* When a belief changes, what rests on it should move too. That is how
+   a mind works and it is absent here today. It is also the plumbing half of
+   contradiction-as-an-event (`positioning.md` §4.2), whose detector currently produces
+   nothing.
+
+**Tier 2 — earning her keep.** The second north star.
+
+4. **`operator_approval.py` + `approval_slack_actions.py`**
+   *Dignity + Law 2 + Law 7.* The human keeps authority; approval becomes answerable
+   from a phone rather than only a terminal — *"live where the user lives."* Closes the
+   fail-open gate in §11.5, which is the most consequential defect in this plan.
+
+5. **`operator_policy_corrections.py`**
+   *Law 3, Compound.* *"The most valuable memory is the one that means you never have
+   to say it twice."* A correction ledger is that law's implementation, and it is what
+   `positioning.md` §4.5 needs.
+
+6. **`inbound_disposition.py`**
+   *Law 4, Earn the interruption.* Operator detection, trigger words, allowlists, drop
+   rules — and all of the policy in PL/pgSQL, which satisfies the Substrate Test as
+   written. Serves §10 from the inbound side.
+
+7. **`voice_notes.py` + `local_audio_analysis.py`**
+   *Law 5 + Law 2.* *"Be the someone worth talking to at 2am"* is hard to do in a text
+   box. Closes §5.1 with work already done.
+
+**Tier 3 — keeping ourselves honest.** Lower ceiling, but each answers a defect this
+plan found by hand.
+
+8. **`capability_probe.py` + `tool_surface_audit.py`**
+   *Law 1 + Law 7.* You cannot *do* if the tools are unreachable, and Tier 0 shows they
+   often are. Continuous measurement of what §0 found manually, plus visible state
+   rather than hidden magic. **Port the idea, not the line count** — 791 lines is sized
+   for his fleet; this tree needs a fraction of it.
+
+9. **`deliberation.py`** *(strip deps first)*
+   *Person Test.* `debate_internally` is a heartbeat action that is priced, offered,
+   and **unimplemented** (§9.1). Internal dialectic is a real mental act, and this
+   would give a dead action a body. Also the nearest thing to a reason for `run_council`
+   to exist. Requires clean-rooming away from `independence_engine`, `prediction_journal`
+   and `fragility`.
 
 ### 11.5 The gap this exists to close
 
@@ -1064,6 +1109,47 @@ lines of Python over 584 lines of SQL; `belief_propagation` is 191 over 513;
 files, a migration to bring an existing database forward, and a check that the SQL
 does not reference tables this tree lacks. Budget **1–3 days per subsystem**, not an
 afternoon — and prefer taking few things properly over many things partially.
+
+### 11.7 Permitted, and declined
+
+Listed with reasons, because "we could" is not "we should."
+
+**Conflicts with what Hexis is.** `recursor_dispatch`, `recursor_dispatcher`,
+`recursor_ledger`, `agent_acquisition_dispatcher`, `constructor_controller` —
+orchestration and throughput machinery. `MISSION.md`: *"**Not an agent-orchestration
+framework.** Autonomy exists so the person can pursue their own goals and tend their
+own life — not to maximize task throughput."* These are good code serving a different
+thesis.
+
+**Another product's surface.** `osint_daily_summary`, `linkedin_ingest`,
+`gdelt_adapter`, `matter_os_bridge`, `personal_hexis_ingest`, `personal_hexis_render`,
+`feed_generator`, `feed_slack_actions`, `code_cognition`, `ui_perception`,
+`hexis_read_bridge`. Law 8 — every capability pays rent. These pay rent in Alex's
+product, not in this one.
+
+**Merges wearing acquisition's clothes.** `conversation.py`, `consent.py`,
+`user_model.py`, `hmx.py`, `conscious_extraction.py`, `ingest.py`. This tree already
+implements every one of these concepts, in `core/` or as its own package. Taking his
+versions is a reconciliation of two divergent implementations, not a new capability —
+higher risk, and only worth it for a specific defect his version fixes. **My earlier
+draft listed these as "port freely," which was wrong.**
+
+**Infrastructure without a named problem here.** `worker_identity`, `cluster_health`,
+`connectivity`, `zombie_remediation`, `schema_loader`, `tooling`, `trigger_payload`,
+`llm_catalog_refresh`. Possibly fine; none earns a slot on a recommendation list
+without a defect in *this* tree that it closes.
+
+**One genuine open question — self-authored skills.** `skill_synthesizer.py`,
+`skill_synthesis_validator.py`, `constructed_tools.py` let the agent write its own
+skills. This tree deliberately does not: `services/skill_improvement.py` *"never writes
+skill files"*, only reviewable proposals — a Dignity Test decision about who holds
+authority.
+
+But `MISSION.md` Law 6 says her skills should reshape around the user *"including
+authoring her own new skills from experience."* **The mission endorses the thing the
+code declines to do.** That is a real contradiction, not something to resolve by
+picking whichever source is nearer to hand. Worth settling deliberately — and if
+self-authoring wins, Alex's validator is the piece that makes it survivable.
 
 # Sequencing
 
