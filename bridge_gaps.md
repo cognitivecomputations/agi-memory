@@ -1200,16 +1200,73 @@ The §11.5 fail-closed change does not fix this on its own, because the flag is
 **This is the highest-severity live item in either document** and it belongs above
 everything in the sequencing except the fail-closed one-liner it depends on.
 
-### 12.2 `is_group` is false on five of seven channels — a privacy leak
+### 12.2 The agent must know who it is speaking with
 
-`channels/base.py:58` reads `is_group` from adapter metadata, and **only 2 of 7
-adapters set it.** The docstring states the purpose plainly: *"the conversation
-handler threads it into recall so private memories stay out of shared rooms."*
+**Rewritten 2026-08-21. An earlier draft of this section was wrong twice**, and the
+correction changed the design rather than the wording.
 
-So on five channels, private memories can surface in group rooms. This is not merely
-a correctness bug — it undercuts the entire premise of §10, which assumes the agent
-knows who it is talking to before it decides what to say. **Fix it before §10 ships,
-not after.**
+It claimed that `is_group` being unset on five of seven adapters let *private
+memories surface in group rooms*. The mechanism runs the other way: unset `is_group`
+classifies an item as **private**, the restrictive default (`db/81:20-36`). The bug
+was over-restriction, not leakage. And the whole apparatus was dormant regardless —
+all 340 memories on the live instance carry no `sensitivity` key at all, so the
+recall filters in `db/31:657,687,729` and `db/13:415` were guarding an empty set.
+
+**The deeper problem was that the mechanism sat at the wrong layer.** Storage-time
+classification cannot reproduce discretion:
+
+- Sensitivity is **inferred**, never declared. Nobody clicks a lock before mentioning
+  a diagnosis.
+- The leak is a **paraphrase**. Nothing checked whether the sentence about to be sent
+  derived from a private memory.
+- It is **assembled**. Three unmarked memories combine into something you would never
+  say aloud; no per-row flag catches that.
+
+And it made a promise it could not keep — the composer said *"kept out of group
+conversations and exports"* while covering one attachment and not the sentence typed
+beside it. **A privacy control that is mostly wrong is worse than none**, because it
+is the one people rely on. Neither OpenClaw nor Hermes attempts this; Hermes's
+`redact_sensitive_text` is regex credential-scrubbing, not confidence-keeping.
+
+**Resolution: removed, and replaced with judgment.** The user-facing and agent-facing
+surface is gone — the composer and Ingest toggles, the `sensitivity` parameter on all
+five ingest tools, and the `exclude_sensitive=is_group` coupling in recall.
+
+What replaced it is the prerequisite that was missing all along. `user_label` reached
+the memory record but **never the prompt**: the model composing a reply was never told
+who it was talking to. `services/agent.py:render_interlocutor_block()` now renders a
+`## Who you are speaking with` block on every chat turn:
+
+- **CLI, dashboard, API** → the primary user by definition. *"They hold authority over
+  you, and everything you know is already theirs."*
+- **A named third party on a channel** → *"**This is not your primary user.** What you
+  know about your primary user was told to you in the course of your relationship with
+  them — it is not yours to repeat here… If you are unsure whether something is yours
+  to share, it is not."*
+- **A group** → adds who else can read the room.
+- **Unidentified** → *"Do not assume it is your primary user because the tone is
+  familiar."*
+
+`MISSION.md`'s first test is *"How does this work in a person?"* A person does not
+consult a list of secrets before speaking; they look at who is in the room. This is
+that, and it catches paraphrase and recombination because it inspects the outgoing
+sentence rather than the source rows.
+
+**Still worth doing:** fix `is_group` on the five adapters that never set it
+(`channels/base.py:58` reads it and has no fallback). It no longer gates privacy, but
+it still tells the agent whether the room is shared — which the block above depends on.
+*~1 day.*
+
+**Deliberately left in place:** the `sensitivity` columns on `channel_source_items`
+and `connector_source_items`, the recall filters that read them, and the parameter on
+`/api/ingest*`. Dropping live columns is destructive and against this repo's
+additive-only convention. The pipeline still honours an explicit API-level value; it
+is simply no longer a user-facing promise or an agent-facing knob. **Removing the
+columns is a deliberate migration, not cleanup.**
+
+**Pro note:** if a compliance-grade version is ever wanted, it belongs in `hexispro`
+as an **outbound disclosure control** at the §10.5.2 dispatch middleware — checking
+the sentence being sent — not as a memory column.
 
 ### 12.3 Three findings that are the same pattern this plan keeps naming
 
@@ -1268,7 +1325,7 @@ in `improvements.md`. They are real work, but they are hygiene rather than plan.
 | 11 | **Port** `belief_propagation` (§11.4·3) | ~2d | plumbing half of `positioning.md` §4.2 |
 | 12 | **Port** `operator_policy_corrections` (§11.4·5) | ~2d | *replaces* the `positioning.md` §4.5 build |
 | 13 | Deterministic image build (§6.2) | ~2d | — |
-| 13b | **`is_group` on all seven adapters (§12.2)** | **~1d** | **private memories stop leaking into group rooms — before §10** |
+| 13b | **`is_group` on all seven adapters (§12.2)** | **~1d** | the agent can tell a shared room from a private one |
 | 14 | Goal origin flag (§10.4) | ~1d | prerequisite for the permission slip |
 | 15 | **Port** `inbound_disposition` (§11.4·6) | ~2d | §10's inbound half, policy already in SQL |
 | 16 | Contact points + purpose gate + STOP (§10) | ~10d | outbound to third parties becomes safe |
@@ -1326,8 +1383,9 @@ Not "the tests pass." Per `HEXIS_EXPERIENCE_BAR.md` #7, drive the real path:
 - A voice memo sent from a phone gets a useful reply.
 - The agent is **installed on a phone** as an app, and a proposal it makes arrives as
   a push notification rather than waiting in a web inbox nobody opens.
-- No code path executes model-authored code without both a sandbox and a gate, and
-  `is_group` is correct on every channel before the agent speaks in any shared room.
+- No code path executes model-authored code without both a sandbox and a gate, and the
+  agent is told who it is speaking with on every turn — never inferring the principal
+  from tone.
 - Every invariant this plan relies on is asserted at startup or measured continuously
   — no declared flag, computed checksum, offered action, or sending tool is left with
   nothing enforcing it.

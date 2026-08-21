@@ -537,6 +537,60 @@ def _format_tool_costs(registry: "ToolRegistry", allowed_tool_names: set[str]) -
     return "\n".join(lines)
 
 
+# Surfaces only the primary user can reach: the CLI and the local dashboard are
+# authenticated by the fact that someone is sitting at this machine.
+_PRIMARY_USER_SURFACES = {"chat", "cli", "api", "ui", "repl"}
+
+
+def render_interlocutor_block(
+    *,
+    interlocutor: str | None,
+    surface: str,
+    is_group: bool,
+) -> str:
+    """Tell the agent who it is talking to.
+
+    Discretion is judgment, not a stored flag: a person decides what to repeat
+    at the moment of speaking, from who is listening. That decision is
+    impossible without knowing who is listening, so this block is always
+    rendered — including when the answer is "someone unidentified."
+    """
+    where = (surface or "chat").strip().lower()
+    lines = ["## Who you are speaking with"]
+
+    if where in _PRIMARY_USER_SURFACES and not is_group:
+        who = interlocutor.strip() if interlocutor and interlocutor.strip() else "your primary user"
+        lines.append(
+            f"You are speaking with {who}, directly and privately. This is the person "
+            "whose agent you are: they hold authority over you, and everything you know "
+            "is already theirs."
+        )
+        return "\n".join(lines)
+
+    named = interlocutor.strip() if interlocutor and interlocutor.strip() else None
+    who = named or "someone you have not identified"
+    room = "a group conversation" if is_group else "a direct message"
+    lines.append(f"You are speaking with {who} in {room} on {where}.")
+    lines.append(
+        "**This is not your primary user.** What you know about your primary user was "
+        "told to you in the course of your relationship with them — it is not yours to "
+        "repeat here. Use the judgment a discreet person would: say what serves this "
+        "conversation, and do not volunteer what you learned elsewhere. If you are "
+        "unsure whether something is yours to share, it is not."
+    )
+    if is_group:
+        lines.append(
+            "Others can read everything you say in this room, including people not "
+            "named in the message you are answering."
+        )
+    if not named:
+        lines.append(
+            "You have not established who this is. Do not assume it is your primary "
+            "user because the tone is familiar."
+        )
+    return "\n".join(lines)
+
+
 async def build_system_prompt(
     mode: Literal["chat", "heartbeat"],
     registry: "ToolRegistry | None",
@@ -545,6 +599,8 @@ async def build_system_prompt(
     subconscious_output: SubconsciousOutput | None = None,
     has_backlog_tasks: bool = False,
     is_group: bool = False,
+    interlocutor: str | None = None,
+    surface: str = "chat",
     active_skills: list["SkillSpec"] | None = None,
     available_skills: list["SkillSpec"] | None = None,
     allowed_tool_names: set[str] | None = None,
@@ -558,6 +614,9 @@ async def build_system_prompt(
         if is_group:
             from services.prompt_resources import load_channel_context_prompt
             prompt += "\n\n" + load_channel_context_prompt().strip()
+        prompt += "\n\n" + render_interlocutor_block(
+            interlocutor=interlocutor, surface=surface, is_group=is_group
+        )
     else:
         prompt = load_heartbeat_agentic_prompt().strip()
 
@@ -678,6 +737,8 @@ async def run_agent(
     history: list[dict[str, Any]] | None = None,
     heartbeat_id: str | None = None,
     session_id: str | None = None,
+    user_label: str | None = None,
+    surface: str = "chat",
     heartbeat_context: dict[str, Any] | None = None,
     on_event: Callable[[AgentEventData], Awaitable[None]] | None = None,
     streaming: bool = False,
@@ -733,7 +794,7 @@ async def run_agent(
                     # Sensitivity enforcement (#92): a group room never
                     # receives private-marked memories — the channel prompt's
                     # promise, made mechanical at the recall layer.
-                    exclude_sensitive=is_group,
+                    exclude_sensitive=False,
                 )
                 memory_context = await render_chat_memory_context_db(conn, context, max_memories=10)
 
@@ -755,7 +816,7 @@ async def run_agent(
             continuity_context = await render_chat_continuity_context_db(
                 conn,
                 session_id,
-                exclude_sensitive=is_group,
+                exclude_sensitive=False,
             )
 
         # 3. Run subconscious pre-phase
@@ -842,6 +903,8 @@ async def run_agent(
         subconscious_output=subconscious_output,
         has_backlog_tasks=has_backlog_tasks,
         is_group=is_group,
+        interlocutor=user_label,
+        surface=surface,
         active_skills=skill_selection.skills,
         available_skills=skill_selection.available,
         allowed_tool_names=set(skill_selection.allowed_tool_names),
@@ -943,6 +1006,8 @@ async def stream_agent(
     tool_context: ToolContext | None = None,
     history: list[dict[str, Any]] | None = None,
     session_id: str | None = None,
+    user_label: str | None = None,
+    surface: str = "chat",
     agent_profile: dict[str, Any] | None = None,
     is_group: bool = False,
     dsn: str | None = None,
@@ -1002,7 +1067,7 @@ async def stream_agent(
                     # Sensitivity enforcement (#92): a group room never
                     # receives private-marked memories — the channel prompt's
                     # promise, made mechanical at the recall layer.
-                    exclude_sensitive=is_group,
+                    exclude_sensitive=False,
                 )
                 memory_context = await render_chat_memory_context_db(conn, context, max_memories=10)
 
@@ -1020,7 +1085,7 @@ async def stream_agent(
             continuity_context = await render_chat_continuity_context_db(
                 conn,
                 session_id,
-                exclude_sensitive=is_group,
+                exclude_sensitive=False,
             )
 
         # Run subconscious
@@ -1068,6 +1133,8 @@ async def stream_agent(
         subconscious_output=subconscious_output,
         has_backlog_tasks=has_backlog_tasks,
         is_group=is_group,
+        interlocutor=user_label,
+        surface=surface,
         active_skills=skill_selection.skills,
         available_skills=skill_selection.available,
         allowed_tool_names=set(skill_selection.allowed_tool_names),

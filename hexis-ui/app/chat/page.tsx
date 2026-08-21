@@ -9,8 +9,6 @@ import {
   Check,
   ExternalLink,
   Inbox,
-  Lock,
-  LockOpen,
   Mail,
   Paperclip,
   Plus,
@@ -71,7 +69,6 @@ type ChatAttachmentPayload = {
   byte_size?: number;
   kind?: AttachmentKind;
   artifact_id?: string;
-  sensitivity?: "private";
 };
 
 type ConnectorSetupCapabilityOption = {
@@ -166,7 +163,6 @@ type PastedAttachment = {
   wordCount: number;
   // "private" keeps the ingested memories out of group-channel recall and
   // default HMX export (#92); toggled per-chip before sending.
-  sensitivity: "private" | null;
 };
 
 // A dropped/picked file. Attaching it preserves the original bytes and reads
@@ -178,7 +174,6 @@ type FileAttachment = {
   name: string;
   size: number;
   mimeType: string;
-  sensitivity: "private" | null;
   status: "preparing" | "ready" | "error";
   kind: AttachmentKind;
   // Object URL for image previews in the composer; revoked when the chip goes.
@@ -1487,8 +1482,7 @@ export default function ChatPage() {
           title: attachmentTitle(pasted),
           content: pasted,
           wordCount: pasted.split(/\s+/).filter(Boolean).length,
-          sensitivity: null,
-        },
+          },
       ]);
       handled = true;
     }
@@ -1500,15 +1494,6 @@ export default function ChatPage() {
     setAttachments((prev) => prev.filter((attachment) => attachment.id !== id));
   };
 
-  const toggleAttachmentPrivacy = (id: string) => {
-    setAttachments((prev) =>
-      prev.map((attachment) =>
-        attachment.id === id
-          ? { ...attachment, sensitivity: attachment.sensitivity === "private" ? null : "private" }
-          : attachment
-      )
-    );
-  };
 
   // Attaching a file reads it immediately: the original is preserved and its
   // text comes back before the message is even sent, so the agent can answer
@@ -1578,7 +1563,6 @@ export default function ChatPage() {
         name: uploadFile.name,
         size: uploadFile.size,
         mimeType: uploadFile.type,
-        sensitivity: null,
         status: "preparing",
         kind: isImageAttachmentFile(uploadFile) ? "image" : "document",
         previewUrl: objectUrlFor(uploadFile),
@@ -1610,15 +1594,6 @@ export default function ChatPage() {
     );
   };
 
-  const toggleFileAttachmentPrivacy = (id: string) => {
-    setFileAttachments((prev) =>
-      prev.map((attachment) =>
-        attachment.id === id
-          ? { ...attachment, sensitivity: attachment.sensitivity === "private" ? null : "private" }
-          : attachment
-      )
-    );
-  };
 
   const handleSend = async () => {
     if ((!input.trim() && attachments.length === 0 && fileAttachments.length === 0) || sending) return;
@@ -1674,7 +1649,6 @@ export default function ChatPage() {
         byte_size: attachment.size,
         kind: attachment.kind,
         artifact_id: attachment.artifactId ?? undefined,
-        sensitivity: attachment.sensitivity ?? undefined,
       });
       attachmentAddenda.push(
         isImage
@@ -1694,7 +1668,6 @@ export default function ChatPage() {
           body: JSON.stringify({
             filename: attachment.name,
             mode: "fast",
-            sensitivity: attachment.sensitivity ?? undefined,
           }),
         });
         if (!res.ok) {
@@ -1723,7 +1696,6 @@ export default function ChatPage() {
         name: attachment.title,
         mime_type: "text/plain",
         kind: "document",
-        sensitivity: attachment.sensitivity ?? undefined,
       });
       messageAttachments.push({
         id: attachment.id,
@@ -1740,7 +1712,6 @@ export default function ChatPage() {
             content: attachment.content,
             title: attachment.title,
             mode: "fast",
-            sensitivity: attachment.sensitivity ?? undefined,
           }),
         });
         if (!res.ok) {
@@ -2364,27 +2335,6 @@ export default function ChatPage() {
                       <>
                         <button
                           type="button"
-                          aria-label={
-                            attachment.sensitivity === "private"
-                              ? `Make file ${attachment.name} shareable`
-                              : `Mark file ${attachment.name} private`
-                          }
-                          title={
-                            attachment.sensitivity === "private"
-                              ? "Private: kept out of group conversations and exports. Click to make shareable."
-                              : "Shareable. Click to keep out of group conversations and exports."
-                          }
-                          onClick={() => toggleFileAttachmentPrivacy(attachment.id)}
-                          className={`flex flex-none items-center rounded p-1 ${
-                            attachment.sensitivity === "private"
-                              ? "text-[var(--teal)]"
-                              : "text-[var(--ink-soft)] hover:bg-[var(--surface-strong)] hover:text-[var(--foreground)]"
-                          }`}
-                        >
-                          {attachment.sensitivity === "private" ? <Lock size={14} /> : <LockOpen size={14} />}
-                        </button>
-                        <button
-                          type="button"
                           aria-label={`Remove file ${attachment.name}`}
                           title="Remove"
                           onClick={() => removeFileAttachment(attachment.id)}
@@ -2404,27 +2354,6 @@ export default function ChatPage() {
                     note={`Pasted text · ${attachment.wordCount.toLocaleString()} words`}
                     actions={
                       <>
-                        <button
-                          type="button"
-                          aria-label={
-                            attachment.sensitivity === "private"
-                              ? `Make attachment ${attachment.title} shareable`
-                              : `Mark attachment ${attachment.title} private`
-                          }
-                          title={
-                            attachment.sensitivity === "private"
-                              ? "Private: kept out of group conversations and exports. Click to make shareable."
-                              : "Shareable. Click to keep out of group conversations and exports."
-                          }
-                          onClick={() => toggleAttachmentPrivacy(attachment.id)}
-                          className={`flex flex-none items-center rounded p-1 ${
-                            attachment.sensitivity === "private"
-                              ? "text-[var(--teal)]"
-                              : "text-[var(--ink-soft)] hover:bg-[var(--surface-strong)] hover:text-[var(--foreground)]"
-                          }`}
-                        >
-                          {attachment.sensitivity === "private" ? <Lock size={14} /> : <LockOpen size={14} />}
-                        </button>
                         <button
                           type="button"
                           aria-label={`Remove attachment ${attachment.title}`}
