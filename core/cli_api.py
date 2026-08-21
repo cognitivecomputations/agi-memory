@@ -258,7 +258,14 @@ async def config_validate(dsn: str | None = None, *, wait_seconds: int = 30) -> 
                     "Run: `hexis auth anthropic setup-token` or set api_key_env"
                 )
 
-            if provider in {"openai", "anthropic", "openai_compatible", "grok", "gemini"}:
+            if provider == "openai_compatible":
+                if not endpoint:
+                    errors.append(f"{name}.endpoint is required for openai_compatible")
+                if api_key_env and os.getenv(api_key_env) is None:
+                    errors.append(f"{name}.api_key_env={api_key_env} is not set in environment")
+                return
+
+            if provider in {"openai", "anthropic", "grok", "gemini"}:
                 if api_key_env:
                     if os.getenv(api_key_env) is None:
                         errors.append(f"{name}.api_key_env={api_key_env} is not set in environment")

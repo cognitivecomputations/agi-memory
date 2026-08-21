@@ -79,6 +79,42 @@ def test_normalize_llm_config_falls_back_to_env(monkeypatch):
     assert normalized["api_key"] == "envkey"
 
 
+def test_openai_compatible_does_not_consume_ambient_openai_key(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "ambient-openai-key")
+
+    normalized = llm.normalize_llm_config({
+        "provider": "openai_compatible",
+        "model": "local-model",
+        "endpoint": "http://localhost:11434/v1",
+    })
+
+    assert normalized["api_key"] is None
+
+
+def test_keyless_openai_compatible_uses_internal_sdk_key(monkeypatch):
+    captured: dict[str, object] = {}
+    client = object()
+
+    def fake_async_openai(**kwargs):
+        captured.update(kwargs)
+        return client
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr(llm.openai, "AsyncOpenAI", fake_async_openai)
+
+    result = llm._get_openai_client(
+        None,
+        "http://localhost:11434/v1",
+        "openai_compatible",
+    )
+
+    assert result is client
+    assert captured == {
+        "api_key": llm._LOCAL_OPENAI_COMPATIBLE_API_KEY,
+        "base_url": "http://localhost:11434/v1",
+    }
+
+
 def test_extract_system_prompt():
     messages = [
         {"role": "system", "content": "A"},

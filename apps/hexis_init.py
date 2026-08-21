@@ -15,6 +15,7 @@ import sys
 from getpass import getpass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 
@@ -84,6 +85,23 @@ def _normalize_provider_name(provider: str | None) -> str:
         "google_antigravity": "google-antigravity",
     }
     return _ALIASES.get(raw, raw)
+
+
+def _openai_compatible_endpoint_error(endpoint: str) -> str | None:
+    """Return actionable guidance when an endpoint cannot serve all runtimes."""
+    try:
+        parsed = urlsplit(endpoint)
+    except ValueError:
+        parsed = None
+    if parsed is None or parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return "Enter a complete http:// or https:// base URL, including /v1 when required."
+    if parsed.hostname.lower() in {"localhost", "127.0.0.1", "::1", "0.0.0.0"}:
+        return (
+            "localhost only reaches the current process, while Hexis workers run in Docker. "
+            "Use the server's LAN/Tailscale IP or DNS name so both this host and "
+            "Docker can reach it."
+        )
+    return None
 
 
 async def _ensure_oauth_login(
@@ -610,37 +628,76 @@ async def _configure_llm(conn: Any, *, dsn: str, wait_seconds: int) -> dict[str,
     from apps.cli_prompts import autocomplete as _ac
     from apps.cli_prompts import select_value
 
-    _PROVIDER_MENU = [
+    _PROVIDER_MENU: list[tuple[str, object]] = [
         ("OpenAI Codex — ChatGPT Plus/Pro OAuth (no API key)", "openai-codex"),
         ("OpenAI — API key", "openai"),
         ("Anthropic — API key", "anthropic"),
         ("Grok (xAI) — API key", "grok"),
         ("Gemini — API key", "gemini"),
+        ("Chutes — OAuth", "chutes"),
         ("GitHub Copilot — OAuth", "github-copilot"),
         ("Qwen Portal — OAuth", "qwen-portal"),
         ("MiniMax Portal — OAuth", "minimax-portal"),
-        ("Other / custom (type it)", "__custom__"),
+        ("Google Gemini CLI — OAuth", "google-gemini-cli"),
+        ("Google Antigravity — OAuth", "google-antigravity"),
+        (
+            "Local / custom — OpenAI-compatible (Ollama, LM Studio, vLLM)",
+            "openai_compatible",
+        ),
     ]
+
     # Only honor LLM_PROVIDER if it's actually set — a brand-new user shouldn't
     # be pre-pointed at a paid API-key path (Bar #5, #6). With nothing set,
     # highlight the first (featured, zero-key) option instead.
     _env_provider = os.getenv("LLM_PROVIDER")
     env_default = _normalize_provider_name(_env_provider) if _env_provider else None
     provider = await select_value("Provider:", _PROVIDER_MENU, default_value=env_default)
-    if provider == "__custom__":
-        provider = _normalize_provider_name(
-            _prompt("Provider id", default=env_default or "", required=True))
+
+    # An OpenAI-compatible server is a concrete supported provider, not an
+    # arbitrary provider plug-in. Ask for its base URL before model discovery
+    # so the list comes from the server the user actually selected.
+    endpoint = ""
+    api_key_env = ""
+    if provider == "openai_compatible":
+        while True:
+            endpoint = _prompt(
+                "OpenAI-compatible endpoint (include /v1)",
+                default=os.getenv("OPENAI_BASE_URL", ""),
+                required=True,
+            )
+            endpoint_error = _openai_compatible_endpoint_error(endpoint)
+            if not endpoint_error:
+                break
+            err_console.print(f"[fail]{endpoint_error}[/fail]")
+        api_key_env = _prompt(
+            "API key env var name (blank if none; use HEXIS_LLM_CONSCIOUS_API_KEY for Docker)",
+            default=(
+                "HEXIS_LLM_CONSCIOUS_API_KEY"
+                if os.getenv("HEXIS_LLM_CONSCIOUS_API_KEY")
+                else ""
+            ),
+        )
 
     # Model — the list AND the default both come from the live catalog
     # (models.dev), the way hermes-agent and openclaw do it. No
     # stale hard-coded default; any free-typed name is still accepted.
     from apps.tui import model_catalog
     catalog: list[str] = []
+    catalog_error: str | None = None
     try:
         console.print("[muted]Fetching available models…[/muted]")
-        catalog = await model_catalog.fetch_models(provider)
-    except Exception:
+        catalog = await model_catalog.fetch_models(
+            provider,
+            endpoint=endpoint or None,
+            api_key=os.getenv(api_key_env) if api_key_env else None,
+        )
+    except Exception as exc:
+        catalog_error = str(exc)[:200]
         catalog = []
+    if provider == "openai_compatible" and not catalog:
+        if catalog_error:
+            err_console.print(f"[warn]Could not fetch endpoint models: {catalog_error}[/warn]")
+        console.print("[muted]Enter the endpoint's exact model id to continue.[/muted]")
     default_model = os.getenv("LLM_MODEL") or model_catalog.recommended_default(provider, catalog)
     if catalog:
         model = (await _ac("Model (type to filter, or enter your own)", catalog,
@@ -657,7 +714,7 @@ async def _configure_llm(conn: Any, *, dsn: str, wait_seconds: int) -> dict[str,
         api_key_env = ""
         console.print("[muted]OAuth provider — no endpoint or API key needed.[/muted]")
         use_separate_sub = False
-    else:
+    elif provider != "openai_compatible":
         endpoint = _prompt(
             "Endpoint (blank for provider default)",
             # Only OpenAI-shaped providers should inherit OPENAI_BASE_URL — don't
@@ -666,8 +723,11 @@ async def _configure_llm(conn: Any, *, dsn: str, wait_seconds: int) -> dict[str,
         )
         api_key_env = _prompt(
             "API key env var name (e.g. OPENAI_API_KEY)",
-            default=_PROVIDER_ENV_VARS.get(provider, "") or ("OPENAI_API_KEY" if provider in {"openai", "openai_compatible"} else ""),
+            default=_PROVIDER_ENV_VARS.get(provider, "")
+            or ("OPENAI_API_KEY" if provider == "openai" else ""),
         )
+        use_separate_sub = _prompt_yes_no("Use separate subconscious model?", default=False)
+    else:
         use_separate_sub = _prompt_yes_no("Use separate subconscious model?", default=False)
 
     if use_separate_sub:
