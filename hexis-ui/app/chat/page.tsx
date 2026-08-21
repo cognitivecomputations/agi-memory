@@ -902,7 +902,14 @@ export default function ChatPage() {
       const result = await res.json();
       if (!res.ok) {
         const detail = result.error || result.detail || "Hexis's inbox did not accept the reply.";
-        setDecideNotice(`Reply was not queued: ${detail}`);
+        const notice = /^reply was not queued\b/i.test(detail)
+          ? detail
+          : `Reply was not queued: ${detail}`;
+        setDecideNotice(
+          res.status === 503
+            ? `${notice} Check Hexis's RabbitMQ connection, then retry.`
+            : notice
+        );
         return;
       }
 
