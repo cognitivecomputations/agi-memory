@@ -1,6 +1,7 @@
 -- Action-claim guardrail (#38): detect assistant prose that claims an action
 -- (stored / created / scheduled / sent / read file X) with no matching
--- successful tool call in the same turn. Patterns are DATA, tunable live.
+-- successful tool call in the same turn or a durable receipt from a prior
+-- turn in the hydrated chat session. Patterns are DATA, tunable live.
 -- Advisory by design: detection never blocks a reply; the loop appends a
 -- visible correction. Kill switch: config 'guardrails.action_claims.enabled'.
 SET search_path = public, ag_catalog, "$user";
@@ -96,7 +97,7 @@ INSERT INTO config_defaults (key, value, description) VALUES
 ON CONFLICT (key) DO NOTHING;
 
 -- Detect action claims in p_text unsupported by the turn's successful tool
--- calls (agent_turns.runtime_state->'tool_calls_made'). Fail-soft: unknown
+-- calls or hydrated prior-action receipts. Fail-soft: unknown
 -- turn or empty text returns an empty report — the guardrail is advisory and
 -- must never block the reply.
 CREATE OR REPLACE FUNCTION detect_unsupported_action_claims(
@@ -107,11 +108,14 @@ LANGUAGE plpgsql
 AS $$
 DECLARE
     turn agent_turns%ROWTYPE;
+    current_calls JSONB;
+    prior_calls JSONB;
     calls JSONB;
     flagged JSONB := '[]'::jsonb;
     sentence TEXT;
     norm TEXT;
     is_negated BOOLEAN;
+    historical_reference BOOLEAN;
     checked INT := 0;
     pat RECORD;
     satisfied BOOLEAN;
@@ -122,6 +126,7 @@ DECLARE
     tok TEXT;
     uuid_txt TEXT;
     success_count INT := 0;
+    prior_receipt_count INT := 0;
 BEGIN
     IF COALESCE(trim(p_text), '') = '' THEN
         RETURN jsonb_build_object('flagged', '[]'::jsonb, 'checked_sentences', 0, 'successful_tool_calls', 0);
@@ -133,10 +138,23 @@ BEGIN
                                   'successful_tool_calls', 0, 'error', 'turn_not_found');
     END IF;
 
-    calls := COALESCE(turn.runtime_state->'tool_calls_made', '[]'::jsonb);
+    current_calls := COALESCE(turn.runtime_state->'tool_calls_made', '[]'::jsonb);
+    SELECT COALESCE(jsonb_agg(receipt), '[]'::jsonb)
+    INTO prior_calls
+    FROM jsonb_array_elements(COALESCE(turn.messages, '[]'::jsonb)) message
+    CROSS JOIN LATERAL jsonb_array_elements(
+        CASE
+            WHEN jsonb_typeof(message#>'{metadata,action_receipts}') = 'array'
+                THEN message#>'{metadata,action_receipts}'
+            ELSE '[]'::jsonb
+        END
+    ) receipt
+    WHERE message->>'role' = 'assistant'
+      AND COALESCE((receipt->>'success')::boolean, FALSE);
     SELECT count(*) INTO success_count
-    FROM jsonb_array_elements(calls) c
+    FROM jsonb_array_elements(current_calls) c
     WHERE COALESCE((c->>'success')::boolean, FALSE);
+    prior_receipt_count := jsonb_array_length(prior_calls);
 
     -- Split on newlines, then on sentence enders followed by whitespace, so
     -- dots inside file paths ("core/agent_loop.py") never split a sentence.
@@ -151,13 +169,18 @@ BEGIN
         -- producing a live false positive (#48): match against a normalized
         -- copy, report the original.
         norm := regexp_replace(sentence, '[*_`~]+', '', 'g');
+        historical_reference := norm ~* '\m(earlier|previously|previous (turn|message|conversation|session|exchange)|prior turn|last (turn|time|session)|already|at the time|back then|originally|yesterday)\M';
+        calls := current_calls || CASE
+            WHEN historical_reference THEN prior_calls
+            ELSE '[]'::jsonb
+        END;
 
-        -- Futurity / hypothetical / question / past-reference suppression:
+        -- Futurity / hypothetical / question suppression:
         -- false negatives are acceptable for an advisory check, false
-        -- accusations are not. Claims about PREVIOUS turns are out of scope.
+        -- accusations are not. Claims about previous turns are checked against
+        -- the durable receipts hydrated above.
         CONTINUE WHEN norm ~ '\?'
             OR norm ~* '\m(will|would|could|should|cannot|can(?!''t)|going to|about to|let me|want(ed)? to|plan(ning|ned)? to|intend to|try(ing)? to|need to|if|unless|whether|once|before I|when I|instead of)\M'
-            OR norm ~* '\m(earlier|previously|previous (turn|message|conversation|session|exchange)|prior turn|last (turn|time|session)|already|at the time|back then|originally|yesterday)\M'
             OR position('[Correction]' in norm) > 0
             OR left(sentence, 1) = '>';
 
@@ -223,8 +246,11 @@ BEGIN
     LOOP
         IF NOT EXISTS (
             SELECT 1 FROM jsonb_array_elements(COALESCE(turn.messages, '[]'::jsonb)) msg
-            WHERE msg->>'role' IN ('tool', 'user', 'system')
-              AND position(uuid_txt in lower(COALESCE(msg->>'content', ''))) > 0
+            WHERE (
+                    msg->>'role' IN ('tool', 'user', 'system')
+                    AND position(uuid_txt in lower(COALESCE(msg->>'content', ''))) > 0
+                  )
+               OR position(uuid_txt in lower(COALESCE(msg#>>'{metadata,action_receipts}', ''))) > 0
         ) THEN
             flagged := flagged || jsonb_build_array(jsonb_build_object(
                 'kind', 'fabricated_artifact',
@@ -237,7 +263,8 @@ BEGIN
     RETURN jsonb_build_object(
         'flagged', flagged,
         'checked_sentences', checked,
-        'successful_tool_calls', success_count
+        'successful_tool_calls', success_count,
+        'prior_action_receipts', prior_receipt_count
     );
 END;
 $$;

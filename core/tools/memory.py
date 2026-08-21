@@ -29,12 +29,19 @@ async def _try_db_memory_tool(tool_name: str, arguments: dict[str, Any], context
     pool = context.registry.pool if context.registry else None
     if not pool:
         return None
+    db_arguments = dict(arguments)
+    if tool_name == "remember":
+        db_arguments["_execution_context"] = {
+            "session_id": context.session_id,
+            "call_id": context.call_id,
+            "tool_context": context.tool_context.value,
+        }
     try:
         async with pool.acquire() as conn:
             raw = await conn.fetchval(
                 "SELECT execute_memory_tool($1::text, $2::jsonb)",
                 tool_name,
-                json.dumps(arguments),
+                json.dumps(db_arguments),
             )
         payload = json.loads(raw) if isinstance(raw, str) else raw
         if isinstance(payload, dict) and "success" in payload:
@@ -287,14 +294,16 @@ class SearchHistoryHandler(ToolHandler):
 
 
 class RememberHandler(ToolHandler):
-    """Store a new memory."""
+    """Store or reuse a durable memory."""
 
     @property
     def spec(self) -> ToolSpec:
         return ToolSpec(
             name="remember",
             description=(
-                "Store a new memory. Use this to save important information, "
+                "Store a durable memory. Equivalent recent writes in the same "
+                "chat session reuse the existing memory. Use this to save important "
+                "information, "
                 "events, or learnings for future recall. When the memory comes "
                 "from a document, conversation, or other source, cite it in "
                 "`sources` — provenance is what makes a belief revisable and "

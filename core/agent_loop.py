@@ -75,6 +75,21 @@ def _trace_safe_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]
     return safe
 
 
+def _model_safe_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Remove Hexis-only message metadata before calling a provider.
+
+    Chat history carries durable action receipts in ``metadata`` so the DB can
+    audit historical claims. Provider message schemas do not understand that
+    field; the human-readable receipt is supplied as a normal system message.
+    """
+    allowed = {"role", "content", "tool_calls", "tool_call_id", "name"}
+    return [
+        {key: value for key, value in message.items() if key in allowed}
+        for message in messages
+        if isinstance(message, dict)
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Events
 # ---------------------------------------------------------------------------
@@ -174,6 +189,9 @@ class AgentLoopResult:
     tool_calls_made: list[dict[str, Any]]
     iterations: int
     energy_spent: int
+    turn_id: str | None = None
+    visible_text: str = ""
+    tool_results: list[dict[str, Any]] = field(default_factory=list)
     timed_out: bool = False
     stopped_reason: str = "completed"
     plan_text: str = ""
@@ -211,7 +229,9 @@ class AgentLoop:
         self._energy_spent: int = 0
         self._iteration_count: int = 0
         self._tool_calls_made: list[dict[str, Any]] = []
+        self._tool_results: list[dict[str, Any]] = []
         self._last_text: str = ""
+        self._visible_text_parts: list[str] = []
         self._streaming: bool = False
         self._continuations_used: int = 0
         self._plan_text: str = ""
@@ -381,11 +401,12 @@ class AgentLoop:
         cfg = self.config
         llm = cfg.llm_config
 
+        model_messages = _model_safe_messages(messages)
         await self._emit(AgentEvent.LLM_REQUEST, {
             "iteration": self._iteration_count,
             "provider": llm.get("provider"),
             "model": llm.get("model"),
-            "messages": _trace_safe_messages(messages),
+            "messages": _trace_safe_messages(model_messages),
             "tools": [
                 spec.get("function", {}).get("name", "unknown")
                 for spec in (tools or [])
@@ -406,7 +427,7 @@ class AgentLoop:
                 model=llm["model"],
                 endpoint=llm.get("endpoint"),
                 api_key=llm.get("api_key"),
-                messages=messages,
+                messages=model_messages,
                 tools=tools if tools else None,
                 temperature=cfg.temperature,
                 max_tokens=cfg.max_tokens,
@@ -419,7 +440,7 @@ class AgentLoop:
                 model=llm["model"],
                 endpoint=llm.get("endpoint"),
                 api_key=llm.get("api_key"),
-                messages=messages,
+                messages=model_messages,
                 tools=tools if tools else None,
                 temperature=cfg.temperature,
                 max_tokens=cfg.max_tokens,
@@ -497,6 +518,7 @@ class AgentLoop:
 
             if text:
                 self._last_text = text
+                self._visible_text_parts.append(text)
                 # Only emit per-iteration TEXT_DELTA in non-streaming mode
                 # (streaming mode emits per-token via the callback)
                 if not self._streaming:
@@ -537,6 +559,7 @@ class AgentLoop:
                         ),
                     })
                     self._tool_calls_made.append({
+                        "id": call_id,
                         "name": tool_name,
                         "arguments": arguments,
                         "success": False,
@@ -567,6 +590,7 @@ class AgentLoop:
                             "model_output": f"Tool call '{tool_name}' was denied by the user.",
                         })
                         self._tool_calls_made.append({
+                            "id": call_id,
                             "name": tool_name,
                             "arguments": arguments,
                             "success": False,
@@ -603,7 +627,9 @@ class AgentLoop:
                 self._energy_spent = int(applied.get("energy_spent", self._energy_spent + result.energy_spent))
 
                 await self._emit(AgentEvent.TOOL_RESULT, {
+                    "call_id": call_id,
                     "tool_name": tool_name,
+                    "arguments": arguments,
                     "success": result.success,
                     "energy_spent": result.energy_spent,
                     "total_energy_spent": self._energy_spent,
@@ -614,11 +640,19 @@ class AgentLoop:
                 })
 
                 self._tool_calls_made.append({
+                    "id": call_id,
                     "name": tool_name,
                     "arguments": arguments,
                     "success": result.success,
                     "energy_spent": result.energy_spent,
                     "error": result.error,
+                })
+                self._tool_results.append({
+                    "id": call_id,
+                    "name": tool_name,
+                    "arguments": arguments,
+                    "success": result.success,
+                    "output": result.output,
                 })
 
                 if result.success and tool_name == "use_skill" and cfg.allowed_tool_names is not None:
@@ -680,6 +714,7 @@ class AgentLoop:
         plan_text = response.get("content", "") or ""
         if plan_text:
             self._last_text = plan_text
+            self._visible_text_parts.append(plan_text)
             self._plan_text = plan_text
             if not self._streaming:
                 await self._emit(AgentEvent.TEXT_DELTA, {"text": plan_text, "iteration": self._iteration_count})
@@ -844,11 +879,12 @@ class AgentLoop:
         return parsed if isinstance(parsed, dict) else {}
 
     async def _enforce_action_claims(self, result: AgentLoopResult) -> None:
-        """Detect prose claims of actions with no matching successful tool call
-        this turn and append a visible correction (#38). The reply has already
-        streamed, so enforcement is detect + correct + record, never block.
-        Advisory: any failure here leaves the reply untouched."""
-        text = result.text or ""
+        """Correct action claims unsupported by a call or durable prior receipt.
+
+        The reply has already streamed, so enforcement is detect + correct +
+        record, never block. Advisory: any failure leaves the reply untouched.
+        """
+        text = result.visible_text or result.text or ""
         if not text.strip() or not self._turn_id:
             return
         try:
@@ -881,11 +917,13 @@ class AgentLoop:
                 for f in findings[:5]
             )
             correction = (
-                "\n\n[Correction] I described actions I did not actually take this "
-                f"turn — {summary} — no matching successful tool call. Treat those "
+                "\n\n[Correction] I described actions I could not verify — "
+                f"{summary} — no matching successful tool call or durable "
+                "prior-action receipt. Treat those "
                 "statements as unverified."
             )
             result.text += correction
+            result.visible_text = (result.visible_text or text) + correction
             self._last_text = result.text
             await self._emit(AgentEvent.TEXT_DELTA, {"text": correction, "correction": True})
             await self._emit(AgentEvent.CLAIM_FLAGGED, {
@@ -972,6 +1010,7 @@ class AgentLoop:
                         "status": "completed",
                         "stopped_reason": result.stopped_reason,
                         "text": result.text,
+                        "visible_text": result.visible_text,
                         "iterations": result.iterations,
                         "energy_spent": result.energy_spent,
                         "timed_out": result.timed_out,
@@ -982,6 +1021,9 @@ class AgentLoop:
 
     async def _emit(self, event: AgentEvent, data: dict[str, Any] | None = None) -> None:
         """Emit an event via the configured callback."""
+        event_data = dict(data or {})
+        if self._turn_id:
+            event_data.setdefault("turn_id", self._turn_id)
         if self._turn_id:
             try:
                 async with self.config.pool.acquire() as conn:
@@ -989,7 +1031,7 @@ class AgentLoop:
                         "SELECT record_agent_turn_event($1::uuid, $2::text, $3::jsonb)",
                         self._turn_id,
                         event.value,
-                        json.dumps(data or {}),
+                        json.dumps(event_data),
                     )
             except Exception:
                 logger.debug("DB agent event record failed", exc_info=True)
@@ -997,7 +1039,7 @@ class AgentLoop:
             try:
                 await self.config.on_event(AgentEventData(
                     event=event,
-                    data=data or {},
+                    data=event_data,
                 ))
             except Exception:
                 logger.debug("Event callback failed for %s", event, exc_info=True)
@@ -1010,6 +1052,9 @@ class AgentLoop:
             tool_calls_made=self._tool_calls_made,
             iterations=self._iteration_count,
             energy_spent=self._energy_spent,
+            turn_id=self._turn_id,
+            visible_text="\n\n".join(self._visible_text_parts),
+            tool_results=self._tool_results,
             timed_out=False,
             stopped_reason=stopped_reason,
             plan_text=self._plan_text,

@@ -17,10 +17,11 @@ def _coerce_json(value):
     return value
 
 
-async def _start_turn(conn) -> str:
+async def _start_turn(conn, messages: list[dict] | None = None) -> str:
     started = _coerce_json(
         await conn.fetchval(
-            "SELECT start_agent_turn('chat', 'test', NULL, '{}'::jsonb)"
+            "SELECT start_agent_turn('chat', 'test', NULL, $1::jsonb)",
+            json.dumps({"messages": messages or []}),
         )
     )
     return started["turn_id"]
@@ -208,9 +209,8 @@ async def test_tool_call_arguments_recorded_in_runtime_state(db_pool):
             await tr.rollback()
 
 
-async def test_markdown_negation_and_past_reference_are_not_flagged(db_pool):
-    """The live false positive (#48): truthful sentence, markdown-bold negation,
-    past-turn inspection reference — must produce zero flags."""
+async def test_markdown_negation_is_not_flagged(db_pool):
+    """The live false positive (#48): truthful markdown-bold negation stays clean."""
     async with db_pool.acquire() as conn:
         tr = conn.transaction()
         await tr.start()
@@ -226,10 +226,43 @@ async def test_markdown_negation_and_past_reference_are_not_flagged(db_pool):
             )
             assert report["flagged"] == []
 
-            past = await _detect(
-                conn, turn_id, "Earlier I filed the issue on GitHub for you."
+        finally:
+            await tr.rollback()
+
+
+async def test_historical_action_claim_requires_durable_receipt(db_pool):
+    memory_id = "11111111-2222-4333-8444-555555555555"
+    receipt = {
+        "name": "remember",
+        "success": True,
+        "arguments": {"content": "the lighthouse agreement"},
+        "result": {"memory_id": memory_id},
+    }
+
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            unsupported_turn = await _start_turn(conn)
+            unsupported = await _detect(
+                conn,
+                unsupported_turn,
+                "I already stored that as a memory for next time.",
             )
-            assert past["flagged"] == []
+            assert _kinds(unsupported) == ["memory_write"]
+
+            supported_turn = await _start_turn(conn, [{
+                "role": "assistant",
+                "content": "Stored it.",
+                "metadata": {"action_receipts": [receipt]},
+            }])
+            supported = await _detect(
+                conn,
+                supported_turn,
+                f"I already stored that as memory {memory_id}.",
+            )
+            assert supported["flagged"] == []
+            assert supported["prior_action_receipts"] == 1
         finally:
             await tr.rollback()
 

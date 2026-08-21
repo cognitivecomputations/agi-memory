@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from uuid import uuid4
 
 import pytest
 
@@ -223,6 +224,65 @@ async def test_remember_episodic_takes_first_source_as_attribution(db_pool):
             assert attribution["ref"] == "session:abc"
             # Episodic memories carry no confidence key in the response.
             assert "confidence" not in result["output"]
+        finally:
+            await tr.rollback()
+
+
+async def test_remember_reuses_equivalent_session_write_with_conversation_provenance(db_pool):
+    session_id = str(uuid4())
+    marker = uuid4().hex
+    args = {
+        "content": f"Eric and I agreed to preserve the lighthouse thread {marker}",
+        "type": "semantic",
+        "confidence": 0.7,
+        "_execution_context": {
+            "session_id": session_id,
+            "call_id": "remember-first",
+            "tool_context": "chat",
+        },
+    }
+
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            first = _coerce_json(await conn.fetchval(
+                "SELECT execute_memory_tool('remember', $1::jsonb)",
+                json.dumps(args),
+            ))
+            args["_execution_context"]["call_id"] = "remember-retry"
+            args["content"] = (
+                f"Eric and I agreed to preserve the lighthouse thread: {marker}."
+            )
+            second = _coerce_json(await conn.fetchval(
+                "SELECT execute_memory_tool('remember', $1::jsonb)",
+                json.dumps(args),
+            ))
+
+            assert first["success"] is True, first
+            assert first["output"]["reused"] is False
+            assert second["success"] is True, second
+            assert second["output"]["reused"] is True
+            assert second["output"]["memory_id"] == first["output"]["memory_id"]
+
+            row = await conn.fetchrow(
+                """
+                SELECT source_attribution, trust_level, metadata
+                FROM memories
+                WHERE id = $1::uuid
+                """,
+                first["output"]["memory_id"],
+            )
+            count = await conn.fetchval(
+                "SELECT count(*) FROM memories WHERE content LIKE $1",
+                f"%{marker}%",
+            )
+            assert count == 1
+            attribution = _coerce_json(row["source_attribution"])
+            metadata = _coerce_json(row["metadata"])
+            assert attribution["ref"] == f"chat_session:{session_id}"
+            assert row["trust_level"] > 0.15
+            assert metadata["tool_write"]["session_id"] == session_id
         finally:
             await tr.rollback()
 

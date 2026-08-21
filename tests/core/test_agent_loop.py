@@ -976,6 +976,25 @@ class TestErrorHandling:
 
 class TestMessageFormat:
     @patch("core.agent_loop.chat_completion")
+    async def test_provider_messages_strip_internal_receipt_metadata(self, mock_llm):
+        mock_llm.return_value = _text_response("Understood.")
+        receipt = {"name": "remember", "success": True}
+        history = [{
+            "role": "assistant",
+            "content": "Stored it.",
+            "metadata": {"action_receipts": [receipt]},
+        }]
+
+        result = await AgentLoop(_make_config()).run("Continue", history=history)
+
+        sent_messages = mock_llm.call_args.kwargs["messages"]
+        assert all("metadata" not in message for message in sent_messages)
+        stored_history = [
+            message for message in result.messages if message.get("role") == "assistant"
+        ]
+        assert stored_history[0]["metadata"]["action_receipts"] == [receipt]
+
+    @patch("core.agent_loop.chat_completion")
     async def test_assistant_message_includes_tool_calls(self, mock_llm):
         """Assistant message with tool calls includes them in OpenAI format."""
         tool_result = ToolResult.success_result("ok")
@@ -1770,6 +1789,27 @@ class TestActionClaimGuardrail:
 
         assert "[Correction]" not in result.text
         assert result.text == "I've stored that as a memory for next time."
+        assert result.turn_id is not None
+        assert result.tool_results[0]["output"] == {"memory_id": "m-1"}
+
+    @patch("core.agent_loop.chat_completion")
+    async def test_visible_intermediate_claim_is_checked(self, mock_llm):
+        """Claims streamed before a later tool iteration cannot evade auditing."""
+        recall_result = ToolResult.success_result({"results": []})
+        registry = _mock_registry(execute_results={"recall": recall_result})
+        mock_llm.side_effect = [
+            _tool_response(
+                "I've stored that as a memory for next time.",
+                [_tool_call("recall", {"query": "the agreement"})],
+            ),
+            _text_response("I found no matching memory."),
+        ]
+        config = _make_config(registry=registry)
+        result = await AgentLoop(config).run("Did you keep the agreement?")
+
+        assert "I've stored that" in result.visible_text
+        assert "[Correction]" in result.text
+        assert "memory_write" in result.text
 
     @patch("core.agent_loop.chat_completion")
     async def test_kill_switch_disables_guardrail(self, mock_llm):

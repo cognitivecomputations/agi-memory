@@ -33,6 +33,7 @@ async def _stub_get_embedding(conn):
 async def test_record_hydrate_and_clear_chat_session(db_pool):
     marker = uuid4().hex
     session_id = str(uuid4())
+    receipt_memory_id = str(uuid4())
 
     async with db_pool.acquire() as conn:
         tr = conn.transaction()
@@ -50,7 +51,16 @@ async def test_record_hydrate_and_clear_chat_session(db_pool):
                 session_id,
                 f"remember the cedar gate {marker}",
                 "I will keep that in view.",
-                json.dumps({"metadata": {"type": "conversation", "test_marker": marker}}),
+                json.dumps({
+                    "metadata": {"type": "conversation", "test_marker": marker},
+                    "assistant_metadata": {
+                        "action_receipts": [{
+                            "name": "remember",
+                            "success": True,
+                            "result": {"memory_id": receipt_memory_id},
+                        }],
+                    },
+                }),
             ))
 
             assert recorded["session"]["surface"] == "cli"
@@ -64,6 +74,8 @@ async def test_record_hydrate_and_clear_chat_session(db_pool):
             assert hydrated["count"] == 2
             assert hydrated["messages"][0]["content"] == f"remember the cedar gate {marker}"
             assert hydrated["messages"][1]["content"] == "I will keep that in view."
+            assistant_receipts = hydrated["messages"][1]["metadata"]["action_receipts"]
+            assert assistant_receipts[0]["result"]["memory_id"] == receipt_memory_id
 
             cleared = _j(await conn.fetchval(
                 "SELECT clear_chat_session_context($1::uuid, 'test_clear')",

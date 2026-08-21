@@ -58,6 +58,55 @@ async def test_migrations_recorded_and_idempotent(db_pool):
         )
 
 
+async def test_action_receipt_migration_upgrades_existing_memory_dispatch(db_pool):
+    """0199 must preserve the old dispatcher while installing remember v2."""
+    migration = (
+        _DB_ROOT / "migrations" / "0199_persist_action_receipts.sql"
+    ).read_text(encoding="utf-8")
+
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            # Recreate the function layout present before 0199.
+            await conn.execute("DROP FUNCTION execute_memory_tool(TEXT, JSONB)")
+            await conn.execute(
+                "ALTER FUNCTION _execute_memory_tool_dispatch(TEXT, JSONB) "
+                "RENAME TO execute_memory_tool"
+            )
+            legacy_prompt = """# Conversation System Prompt
+
+- Tool results, conversation history
+
+Your words about your own actions must match what actually happened this turn.
+
+- **Inspected** means you read content into this conversation only — nothing was retained.
+- **Ingested** means a durable ingestion tool (`slow_ingest`, `fast_ingest`, ...) succeeded and wrote provenanced memories.
+- **Remembered** means an explicit `remember` call succeeded.
+
+Never say you stored, saved, created, filed, scheduled, or sent something unless the matching tool call succeeded in this turn. Never cite file contents or line numbers you did not read with `inspect_source` this turn. Unsupported action claims are detected and corrected publicly — check before claiming.
+"""
+            await conn.execute(
+                "UPDATE prompt_modules SET content = $1 WHERE key = 'conversation'",
+                legacy_prompt,
+            )
+
+            await conn.execute(migration)
+
+            assert await conn.fetchval(
+                "SELECT to_regprocedure('public.execute_memory_tool(text,jsonb)') IS NOT NULL"
+            )
+            assert await conn.fetchval(
+                "SELECT to_regprocedure('public._execute_memory_tool_dispatch(text,jsonb)') IS NOT NULL"
+            )
+            conversation_prompt = await conn.fetchval(
+                "SELECT content FROM prompt_modules WHERE key = 'conversation'"
+            )
+            assert "durable prior-action receipts as the authority" in conversation_prompt
+        finally:
+            await tr.rollback()
+
+
 async def test_migrate_existing_database_preserves_data():
     """Build a DB from the BASELINE only (an 'old' deployment), give it real data,
     then run the migrator: the data survives and the new schema is present."""

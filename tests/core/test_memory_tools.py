@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 from unittest.mock import MagicMock
+from uuid import uuid4
 
 import pytest
 
@@ -168,6 +169,28 @@ class TestQueueUserMessage:
 
 
 class TestProvenanceTooling:
+    async def test_remember_handler_passes_session_context_for_idempotency(self, db_pool):
+        marker = get_test_identifier("rememberreceipt")
+        context = _ctx(db_pool)
+        context.session_id = str(uuid4())
+        try:
+            first = await RememberHandler().execute(
+                {"content": f"Keep the copper thread {marker}", "type": "semantic"},
+                context,
+            )
+            context.call_id = "test-call-retry"
+            second = await RememberHandler().execute(
+                {"content": f"Keep the copper thread: {marker}.", "type": "semantic"},
+                context,
+            )
+
+            assert first.success, first.error
+            assert second.success, second.error
+            assert first.output["memory_id"] == second.output["memory_id"]
+            assert second.output["reused"] is True
+        finally:
+            await _cleanup(db_pool, marker)
+
     async def test_get_strategies_schema_accepts_query_alias(self):
         handler = GetStrategiesHandler()
         assert handler.validate({"query": "recover from heartbeat failures"}) == []
