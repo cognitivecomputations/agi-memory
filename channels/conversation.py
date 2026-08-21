@@ -281,6 +281,12 @@ async def stream_channel_message(
         )
 
         collected: list[str] = []
+        terminal_outcome = "unknown"
+
+        def record_terminal_outcome(outcome: str) -> None:
+            nonlocal terminal_outcome
+            terminal_outcome = outcome
+
         async for token in stream_chat_turn(
             user_message=user_content,
             history=history,
@@ -291,12 +297,19 @@ async def stream_channel_message(
             user_label=msg.sender_name,
             is_group=msg.is_group,
             surface="channel",
+            on_terminal_outcome=record_terminal_outcome,
         ):
             collected.append(token)
             await coalescer.push(token)
 
         message_id = await coalescer.flush()
         assistant_text = "".join(collected)
+
+        # The incomplete notice is useful to the person, but failed/timeout
+        # output must never become durable conversation history. Raising here
+        # would trigger a second non-streaming model turn, so return normally.
+        if terminal_outcome != "completed":
+            return message_id
 
         # Update session and log
         fallback_history = [

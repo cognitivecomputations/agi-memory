@@ -348,6 +348,7 @@ async def stream_chat_turn(
     is_group: bool = False,
     surface: str = "chat",
     visual_attachments: list[dict[str, Any]] | None = None,
+    on_terminal_outcome: Callable[[str], None] | None = None,
 ) -> AsyncIterator[str]:
     """
     Streaming variant of chat_turn().
@@ -359,33 +360,51 @@ async def stream_chat_turn(
     collected: list[str] = []
     timed_out = False
     error_message: str | None = None
+    saw_loop_end = False
 
-    async for event in stream_chat_events(
-        user_message=user_message,
-        history=history,
-        llm_config=llm_config,
-        dsn=dsn,
-        memory_limit=memory_limit,
-        max_tool_iterations=max_tool_iterations,
-        session_id=session_id,
-        pool=pool,
-        user_label=user_label,
-        is_group=is_group,
-        surface=surface,
-        visual_attachments=visual_attachments,
-    ):
-        if event.event == AgentEvent.TEXT_DELTA:
-            text = event.data.get("text", "")
-            if text:
-                collected.append(text)
-                yield text
-        elif event.event == AgentEvent.LOOP_END:
-            stopped = str(event.data.get("stopped_reason") or "")
-            timed_out = stopped == "timeout" or bool(event.data.get("timed_out"))
-        elif event.event == AgentEvent.ERROR:
-            error_message = str(event.data.get("error") or "Unknown agent error")
+    try:
+        async for event in stream_chat_events(
+            user_message=user_message,
+            history=history,
+            llm_config=llm_config,
+            dsn=dsn,
+            memory_limit=memory_limit,
+            max_tool_iterations=max_tool_iterations,
+            session_id=session_id,
+            pool=pool,
+            user_label=user_label,
+            is_group=is_group,
+            surface=surface,
+            visual_attachments=visual_attachments,
+        ):
+            if event.event == AgentEvent.TEXT_DELTA:
+                text = event.data.get("text", "")
+                if text:
+                    collected.append(text)
+                    yield text
+            elif event.event == AgentEvent.LOOP_END:
+                saw_loop_end = True
+                stopped = str(event.data.get("stopped_reason") or "")
+                timed_out = stopped == "timeout" or bool(
+                    event.data.get("timed_out")
+                )
+                if stopped == "error" and error_message is None:
+                    error_message = "Agent loop ended with an error."
+            elif event.event == AgentEvent.ERROR:
+                error_message = str(event.data.get("error") or "Unknown agent error")
+    except Exception as exc:
+        logger.exception("Streaming chat turn failed")
+        error_message = describe_exception(exc)
+
+    if not saw_loop_end and error_message is None:
+        error_message = "The response stream ended before Hexis finished."
 
     full_text = "".join(collected)
+    terminal_outcome = (
+        "timeout" if timed_out else "error" if error_message else "completed"
+    )
+    if on_terminal_outcome is not None:
+        on_terminal_outcome(terminal_outcome)
     if timed_out:
         if full_text:
             yield "\n\n[Response timed out before completion.]"
@@ -635,6 +654,7 @@ async def stream_chat_events(
             elif event.event == AgentEvent.LOOP_END:
                 stopped = str(event.data.get("stopped_reason") or "")
                 timed_out = stopped == "timeout" or bool(event.data.get("timed_out"))
+                failed = failed or stopped == "error"
             elif event.event == AgentEvent.ERROR:
                 failed = True
             elif event.event == AgentEvent.PHASE_CHANGE:

@@ -37,7 +37,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from channels.presentation import presentation_from_text
 from core.agent_api import db_dsn_from_env, pool_sizes_from_env
-from core.agent_loop import AgentEvent, AgentEventData
+from core.agent_loop import AgentEvent, AgentEventData, describe_exception
 from core.auth.ui_flow import AuthFlowError, auth_flow_coordinator
 from core.cli_api import status_payload_rich
 from core.gateway import EventSource, Gateway
@@ -1901,9 +1901,11 @@ async def _collect_openai_chat_completion(
                 stopped = str(event.data.get("stopped_reason") or "completed")
                 if stopped == "timeout" or bool(event.data.get("timed_out")):
                     finish_reason = "length"
+                elif stopped == "error" and error is None:
+                    error = "Agent loop ended with an error."
     except Exception as exc:
         logger.exception("OpenAI-compatible chat completion failed")
-        error = str(exc)
+        error = describe_exception(exc)
 
     full_text = "".join(parts)
     return full_text, error, finish_reason
@@ -1955,9 +1957,11 @@ async def _stream_openai_chat_completion(
                 stopped = str(event.data.get("stopped_reason") or "completed")
                 if stopped == "timeout" or bool(event.data.get("timed_out")):
                     finish_reason = "length"
+                elif stopped == "error" and error is None:
+                    error = "Agent loop ended with an error."
     except Exception as exc:
         logger.exception("OpenAI-compatible chat stream failed")
-        error = str(exc)
+        error = describe_exception(exc)
 
     if error:
         yield _openai_sse_data(
@@ -2012,16 +2016,31 @@ async def _stream_chat(req: ChatRequest) -> AsyncIterator[str]:
     if session_id is None:
         session_id = str(uuid.uuid4())
 
+    full_text = ""
+    conscious_started = False
+    active_stream_phase = "conscious_final"
+    done_sent = False
+    stream_failed = False
+    failure_message = "Unknown error"
+    reasoning_last_sent = 0.0
+    visual_attachment_count = len(req.visual_attachments or [])
+
+    def build_done_payload() -> dict[str, Any]:
+        payload: dict[str, Any] = {"assistant": full_text, "session_id": session_id}
+        if full_text:
+            payload["presentation"] = presentation_from_text(full_text).to_dict()
+        return payload
+
+    def build_failed_payload() -> dict[str, Any]:
+        return {
+            "assistant": full_text,
+            "session_id": session_id,
+            "message": failure_message,
+            "incomplete": True,
+        }
+
     try:
         addenda = await resolve_prompt_addenda(pool, req.prompt_addenda)
-        full_text = ""
-        conscious_started = False
-        active_stream_phase = "conscious_final"
-        done_sent = False
-        stream_failed = False
-        failure_message = "Unknown error"
-        reasoning_last_sent = 0.0
-        visual_attachment_count = len(req.visual_attachments or [])
 
         if visual_attachment_count:
             plural = "image" if visual_attachment_count == 1 else "images"
@@ -2031,20 +2050,6 @@ async def _stream_chat(req: ChatRequest) -> AsyncIterator[str]:
                 "title": "Visual Attachment",
                 "detail": f"{visual_attachment_count} {plural} attached to this model request",
             })
-
-        def build_done_payload() -> dict[str, Any]:
-            payload: dict[str, Any] = {"assistant": full_text, "session_id": session_id}
-            if full_text:
-                payload["presentation"] = presentation_from_text(full_text).to_dict()
-            return payload
-
-        def build_failed_payload() -> dict[str, Any]:
-            return {
-                "assistant": full_text,
-                "session_id": session_id,
-                "message": failure_message,
-                "incomplete": True,
-            }
 
         async for event in stream_chat_events(
             user_message=user_message,
@@ -2223,9 +2228,17 @@ async def _stream_chat(req: ChatRequest) -> AsyncIterator[str]:
             else:
                 yield _sse_event("done", build_done_payload())
 
-    except Exception as e:
+    except Exception as exc:
         logger.exception("Chat stream error")
-        yield _sse_event("error", {"message": str(e)})
+        if done_sent:
+            yield _sse_event("error", {"message": describe_exception(exc)})
+            return
+        if not stream_failed:
+            failure_message = describe_exception(exc)
+            yield _sse_event("error", {"message": failure_message})
+        if conscious_started:
+            yield _sse_event("phase_end", {"phase": active_stream_phase})
+        yield _sse_event("failed", build_failed_payload())
 
 
 def _resolve_fallback_api_key(provider: str, role: str) -> str | None:

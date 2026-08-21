@@ -124,6 +124,9 @@ async def _close_async_stream(stream: Any) -> None:
 
     close = getattr(stream, "close", None) or getattr(stream, "aclose", None)
     if not callable(close):
+        response = getattr(stream, "response", None)
+        close = getattr(response, "aclose", None)
+    if not callable(close):
         return
     try:
         result = close()
@@ -1253,7 +1256,25 @@ async def _compatible_chat_stream_completion(
         for tool_delta in tool_deltas:
             if not isinstance(tool_delta, dict):
                 continue
-            index = int(tool_delta.get("index") or 0)
+            raw_index = tool_delta.get("index")
+            if raw_index is None:
+                index = 0
+            elif isinstance(raw_index, bool):
+                raise RuntimeError("Streamed tool call has an invalid index.")
+            elif isinstance(raw_index, int) and raw_index >= 0:
+                index = raw_index
+            elif isinstance(raw_index, str):
+                index_text = raw_index.strip()
+                if not index_text.isascii() or not index_text.isdecimal():
+                    raise RuntimeError("Streamed tool call has an invalid index.")
+                try:
+                    index = int(index_text)
+                except (ValueError, OverflowError) as exc:
+                    raise RuntimeError(
+                        "Streamed tool call has an invalid index."
+                    ) from exc
+            else:
+                raise RuntimeError("Streamed tool call has an invalid index.")
             current = tool_parts.setdefault(
                 index,
                 {"id": None, "name": None, "arguments_parts": []},

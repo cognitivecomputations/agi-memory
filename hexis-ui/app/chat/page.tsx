@@ -2112,14 +2112,14 @@ export default function ChatPage() {
                         ) : message.content ? (
                           <MessagePresentationView presentation={{ tone: "neutral", blocks: [{ type: "text", text: message.content }] }} />
                         ) : message.incomplete ? (
-                          <p className="text-sm text-red-700">
+                          <p role="status" aria-live="polite" className="text-sm text-red-700">
                             Response incomplete — {inlineErrorDetail(message.error)}. You can retry.
                           </p>
                         ) : message.ui?.length ? null : (
                           <Spinner label="Thinking..." />
                         )}
                         {message.incomplete && message.content ? (
-                          <p className="text-xs text-red-700">
+                          <p role="status" aria-live="polite" className="text-xs text-red-700">
                             Response incomplete{message.error ? `: ${inlineErrorDetail(message.error)}` : ""} — not added to conversation history. You can retry.
                           </p>
                         ) : null}

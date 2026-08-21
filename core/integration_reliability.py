@@ -613,8 +613,8 @@ def _parse_sse_json_payload(
         return None
     try:
         obj = _loads_json(data)
-    except ValueError:
+    except ValueError as exc:
         if strict:
-            raise ValueError("Malformed SSE JSON payload.")
+            raise ValueError("Malformed SSE JSON payload.") from exc
         return None
     return obj if isinstance(obj, dict) else None

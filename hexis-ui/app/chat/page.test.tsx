@@ -270,6 +270,11 @@ describe("ChatPage attachments", () => {
         "Response incomplete: stream disconnected — not added to conversation history. You can retry."
       )
     ).toBeInTheDocument();
+    expect(
+      screen
+        .getAllByRole("status")
+        .some((status) => status.textContent?.includes("stream disconnected"))
+    ).toBe(true);
 
     fireEvent.change(composer, { target: { value: "again" } });
     fireEvent.click(screen.getByRole("button", { name: "Send message" }));
@@ -417,6 +422,9 @@ describe("ChatPage attachments", () => {
         "Response incomplete — Failed to reach chat endpoint (502). You can retry."
       )
     ).toBeInTheDocument();
+    expect(
+      screen.getAllByRole("status").some((status) => status.textContent?.includes("502"))
+    ).toBe(true);
 
     fireEvent.change(composer, { target: { value: "second" } });
     fireEvent.click(screen.getByRole("button", { name: "Send message" }));

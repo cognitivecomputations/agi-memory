@@ -337,6 +337,11 @@ class ChatScreen(Screen):
                 tr.write_info("continuing…")
             elif ev == AgentEvent.ENERGY_EXHAUSTED:
                 tr.write_info("energy exhausted")
+            elif ev == AgentEvent.LOOP_END:
+                if data.get("stopped_reason") == "error":
+                    if not self._turn_failed:
+                        tr.write_error("Agent loop ended with an error.")
+                    self._turn_failed = True
             elif ev == AgentEvent.ERROR:
                 self._turn_failed = True
                 tr.write_error(

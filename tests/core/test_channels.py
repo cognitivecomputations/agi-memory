@@ -559,6 +559,101 @@ class TestChannelConversation:
                 await self._cleanup(conn, sender_id)
 
 
+async def test_streaming_channel_does_not_finalize_failed_partial_turn(monkeypatch):
+    import channels.conversation as conversation
+    import channels.streaming as streaming
+    import core.agent_api as agent_api
+    import core.gateway as gateway
+    import core.llm_config as llm_config
+    import services.chat as chat
+    from channels.base import ChannelCapabilities, ChannelMessage
+    from core.agent_loop import AgentEvent, AgentEventData
+
+    class _Acquire:
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class _Pool:
+        def acquire(self):
+            return _Acquire()
+
+    pushed: list[str] = []
+
+    class _Coalescer:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def push(self, text: str) -> None:
+            pushed.append(text)
+
+        async def flush(self) -> str:
+            return "platform-message-1"
+
+    class _Gateway:
+        def __init__(self, _pool):
+            pass
+
+        async def record(self, *_args, **_kwargs):
+            return None
+
+    async def fake_stream_chat_events(*_args, **_kwargs):
+        yield AgentEventData(event=AgentEvent.TEXT_DELTA, data={"text": "partial"})
+        raise ConnectionError("provider disconnected")
+
+    finalize = AsyncMock(
+        side_effect=AssertionError("failed partial turns must not be finalized")
+    )
+    hydrate = AsyncMock(
+        side_effect=AssertionError("failed partial turns must not enter history")
+    )
+    fallback = AsyncMock(
+        side_effect=AssertionError("failed streams must not start a second model turn")
+    )
+    monkeypatch.setattr(
+        conversation,
+        "_prepare_channel_turn_db",
+        AsyncMock(return_value={
+            "allowed": True,
+            "session_id": "11111111-1111-4111-8111-111111111111",
+            "history": [],
+        }),
+    )
+    monkeypatch.setattr(conversation, "_finalize_channel_turn_db", finalize)
+    monkeypatch.setattr(streaming, "StreamCoalescer", _Coalescer)
+    monkeypatch.setattr(agent_api, "db_dsn_from_env", lambda: "postgresql://unused")
+    monkeypatch.setattr(llm_config, "load_llm_config", AsyncMock(return_value={}))
+    monkeypatch.setattr(gateway, "Gateway", _Gateway)
+    monkeypatch.setattr(chat, "stream_chat_events", fake_stream_chat_events)
+    monkeypatch.setattr(chat, "_hydrate_chat_history", hydrate)
+    monkeypatch.setattr(conversation, "process_channel_message", fallback)
+
+    adapter = MagicMock()
+    adapter.capabilities = ChannelCapabilities(edit_message=True)
+    adapter.send = AsyncMock()
+    message = ChannelMessage(
+        channel_type="test",
+        channel_id="channel-1",
+        sender_id="sender-1",
+        sender_name="Test User",
+        content="Hello",
+        message_id="message-1",
+    )
+
+    result = await conversation.stream_channel_message(message, _Pool(), adapter)
+
+    assert result == "platform-message-1"
+    assert "".join(pushed) == (
+        "partial\n\n[Response failed before completion: provider disconnected]"
+    )
+    finalize.assert_not_awaited()
+    hydrate.assert_not_awaited()
+    fallback.assert_not_awaited()
+    adapter.send.assert_not_awaited()
+
+
 # ============================================================================
 # Hook Event
 # ============================================================================

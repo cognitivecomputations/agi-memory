@@ -25,6 +25,21 @@ def test_normalize_provider_variants():
     assert llm.normalize_provider("openai_chat_completions_endpoint") == "openai-chat-completions-endpoint"
 
 
+@pytest.mark.asyncio(loop_scope="session")
+async def test_close_async_stream_falls_back_to_response():
+    class _Stream:
+        pass
+
+    response = MagicMock()
+    response.aclose = AsyncMock()
+    stream = _Stream()
+    stream.response = response
+
+    await llm._close_async_stream(stream)
+
+    response.aclose.assert_awaited_once_with()
+
+
 def test_normalize_provider_new_aliases():
     assert llm.normalize_provider("github_copilot") == "github-copilot"
     assert llm.normalize_provider("qwen_portal") == "qwen-portal"
@@ -716,7 +731,9 @@ async def test_compatible_stream_uses_chat_and_separates_reasoning(monkeypatch):
 
 
 @pytest.mark.asyncio(loop_scope="session")
-async def test_compatible_stream_does_not_replay_after_visible_delta(monkeypatch):
+async def test_compatible_stream_propagates_midstream_error_after_partial_text(
+    monkeypatch,
+):
     calls = 0
     delivered: list[str] = []
 
@@ -790,6 +807,41 @@ async def test_compatible_stream_accumulates_tool_call_deltas(monkeypatch):
         "name": "lookup",
         "arguments": {"query": "Libre WebUI"},
     }]
+
+
+@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.parametrize(
+    "invalid_index",
+    ["bad", -1, 1.5, True, "²", "9" * 5000],
+)
+async def test_compatible_stream_rejects_invalid_tool_call_index(
+    monkeypatch,
+    invalid_index,
+):
+    async def fake_sse(*_args, **_kwargs):
+        yield {
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "index": invalid_index,
+                        "id": "call-1",
+                        "function": {"name": "lookup", "arguments": "{}"},
+                    }]
+                },
+                "finish_reason": "tool_calls",
+            }]
+        }
+
+    monkeypatch.setattr(llm, "iter_sse_json_events", fake_sse)
+
+    with pytest.raises(RuntimeError, match="invalid index"):
+        await llm.stream_chat_completion(
+            provider="openai_compatible",
+            model="local-model",
+            endpoint="http://local.test/v1",
+            api_key=None,
+            messages=[{"role": "user", "content": "look it up"}],
+        )
 
 
 @pytest.mark.asyncio(loop_scope="session")
@@ -906,6 +958,51 @@ async def test_responses_stream_does_not_replay_after_visible_delta(monkeypatch)
 
     assert calls == 1
     assert delivered == ["partial"]
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_responses_stream_does_not_replay_after_reasoning_delivery(monkeypatch):
+    monkeypatch.setattr(llm, "_HAS_RESPONSES_API", True)
+    calls = 0
+    reasoning_deltas: list[str] = []
+
+    reasoning_event = MagicMock()
+    reasoning_event.type = "response.reasoning_summary_text.delta"
+    reasoning_event.delta = "private thought"
+
+    class FailingStream:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def __aiter__(self):
+            yield reasoning_event
+            raise ConnectionError("responses stream disconnected")
+
+    def fake_stream(**_kwargs):
+        nonlocal calls
+        calls += 1
+        return FailingStream()
+
+    mock_client = MagicMock()
+    mock_client.responses.stream = fake_stream
+    monkeypatch.setattr(llm.openai, "AsyncOpenAI", lambda **_kwargs: mock_client)
+
+    with patch("asyncio.sleep", new=AsyncMock()):
+        with pytest.raises(ConnectionError, match="responses stream disconnected"):
+            await llm.stream_chat_completion(
+                provider="openai",
+                model="gpt-4o",
+                endpoint=None,
+                api_key="test",
+                messages=[{"role": "user", "content": "hi"}],
+                on_reasoning_delta=reasoning_deltas.append,
+            )
+
+    assert calls == 1
+    assert reasoning_deltas == ["private thought"]
 
 
 @pytest.mark.asyncio(loop_scope="session")

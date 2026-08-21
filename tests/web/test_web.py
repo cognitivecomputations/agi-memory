@@ -217,6 +217,50 @@ async def test_chat_marks_partial_error_failed_instead_of_done(client):
     assert failed["incomplete"] is True
 
 
+async def test_chat_iterator_exception_emits_failed_terminal_event(client):
+    async def fake_stream(*_args, **_kwargs):
+        yield AgentEventData(event=AgentEvent.LOOP_START)
+        yield AgentEventData(event=AgentEvent.TEXT_DELTA, data={"text": "partial"})
+        raise ConnectionError("iterator broke")
+
+    with patch.object(web_module, "stream_chat_events", fake_stream):
+        response = await client.post("/api/chat", json={"message": "Hello"})
+
+    events = _parse_sse(response.text)
+    event_types = [event["event"] for event in events]
+    failed = json.loads(next(
+        event["data"] for event in events if event["event"] == "failed"
+    ))
+
+    assert event_types.count("error") == 1
+    assert event_types.count("failed") == 1
+    assert "done" not in event_types
+    assert failed["assistant"] == "partial"
+    assert failed["message"] == "iterator broke"
+    assert failed["incomplete"] is True
+
+
+async def test_chat_iterator_exception_after_done_does_not_duplicate_terminal(client):
+    async def fake_stream(*_args, **_kwargs):
+        yield AgentEventData(event=AgentEvent.LOOP_START)
+        yield AgentEventData(event=AgentEvent.TEXT_DELTA, data={"text": "complete"})
+        yield AgentEventData(
+            event=AgentEvent.LOOP_END,
+            data={"stopped_reason": "completed"},
+        )
+        raise ConnectionError("late bookkeeping failure")
+
+    with patch.object(web_module, "stream_chat_events", fake_stream):
+        response = await client.post("/api/chat", json={"message": "Hello"})
+
+    events = _parse_sse(response.text)
+    event_types = [event["event"] for event in events]
+
+    assert event_types.count("done") == 1
+    assert "failed" not in event_types
+    assert event_types.count("error") == 1
+
+
 async def test_chat_sends_done_before_post_loop_memory_events(client):
     """The visible turn completes before post-response bookkeeping logs."""
     async def fake_stream(*args, **kwargs):
