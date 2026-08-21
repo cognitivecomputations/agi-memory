@@ -174,6 +174,11 @@ turn and the `not_available_in_active_skills` refusals. Without this, the regres
 is invisible — as it has been. *~2 hours, and it should land first so 0.1–0.5 can be
 measured.*
 
+Then **port** `capability_probe.py` + `tool_surface_audit.py` (§11.4·8) so this stops
+being a one-off audit: a per-worker × per-tool reachability probe and an immutable
+record of every tool-surface decision. The findings above were produced by hand once;
+these keep producing them.
+
 **Total: about two days for all six.** Compare against every other tier in this
 document. This is the cheapest capability increase available, because none of it
 builds a capability — it stops hiding the ones already built.
@@ -445,7 +450,9 @@ in the tree is `services/ingest/readers.py`, for ingesting audio *files*. Grep f
 
 1. **`transcribe` tool** — a voice memo sent on Telegram/WhatsApp/Signal becomes text.
    Works today with no node and no PWA, because the audio arrives as a file through
-   the channel adapters. **Cheapest real voice win; do it first.** The PWA (§3a) then
+   the channel adapters. **Cheapest real voice win; do it first.** **Port, do not
+   build** — `voice_notes.py` + `local_audio_analysis.py` in Alex's fork (§11.4·7)
+   already implement this pipeline. The PWA (§3a) then
    reuses the same endpoint for in-app capture via `getUserMedia`.
 2. **`speak` tool** — TTS out, following the `embeddinggemma` sidecar precedent: a
    self-published binary, no third-party runtime. See `docs/operations/embeddings.md`
@@ -586,6 +593,11 @@ and it belongs to the same fix-it-first bucket.
 it. Add a startup assertion that every entry in `allowed_actions` has a handler branch,
 so this cannot silently return. *~half a day either way.*
 
+For `debate_internally` specifically there is a third option: **give it a body.**
+Alex's `deliberation.py` implements adversarial conjecture–attack–verdict reasoning
+(§11.4·9), which is what that action was always supposed to mean. It needs its
+`independence_engine` / `prediction_journal` / fragility dependencies stripped first.
+
 ### 9.2 Energy saturates and the surplus is destroyed
 
 `base_regeneration = 10`, `max_energy = 20`, interval 60 minutes. **Energy is full
@@ -686,6 +698,11 @@ see §10.4.
   because it has been four days and something is thin is exactly what an engaged
   person does, and it is the whole premise of the product. This is the one place a
   *relational* rather than *instrumental* reason passes the gate.
+
+**On the inbound half, port rather than build.** Alex's `inbound_disposition.py`
+(§11.4·6) already implements operator detection, trigger words, allowlists, drop rules
+and ambiguity flagging, with all of the policy in PL/pgSQL — which is where this plan
+wants it anyway.
 
 Implementation: the purpose is a required, recorded field on the outbound action —
 not a prompt convention. `reach_out_user` and `reach_out_public` take
@@ -1089,8 +1106,10 @@ Two fixes, and both are wanted:
 
 1. **Fail closed.** Absent a callback, an approval-required tool refuses and files a
    request rather than proceeding. *One line, today.*
-2. **Give it a callback worth having** — Alex's Slack → iMessage escalation, so
-   approval is answerable from a phone instead of only from a terminal.
+2. **Give it a callback worth having** — port `operator_approval.py` +
+   `approval_slack_actions.py` (§11.4·4, sequencing item 2): Slack → iMessage
+   escalation with Block Kit approve/deny, so approval is answerable from a phone
+   instead of only from a terminal.
 
 This is the fifth instance in this plan of one pathology: **a mechanism that exists
 with nothing enforcing it.** Dead heartbeat actions (§9.1), tools bound to no
@@ -1157,35 +1176,48 @@ self-authoring wins, Alex's validator is the piece that makes it survivable.
 |---|------|--------|----------|
 | −1 | **Approval gate fails closed (§11.5)** | **~1h** | **51 tools stop firing unattended** |
 | 0 | **Tier 0 — reachability (§0.1–0.6)** | **~2d** | **turns on capability already built** |
+| 0b | **Port** `capability_probe` + `tool_surface_audit` (§11.4·8) | ~3d | Tier 0 stops being a one-off audit |
 | 1 | Wave A everyday skills (§4) | ~2d | visible value immediately, no new code |
-| 2 | Automation suggestions (§1) | ~2d | the agent starts proposing |
-| 3 | `ask_user` (§2) | ~3d | the agent stops guessing |
-| 4 | **Dead heartbeat actions (§9.1)** | **~0.5d** | **20% of the action space stops being a trap** |
-| 4b | Build off the install path (§6.1) | ~0.5d | no more failed installs |
-| 5 | `transcribe` (§5.1) | ~2d | voice in, no client needed |
-| 6 | Tailscale/HTTPS path documented (§8.1) | ~1d | **unblocks the PWA** |
-| 7 | **PWA layer on `hexis-ui` (§3a)** | **~3d** | installable client + push + mic |
-| 8 | Deterministic image build (§6.2) | ~2d | — |
-| 9 | Wave B skills (§4) | ~1d each | — |
-| 10 | `hexis-node` + pairing (§3b) | ~1w | §4 Wave C, wake word |
-| 11 | Workers as host services (§6.3) | ~1w | — |
-| 12 | `hexis tunnel` + exposure posture (§8.2–3) | ~1w | — |
-| 13 | Voice out / talk / wake (§5.2–4) | ~3w | — |
-| 14 | Execution backends (§7) | ~2w | — |
-| 15 | Heartbeat cadence + economy (§9.2–9.4) | ~1w | long-horizon autonomy |
-| 16 | Action/tool gate reconciliation (§9.6) | ~2d | after Tier 0 |
-| 17 | Goal origin flag (§10.4) | ~1d | prerequisite for the permission slip |
-| 18 | Contact points + purpose gate + STOP (§10) | ~10d | outbound to third parties becomes safe |
-| 19 | Port `operator_approval` + Slack actions (§11.4) | ~2d | approval answerable from a phone |
-| 20 | Port `capability_probe` + `tool_surface_audit` (§11.4) | ~3d | Tier 0 becomes continuously measured |
+| 2 | **Port** `operator_approval` + Slack actions (§11.4·4) | ~2d | approval answerable from a phone |
+| 3 | Automation suggestions (§1) | ~2d | the agent starts proposing |
+| 4 | `ask_user` (§2) | ~3d | the agent stops guessing |
+| 5 | **Dead heartbeat actions (§9.1)** | **~0.5d** | **20% of the action space stops being a trap** |
+| 5b | Build off the install path (§6.1) | ~0.5d | no more failed installs |
+| 6 | **Port** `voice_notes` + `local_audio_analysis` (§11.4·7) | ~1d | *replaces* the §5.1 `transcribe` build |
+| 7 | Tailscale/HTTPS path documented (§8.1) | ~1d | **unblocks the PWA** |
+| 8 | **PWA layer on `hexis-ui` (§3a)** | **~3d** | installable client + push + mic |
+| 9 | **Port** `retention` + `scene_consolidation` + `incubation` (§11.4·1) | ~4d | *replaces* the `positioning.md` §4.6 build |
+| 10 | **Port** `memory_supersessions` (§11.4·2) | ~2d | unblocks `positioning.md` §4.3 bitemporal |
+| 11 | **Port** `belief_propagation` (§11.4·3) | ~2d | plumbing half of `positioning.md` §4.2 |
+| 12 | **Port** `operator_policy_corrections` (§11.4·5) | ~2d | *replaces* the `positioning.md` §4.5 build |
+| 13 | Deterministic image build (§6.2) | ~2d | — |
+| 14 | Goal origin flag (§10.4) | ~1d | prerequisite for the permission slip |
+| 15 | **Port** `inbound_disposition` (§11.4·6) | ~2d | §10's inbound half, policy already in SQL |
+| 16 | Contact points + purpose gate + STOP (§10) | ~10d | outbound to third parties becomes safe |
+| 17 | Wave B skills (§4) | ~1d each | — |
+| 18 | Action/tool gate reconciliation (§9.6) | ~2d | after Tier 0 |
+| 19 | **Port** `deliberation`, deps stripped (§11.4·9) | ~4d | gives `debate_internally` a body |
+| 20 | `hexis-node` + pairing (§3b) | ~1w | §4 Wave C, wake word |
+| 21 | Heartbeat cadence + economy (§9.2–9.4) | ~1w | long-horizon autonomy |
+| 22 | Workers as host services (§6.3) | ~1w | — |
+| 23 | `hexis tunnel` + exposure posture (§8.2–3) | ~1w | — |
+| 24 | Voice out / talk / wake (§5.2–4) | ~3w | — |
+| 25 | Execution backends (§7) | ~2w | — |
 
 Tier 0 comes before all of it: shipping new skills (item 1) into a selector that
 will not activate them is building on sand.
 
-Items 6–7 are deliberately adjacent: the HTTPS day is worthless on its own and the
+Items 7–8 are deliberately adjacent: the HTTPS day is worthless on its own and the
 PWA is impossible without it, so they ship as one change.
 
-Items 0–7 are about four weeks and cover the gap that actually matters: an assistant
+**Nine of these are ports, not builds** (§11.4), and four of them *replace* work this
+plan had costed as new: `voice_notes` for §5.1, the retention trio for
+`positioning.md` §4.6, `operator_policy_corrections` for §4.5, and `capability_probe`
+for Tier 0's instrumentation. Ports are cheaper than builds but not free — each is a
+Python module plus SQL plus a migration (§11.6), so they are costed at 1–4 days, not
+at zero.
+
+Items 0–8 are about four weeks and cover the gap that actually matters: an assistant
 that proposes work, asks when unsure, speaks the languages you already use, and
 installs without a build. Everything after is depth.
 
