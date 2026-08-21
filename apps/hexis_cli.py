@@ -4460,6 +4460,49 @@ def _wait_port_ready(port: int, host: str = "127.0.0.1", overall: float = 45.0) 
     return False
 
 
+def _ui_dependency_fingerprint(ui_dir: Path) -> str | None:
+    """Hash the npm manifest and lockfile for install readiness."""
+    import hashlib
+
+    paths = [ui_dir / "package.json", ui_dir / "package-lock.json"]
+    if any(not path.is_file() for path in paths):
+        return None
+
+    digest = hashlib.sha256()
+    try:
+        for path in paths:
+            digest.update(path.read_bytes())
+    except OSError:
+        return None
+    return digest.hexdigest()
+
+
+def _ui_dependencies_ready(ui_dir: Path) -> bool:
+    fingerprint = _ui_dependency_fingerprint(ui_dir)
+    if not fingerprint:
+        return False
+    stamp = ui_dir / "node_modules" / ".hexis-install"
+    next_name = "next.cmd" if os.name == "nt" else "next"
+    next_bin = ui_dir / "node_modules" / ".bin" / next_name
+    prisma_client = ui_dir / "node_modules" / ".prisma" / "client" / "index.js"
+    try:
+        return (
+            next_bin.is_file()
+            and prisma_client.is_file()
+            and stamp.read_text(encoding="utf-8").strip() == fingerprint
+        )
+    except OSError:
+        return False
+
+
+def _mark_ui_dependencies_ready(ui_dir: Path) -> None:
+    fingerprint = _ui_dependency_fingerprint(ui_dir)
+    if not fingerprint:
+        return
+    stamp = ui_dir / "node_modules" / ".hexis-install"
+    stamp.write_text(f"{fingerprint}\n", encoding="utf-8")
+
+
 def _handle_ui(
     stack_root: Path,
     port: int,
@@ -4479,23 +4522,32 @@ def _handle_ui(
         _print_err(f"hexis-ui directory not found at {ui_dir}")
         return 1
 
-    # Detect package manager
-    runner = shutil.which("bun")
-    pkg_cmd = "bun"
+    # npm's lockfile is the single dependency authority shared by the source
+    # launcher, production image, and CI.
+    runner = shutil.which("npm")
     if not runner:
-        runner = shutil.which("npm")
-        pkg_cmd = "npm"
-    if not runner:
-        _print_err("Neither bun nor npm found on PATH. Install one of them first.")
+        _print_err("npm was not found on PATH. Install Node.js (which includes npm) first.")
         return 1
 
-    # Install deps if needed
-    if not (ui_dir / "node_modules").is_dir():
+    # Install deps if missing, interrupted, or stale relative to the lockfile.
+    if not _ui_dependencies_ready(ui_dir):
         from apps.cli_theme import console
-        console.print(f"[accent]Installing dependencies with {pkg_cmd}...[/accent]")
-        rc = subprocess.run([runner, "install"], cwd=ui_dir).returncode
+        console.print("[accent]Installing dependencies with npm...[/accent]")
+        install_cmd = [
+            runner,
+            "ci" if (ui_dir / "package-lock.json").is_file() else "install",
+        ]
+        rc = subprocess.run(install_cmd, cwd=ui_dir).returncode
         if rc != 0:
-            _print_err(f"{pkg_cmd} install failed (exit {rc})")
+            _print_err(
+                f"npm dependency install failed (exit {rc}). "
+                "Review the error above, then run `hexis ui` to retry."
+            )
+            return 1
+        try:
+            _mark_ui_dependencies_ready(ui_dir)
+        except OSError as exc:
+            _print_err(f"Dependencies installed, but readiness could not be recorded: {exc}")
             return 1
 
     active_instance = instance or resolve_instance()
@@ -4611,18 +4663,16 @@ def _handle_ui(
         t = threading.Thread(target=_open_browser, daemon=True)
         t.start()
 
-    # Run dev server in foreground
-    if pkg_cmd == "bun":
-        dev_cmd = [runner, "run", "dev", "--port", str(port)]
-    else:
-        npx = shutil.which("npx") or "npx"
-        dev_cmd = [npx, "next", "dev", "-p", str(port)]
+    # Run the exact locally installed binary from the locked dependency tree.
+    next_name = "next.cmd" if os.name == "nt" else "next"
+    dev_cmd = [str(ui_dir / "node_modules" / ".bin" / next_name), "dev", "-p", str(port)]
 
     dev_env = os.environ.copy()
     dev_env["HEXIS_API_URL"] = api_url
     dev_env["HEXIS_UI_URL"] = chat_url
     dev_env["HEXIS_DATABASE_URL"] = dsn
     dev_env["DATABASE_URL"] = dsn
+    dev_env["NEXT_TELEMETRY_DISABLED"] = "1"
     if active_instance:
         dev_env["HEXIS_INSTANCE"] = active_instance
 

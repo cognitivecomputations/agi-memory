@@ -1295,22 +1295,31 @@ def _post_init_handoff() -> int:
     Runs in the sync layer (the wizard's event loop has closed), so it starts a
     fresh loop just for the prompt.
     """
-    try:
-        choice = asyncio.run(_prompt_choice(
-            "What now?",
-            ["Open chat now", "Open the web dashboard", "Exit"],
-            default=1,
-        ))
-    except (KeyboardInterrupt, Exception):
-        console.print("[muted]Run `hexis chat` to say hello.[/muted]")
+    while True:
+        try:
+            choice = asyncio.run(_prompt_choice(
+                "What now?",
+                ["Open chat now", "Open the web dashboard", "Exit"],
+                default=1,
+            ))
+        except (KeyboardInterrupt, Exception):
+            console.print("[muted]Run `hexis chat` to say hello.[/muted]")
+            return 0
+        if choice == 1:
+            from apps import cli_chat
+            return cli_chat.main(["--greet"])
+        if choice == 2:
+            from apps.hexis_cli import main as cli_main
+            rc = cli_main(["ui"])
+            if rc == 0:
+                return 0
+            if rc == 130:
+                return 130
+            console.print(
+                "[warn]The dashboard did not start. Retry, open chat, or exit.[/warn]"
+            )
+            continue
         return 0
-    if choice == 1:
-        from apps import cli_chat
-        return cli_chat.main(["--greet"])
-    if choice == 2:
-        from apps.hexis_cli import main as cli_main
-        return cli_main(["ui"])
-    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
