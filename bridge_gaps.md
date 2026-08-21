@@ -826,12 +826,55 @@ what is writing; it does not tell them *for whom*. The interesting question in a
 stranger's head is always "who is this actually from," and answering it is both more
 honest and more effective. Prefer `— Samantha, Eric's Hexis AI`.
 
-**10.5.2 Append at the channel layer, never in the prompt.** A model asked to remember
-a disclaimer will omit it under pressure on turn 40 — the same reasoning as
-provenance-by-default in `positioning.md` §4.0.a. The footer is appended in
-`channels/base.py:send()` and the outbox path, after composition, for every recipient
-that is not the primary user. There is no code path to a third party that can skip it,
-and a channel adapter that cannot render it does not get to send.
+**10.5.2 Enforce at tool dispatch, never in the prompt — and there are two outbound
+paths, not one.** A model asked to remember a disclaimer will omit it under pressure on
+turn 40, the same reasoning as provenance-by-default in `positioning.md` §4.0.a. But
+*where* to enforce is the part an earlier draft of this section got wrong.
+
+**The outbox is not the main road.** It is the formal, asynchronous, email-shaped
+channel. **Most communication goes out through tool calls**, and those tools bypass
+the channel layer entirely — `core/tools/messaging.py` posts straight to
+`https://slack.com/api/chat.postMessage`, `https://discord.com/api/v10/channels/…`,
+`https://api.telegram.org/bot…/sendMessage`, and a local Signal API. A footer appended
+in `channels/base.py:send()` would cover the minority path and miss the majority.
+
+The live catalog has thirteen outbound tools today:
+
+```
+slack_send  discord_send  telegram_send  signal_send
+email_send  email_send_sendgrid  gmail_send  gmail_reply
+twitter_x_dm_send  twitter_x_post  twitter_x_reply
+queue_user_message  (+ connector actions, which grow)
+```
+
+**Do not patch thirteen call sites.** Patching each one guarantees the fourteenth
+leaks, and connector actions are added continuously.
+
+**The design: declare outbound-ness in the ToolSpec, enforce in the dispatcher.** Give
+`ToolSpec` an optional `outbound` descriptor naming which argument carries the
+recipient and which carries the message body:
+
+```python
+outbound=OutboundSpec(recipient_arg="channel_id", body_arg="message", channel="slack")
+```
+
+Then one middleware in the dispatch path — beside the energy check and the approval
+callback that already run there (`core/agent_loop.py:548`) — does all of it in order:
+
+1. **STOP gate** — recipient excommunicated? refuse, above everything else.
+2. **Purpose gate** (§10.2) — is a purpose present and backed?
+3. **Contact budget** (§10.3) — can this be afforded, at this hour, on this channel?
+4. **Footer injection** — append the channel-appropriate disclosure to `body_arg`.
+
+The same middleware wraps `channels/outbox.py` for the formal path, so both roads pass
+the same four checks.
+
+**Make omission impossible, not merely discouraged.** A startup assertion: every tool
+whose handler performs network I/O to a messaging provider must declare `outbound`, or
+the registry refuses to load. This is the same shape as the `allowed_actions` handler
+assertion in §9.1 — the failure mode this whole plan keeps rediscovering is *capability
+that exists with no enforcement path attached*, and an assertion is how you stop
+rediscovering it.
 
 **10.5.3 The channel decides the form.** A 160-character SMS segment is money; Slack
 has small-text formatting; email has a signature convention.
@@ -859,8 +902,9 @@ minor annoyance into a broken promise.
 
 **10.5.5 A STOP is news for the user, not just a flag.** If someone excommunicates the
 agent, **the human's relationship is what took the damage**, and they need to know
-immediately — who, which channel, and the message that caused it. This is high-priority
-outbox traffic, not a row in a table nobody reads. It is also the single best signal
+immediately — who, which channel, and the message that caused it. The outbox is the
+right road for this one: it is formal, asynchronous, and meant to be read rather than
+glanced at. Not a row in a table nobody opens. It is also the single best signal
 that the cadence model in §10.3 is miscalibrated, and should feed back into
 `regen_per_day` for every comparable relationship.
 
@@ -873,7 +917,8 @@ The identification never disappears; only the instructions compress.
 **10.5.7 Never to the primary user.** They configured the agent, signed its consent,
 and know exactly what it is. A disclaimer on every message home would be absurd.
 
-**Effort:** ~2 days for the footer, the STOP gate, and the ledger entries — and it
+**Effort:** ~3 days for the `outbound` descriptor, the dispatch middleware, the STOP
+gate, the footer, and the ledger entries — and it
 **ships in the same change as §10.3**, never after. Autonomous outbound without a
 working opt-out is not a feature to be added to later.
 
@@ -889,8 +934,9 @@ working opt-out is not a feature to be added to later.
   times with no reply should be visibly aware of it, not merely throttled by it.
 
 **Effort:** ~1 day for the goal-origin flag, ~3 days for the ledger and purpose gate,
-~2 days for reciprocity and the history bootstrap, ~2 days for disclosure and the STOP
-gate, ~1 day for the kill switch and ledger view. **~9 days total**, and it should not
+~2 days for reciprocity and the history bootstrap, ~3 days for the outbound
+descriptor, disclosure and the STOP gate, ~1 day for the kill switch and ledger view.
+**~10 days total**, and it should not
 ship in halves — a purpose gate without a budget still floods, a budget without a kill
 switch is not something to point at anyone's colleagues, and a disclaimer promising an
 opt-out that is not wired is worse than sending nothing at all.
@@ -918,7 +964,7 @@ opt-out that is not wired is worse than sending nothing at all.
 | 15 | Heartbeat cadence + economy (§9.2–9.4) | ~1w | long-horizon autonomy |
 | 16 | Action/tool gate reconciliation (§9.6) | ~2d | after Tier 0 |
 | 17 | Goal origin flag (§10.4) | ~1d | prerequisite for the permission slip |
-| 18 | Contact points + purpose gate + STOP (§10) | ~9d | outbound to third parties becomes safe |
+| 18 | Contact points + purpose gate + STOP (§10) | ~10d | outbound to third parties becomes safe |
 
 Tier 0 comes before all of it: shipping new skills (item 1) into a selector that
 will not activate them is building on sand.
