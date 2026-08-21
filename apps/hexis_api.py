@@ -1983,6 +1983,7 @@ async def _stream_chat(req: ChatRequest) -> AsyncIterator[str]:
     Event mapping:
         AgentEvent.PHASE_CHANGE  → phase_start/phase_end  {phase}
         AgentEvent.LOOP_START    → phase_start  {phase: "conscious_final"}
+        AgentEvent.REASONING_DELTA → reasoning  {}
         AgentEvent.TEXT_DELTA    → token        {phase: "conscious_final", text}
         AgentEvent.TOOL_START    → log          {id, kind: "tool_call", title, detail}
         AgentEvent.TOOL_RESULT   → log          {id, kind: "tool_result", title, detail}
@@ -2019,6 +2020,7 @@ async def _stream_chat(req: ChatRequest) -> AsyncIterator[str]:
         done_sent = False
         stream_failed = False
         failure_message = "Unknown error"
+        reasoning_last_sent = 0.0
         visual_attachment_count = len(req.visual_attachments or [])
 
         if visual_attachment_count:
@@ -2108,6 +2110,15 @@ async def _stream_chat(req: ChatRequest) -> AsyncIterator[str]:
                     yield _sse_event("phase_start", {"phase": active_stream_phase})
                     conscious_started = True
 
+            elif event.event == AgentEvent.REASONING_DELTA:
+                # Keep the dashboard alive during reasoning-heavy model output
+                # without exposing private reasoning text or flooding React
+                # with one event per token.
+                now = time.monotonic()
+                if reasoning_last_sent == 0.0 or now - reasoning_last_sent >= 1.0:
+                    yield _sse_event("reasoning", {})
+                    reasoning_last_sent = now
+
             elif event.event == AgentEvent.TEXT_DELTA:
                 if not conscious_started:
                     active_stream_phase = str(event.data.get("phase") or "conscious_final")
@@ -2164,6 +2175,7 @@ async def _stream_chat(req: ChatRequest) -> AsyncIterator[str]:
                 })
 
             elif event.event == AgentEvent.LLM_REQUEST:
+                reasoning_last_sent = 0.0
                 yield _sse_event("trace", {
                     "id": str(uuid.uuid4()),
                     "kind": "llm_request",

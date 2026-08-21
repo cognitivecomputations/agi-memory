@@ -43,6 +43,7 @@ type ChatMessage = {
   presentation?: MessagePresentation;
   ui?: ChatUiArtifact[];
   incomplete?: boolean;
+  error?: string;
 };
 
 type ChatImageAttachment = {
@@ -1046,11 +1047,19 @@ export default function ChatPage() {
     );
   };
 
-  const markTurnIncomplete = (userId: string, assistantId: string) => {
+  const markTurnIncomplete = (
+    userId: string,
+    assistantId: string,
+    error?: string
+  ) => {
     setMessages((prev) =>
       prev.map((msg) =>
         msg.id === userId || msg.id === assistantId
-          ? { ...msg, incomplete: true }
+          ? {
+              ...msg,
+              incomplete: true,
+              ...(msg.id === assistantId && error ? { error } : {}),
+            }
           : msg
       )
     );
@@ -1598,6 +1607,7 @@ export default function ChatPage() {
     setSessionNotice(null);
 
     let receivedDone = false;
+    let streamError: string | null = null;
 
     try {
       const currentSessionId = sessionId || loadSessionId();
@@ -1625,11 +1635,13 @@ export default function ChatPage() {
         body: JSON.stringify(chatBody),
       });
       if (!res.ok || !res.body) {
+        const detail = `Failed to reach chat endpoint (${res.status}).`;
+        markTurnIncomplete(userMessage.id, assistantMessage.id, detail);
         appendLog({
           id: crypto.randomUUID(),
           category: "error",
           title: "Chat error",
-          detail: `Failed to reach chat endpoint (${res.status}).`,
+          detail,
           ts: Date.now(),
         });
         setSending(false);
@@ -1693,6 +1705,10 @@ export default function ChatPage() {
                 setShowSearchConfig(true);
               }
             }
+          }
+
+          if (eventType === "reasoning") {
+            setCurrentPhase("reasoning");
           }
 
           if (eventType === "phase_start") {
@@ -1795,6 +1811,7 @@ export default function ChatPage() {
 
           if (eventType === "error") {
             const detail = asString(payload.message, "Unknown error");
+            streamError = detail;
             appendLog({
               id: crypto.randomUUID(),
               category: "error",
@@ -1819,7 +1836,11 @@ export default function ChatPage() {
           }
           if (eventType === "failed") {
             receivedDone = true;
-            markTurnIncomplete(userMessage.id, assistantMessage.id);
+            markTurnIncomplete(
+              userMessage.id,
+              assistantMessage.id,
+              asString(payload.message) || streamError || "The response stream ended early."
+            );
             if (typeof payload.session_id === "string" && payload.session_id) {
               saveSessionId(payload.session_id);
               setSessionId(payload.session_id);
@@ -1830,15 +1851,24 @@ export default function ChatPage() {
           }
         }
       }
+      if (!receivedDone) {
+        markTurnIncomplete(
+          userMessage.id,
+          assistantMessage.id,
+          streamError || "The response stream ended before Hexis finished."
+        );
+      }
     } catch (err: unknown) {
       if (receivedDone) {
         return;
       }
+      const detail = err instanceof Error ? err.message : "Unknown error";
+      markTurnIncomplete(userMessage.id, assistantMessage.id, detail);
       appendLog({
         id: crypto.randomUUID(),
         category: "error",
         title: "Chat error",
-        detail: err instanceof Error ? err.message : "Unknown error",
+        detail,
         ts: Date.now(),
       });
     } finally {
@@ -2082,13 +2112,15 @@ export default function ChatPage() {
                         ) : message.content ? (
                           <MessagePresentationView presentation={{ tone: "neutral", blocks: [{ type: "text", text: message.content }] }} />
                         ) : message.incomplete ? (
-                          <p className="text-sm text-red-700">Response incomplete — try again.</p>
+                          <p className="text-sm text-red-700">
+                            Response incomplete — {inlineErrorDetail(message.error)}. You can retry.
+                          </p>
                         ) : message.ui?.length ? null : (
                           <Spinner label="Thinking..." />
                         )}
                         {message.incomplete && message.content ? (
                           <p className="text-xs text-red-700">
-                            Response incomplete — not added to conversation history.
+                            Response incomplete{message.error ? `: ${inlineErrorDetail(message.error)}` : ""} — not added to conversation history. You can retry.
                           </p>
                         ) : null}
                         {message.ui?.map((ui) => (
@@ -3731,6 +3763,8 @@ function streamLabel(phase: string) {
       return "Conscious Plan";
     case "conscious_final":
       return "Conscious Response";
+    case "reasoning":
+      return "Model Reasoning";
     default:
       return phase || "Stream";
   }
@@ -3738,6 +3772,10 @@ function streamLabel(phase: string) {
 
 function asString(value: unknown, fallback = ""): string {
   return typeof value === "string" ? value : fallback;
+}
+
+function inlineErrorDetail(value?: string): string {
+  return (value || "the stream ended early").trim().replace(/[.!?]+$/, "");
 }
 
 async function readIntegrationActionPayload(response: Response): Promise<IntegrationActionResult> {
@@ -3832,6 +3870,8 @@ function phaseDescription(phase: string) {
       return "Planning response...";
     case "conscious_final":
       return "Generating response...";
+    case "reasoning":
+      return "Reasoning...";
     case "connector_setup":
       return "Opening setup...";
     default:

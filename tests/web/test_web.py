@@ -151,6 +151,44 @@ async def test_chat_returns_sse_stream(client):
     }
 
 
+async def test_chat_reports_reasoning_activity_without_exposing_reasoning_text(client):
+    async def fake_stream(*_args, **_kwargs):
+        yield AgentEventData(
+            event=AgentEvent.LLM_REQUEST,
+            data={"provider": "openai_compatible", "model": "test-model"},
+        )
+        yield AgentEventData(
+            event=AgentEvent.REASONING_DELTA,
+            data={"text": "private first thought"},
+        )
+        yield AgentEventData(
+            event=AgentEvent.REASONING_DELTA,
+            data={"text": "private second thought"},
+        )
+        yield AgentEventData(
+            event=AgentEvent.TEXT_DELTA,
+            data={"text": "Visible answer"},
+        )
+        yield AgentEventData(
+            event=AgentEvent.LOOP_END,
+            data={"stopped_reason": "completed"},
+        )
+
+    with patch.object(web_module, "stream_chat_events", fake_stream):
+        response = await client.post("/api/chat", json={"message": "Think first"})
+
+    events = _parse_sse(response.text)
+    event_types = [event["event"] for event in events]
+    reasoning_events = [event for event in events if event["event"] == "reasoning"]
+
+    assert len(reasoning_events) == 1
+    assert json.loads(reasoning_events[0]["data"]) == {}
+    assert event_types.index("reasoning") < event_types.index("token")
+    assert "private first thought" not in response.text
+    assert "private second thought" not in response.text
+    assert "Visible answer" in response.text
+
+
 async def test_chat_marks_partial_error_failed_instead_of_done(client):
     async def fake_stream(*_args, **_kwargs):
         yield AgentEventData(event=AgentEvent.LOOP_START)
