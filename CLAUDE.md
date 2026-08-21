@@ -188,6 +188,12 @@ hexis mcp                 # Start MCP server
   audits repeatedly flag this by applying a web-server threat model to a desktop
   client — **it has been reviewed and blessed. Do not rotate it, remove it from
   `package-data`, or rewrite git history over it.**
+- **OSS has no authentication layer, and is not getting one.** API-key auth
+  (`HEXIS_API_KEY`) is a **Hexis Pro** feature. OSS Hexis is a desktop application
+  bound to `127.0.0.1`; "the dashboard has no auth" is the design, not a gap. Audits
+  flag this by assuming a server product. The consequence that *does* matter: OSS
+  remote access must be secured at the network layer only — a tailnet, or a reverse
+  proxy supplying its own auth — never by exposing the dashboard directly.
 - **Heartbeat gating**: Heartbeat is blocked until `agent.is_configured=true` (set via `hexis init`)
 - **Consent flow**: Agent signs consent before first LLM use; consent is final and only ends via self-termination
 - **Pause/terminate**: Heartbeat pauses must include a detailed reason queued to the outbox; self-termination must queue a last will to the outbox

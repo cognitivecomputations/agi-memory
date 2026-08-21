@@ -16,6 +16,13 @@ Audits flag this repeatedly by applying a web-server threat model to a desktop
 client. **It has been reviewed and blessed.** Do not rotate it, strip it from
 packaging, or rewrite history over it. See `CLAUDE.md` → Configuration & Safety Notes.
 
+## OSS has no auth layer — that is the design
+
+`HEXIS_API_KEY` and API-key authentication are **Hexis Pro** features. OSS is a
+desktop app on `127.0.0.1` with no auth, by intent. Do not "fix" it, and do not
+propose exposing the dashboard on a public interface — OSS remote access is
+network-layer only (tailnet, or a reverse proxy with its own auth).
+
 ## The Experience Bar (applies to every user-facing change)
 
 A change is not "done" when it compiles or the test passes — it is done when the

@@ -17,8 +17,8 @@
 > |---|---|---|
 > | **P0-1** | **NOT A DEFECT — see below** | Correct and intentional for a desktop application; the original finding misread it |
 > | **P0-4** | **LIVE, and worse** | `core/tools/code_execution.py:86` still `requires_approval=False`; the DB catalog agrees. And per `bridge_gaps.md` §11.5 the approval gate is **fail-open** when no callback is supplied — so the flag would not have helped |
-> | **P0-5** | LIVE | `HEXIS_API_KEY` appears **0 times** in `docker-compose.yml` and `ops/docker-compose.runtime.yml` — still unsettable in a shipped deployment |
-> | **P0-6** | LIVE | **12 of 21** UI proxy routes call `hexisApiHeaders`; nine still forward no bearer token |
+> | **P0-5** | **NOT APPLICABLE TO OSS** | API-key auth is a **Hexis Pro** feature. OSS is not meant to have it, so "cannot be enabled" is the intended state, not a defect |
+> | **P0-6** | **NOT APPLICABLE TO OSS** | Same — with no API key in OSS there is no bearer token to forward. Relevant to Pro only |
 > | **P0-7** | LIVE | `core/migrations.py:243` computes the checksum and `:251` stores it. Zero comparison, mismatch, or drift logic anywhere in the file |
 > | **P1-1** | LIVE | `create_full_registry` is called only by `apps/hexis_mcp_server.py` and tests. The chat and heartbeat runtimes still build `create_default_registry`, so plugins and dynamic tools remain invisible to the agent itself |
 > | **P1-3** | LIVE | Only **2 of 7** channel adapters set `is_group` in metadata; `channels/base.py:58` reads it and has no derivation fallback |
@@ -62,11 +62,15 @@
 >   one-hour fail-closed change closes the second half; the first half needs the flag
 >   set and a sandbox.
 >
-> **A note on the rest of the security findings.** P0-5 and P0-6 (`HEXIS_API_KEY`
-> unsettable, bearer auth on 12 of 21 proxy routes) were also written against a
-> server threat model. For a desktop app bound to `127.0.0.1` their severity is lower
-> than P0 — though they become real again the moment §8 exposes the dashboard beyond
-> localhost. Worth re-rating deliberately rather than inheriting the audit's ranking.
+> **P0-5 and P0-6 are withdrawn for OSS.** API-key authentication belongs to **Hexis
+> Pro**; OSS is a desktop application with no auth layer by design. Both findings
+> assumed a server product that OSS is not. They remain valid input for Pro.
+>
+> **This has a consequence the audit could not have seen, and it is not small.** OSS
+> will never gain first-party auth, so **remote access can only ever be secured at the
+> network layer** — a tailnet, or a reverse proxy that brings its own authentication.
+> `bridge_gaps.md` §8 has been corrected: exposing the OSS dashboard directly is not
+> "premature," it is permanently out of bounds.
 >
 > A pattern also worth naming, because it now has six instances across this audit and
 > `bridge_gaps.md`: **a mechanism exists, and nothing enforces it.** Checksums computed

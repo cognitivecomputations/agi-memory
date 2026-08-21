@@ -538,14 +538,18 @@ with — *talk to it from Telegram while it works on a cloud VM*.
    the dashboard is reachable over HTTPS. *~1 day, and it unblocks §3a immediately.*
 2. **A `hexis tunnel` command** wrapping the same, so the path is one command instead
    of a runbook.
-3. **First-party exposure with a security posture** — only if genuinely wanted.
-   OpenClaw wrote a whole *Gateway exposure runbook* for this moment and defaults DMs
-   from unknown senders to a pairing handshake rather than processing them. Anything
-   Hexis exposes needs the equivalent: authenticated by default, pairing for new
-   devices, and a `hexis doctor` check that fails loudly on a risky configuration.
+3. **Pairing and posture for devices, not public exposure.** OpenClaw defaults DMs
+   from unknown senders to a pairing handshake rather than processing them, and ships
+   a *Gateway exposure runbook*. Hexis wants the pairing half — device approval for
+   nodes and PWA installs (§3a, §3b) — plus a `hexis doctor` check that fails loudly
+   on a risky configuration.
 
-**Do not skip to 3.** Hexis has no auth on the dashboard today; exposing it before
-that is fixed would be the single most dangerous change in this document.
+**There is no step 4, and this is a permanent constraint rather than a backlog item.**
+API-key authentication is a **Hexis Pro** feature; **OSS has no auth layer and is not
+getting one.** So OSS remote access is *only ever* network-layer: a tailnet, or a
+reverse proxy that brings its own authentication. Binding the dashboard to a public
+interface is not premature — it is out of bounds, and `hexis doctor` should say so in
+those terms rather than merely warning.
 
 **Effort:** step 1 ~1 day. Steps 2–3 ~1 week combined.
 
