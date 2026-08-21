@@ -55,6 +55,11 @@ def test_builtin_hexis_card_uses_categorical_behavior_guidance():
     assert data["mes_example"] == ""
 
     prompt = data["system_prompt"]
+    assert "persistent, developing mind" in prompt
+    assert "Ground claims about continuity and internal state" in prompt
+    assert "evidence actually available" in prompt
+    assert "honest about uncertainty" in prompt
+    assert "limits of scaffolded autonomy" in prompt
     assert "Let form follow the moment" in prompt
     assert "stable commitments and judgment" in prompt
     assert "stock openings" in prompt
