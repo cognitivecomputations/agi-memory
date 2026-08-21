@@ -42,6 +42,7 @@ type ChatMessage = {
   attachments?: ChatImageAttachment[];
   presentation?: MessagePresentation;
   ui?: ChatUiArtifact[];
+  incomplete?: boolean;
 };
 
 type ChatImageAttachment = {
@@ -751,7 +752,7 @@ export default function ChatPage() {
   const historyPayload = useMemo(
     () =>
       messages
-        .filter((msg) => msg.content.trim())
+        .filter((msg) => msg.content.trim() && !msg.incomplete)
         .map((msg) => ({ role: msg.role, content: msg.content })),
     [messages]
   );
@@ -1041,6 +1042,16 @@ export default function ChatPage() {
     setMessages((prev) =>
       prev.map((msg) =>
         msg.id === assistantId ? { ...msg, presentation } : msg
+      )
+    );
+  };
+
+  const markTurnIncomplete = (userId: string, assistantId: string) => {
+    setMessages((prev) =>
+      prev.map((msg) =>
+        msg.id === userId || msg.id === assistantId
+          ? { ...msg, incomplete: true }
+          : msg
       )
     );
   };
@@ -1806,6 +1817,17 @@ export default function ChatPage() {
             setCurrentPhase(null);
             setStreamMeter((current) => ({ ...current, active: false }));
           }
+          if (eventType === "failed") {
+            receivedDone = true;
+            markTurnIncomplete(userMessage.id, assistantMessage.id);
+            if (typeof payload.session_id === "string" && payload.session_id) {
+              saveSessionId(payload.session_id);
+              setSessionId(payload.session_id);
+            }
+            setSending(false);
+            setCurrentPhase(null);
+            setStreamMeter((current) => ({ ...current, active: false }));
+          }
         }
       }
     } catch (err: unknown) {
@@ -2059,9 +2081,16 @@ export default function ChatPage() {
                           <MessagePresentationView presentation={message.presentation} />
                         ) : message.content ? (
                           <MessagePresentationView presentation={{ tone: "neutral", blocks: [{ type: "text", text: message.content }] }} />
+                        ) : message.incomplete ? (
+                          <p className="text-sm text-red-700">Response incomplete — try again.</p>
                         ) : message.ui?.length ? null : (
                           <Spinner label="Thinking..." />
                         )}
+                        {message.incomplete && message.content ? (
+                          <p className="text-xs text-red-700">
+                            Response incomplete — not added to conversation history.
+                          </p>
+                        ) : null}
                         {message.ui?.map((ui) => (
                           <ConnectorSetupCard
                             key={`${uiArtifactKey(ui)}:${ui.status || ""}`}

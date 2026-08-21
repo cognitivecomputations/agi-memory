@@ -8,7 +8,7 @@ from __future__ import annotations
 import os
 
 from apps.tui import activity, model_catalog, textkit
-from apps.tui.chat_widgets import COMMANDS, StreamingBlock, ToolTree
+from apps.tui.chat_widgets import AssistantTurn, COMMANDS, StreamingBlock, ToolTree
 from apps.tui.init_widgets import (
     BigFiveSliders,
     CharacterPreview,
@@ -31,6 +31,16 @@ def test_widgets_accept_id_kwarg():
     assert ModelMenu(id="model-menu").id == "model-menu"
     assert StreamingBlock() is not None
     assert ToolTree() is not None
+
+
+def test_assistant_turn_keeps_structured_reasoning_out_of_visible_text():
+    turn = AssistantTurn("Hexis")
+    turn.append_reasoning_delta("private thought")
+    turn.append_delta("visible answer")
+
+    assert turn._structured_reasoning == "private thought"
+    assert turn._raw == "visible answer"
+    assert turn._visible == ""
 
 
 # ── Model catalog (models.dev parsing) ────────────────────────────────────────

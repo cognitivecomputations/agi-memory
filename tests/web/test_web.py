@@ -151,6 +151,34 @@ async def test_chat_returns_sse_stream(client):
     }
 
 
+async def test_chat_marks_partial_error_failed_instead_of_done(client):
+    async def fake_stream(*_args, **_kwargs):
+        yield AgentEventData(event=AgentEvent.LOOP_START)
+        yield AgentEventData(event=AgentEvent.TEXT_DELTA, data={"text": "partial"})
+        yield AgentEventData(
+            event=AgentEvent.ERROR,
+            data={"error": "stream disconnected", "error_type": "ConnectionError"},
+        )
+        yield AgentEventData(
+            event=AgentEvent.LOOP_END,
+            data={"stopped_reason": "error"},
+        )
+
+    with patch.object(web_module, "stream_chat_events", fake_stream):
+        response = await client.post("/api/chat", json={"message": "Hello"})
+
+    events = _parse_sse(response.text)
+    event_types = [event["event"] for event in events]
+    assert "error" in event_types
+    assert "failed" in event_types
+    assert "done" not in event_types
+    failed = json.loads(next(
+        event["data"] for event in events if event["event"] == "failed"
+    ))
+    assert failed["assistant"] == "partial"
+    assert failed["incomplete"] is True
+
+
 async def test_chat_sends_done_before_post_loop_memory_events(client):
     """The visible turn completes before post-response bookkeeping logs."""
     async def fake_stream(*args, **kwargs):
@@ -645,6 +673,20 @@ async def test_heartbeat_agent_sse_exposes_model_exchange_without_credentials():
     assert response_data["kind"] == "llm_response"
     assert response_data["content"] == "hello back"
     assert "api_key" not in request_data
+
+
+async def test_heartbeat_agent_sse_does_not_expose_reasoning_text():
+    from core.agent_loop import AgentEvent, AgentEventData
+
+    reasoning = AgentEventData(
+        event=AgentEvent.REASONING_DELTA,
+        data={"text": "private chain of thought"},
+    )
+
+    event = _parse_sse(web_module._heartbeat_agent_sse(reasoning))[0]
+
+    assert event["event"] == "phase"
+    assert "private chain of thought" not in event["data"]
 
 
 def _parse_sse(text: str) -> list[dict[str, str]]:

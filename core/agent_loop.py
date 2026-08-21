@@ -75,6 +75,14 @@ def _trace_safe_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]
     return safe
 
 
+def describe_exception(exc: BaseException) -> str:
+    """Return a non-empty, user-safe exception description."""
+    message = str(exc).strip()
+    if message:
+        return message
+    return type(exc).__name__
+
+
 # ---------------------------------------------------------------------------
 # Events
 # ---------------------------------------------------------------------------
@@ -85,6 +93,7 @@ class AgentEvent(str, Enum):
 
     LOOP_START = "loop_start"
     TEXT_DELTA = "text_delta"
+    REASONING_DELTA = "reasoning_delta"
     TOOL_START = "tool_start"
     TOOL_RESULT = "tool_result"
     APPROVAL_REQUEST = "approval_request"
@@ -399,7 +408,13 @@ class AgentLoop:
                 await self._emit(AgentEvent.TEXT_DELTA, {
                     "text": token,
                     "iteration": self._iteration_count,
-                })
+                }, persist=False)
+
+            async def _on_reasoning_delta(token: str) -> None:
+                await self._emit(AgentEvent.REASONING_DELTA, {
+                    "text": token,
+                    "iteration": self._iteration_count,
+                }, persist=False)
 
             result = await stream_chat_completion(
                 provider=llm["provider"],
@@ -411,6 +426,7 @@ class AgentLoop:
                 temperature=cfg.temperature,
                 max_tokens=cfg.max_tokens,
                 on_text_delta=_on_text_delta,
+                on_reasoning_delta=_on_reasoning_delta,
                 auth_mode=llm.get("auth_mode"),
             )
         else:
@@ -485,8 +501,19 @@ class AgentLoop:
             try:
                 response = await self._llm_call(messages, tools)
             except Exception as e:
-                logger.error("LLM call failed at iteration %d: %s", self._iteration_count, e)
-                await self._emit(AgentEvent.ERROR, {"error": str(e), "iteration": self._iteration_count})
+                error = describe_exception(e)
+                logger.exception(
+                    "LLM call failed at iteration %d: %s",
+                    self._iteration_count,
+                    error,
+                )
+                await self._emit(AgentEvent.ERROR, {
+                    "error": error,
+                    "error_type": type(e).__name__,
+                    "provider": cfg.llm_config.get("provider"),
+                    "model": cfg.llm_config.get("model"),
+                    "iteration": self._iteration_count,
+                })
                 return self._make_result(await self._get_messages(), "error")
 
             text = response.get("content", "") or ""
@@ -673,8 +700,15 @@ class AgentLoop:
         try:
             response = await self._llm_call(messages, tools=None)
         except Exception as e:
-            logger.error("Plan phase LLM call failed: %s", e)
-            await self._emit(AgentEvent.ERROR, {"error": str(e), "phase": "plan"})
+            error = describe_exception(e)
+            logger.exception("Plan phase LLM call failed: %s", error)
+            await self._emit(AgentEvent.ERROR, {
+                "error": error,
+                "error_type": type(e).__name__,
+                "provider": self.config.llm_config.get("provider"),
+                "model": self.config.llm_config.get("model"),
+                "phase": "plan",
+            })
             return self._make_result(await self._get_messages(), "error")
 
         plan_text = response.get("content", "") or ""
@@ -969,7 +1003,7 @@ class AgentLoop:
                     "SELECT finish_agent_turn($1::uuid, $2::jsonb)",
                     self._turn_id,
                     json.dumps({
-                        "status": "completed",
+                        "status": "failed" if result.stopped_reason == "error" else "completed",
                         "stopped_reason": result.stopped_reason,
                         "text": result.text,
                         "iterations": result.iterations,
@@ -980,9 +1014,15 @@ class AgentLoop:
         except Exception:
             logger.warning("finish_agent_turn failed for turn %s", self._turn_id, exc_info=True)
 
-    async def _emit(self, event: AgentEvent, data: dict[str, Any] | None = None) -> None:
+    async def _emit(
+        self,
+        event: AgentEvent,
+        data: dict[str, Any] | None = None,
+        *,
+        persist: bool = True,
+    ) -> None:
         """Emit an event via the configured callback."""
-        if self._turn_id:
+        if persist and self._turn_id:
             try:
                 async with self.config.pool.acquire() as conn:
                     await conn.fetchval(

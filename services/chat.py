@@ -6,7 +6,7 @@ from typing import Any, AsyncIterator, Awaitable, Callable
 from uuid import UUID
 
 from core.agent_api import db_dsn_from_env, get_agent_profile_context, pool_sizes_from_env
-from core.agent_loop import AgentEvent, AgentEventData
+from core.agent_loop import AgentEvent, AgentEventData, describe_exception
 from core.cognitive_memory_api import CognitiveMemory
 from core.llm import normalize_llm_config
 from core.llm_config import load_llm_config
@@ -395,8 +395,11 @@ async def stream_chat_turn(
                 "or run `hexis doctor --llm` if it keeps happening."
             )
         return
-    if not full_text and error_message:
-        yield f"Request failed: {error_message}"
+    if error_message:
+        if full_text:
+            yield f"\n\n[Response failed before completion: {error_message}]"
+        else:
+            yield f"Request failed: {error_message}"
 
 
 async def stream_chat_events(
@@ -586,9 +589,14 @@ async def stream_chat_events(
                         )
             except Exception as exc:
                 logger.exception("RLM chat stream failed")
+                error = describe_exception(exc)
                 yield AgentEventData(
                     event=AgentEvent.ERROR,
-                    data={"error": str(exc), "runtime": "rlm"},
+                    data={
+                        "error": error,
+                        "error_type": type(exc).__name__,
+                        "runtime": "rlm",
+                    },
                 )
                 yield AgentEventData(
                     event=AgentEvent.LOOP_END,
@@ -600,6 +608,7 @@ async def stream_chat_events(
         agent_profile = await get_agent_profile_context(pool=pool)
         collected: list[str] = []
         timed_out = False
+        failed = False
         appraisal_affect: dict[str, Any] | None = None
         tool_energy_spent = 0
 
@@ -626,6 +635,8 @@ async def stream_chat_events(
             elif event.event == AgentEvent.LOOP_END:
                 stopped = str(event.data.get("stopped_reason") or "")
                 timed_out = stopped == "timeout" or bool(event.data.get("timed_out"))
+            elif event.event == AgentEvent.ERROR:
+                failed = True
             elif event.event == AgentEvent.PHASE_CHANGE:
                 if (
                     event.data.get("phase") == "subconscious"
@@ -645,7 +656,7 @@ async def stream_chat_events(
             yield event
 
         full_text = "".join(collected)
-        if full_text and not timed_out:
+        if full_text and not timed_out and not failed:
             persisted = await _remember_conversation(
                 CognitiveMemory(pool),
                 user_message=user_message,

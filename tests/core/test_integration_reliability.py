@@ -177,3 +177,22 @@ async def test_iter_sse_json_does_not_retry_after_emitted_event():
     assert events == [{"partial": True}]
     assert calls == 1
     assert raised.value.error_kind == "network"
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_iter_sse_json_strict_mode_rejects_malformed_payload():
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="data: {not-json}\n\n")
+
+    with pytest.raises(ValueError, match="Malformed SSE JSON"):
+        _ = [
+            event
+            async for event in iter_sse_json_events(
+                "test_provider",
+                "POST",
+                "https://example.test/stream",
+                transport=httpx.MockTransport(handler),
+                attempts=1,
+                strict_json=True,
+            )
+        ]

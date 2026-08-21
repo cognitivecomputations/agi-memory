@@ -1463,6 +1463,8 @@ def _heartbeat_agent_sse(event: AgentEventData) -> str:
         return _sse_event("tool", {"status": "end", **event.data})
     if event.event == AgentEvent.TEXT_DELTA:
         return _sse_event("text", event.data)
+    if event.event == AgentEvent.REASONING_DELTA:
+        return _sse_event("phase", {"phase": "reasoning", "status": "progress"})
     if event.event == AgentEvent.ERROR:
         return _sse_event("error", {"message": event.data.get("error", "Heartbeat failed")})
     return _sse_event("agent_event", {"event": event.event.value, **event.data})
@@ -1987,7 +1989,7 @@ async def _stream_chat(req: ChatRequest) -> AsyncIterator[str]:
         AgentEvent.LLM_REQUEST   → trace        {kind: "llm_request", ...}
         AgentEvent.LLM_RESPONSE  → trace        {kind: "llm_response", ...}
         AgentEvent.UI_ARTIFACT   → ui           {kind, ui, ...}
-        AgentEvent.LOOP_END      → done         {assistant, presentation}
+        AgentEvent.LOOP_END      → done/failed  {assistant, presentation/incomplete}
         AgentEvent.ERROR         → error        {message}
     """
     pool = _pool
@@ -2015,6 +2017,8 @@ async def _stream_chat(req: ChatRequest) -> AsyncIterator[str]:
         conscious_started = False
         active_stream_phase = "conscious_final"
         done_sent = False
+        stream_failed = False
+        failure_message = "Unknown error"
         visual_attachment_count = len(req.visual_attachments or [])
 
         if visual_attachment_count:
@@ -2031,6 +2035,14 @@ async def _stream_chat(req: ChatRequest) -> AsyncIterator[str]:
             if full_text:
                 payload["presentation"] = presentation_from_text(full_text).to_dict()
             return payload
+
+        def build_failed_payload() -> dict[str, Any]:
+            return {
+                "assistant": full_text,
+                "session_id": session_id,
+                "message": failure_message,
+                "incomplete": True,
+            }
 
         async for event in stream_chat_events(
             user_message=user_message,
@@ -2166,8 +2178,14 @@ async def _stream_chat(req: ChatRequest) -> AsyncIterator[str]:
                 })
 
             elif event.event == AgentEvent.ERROR:
+                stream_failed = True
+                failure_message = str(
+                    event.data.get("error")
+                    or event.data.get("error_type")
+                    or "Unknown error"
+                )
                 yield _sse_event("error", {
-                    "message": event.data.get("error", "Unknown error"),
+                    "message": failure_message,
                 })
 
             elif event.event == AgentEvent.LOOP_END and not done_sent:
@@ -2177,7 +2195,10 @@ async def _stream_chat(req: ChatRequest) -> AsyncIterator[str]:
                 # while the response is already finished.
                 if conscious_started:
                     yield _sse_event("phase_end", {"phase": active_stream_phase})
-                yield _sse_event("done", build_done_payload())
+                if stream_failed or event.data.get("stopped_reason") == "error":
+                    yield _sse_event("failed", build_failed_payload())
+                else:
+                    yield _sse_event("done", build_done_payload())
                 done_sent = True
 
         # Signal phase end and completion for runtimes that do not surface a
@@ -2185,7 +2206,10 @@ async def _stream_chat(req: ChatRequest) -> AsyncIterator[str]:
         if conscious_started and not done_sent:
             yield _sse_event("phase_end", {"phase": active_stream_phase})
         if not done_sent:
-            yield _sse_event("done", build_done_payload())
+            if stream_failed:
+                yield _sse_event("failed", build_failed_payload())
+            else:
+                yield _sse_event("done", build_done_payload())
 
     except Exception as e:
         logger.exception("Chat stream error")

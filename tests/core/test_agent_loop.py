@@ -858,10 +858,13 @@ class TestStreaming:
 
     @patch("core.agent_loop.stream_chat_completion")
     async def test_stream_text_delta_content(self, mock_stream_llm):
-        """TEXT_DELTA events contain the text content."""
+        """Provider deltas reach the client without per-token DB writes."""
         # Simulate stream_chat_completion calling on_text_delta per-token
         async def _fake_stream(**kwargs):
             cb = kwargs.get("on_text_delta")
+            reasoning_cb = kwargs.get("on_reasoning_delta")
+            if reasoning_cb:
+                await reasoning_cb("considering")
             if cb:
                 await cb("Hello ")
                 await cb("stream!")
@@ -872,14 +875,30 @@ class TestStreaming:
         agent = AgentLoop(config)
 
         text_events = []
+        reasoning_events = []
         async for event in agent.stream("Hi"):
             if event.event == AgentEvent.TEXT_DELTA:
                 text_events.append(event)
+            elif event.event == AgentEvent.REASONING_DELTA:
+                reasoning_events.append(event)
 
         # Two token-level deltas
         assert len(text_events) == 2
         assert text_events[0].data["text"] == "Hello "
         assert text_events[1].data["text"] == "stream!"
+        assert [event.data["text"] for event in reasoning_events] == ["considering"]
+
+        async with _DB_POOL.acquire() as conn:
+            transient_count = await conn.fetchval(
+                """
+                SELECT count(*)
+                FROM agent_turn_events
+                WHERE turn_id = $1::uuid
+                  AND event_type IN ('text_delta', 'reasoning_delta')
+                """,
+                agent._turn_id,
+            )
+        assert transient_count == 0
 
     @patch("core.agent_loop.stream_chat_completion")
     async def test_stream_with_tools(self, mock_stream_llm):
@@ -913,6 +932,27 @@ class TestStreaming:
 
         assert AgentEvent.TOOL_START in event_types
         assert AgentEvent.TOOL_RESULT in event_types
+        assert call_count == 2
+        assert registry.execute.await_count == 1
+
+    @patch("core.agent_loop.stream_chat_completion")
+    async def test_failed_stream_never_executes_partial_tool_call(self, mock_stream_llm):
+        registry = _mock_registry()
+
+        async def _fake_stream(**kwargs):
+            callback = kwargs.get("on_text_delta")
+            if callback:
+                await callback("partial")
+            raise ConnectionError("stream disconnected during tool arguments")
+
+        mock_stream_llm.side_effect = _fake_stream
+        agent = AgentLoop(_make_config(registry=registry))
+
+        events = [event async for event in agent.stream("Find it")]
+
+        assert any(event.event == AgentEvent.ERROR for event in events)
+        assert not any(event.event == AgentEvent.TOOL_START for event in events)
+        assert registry.execute.await_count == 0
 
 
 # ============================================================================
@@ -932,6 +972,25 @@ class TestErrorHandling:
         assert result.stopped_reason == "error"
         assert result.iterations == 1
         assert result.timed_out is False
+
+    @patch("core.agent_loop.stream_chat_completion")
+    async def test_stream_error_has_detail_and_marks_turn_failed(self, mock_stream_llm):
+        mock_stream_llm.side_effect = AssertionError()
+        config = _make_config()
+        agent = AgentLoop(config)
+
+        events = [event async for event in agent.stream("Fail please")]
+        errors = [event for event in events if event.event == AgentEvent.ERROR]
+
+        assert len(errors) == 1
+        assert errors[0].data["error"] == "AssertionError"
+        assert errors[0].data["error_type"] == "AssertionError"
+        async with _DB_POOL.acquire() as conn:
+            status = await conn.fetchval(
+                "SELECT status FROM agent_turns WHERE id = $1::uuid",
+                agent._turn_id,
+            )
+        assert status == "failed"
 
     @patch("core.agent_loop.chat_completion")
     async def test_tool_error_visible_to_llm(self, mock_llm):

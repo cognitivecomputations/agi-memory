@@ -214,6 +214,67 @@ describe("ChatPage attachments", () => {
       expect(screen.queryByText("network error")).not.toBeInTheDocument();
     });
   });
+
+  it("marks a partial failed response as incomplete", async () => {
+    const chatBodies: Record<string, unknown>[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith("/api/status")) {
+          return Response.json({
+            configured: true,
+            agent_name: "Samantha",
+            mood: "Ready",
+            valence: 0,
+          });
+        }
+        if (url.endsWith("/api/outbox")) {
+          return Response.json({ unread: 0, messages: [], pending_requests: [] });
+        }
+        if (url.endsWith("/api/chat")) {
+          chatBodies.push(JSON.parse(String(init?.body || "{}")));
+          if (chatBodies.length > 1) {
+            return eventStream([
+              [
+                "event: done",
+                'data: {"assistant":"ok","session_id":"00000000-0000-4000-8000-000000000001"}',
+                "",
+                "",
+              ].join("\n"),
+            ]);
+          }
+          return eventStream([
+            'event: token\ndata: {"phase":"conscious_final","text":"partial"}\n\n',
+            'event: error\ndata: {"message":"stream disconnected"}\n\n',
+            [
+              "event: failed",
+              'data: {"assistant":"partial","incomplete":true}',
+              "",
+              "",
+            ].join("\n"),
+          ]);
+        }
+        return Response.json({});
+      }) as unknown as typeof fetch
+    );
+
+    render(<ChatPage />);
+
+    const composer = await screen.findByLabelText("Message Samantha");
+    fireEvent.change(composer, { target: { value: "hello" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    expect(
+      await screen.findByText("Response incomplete — not added to conversation history.")
+    ).toBeInTheDocument();
+
+    fireEvent.change(composer, { target: { value: "again" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() => expect(chatBodies).toHaveLength(2));
+    expect(chatBodies[1].history).toBeUndefined();
+  });
 });
 
 describe("ChatPage outbox replies", () => {

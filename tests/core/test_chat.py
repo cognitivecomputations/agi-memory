@@ -339,6 +339,44 @@ async def test_stream_chat_turn_skips_memory_for_partial_timeout(monkeypatch):
     assert "".join(chunks) == "partial\n\n[Response timed out before completion.]"
 
 
+async def test_stream_chat_turn_marks_partial_error_without_memory(monkeypatch):
+    async def fake_agent_profile(_dsn=None, **_kwargs):
+        return {}
+
+    async def fake_stream_agent(*_args, **_kwargs):
+        yield AgentEventData(event=AgentEvent.TEXT_DELTA, data={"text": "partial"})
+        yield AgentEventData(
+            event=AgentEvent.ERROR,
+            data={"error": "AssertionError", "error_type": "AssertionError"},
+        )
+        yield AgentEventData(
+            event=AgentEvent.LOOP_END,
+            data={"stopped_reason": "error", "timed_out": False},
+        )
+
+    async def fail_remember(*_args, **_kwargs):
+        raise AssertionError("partial failed replies must not be written as memories")
+
+    monkeypatch.setattr(chat_mod, "get_agent_profile_context", fake_agent_profile)
+    monkeypatch.setattr(chat_mod, "stream_agent", fake_stream_agent)
+    monkeypatch.setattr(chat_mod, "_remember_conversation", fail_remember)
+
+    chunks = [
+        chunk
+        async for chunk in chat_mod.stream_chat_turn(
+            user_message="hi",
+            history=[],
+            llm_config={"provider": "openai", "model": "gpt-4o"},
+            dsn="postgresql://unused",
+            pool=object(),
+        )
+    ]
+
+    assert "".join(chunks) == (
+        "partial\n\n[Response failed before completion: AssertionError]"
+    )
+
+
 async def test_stream_chat_events_keeps_token_streaming_when_rlm_streaming_disabled(monkeypatch):
     seen: dict[str, bool] = {}
 
@@ -348,6 +386,10 @@ async def test_stream_chat_events_keeps_token_streaming_when_rlm_streaming_disab
     async def fake_stream_agent(*_args, **_kwargs):
         seen["stream_agent"] = True
         yield AgentEventData(event=AgentEvent.LOOP_START, data={})
+        yield AgentEventData(
+            event=AgentEvent.REASONING_DELTA,
+            data={"text": "private thought"},
+        )
         yield AgentEventData(event=AgentEvent.TEXT_DELTA, data={"text": "Hello"})
         yield AgentEventData(event=AgentEvent.TEXT_DELTA, data={"text": " there"})
         yield AgentEventData(
@@ -355,8 +397,9 @@ async def test_stream_chat_events_keeps_token_streaming_when_rlm_streaming_disab
             data={"stopped_reason": "completed", "timed_out": False},
         )
 
-    async def fake_remember(*_args, **_kwargs):
+    async def fake_remember(*_args, **kwargs):
         seen["remembered"] = True
+        seen["assistant"] = kwargs.get("assistant_message")
         return {}
 
     async def fake_energy(*_args, **_kwargs):
@@ -383,6 +426,7 @@ async def test_stream_chat_events_keeps_token_streaming_when_rlm_streaming_disab
 
     assert seen["stream_agent"] is True
     assert seen["remembered"] is True
+    assert seen["assistant"] == "Hello there"
     assert [
         event.data.get("text")
         for event in events

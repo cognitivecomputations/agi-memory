@@ -54,7 +54,7 @@ class ChatScreen(Screen):
         self._history: list[dict[str, Any]] = []
         self._verbose = False
         self._debug = False
-        self._show_reasoning = True
+        self._show_reasoning = False
         self._agent_name = "Hexis"
         self._mood = ""
         self._streaming = False
@@ -62,6 +62,7 @@ class ChatScreen(Screen):
         self._pending_user = ""
         self._queued: list[str] = []
         self._tool_count = 0
+        self._turn_failed = False
         self._flush_timer: Any = None
         self._greet = False
         self._chat_session_id = str(uuid.uuid4())
@@ -259,6 +260,7 @@ class ChatScreen(Screen):
         await tr.add_user(text)
         self._pending_user = text
         self._tool_count = 0
+        self._turn_failed = False
         self._streaming = True
         self._current_turn = await tr.add_assistant(self._agent_name)
         self._current_turn.show_reasoning(self._show_reasoning)
@@ -312,6 +314,11 @@ class ChatScreen(Screen):
                         saw_token = True
                         status.set_busy("")  # switch to rotating think-verbs
                     turn.append_delta(text)
+            elif ev == AgentEvent.REASONING_DELTA:
+                text = data.get("text", "")
+                if text and turn is not None:
+                    turn.append_reasoning_delta(text)
+                    status.set_busy("thinking")
             elif ev == AgentEvent.TOOL_START:
                 name = data.get("tool_name", "tool")
                 self._tool_count += 1
@@ -331,7 +338,10 @@ class ChatScreen(Screen):
             elif ev == AgentEvent.ENERGY_EXHAUSTED:
                 tr.write_info("energy exhausted")
             elif ev == AgentEvent.ERROR:
-                tr.write_error(data.get("error", "Unknown error"))
+                self._turn_failed = True
+                tr.write_error(
+                    data.get("error") or data.get("error_type") or "Unknown error"
+                )
 
     async def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
         if event.worker.name != "chat-stream":
@@ -353,11 +363,12 @@ class ChatScreen(Screen):
 
         tr = self.query_one(Transcript)
         if event.state == WorkerState.ERROR:
-            tr.write_error(str(event.worker.error))
+            from core.agent_loop import describe_exception
+            tr.write_error(describe_exception(event.worker.error))
         elif event.state == WorkerState.CANCELLED:
             tr.write_info("interrupted")
 
-        if event.state == WorkerState.SUCCESS and turn is not None:
+        if event.state == WorkerState.SUCCESS and turn is not None and not self._turn_failed:
             final_text = getattr(turn, "_visible", "") or ""
             self._history.append({"role": "user", "content": self._pending_user})
             self._history.append({"role": "assistant", "content": final_text})
