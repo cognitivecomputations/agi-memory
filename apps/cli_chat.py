@@ -21,6 +21,7 @@ import uuid
 from typing import Any
 
 from dotenv import load_dotenv
+from rich.markup import escape
 
 from apps.cli_theme import console, err_console
 
@@ -541,7 +542,10 @@ async def _run_chat(dsn: str, *, verbose: bool = False, debug: bool = False,
                                     console.print(f"    [dim]{_fmt_json(display, 500)}[/dim]")
                         else:
                             error_msg = event.data.get("error", "")
-                            console.print(f" [fail]failed[/fail][dim]{dur_str}[/dim] [muted]{error_msg[:120]}[/muted]")
+                            console.print(
+                                f" [fail]failed[/fail][dim]{dur_str}[/dim] "
+                                f"[muted]{escape(error_msg[:120])}[/muted]"
+                            )
                             if ui and _connector_setup_requires_action(ui):
                                 _print_connector_setup_ui(ui)
 
@@ -558,6 +562,9 @@ async def _run_chat(dsn: str, *, verbose: bool = False, debug: bool = False,
 
                     elif event.event == AgentEvent.LOOP_END:
                         turn_timed_out = bool(event.data.get("timed_out", False))
+                        reason = str(event.data.get("stopped_reason") or "")
+                        if reason == "error" and not turn_error:
+                            turn_error = "Agent loop ended with an error."
                         if debug:
                             reason = event.data.get("stopped_reason", "?")
                             iters = event.data.get("iterations", 0)
@@ -575,7 +582,9 @@ async def _run_chat(dsn: str, *, verbose: bool = False, debug: bool = False,
                             or "Unknown error"
                         )
                         turn_error = error_msg
-                        console.print(f"\n[fail]Error: {error_msg}[/fail]")
+                        console.print(
+                            f"\n[fail]Error: {escape(error_msg)}[/fail]"
+                        )
 
                 # End the streaming line
                 _end_reasoning_activity()

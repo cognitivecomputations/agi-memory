@@ -24,6 +24,7 @@ from core.agent_loop import (
     AgentLoopConfig,
     AgentLoopResult,
     _to_openai_tool_call,
+    describe_exception,
 )
 from core.tools.base import (
     ToolCategory,
@@ -961,6 +962,169 @@ class TestStreaming:
 
 
 class TestErrorHandling:
+    async def test_exception_description_redacts_credentials_and_sensitive_urls(self):
+        secret_key = "sk-supersecret123456"
+        secret_token = "eyJheader12345.eyJpayload12345.signature12345"
+        error = RuntimeError(
+            "POST https://alice:password@example.test/v1/private"
+            f"?api_key={secret_key} Authorization: Bearer {secret_token}\n"
+            'password=another-secret {"client_secret":"json-secret"}'
+        )
+
+        description = describe_exception(error)
+
+        assert secret_key not in description
+        assert secret_token not in description
+        assert "alice" not in description
+        assert "password" not in description.splitlines()[0]
+        assert "another-secret" not in description
+        assert "json-secret" not in description
+        assert "https://example.test/[redacted]" in description
+        assert "Authorization: [redacted]" in description
+        assert "password=[redacted]" in description
+        assert '"client_secret":"[redacted]"' in description
+
+    async def test_exception_description_bounds_provider_response_bodies(self):
+        description = describe_exception(RuntimeError("provider body: " + "x" * 2000))
+
+        assert len(description) <= 1000
+        assert description.endswith("… [truncated]")
+
+    async def test_exception_description_blocks_common_bypass_formats(self):
+        secrets = {
+            "basic": "dXNlcjpwYXNz",
+            "cookie": "session=abc123",
+            "database": "dbpassword",
+            "rabbitmq": "rabbitsecret",
+            "signature": "signed-query-secret",
+            "openai": "opaque-openai-secret",
+            "env_password": "opaque-rabbit-secret",
+            "private_key": "multiline-private-secret",
+            "image": "iVBORw0KGgoAAAANSUhEUgAAABYPASSPixels",
+        }
+        error = RuntimeError(
+            "headers={'Authorization': 'Basic " + secrets["basic"]
+            + "', 'Cookie': '" + secrets["cookie"] + "'}\n"
+            "postgresql://alice:" + secrets["database"] + "@db.example/hexis\n"
+            "amqp://hexis:" + secrets["rabbitmq"] + "@mq.example/%2F\n"
+            "https://signed.example?X-Amz-Signature=" + secrets["signature"] + "\n"
+            "OPENAI_API_KEY=" + secrets["openai"] + "\n"
+            "RABBITMQ_PASSWORD=" + secrets["env_password"] + "\n"
+            "private_key='-----BEGIN PRIVATE KEY-----\n"
+            + secrets["private_key"]
+            + "\n-----END PRIVATE KEY-----'\n"
+            "image_url='data:image/png;base64,"
+            + secrets["image"]
+            + "'\nterminal=\x1b[31mred\x9b32mgreen\roverwrite"
+        )
+
+        description = describe_exception(error)
+
+        for secret in secrets.values():
+            assert secret not in description
+        assert "postgresql://db.example/[redacted]" in description
+        assert "amqp://mq.example/[redacted]" in description
+        assert "https://signed.example/[redacted]" in description
+        assert "OPENAI_API_KEY=[redacted]" in description
+        assert "RABBITMQ_PASSWORD=[redacted]" in description
+        assert "private_key='[redacted]'" in description
+        assert "data:[redacted]" in description
+        assert "\x1b" not in description
+        assert "\x9b" not in description
+        assert "\r" not in description
+
+    async def test_exception_description_uses_type_for_blank_messages(self):
+        assert describe_exception(AssertionError()) == "AssertionError"
+
+    async def test_exception_description_normalizes_controls_before_redaction(self):
+        secrets = (
+            "opaque-env-secret",
+            "opaque-bearer-secret",
+            "opaque-url-secret",
+            "opaque-image-secret",
+        )
+        error = RuntimeError(
+            "OPENAI_API\x1b_KEY=" + secrets[0] + "\n"
+            "Authorization: Bearer\x9b " + secrets[1] + "\n"
+            "ht\x1btps://user:" + secrets[2] + "@example.test/v1\n"
+            "image=da\x9bta:image/png;base64," + secrets[3]
+        )
+
+        description = describe_exception(error)
+
+        for secret in secrets:
+            assert secret not in description
+        assert "OPENAI_API_KEY=[redacted]" in description
+        assert "Authorization: [redacted]" in description
+        assert "https://example.test/[redacted]" in description
+        assert "data:[redacted]" in description
+
+    async def test_exception_description_handles_escaped_quotes_and_wrapped_data(self):
+        secrets = (
+            "single-quote-secret",
+            "double-quote-secret",
+            "cookie-quote-secret",
+            "LINEONESECRET",
+            "LINETWOSECRET",
+            "UNQUOTEDLINEONE",
+            "UNQUOTEDLINETWO",
+        )
+        error = RuntimeError(
+            "password='pa\\'ss-" + secrets[0] + "'\n"
+            'client_secret="abc\\"' + secrets[1] + '"\n'
+            "headers={'Cookie': 'session=abc\\'" + secrets[2] + "'}\n"
+            "image_url='data:image/png;base64,"
+            + secrets[3]
+            + "\n"
+            + secrets[4]
+            + "'\nimage=data:image/png;base64,"
+            + secrets[5]
+            + "\n"
+            + secrets[6]
+            + " status=failed"
+        )
+
+        description = describe_exception(error)
+
+        for secret in secrets:
+            assert secret not in description
+        assert "password='[redacted]'" in description
+        assert 'client_secret="[redacted]"' in description
+        assert "'Cookie': '[redacted]'" in description
+        assert "data:[redacted]" in description
+
+    @patch("core.agent_loop.stream_chat_completion")
+    async def test_stream_error_persists_only_sanitized_detail(self, mock_stream_llm):
+        secret = "sk-supersecret123456"
+        private_image = "iVBORw0KGgoAAAANSUhEUgAAASECRETPixels"
+        mock_stream_llm.side_effect = RuntimeError(
+            f"provider failed at https://example.test/v1?api_key={secret} "
+            f"image_url=data:image/png;base64,{private_image}"
+        )
+        agent = AgentLoop(_make_config())
+
+        events = [event async for event in agent.stream("Fail safely")]
+        error_event = next(event for event in events if event.event == AgentEvent.ERROR)
+
+        assert secret not in error_event.data["error"]
+        assert private_image not in error_event.data["error"]
+        assert "https://example.test/[redacted]" in error_event.data["error"]
+        async with _DB_POOL.acquire() as conn:
+            persisted_error = await conn.fetchval(
+                """
+                SELECT payload ->> 'error'
+                FROM agent_turn_events
+                WHERE turn_id = $1::uuid
+                  AND event_type = 'error'
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                agent._turn_id,
+            )
+        assert secret not in persisted_error
+        assert private_image not in persisted_error
+        assert persisted_error == error_event.data["error"]
+
     @patch("core.agent_loop.chat_completion")
     async def test_llm_error_returns_error_result(self, mock_llm):
         """LLM call failure returns error stopped_reason."""
