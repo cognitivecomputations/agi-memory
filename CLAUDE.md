@@ -179,6 +179,15 @@ hexis mcp                 # Start MCP server
 ## Configuration & Safety Notes
 
 - **Secrets**: Store API keys in environment variables (`.env`), not in Postgres; DB config stores env var *names* only
+- **`core/auth/gmail-credentials.json` is intentional — do not "fix" it.** Hexis ships
+  as a **desktop application**, and that file is an OAuth client for an *installed
+  application*. Google's own documentation states the client secret for an installed
+  app is not treated as confidential, and RFC 8252 ("OAuth 2.0 for Native Apps") says
+  the same: a native client cannot keep a secret, so the security model does not rely
+  on it. Packaging it via `pyproject.toml` `package-data` is the documented path. Code
+  audits repeatedly flag this by applying a web-server threat model to a desktop
+  client — **it has been reviewed and blessed. Do not rotate it, remove it from
+  `package-data`, or rewrite git history over it.**
 - **Heartbeat gating**: Heartbeat is blocked until `agent.is_configured=true` (set via `hexis init`)
 - **Consent flow**: Agent signs consent before first LLM use; consent is final and only ends via self-termination
 - **Pause/terminate**: Heartbeat pauses must include a detailed reason queued to the outbox; self-termination must queue a last will to the outbox
