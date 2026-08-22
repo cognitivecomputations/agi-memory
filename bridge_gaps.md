@@ -1303,6 +1303,120 @@ surfaced in `hexis doctor`.
 The remaining live findings (P3-2 no UI CI, and the twenty-two not re-verified) stay
 in `improvements.md`. They are real work, but they are hygiene rather than plan.
 
+## 13. No keyword lists — ask the model
+
+**Added 2026-08-23**, after Tier 0 shipped an alias list and immediately proved the
+point. `council` fired on *"what did we decide last time"* — a memory question, not a
+request for deliberation — because `decide` was in its alias list. The fix was to
+remove the past-tense forms. **That fix is the diagnosis:** tuning a word list against
+one example is not building an understanding of the request, and the next phrasing
+nobody anticipated will miss again.
+
+Tier 0 §0.3 called aliases a stopgap and §0.5 named semantic selection as the real
+fix. The stopgap shipped; the real fix did not. This section is that debt, plus every
+other place the same shortcut is taken.
+
+### 13.1 The rule
+
+> **If the question is "what does this text mean," it is not a string operation.**
+
+Three mechanisms, chosen by what is actually being asked:
+
+| Question | Mechanism | Cost |
+|---|---|---|
+| *"Which of these N things is this most like?"* | **Embeddings** — cosine over cached vectors | **Zero LLM calls.** The query is already embedded by `fast_recall`, and `embedding_cache` is keyed by content hash |
+| *"Is this X?" / "Pull X out of this"* | **LLM classification**, batched, cached by content hash | One cheap call, amortized |
+| *"Does this string have this shape?"* | **Regex.** Still correct | Free |
+
+The third row matters as much as the first two. UUIDs, file paths, OAuth redirect
+URLs, HTTP status codes, `[Page 3]` markers emitted by our own reader — those are
+**parsing**, not understanding, and rewriting them as model calls would be a
+different mistake. The audit below separates the two deliberately.
+
+### 13.2 What the audit found
+
+**Free-text semantic matching — replace these.**
+
+| Where | What it does |
+|---|---|
+| `services/skill_runtime.py` | `STOPWORDS`, `_score_skill` token overlap, `_passes_specialized_gate`, and the `aliases:` list now on 19 skills. **Decides which tools exist for a turn** — the highest-stakes instance |
+| `services/connector_cognition.py:60,71` | `_URGENT_TERMS` (`crash`, `hospital`, `911`…), `_IMPORTANT_TERMS` (`urgent`, `asap`, `invoice`…) — scores how much a message matters |
+| `services/connector_cognition.py:23-47` | ~15 regexes extracting preferences, routines, identity, relationships, commitments, judgments from free text into the **user model** |
+| `services/connector_cognition.py:398-408` | inline `any(term in lowered …)` for is-this-a-question, is-this-spam, is-this-scheduling |
+
+**Controlled-vocabulary matching — milder, fix at the source.**
+
+`db/75_functions_continuity.sql:113` matches `emo->>'primary_emotion'` against
+`(fear|alarm|dread|terror|anxiet|panic)`. That field is *already* an appraisal label
+the model produced, so this is matching an enum rather than scoring prose. The fix is
+not a model call — it is for the appraisal to emit the **family** (`threat`,
+`loss`, `reward`…) alongside the label, so the consumer reads a field instead of
+guessing from a word list. Same for `db/07_functions_heartbeat.sql:1503`.
+
+**Structural — leave alone.** `core/init_api.py` and `core/cli_api.py` classifying
+provider errors by HTTP code and vendor error strings; `apps/hexis_cli.py:273`
+spotting secret-shaped config *keys*; `connector_setup.py` extracting OAuth redirects
+and client-secret paths; `services/ingest/sectioning.py` page/sheet/slide markers;
+`core/memory_exchange.py` `EXCLUDED_SECRET_PATTERNS` (security wants a conservative
+list, not a judgment call).
+
+### 13.3 The rearchitecture
+
+**A. Skill selection → embeddings.** *The one that matters, and it costs nothing.*
+
+`fast_recall` already embeds the user's message on nearly every turn, and
+`embedding_cache` is keyed by `content_hash` — so the query vector is **already
+computed and cached** before selection runs. Skills are a fixed, tiny set: embed
+`name + description + example phrasings` once per skill, keyed by content hash, and
+re-embed only when the file changes.
+
+Selection becomes: cosine the (free) query vector against 26 skill vectors, take
+those above a similarity threshold, cap at `max_skills`. `"book time with Sarah next
+week"` lands near the calendar skill because that is what the sentence *means* — no
+alias list, no `decide`/`decision` distinction, no stopwords.
+
+Keep exactly one lexical rule: an **exact skill-name mention** always activates it.
+If someone says "use the council," that is unambiguous and should not go through a
+similarity threshold.
+
+Then delete `STOPWORDS`, `_score_skill`, `_passes_specialized_gate`, and the
+`aliases:` frontmatter — or better, keep the alias words as **example phrasings in
+the embedded text**, where they help the vector rather than acting as match tokens.
+
+*Effort ~2 days. The ten-request probe in `tests/services/test_skill_reachability.py`
+is already the regression test, and it should get harder — phrasings no alias list
+would have caught.*
+
+**B. Connector cognition → the LLM path becomes the path.** *Mostly a config flip.*
+
+`extract_user_model_claims_llm` and `estimate_connector_item_importance_llm` already
+exist, dispatched by `connector.user_model_mode` (`rules` | `llm` | `hybrid`) and
+`connector.user_model_llm_enabled`. The architecture is built; the rules are running
+as an equal partner rather than a fallback.
+
+Make the LLM authoritative, keep the rules strictly for LLM-unavailable, and delete
+`_URGENT_TERMS` / `_IMPORTANT_TERMS` — deciding whether "the hospital called" matters
+more than "invoice attached" is judgment, and a set of nine nouns cannot hold it.
+Cache verdicts by `content_hash` so re-processing is free.
+
+*Effort ~1 day, most of it validating that LLM-first does not regress the
+user-model tests.*
+
+**C. Appraisal emits families.** So consumers read a field rather than pattern-match
+a label. *~half a day.*
+
+**D. Port `heartbeat_intent_classifier`** from Alex's fork (§11) — its own docstring
+says it *"replaces the keyword-based trading-intent pre-allocator."* Same disease,
+already cured there.
+
+### 13.4 The standing rule
+
+New code does not get to add a word list for a semantic question. In review, a literal
+list of domain words used for matching is a defect unless it is parsing structure. The
+test is the one at the top: **if the question is what the text means, ask the model —
+by embedding it when the question is "most like which," and by asking outright when it
+is "is this X."**
+
 # Sequencing
 
 | # | Item | Effort | Unblocks |
@@ -1311,6 +1425,7 @@ in `improvements.md`. They are real work, but they are hygiene rather than plan.
 | −1 | **Approval gate fails closed (§11.5)** | **~1h** | **51 tools stop firing unattended** |
 | 0 | **Tier 0 — reachability (§0.1–0.6)** | **~2d** | **turns on capability already built** |
 | 0b | **Port** `capability_probe` + `tool_surface_audit` (§11.4·8) | ~3d | Tier 0 stops being a one-off audit |
+| 0c | **Semantic skill selection (§13.3·A)** | **~2d** | **retires the alias lists Tier 0 shipped as a stopgap** |
 | 1 | Wave A everyday skills (§4) | ~2d | visible value immediately, no new code |
 | 2 | **Port** `operator_approval` + Slack actions (§11.4·4) | ~2d | approval answerable from a phone |
 | 3 | Automation suggestions (§1) | ~2d | the agent starts proposing |
@@ -1338,6 +1453,8 @@ in `improvements.md`. They are real work, but they are hygiene rather than plan.
 | 23 | `hexis tunnel` + exposure posture (§8.2–3) | ~1w | — |
 | 24 | Voice out / talk / wake (§5.2–4) | ~3w | — |
 | 25 | Execution backends (§7) | ~2w | — |
+| 26 | Connector cognition: LLM-first (§13.3·B) | ~1d | retires `_URGENT_TERMS`/`_IMPORTANT_TERMS` |
+| 27 | Appraisal emits emotion families (§13.3·C) | ~0.5d | retires the SQL emotion regexes |
 
 Tier 0 comes before all of it: shipping new skills (item 1) into a selector that
 will not activate them is building on sand.
