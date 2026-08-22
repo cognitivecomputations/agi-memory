@@ -6,11 +6,10 @@ Open this one; the others are reference.
 | Document | Answers |
 |---|---|
 | **`ROADMAP.md`** *(this file)* | **What next?** |
-| `bridge_gaps.md` | *Why does this item exist?* — the evidence and design for every entry below, by section reference |
-| `positioning.md` | *What should Hexis be best in the world at?* — strategy, changes rarely |
-| `improvements.md` | The July 2026 audit, reconciled 2026-08-21. Twelve findings still live |
+| `PLAN.md` | *Why does this item exist?* — Part I strategy (§S1–S7), Part II the gaps and evidence (§1–§14) |
+| `docs/_archive/audit-2026-07-29.md` | The July 2026 audit, reconciled. Evidence, not a plan |
 
-Section references like §14.1 point into `bridge_gaps.md`.
+Section references like §14.1 point into `PLAN.md`.
 
 ---
 
@@ -76,7 +75,7 @@ The first phase a user would notice. Ordered so each makes the next more valuabl
 
 ## Phase 5 — Depth · ~13d
 
-The `positioning.md` thesis. Mostly ports (§11.4), because Alex already built them.
+The Part I thesis (§S4). Mostly ports (§11.4), because Alex already built them.
 
 | Item | Effort | Note |
 |---|---|---|
@@ -128,7 +127,7 @@ Two rules the phase boundaries encode:
 
 **Nine of these are ports, not builds** (§11.4), and four of them *replace* work this
 plan had costed as new: `voice_notes` for §5.1, the retention trio for
-`positioning.md` §4.6, `operator_policy_corrections` for §4.5, and `capability_probe`
+`PLAN.md` §S4.6, `operator_policy_corrections` for §4.5, and `capability_probe`
 for Tier 0's instrumentation. Ports are cheaper than builds but not free — each is a
 Python module plus SQL plus a migration (§11.6), so they are costed at 1–4 days, not
 at zero.
