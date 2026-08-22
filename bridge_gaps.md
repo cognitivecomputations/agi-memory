@@ -1318,15 +1318,26 @@ other place the same shortcut is taken.
 
 ### 13.1 The rule
 
-> **If the question is "what does this text mean," it is not a string operation.**
+> **If the question is "what does this text mean," it is not a string operation —
+> and if you are asking it about N things, it is one call, not N.**
 
 Three mechanisms, chosen by what is actually being asked:
 
 | Question | Mechanism | Cost |
 |---|---|---|
 | *"Which of these N things is this most like?"* | **Embeddings** — cosine over cached vectors | **Zero LLM calls.** The query is already embedded by `fast_recall`, and `embedding_cache` is keyed by content hash |
-| *"Is this X?" / "Pull X out of this"* | **LLM classification**, batched, cached by content hash | One cheap call, amortized |
+| *"Is this X?" / "Pull X out of this"* | **LLM classification** — **one call for the whole batch**, cached by content hash | One cheap call, amortized over N items |
 | *"Does this string have this shape?"* | **Regex.** Still correct | Free |
+
+**And a second rule, which is what "efficiently" means here:**
+
+> **N things to ask about is one call, not N calls.**
+
+A loop that calls the model once per item is the same mistake as a keyword list — it
+treats a batch problem as a per-row problem. The model is perfectly capable of
+classifying eighty messages in one request and returning eighty verdicts keyed by id.
+Asking eighty times costs eighty round trips, eighty prompt preambles, and eighty
+chances to fail independently.
 
 The third row matters as much as the first two. UUIDs, file paths, OAuth redirect
 URLs, HTTP status codes, `[Page 3]` markers emitted by our own reader — those are
@@ -1352,6 +1363,21 @@ the model produced, so this is matching an enum rather than scoring prose. The f
 not a model call — it is for the appraisal to emit the **family** (`threat`,
 `loss`, `reward`…) alongside the label, so the consumer reads a field instead of
 guessing from a word list. Same for `db/07_functions_heartbeat.sql:1503`.
+
+**Per-item LLM loops — batch these.** Found by looking for `await …_llm(…)` inside a
+`for`:
+
+| Where | Today | Should be |
+|---|---|---|
+| `services/connector_cognition.py:503` | one `extract_user_model_claims_llm` call **per item**, over a query with `LIMIT 80` | one call per run |
+| `services/connector_cognition.py:557` | one `estimate_connector_item_importance_llm` call **per item**, same 80 | one call per run |
+| `services/summarization.py:35` | one `chat_json` **per pending memory** | one call per batch |
+
+A single connector-cognition pass can therefore make **~160 model calls where two
+would do.** The same loops also re-read their config *inside* the loop —
+`connector.user_model_synthesis_mode` and `connector.user_model_llm_enabled` are
+fetched once per item, so eighty items cost two hundred and forty extra round trips
+to Postgres for values that cannot change mid-run. Hoist them.
 
 **Structural — leave alone.** `core/init_api.py` and `core/cli_api.py` classifying
 provider errors by HTTP code and vendor error strings; `apps/hexis_cli.py:273`
@@ -1402,6 +1428,25 @@ Cache verdicts by `content_hash` so re-processing is free.
 *Effort ~1 day, most of it validating that LLM-first does not regress the
 user-model tests.*
 
+**B2. Batch the three per-item loops.** *The efficiency half, and it is the reason
+LLM-first is affordable at all.*
+
+Send the whole batch in one structured request and get back one verdict per item,
+**keyed by the item's id** so a partial or reordered response still maps correctly —
+never by array position. Then:
+
+- **Chunk by token budget, not by count.** Eighty short Slack messages fit in one
+  call; eighty long emails do not. Size the chunk from the actual content length and
+  split when it would overflow, so the batch never silently truncates.
+- **Fail per chunk, not per run.** A malformed response retries that chunk once, then
+  falls back to rules for that chunk alone — the other seventy items still get the
+  good path.
+- **Cache by `content_hash`.** Re-processing the same item is free, which matters
+  because backfills re-walk the same inbox.
+- **Hoist the config reads** out of the loop while you are in there.
+
+*Effort ~2 days across the three call sites. It turns ~160 calls per pass into 2–4.*
+
 **C. Appraisal emits families.** So consumers read a field rather than pattern-match
 a label. *~half a day.*
 
@@ -1416,6 +1461,10 @@ list of domain words used for matching is a defect unless it is parsing structur
 test is the one at the top: **if the question is what the text means, ask the model —
 by embedding it when the question is "most like which," and by asking outright when it
 is "is this X."**
+
+And its companion, which review should catch just as readily: **an `await …_llm(item)`
+inside a `for` loop is a defect.** Batch the call, key the results by id, chunk by
+token budget.
 
 # Sequencing
 
@@ -1454,6 +1503,7 @@ is "is this X."**
 | 24 | Voice out / talk / wake (§5.2–4) | ~3w | — |
 | 25 | Execution backends (§7) | ~2w | — |
 | 26 | Connector cognition: LLM-first (§13.3·B) | ~1d | retires `_URGENT_TERMS`/`_IMPORTANT_TERMS` |
+| 26b | **Batch the per-item LLM loops (§13.3·B2)** | **~2d** | **~160 calls per pass become 2–4** |
 | 27 | Appraisal emits emotion families (§13.3·C) | ~0.5d | retires the SQL emotion regexes |
 
 Tier 0 comes before all of it: shipping new skills (item 1) into a selector that
