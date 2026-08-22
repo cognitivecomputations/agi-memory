@@ -1431,6 +1431,40 @@ user-model tests.*
 **B2. Batch the three per-item loops.** *The efficiency half, and it is the reason
 LLM-first is affordable at all.*
 
+> **Decided 2026-08-23: per-use-case batching on a shared helper. No central queue.**
+>
+> A central micro-batching queue with a debounce window was considered and rejected
+> on evidence. **It would never fire.** Coalescing needs independent callers issuing
+> requests concurrently; all three loops are strictly sequential — request 2 does not
+> exist until request 1 returns — so a 200 ms window expires empty every time, adding
+> latency to every call and batching nothing. Making the queue useful would mean first
+> converting the loops to concurrent fan-out, at which point the caller already holds
+> all N items and can simply batch them.
+>
+> The second reason is homogeneity: **batching is only sound among like requests.**
+> There are 20 non-streaming call sites across 12 modules with roughly a dozen
+> distinct prompt/schema shapes — `services/recmem.py` alone uses three. Mixing a
+> summarization prompt with an importance classification in one request degrades both
+> and makes parsing fragile, so a queue would need sub-queues keyed by
+> `(prompt, schema, model)` — which is per-use-case batching with extra indirection.
+>
+> There is also an asymmetry worth naming: a debounce is free on the heartbeat path
+> where nobody waits, and a tax on every chat turn where someone does.
+>
+> **Centralize the machinery, not the queue.** One helper — roughly
+> `batch_classify(items, prompt=…, schema=…, key=lambda i: i["id"])` — owns what every
+> use case needs and none should reimplement. Each caller supplies its own prompt and
+> schema, because that is the part that genuinely differs, and hands over N items.
+>
+> **Revisit the queue when independent concurrent callers actually exist** — multi-user
+> Pro, or channel bursts where ten inbound messages each trigger classification at
+> once. `batch_classify` is the right substrate to build it on then.
+>
+> One site is already the shape a queue wants: `core/tools/council.py:332` fans out
+> `asyncio.gather(*[_run_one(entry) …])` — N personas, one schema, all concurrent.
+> Rewrite that single `gather` into one batched call; it does not justify a global
+> queue on its own.
+
 Send the whole batch in one structured request and get back one verdict per item,
 **keyed by the item's id** so a partial or reordered response still maps correctly —
 never by array position. Then:
