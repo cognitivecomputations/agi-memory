@@ -114,3 +114,22 @@ def test_every_tool_is_reachable_through_some_skill():
     for tool in ("manage_sessions", "explore_concept", "explore_subgraph",
                  "database_backup", "post_process_output"):
         assert tool in bound, f"{tool} is bound to no skill and cannot be reached"
+
+
+def test_the_everyday_floor_does_not_reach_autonomous_turns():
+    """The floor is for answering someone who asked, not for acting unprompted.
+
+    `integrations.gmail.heartbeat_digest_enabled` exists to authorize reading
+    mail during a heartbeat, when nobody asked. A convenience floor must not
+    become a way around that gate.
+    """
+    from core.tools.base import ToolContext
+    import inspect
+    import services.skill_runtime as sr
+
+    src = inspect.getsource(sr.select_skills)
+    assert "if tool_context != ToolContext.HEARTBEAT:" in src, (
+        "the always-available floor must be scoped to live turns"
+    )
+    assert "email_list" in sr.ALWAYS_AVAILABLE_TOOL_NAMES
+    assert ToolContext.HEARTBEAT is not None

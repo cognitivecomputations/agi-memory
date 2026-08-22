@@ -34,6 +34,11 @@ DISCOVERY_TOOL_NAMES = {"list_skills", "use_skill", "propose_skill", "queue_user
 #
 # Everything here is read-only and cheap. The gate still earns its keep on
 # email_send, shell, and the rest.
+#
+# CHAT ONLY, deliberately. A live turn means a person asked; an autonomous
+# heartbeat means nobody did, and reading someone's mail unprompted is exactly
+# what `integrations.gmail.heartbeat_digest_enabled` exists to authorize. A
+# convenience floor must not become a way around a consent gate.
 ALWAYS_AVAILABLE_TOOL_NAMES = {
     "web_search",
     "web_fetch",
@@ -272,7 +277,8 @@ async def select_skills(
             break
 
     allowed = set(DISCOVERY_TOOL_NAMES)
-    allowed.update(t for t in ALWAYS_AVAILABLE_TOOL_NAMES if t in available_tools)
+    if tool_context != ToolContext.HEARTBEAT:
+        allowed.update(t for t in ALWAYS_AVAILABLE_TOOL_NAMES if t in available_tools)
     for skill in selected:
         allowed.update(t for t in skill_bound_tools(skill) if t in available_tools)
 
