@@ -154,6 +154,8 @@ class AgentLoopConfig:
     # Skill-first routing: when set, only these tool schemas are exposed to the
     # model. `use_skill` can expand the set mid-turn.
     allowed_tool_names: set[str] | None = None
+    # Names only, for telemetry: which skills were active when a tool was refused.
+    active_skill_names: list[str] = field(default_factory=list)
 
     # Continuation nudge (Gap 5)
     continuation_prompt: str | None = None
@@ -543,18 +545,52 @@ class AgentLoop:
                         "error": "not_available_in_active_skills",
                         "energy_spent": 0,
                     })
+                    await self._record_gate_refusal(tool_name, "not_available_in_active_skills")
                     continue
 
-                # Check approval via callback
+                # Approval gate. A tool marked `requires_approval` needs a person
+                # to say yes. When no approver is wired — the heartbeat, the API
+                # chat path — that is not permission, it is the absence of anyone
+                # to ask, so the call is refused rather than waved through.
                 spec = cfg.registry.get_spec(tool_name)
-                if spec and spec.requires_approval and cfg.on_approval:
+                if spec and spec.requires_approval:
                     await self._emit(AgentEvent.APPROVAL_REQUEST, {
                         "tool_name": tool_name,
                         "arguments": arguments,
+                        "approver": "none" if cfg.on_approval is None else "callback",
                     })
+
+                    if cfg.on_approval is None:
+                        await self._record_tool_result(call_id, {
+                            "tool_name": tool_name,
+                            "arguments": arguments,
+                            "success": False,
+                            "error": "no_approver_available",
+                            "energy_spent": 0,
+                            "model_output": (
+                                f"'{tool_name}' needs a person's approval and nobody is "
+                                "available to give it right now. It was not run. Either "
+                                "do this another way, or use queue_user_message to ask "
+                                "for it and pick it up once they answer."
+                            ),
+                        })
+                        self._tool_calls_made.append({
+                            "name": tool_name,
+                            "arguments": arguments,
+                            "success": False,
+                            "error": "no_approver_available",
+                            "energy_spent": 0,
+                        })
+                        await self._record_gate_refusal(tool_name, "no_approver_available")
+                        continue
+
                     try:
                         approved = await cfg.on_approval(tool_name, arguments)
                     except Exception:
+                        logger.warning(
+                            "Approval callback raised for %s; treating as denied",
+                            tool_name, exc_info=True,
+                        )
                         approved = False
 
                     if not approved:
@@ -573,6 +609,7 @@ class AgentLoop:
                             "denied": True,
                             "energy_spent": 0,
                         })
+                        await self._record_gate_refusal(tool_name, "denied")
                         continue
 
                 # Build execution context
@@ -712,6 +749,22 @@ class AgentLoop:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    async def _record_gate_refusal(self, tool_name: str, reason: str) -> None:
+        """A refused tool leaves a trace. Advisory — never breaks the turn."""
+        cfg = self.config
+        try:
+            from services.skill_runtime import record_gate_refusal
+
+            await record_gate_refusal(
+                getattr(cfg.registry, "pool", None),
+                session_id=getattr(cfg, "session_id", None),
+                tool_name=tool_name,
+                reason=reason,
+                active_skills=list(getattr(cfg, "active_skill_names", []) or []),
+            )
+        except Exception:
+            logger.debug("Gate-refusal telemetry failed (non-fatal)", exc_info=True)
 
     async def _build_exec_context(self, call_id: str) -> ToolExecutionContext:
         """Build ToolExecutionContext with config overrides and remaining energy."""

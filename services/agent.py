@@ -30,6 +30,7 @@ from services.prompt_resources import (
 from services.skill_runtime import (
     format_skills_prompt,
     load_available_skills,
+    record_selection,
     select_skills,
 )
 
@@ -894,6 +895,11 @@ async def run_agent(
         query=skill_query,
         max_skills=5 if mode == "heartbeat" else 4,
     )
+    await record_selection(
+        pool, skill_selection,
+        session_id=session_id, surface=surface,
+        tool_context=tool_context, query=skill_query,
+    )
 
     # 4. Build system prompt
     system_prompt = await build_system_prompt(
@@ -954,6 +960,7 @@ async def run_agent(
             session_id=session_id,
             is_group=is_group,
             allowed_tool_names=set(skill_selection.allowed_tool_names),
+            active_skill_names=[sk.name for sk in skill_selection.skills],
         )
     else:
         effective_timeout = timeout_seconds or (300.0 if has_backlog_tasks else 120.0)
@@ -979,6 +986,7 @@ async def run_agent(
             max_continuations=2 if has_backlog_tasks else 1,
             context_overrides=context_overrides,
             allowed_tool_names=set(skill_selection.allowed_tool_names),
+            active_skill_names=[sk.name for sk in skill_selection.skills],
         )
 
     # 7. Run agent loop
@@ -1124,6 +1132,11 @@ async def stream_agent(
         query=user_message,
         max_skills=4,
     )
+    await record_selection(
+        pool, skill_selection,
+        session_id=session_id, surface=surface,
+        tool_context=tool_context, query=user_message,
+    )
 
     # Build system prompt
     system_prompt = await build_system_prompt(
@@ -1185,6 +1198,7 @@ async def stream_agent(
         is_group=is_group,
         on_approval=on_approval,
         allowed_tool_names=set(skill_selection.allowed_tool_names),
+        active_skill_names=[sk.name for sk in skill_selection.skills],
     )
 
     agent = AgentLoop(loop_config)

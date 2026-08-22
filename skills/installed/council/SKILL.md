@@ -5,6 +5,7 @@ category: knowledge
 requires:
   tools: [run_council]
 contexts: [heartbeat, chat]
+aliases: [decide, decision, decisions, should, choose, tradeoff, tradeoffs, weigh, advice, dilemma, options]
 bound_tools: [run_council, list_council_personas]
 ---
 

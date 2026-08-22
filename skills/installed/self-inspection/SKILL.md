@@ -5,6 +5,7 @@ category: system
 requires:
   tools: [inspect_source, inspect_database_schema]
 contexts: [heartbeat, chat]
+aliases: [how, why, yourself, your, internals, schema, config, source, debug]
 bound_tools: [inspect_source, inspect_database_schema, inspect_config, review_recent_actions, review_recent_changes, self_repair]
 ---
 

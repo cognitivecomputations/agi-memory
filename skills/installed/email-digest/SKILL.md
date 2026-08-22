@@ -4,7 +4,8 @@ description: Digest and ingest emails into memory, surfacing important threads a
 category: communication
 requires:
   tools: [email_list, email_read, remember, recall, gmail_setup_status, queue_user_message]
-contexts: [heartbeat]
+contexts: [heartbeat, chat]
+aliases: [email, emails, mail, inbox, unread, important, triage]
 bound_tools: [email_list, email_read, email_search, ingest_emails, gmail_setup_status, recall, remember, queue_user_message, email_send, email_send_sendgrid]
 ---
 

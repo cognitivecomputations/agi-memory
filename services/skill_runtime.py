@@ -23,6 +23,26 @@ if False:  # pragma: no cover - typing only
 
 
 DISCOVERY_TOOL_NAMES = {"list_skills", "use_skill", "propose_skill", "queue_user_message"}
+
+# The read-only floor every turn gets, regardless of which skills activate.
+#
+# Skill-gating is right for tools that act — sending, writing, spending. It is
+# wrong for the ones an assistant reaches for constantly just to answer, because
+# a selector that fails to guess the topic leaves the agent unable to look
+# anything up. Measured: seven of ten ordinary requests activated `core-memory`
+# alone, so a question about email or the calendar had no way to reach either.
+#
+# Everything here is read-only and cheap. The gate still earns its keep on
+# email_send, shell, and the rest.
+ALWAYS_AVAILABLE_TOOL_NAMES = {
+    "web_search",
+    "web_fetch",
+    "calendar_events",
+    "email_list",
+    "email_search",
+    "search_contacts",
+    "get_contact",
+}
 DEFAULT_SKILL_NAMES = {"core-memory"}
 HEARTBEAT_DEFAULT_SKILL_NAMES = {"core-memory", "self-reflection"}
 GMAIL_HEARTBEAT_DIGEST_CONFIG_KEY = "integrations.gmail.heartbeat_digest_enabled"
@@ -39,6 +59,10 @@ STOPWORDS = {
 class SkillSelection:
     skills: list[SkillSpec]
     allowed_tool_names: set[str]
+    # Every candidate with its score and whether a specialized gate excluded it.
+    # Kept so the selection decision can be recorded (#0.6): a selector that
+    # quietly fails to activate the right skill is otherwise invisible.
+    considered: list[dict[str, Any]] = field(default_factory=list)
     # Full catalog for this context — used for the compact skill index in the
     # system prompt, so the model can discover skills without a list_skills call.
     available: list[SkillSpec] = field(default_factory=list)
@@ -64,7 +88,11 @@ def _score_skill(skill: SkillSpec, query_tokens: set[str]) -> int:
         return 0
     haystack = " ".join([skill.name, skill.description, skill.content[:1500]]).lower()
     score = 0
+    # Aliases score as name tokens: they are the words a person would use, and
+    # the skill's own name usually is not one of them.
     name_tokens = _tokens(skill.name.replace("-", " "))
+    for alias in getattr(skill, "aliases", []) or []:
+        name_tokens |= _tokens(alias.replace("-", " "))
     desc_tokens = _tokens(skill.description)
     for tok in query_tokens:
         if tok in name_tokens:
@@ -225,11 +253,16 @@ async def select_skills(
 
     selected_names = {s.name for s in selected}
     q_tokens = _tokens(query)
-    scored = [
-        (_score_skill(s, q_tokens), s)
-        for s in skills
-        if s.name not in selected_names and _passes_specialized_gate(s, q_tokens)
-    ]
+    considered: list[dict[str, Any]] = []
+    scored = []
+    for candidate in skills:
+        if candidate.name in selected_names:
+            continue
+        gated = not _passes_specialized_gate(candidate, q_tokens)
+        score = _score_skill(candidate, q_tokens)
+        considered.append({"name": candidate.name, "score": score, "gated": gated})
+        if not gated:
+            scored.append((score, candidate))
     for score, skill in sorted(scored, key=lambda item: (-item[0], item[1].name)):
         if score < AUTO_ACTIVATE_SCORE_THRESHOLD:
             continue
@@ -239,10 +272,78 @@ async def select_skills(
             break
 
     allowed = set(DISCOVERY_TOOL_NAMES)
+    allowed.update(t for t in ALWAYS_AVAILABLE_TOOL_NAMES if t in available_tools)
     for skill in selected:
         allowed.update(t for t in skill_bound_tools(skill) if t in available_tools)
 
-    return SkillSelection(skills=selected, allowed_tool_names=allowed, available=skills)
+    return SkillSelection(
+        skills=selected,
+        allowed_tool_names=allowed,
+        available=skills,
+        considered=sorted(considered, key=lambda item: -item["score"]),
+    )
+
+
+async def record_selection(
+    pool: Any,
+    selection: "SkillSelection",
+    *,
+    session_id: str | None,
+    surface: str,
+    tool_context: ToolContext,
+    query: str,
+) -> None:
+    """Record what the selector decided. Advisory — never breaks a turn.
+
+    Which skills activate decides which tools exist, and a tool outside the
+    active set is hard-refused. Both decisions were previously unrecorded, so a
+    selector that failed to activate the right skill left no trace.
+    """
+    if pool is None:
+        return
+    try:
+        async with pool.acquire() as conn:
+            await conn.fetchval(
+                "SELECT record_skill_selection($1::uuid, $2, $3, $4, $5::text[], $6::jsonb, $7)",
+                _uuid_or_none(session_id),
+                surface,
+                getattr(tool_context, "value", str(tool_context)),
+                query[:400],
+                [s.name for s in selection.skills],
+                json.dumps(selection.considered[:25]),
+                len(selection.allowed_tool_names),
+            )
+    except Exception:
+        logger.debug("Skill-selection telemetry failed (non-fatal)", exc_info=True)
+
+
+async def record_gate_refusal(
+    pool: Any,
+    *,
+    session_id: str | None,
+    tool_name: str,
+    reason: str,
+    active_skills: list[str],
+) -> None:
+    """Record a tool the gate turned away. Advisory — never breaks a turn."""
+    if pool is None:
+        return
+    try:
+        async with pool.acquire() as conn:
+            await conn.fetchval(
+                "SELECT record_tool_gate_refusal($1::uuid, $2, $3, $4::text[])",
+                _uuid_or_none(session_id), tool_name, reason, active_skills,
+            )
+    except Exception:
+        logger.debug("Tool-gate telemetry failed (non-fatal)", exc_info=True)
+
+
+def _uuid_or_none(value: str | None) -> str | None:
+    import uuid as _uuid
+    try:
+        return str(_uuid.UUID(str(value)))
+    except (ValueError, AttributeError, TypeError):
+        return None
 
 
 def format_skills_prompt(

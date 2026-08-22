@@ -5,6 +5,7 @@ category: knowledge
 requires:
   tools: [url_ingest, remember]
 contexts: [heartbeat, chat]
+aliases: [ingest, summarize, summary, document, file, pdf, contract, read, attach]
 bound_tools: [url_ingest, fast_ingest, slow_ingest, hybrid_ingest, remember, recall, search_documents, open_document, open_documents, load_documents, search_document_chunks, load_document_chunks, list_desk, git_ingest]
 ---
 
