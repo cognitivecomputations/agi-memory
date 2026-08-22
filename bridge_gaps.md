@@ -1114,7 +1114,7 @@ Two fixes, and both are wanted:
 1. **Fail closed.** Absent a callback, an approval-required tool refuses and files a
    request rather than proceeding. *One line, today.*
 2. **Give it a callback worth having** — port `operator_approval.py` +
-   `approval_slack_actions.py` (§11.4·4, sequencing item 2): Slack → iMessage
+   `approval_slack_actions.py` (§11.4·4, Phase 3): Slack → iMessage
    escalation with Block Kit approve/deny, so approval is answerable from a phone
    instead of only from a terminal.
 
@@ -1614,52 +1614,117 @@ alarming claims (P2-1 "never used") turned out to have a one-line cause.
 
 # Sequencing
 
-| # | Item | Effort | Unblocks |
-|---|------|--------|----------|
-| −2 | **`execute_code` sandbox + `requires_approval=True` (§12.1)** | **~2d** | **closes unsandboxed RCE in the autonomous loop** |
-| −1 | **Approval gate fails closed (§11.5)** | **~1h** | **51 tools stop firing unattended** |
-| 0 | **Tier 0 — reachability (§0.1–0.6)** | **~2d** | **turns on capability already built** |
-| 0b | **Port** `capability_probe` + `tool_surface_audit` (§11.4·8) | ~3d | Tier 0 stops being a one-off audit |
-| 0c | **Semantic skill selection (§13.3·A)** | **~2d** | **retires the alias lists Tier 0 shipped as a stopgap** |
-| 1 | Wave A everyday skills (§4) | ~2d | visible value immediately, no new code |
-| 2 | **Port** `operator_approval` + Slack actions (§11.4·4) | ~2d | approval answerable from a phone |
-| 3 | Automation suggestions (§1) | ~2d | the agent starts proposing |
-| 4 | `ask_user` (§2) | ~3d | the agent stops guessing |
-| 5 | **Dead heartbeat actions (§9.1)** | **~0.5d** | **20% of the action space stops being a trap** |
-| 5b | Build off the install path (§6.1) | ~0.5d | no more failed installs |
-| 6 | **Port** `voice_notes` + `local_audio_analysis` (§11.4·7) | ~1d | *replaces* the §5.1 `transcribe` build |
-| 7 | Tailscale/HTTPS path documented (§8.1) | ~1d | **unblocks the PWA** |
-| 8 | **PWA layer on `hexis-ui` (§3a)** | **~3d** | installable client + push + mic |
-| 9 | **Port** `retention` + `scene_consolidation` + `incubation` (§11.4·1) | ~4d | *replaces* the `positioning.md` §4.6 build |
-| 10 | **Port** `memory_supersessions` (§11.4·2) | ~2d | unblocks `positioning.md` §4.3 bitemporal |
-| 11 | **Port** `belief_propagation` (§11.4·3) | ~2d | plumbing half of `positioning.md` §4.2 |
-| 12 | **Port** `operator_policy_corrections` (§11.4·5) | ~2d | *replaces* the `positioning.md` §4.5 build |
-| 13 | Deterministic image build (§6.2) | ~2d | — |
-| 13b | **`is_group` on all seven adapters (§12.2)** | **~1d** | the agent can tell a shared room from a private one |
-| 13c | **Prompt caching (§14.4)** | **~1d** | ~6.4–7k tokens stop being re-billed every turn |
-| 13d | Tool-catalog sync once, not per call (§14.2) | ~0.5d | removes a 150-row upsert from every tool call |
-| 13e | Drop `<> zero_vec`; enforce at write (§14.1) | ~1d | the recall index becomes usable before it matters |
-| 14 | Goal origin flag (§10.4) | ~1d | prerequisite for the permission slip |
-| 15 | **Port** `inbound_disposition` (§11.4·6) | ~2d | §10's inbound half, policy already in SQL |
-| 16 | Contact points + purpose gate + STOP (§10) | ~10d | outbound to third parties becomes safe |
-| 17 | Wave B skills (§4) | ~1d each | — |
-| 18 | Action/tool gate reconciliation (§9.6) | ~2d | after Tier 0 |
-| 19 | **Port** `deliberation`, deps stripped (§11.4·9) | ~4d | gives `debate_internally` a body |
-| 20 | `hexis-node` + pairing (§3b) | ~1w | §4 Wave C, wake word |
-| 21 | Heartbeat cadence + economy (§9.2–9.4) | ~1w | long-horizon autonomy |
-| 22 | Workers as host services (§6.3) | ~1w | — |
-| 23 | `hexis tunnel` + exposure posture (§8.2–3) | ~1w | — |
-| 24 | Voice out / talk / wake (§5.2–4) | ~3w | — |
-| 25 | Execution backends (§7) | ~2w | — |
-| 26 | Connector cognition: LLM-first (§13.3·B) | ~1d | retires `_URGENT_TERMS`/`_IMPORTANT_TERMS` |
-| 26b | **Batch the per-item LLM loops (§13.3·B2)** | **~2d** | **~160 calls per pass become 2–4** |
-| 27 | Appraisal emits emotion families (§13.3·C) | ~0.5d | retires the SQL emotion regexes |
+**Restructured 2026-08-23.** The flat list had been patched five times and the order
+had drifted — batching (a cost paid every day) sat at the bottom while a scaling cliff
+sat near the top. Phases now, each with a reason it precedes the next.
 
-Tier 0 comes before all of it: shipping new skills (item 1) into a selector that
-will not activate them is building on sand.
+## Phase 0 — Safety · *mostly shipped*
 
-Items 7–8 are deliberately adjacent: the HTTPS day is worthless on its own and the
-PWA is impossible without it, so they ship as one change.
+Things the system can currently do harm with. Nothing else matters while these are open.
+
+| Item | Effort | Status |
+|---|---|---|
+| Approval gate fails closed (§11.5) | ~1h | **done** — `a306dda` |
+| Tier 0 reachability (§0.1–0.6) | ~2d | **done** — `a306dda`, defaults-only 7/10 → 2/11 |
+| `execute_code` `requires_approval=True` (§12.1) | — | **done** — `a306dda` |
+| **`execute_code` sandbox (§12.1)** | **~2d** | **owed.** The flag stops it unattended; nothing yet contains it when approved |
+
+## Phase 1 — Stop paying for nothing · ~3.5d
+
+Independent of each other, each under two days, and **every item below runs cheaper
+and faster once they land** — including our own development loop. This is why they
+precede the feature work rather than following it.
+
+| Item | Effort | Why now |
+|---|---|---|
+| Prompt caching (§14.4) | ~1d | ~6.4–7k tokens re-billed every turn, today |
+| Batch the per-item LLM loops (§13.3·B2) | ~2d | ~160 model calls per pass become 2–4 |
+| Tool-catalog sync once, not per call (§14.2) | ~0.5d | a 150-row upsert on every tool call |
+
+## Phase 2 — Correct before bigger · ~5.5d
+
+Debt that gets *multiplied* by everything built on top of it. Adding twenty skills to
+a selector that scores word overlap means twenty more skills that do not activate.
+
+| Item | Effort | Why here |
+|---|---|---|
+| Semantic skill selection (§13.3·A) | ~2d | retires the alias stopgap **before** more skills depend on it |
+| Dead heartbeat actions (§9.1) | ~0.5d | 20% of the action space is a trap |
+| `is_group` on all seven adapters (§12.2) | ~1d | the agent cannot tell a shared room from a private one |
+| Port `capability_probe` + `tool_surface_audit` (§11.4·8) | ~3d | keeps Tier 0 measured instead of audited once |
+
+## Phase 3 — Become useful · ~10d
+
+The first phase a user would notice. Ordered so each makes the next more valuable.
+
+| Item | Effort | Why in this order |
+|---|---|---|
+| Wave A everyday skills (§4) | ~2d | pure writing over tools that already exist |
+| Port `operator_approval` + Slack actions (§11.4·4) | ~2d | makes Phase 0's fail-closed *livable* — approve from a phone |
+| Automation suggestions (§1) | ~2d | the agent starts proposing instead of waiting |
+| `ask_user` (§2) | ~3d | it stops guessing when it does not know |
+| Port `voice_notes` (§11.4·7) | ~1d | voice in, no client needed |
+
+## Phase 4 — Reach · ~7.5d
+
+| Item | Effort | Note |
+|---|---|---|
+| Build off the install path (§6.1) | ~0.5d | no more failed installs |
+| Tailscale/HTTPS documented (§8.1) | ~1d | **ships with the PWA or not at all** |
+| PWA layer on `hexis-ui` (§3a) | ~3d | installable client, push, mic |
+| Deterministic image build (§6.2) | ~2d | a slow index stops meaning a wrong one |
+
+## Phase 5 — Depth · ~13d
+
+The `positioning.md` thesis. Mostly ports (§11.4), because Alex already built them.
+
+| Item | Effort | Note |
+|---|---|---|
+| Drop `<> zero_vec`; enforce at write (§14.1) | ~1d | **first in this phase** — memory volume grows from here |
+| Port `retention` + `scene_consolidation` + `incubation` (§11.4·1) | ~4d | forgetting, consolidation, spontaneous recall |
+| Port `memory_supersessions` (§11.4·2) | ~2d | unblocks bitemporal recall |
+| Port `belief_propagation` (§11.4·3) | ~2d | contradiction-as-event, plumbing half |
+| Port `operator_policy_corrections` (§11.4·5) | ~2d | never say it twice |
+| Appraisal emits emotion families (§13.3·C) | ~0.5d | retires the SQL emotion regexes |
+| Connector cognition: LLM-first (§13.3·B) | ~1d | retires `_URGENT_TERMS` / `_IMPORTANT_TERMS` |
+
+## Phase 6 — Outbound · ~14d
+
+The riskiest thing in the plan, deliberately last of the feature work. It messages
+real people, and it is gated behind knowing who is in the room (Phase 2) and being
+able to approve from a phone (Phase 3).
+
+| Item | Effort | Note |
+|---|---|---|
+| Goal origin flag (§10.4) | ~1d | prerequisite for the permission slip |
+| Port `inbound_disposition` (§11.4·6) | ~2d | the inbound half, policy already in SQL |
+| Contact points + purpose gate + STOP (§10) | ~10d | **ships whole or not at all** |
+| Action/tool gate reconciliation (§9.6) | ~2d | the two gates stop disagreeing |
+
+## Phase 7 — Long tail
+
+Real work, no urgency. Ordered by ratio, not by ambition.
+
+`hexis-node` + pairing (§3b, ~1w) · heartbeat cadence and economy (§9.2–9.4, ~1w) ·
+port `deliberation` (§11.4·9, ~4d) · Wave B skills (§4, ~1d each) · workers as host
+services (§6.3, ~1w) · `hexis tunnel` + exposure posture (§8.2–3, ~1w) · voice out,
+talk, wake (§5.2–4, ~3w) · execution backends (§7, ~2w)
+
+## The shape of it
+
+**Phases 1–3 are about three weeks** and take Hexis from "architecturally interesting"
+to "worth having around." Phases 4–6 are another six, and are where it becomes
+something you would put in front of another person.
+
+Two rules the phase boundaries encode:
+
+1. **Fix multipliers before adding to them.** A selector that mis-activates, a gate
+   that disagrees with itself, and a per-item LLM loop all get worse in proportion to
+   what is built on them.
+2. **Nothing that messages a third party ships before everything that makes it safe.**
+   Phase 6 depends on Phase 2 and Phase 3, and §10 ships whole — a purpose gate
+   without a budget still floods, and a disclaimer promising an opt-out that is not
+   wired is worse than sending nothing.
 
 **Nine of these are ports, not builds** (§11.4), and four of them *replace* work this
 plan had costed as new: `voice_notes` for §5.1, the retention trio for
@@ -1668,12 +1733,12 @@ for Tier 0's instrumentation. Ports are cheaper than builds but not free — eac
 Python module plus SQL plus a migration (§11.6), so they are costed at 1–4 days, not
 at zero.
 
-Items −2 and −1 are safety, not features: they come first because everything below
-assumes the agent can act, and right now it can act in ways nothing checks.
+**A note on ports.** Ports are cheaper than builds but not free — each is a Python
+module plus SQL plus a migration (§11.6), so they are costed at 1–4 days, not at zero.
+Prefer taking few properly over many partially.
 
-Items 0–8 are about four weeks and cover the gap that actually matters: an assistant
-that proposes work, asks when unsure, speaks the languages you already use, and
-installs without a build. Everything after is depth.
+**A note on the HTTPS day.** It is worthless alone and the PWA is impossible without
+it, so Phase 4 ships those two as one change rather than as two items.
 
 # Definition of done
 
