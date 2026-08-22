@@ -1500,6 +1500,118 @@ And its companion, which review should catch just as readily: **an `await …_ll
 inside a `for` loop is a defect.** Batch the call, key the results by id, chunk by
 token budget.
 
+## 14. Optimizing the architecture
+
+**Added 2026-08-23.** Every item here was measured against the live database, not
+inferred. The audit's P2 section listed nine performance findings and I had marked
+them *not re-verified*; these are the ones that survived checking, plus two the audit
+did not have.
+
+**Two costs, kept separate.** *Money now* — work repeated on every turn, billed in
+tokens or round trips. *Cliff later* — cheap at 484 memories, severe at 100k. Both
+are worth fixing; conflating them gets the order wrong.
+
+### 14.1 The recall index is disabled by a predicate that filters nothing — **cliff**
+
+`idx_memories_embedding` has **`idx_scan = 0` lifetime.** The audit reported that and
+stopped; the cause is more specific than "unused."
+
+The index is fine and the query shape is right — `recmem_recall_context` does
+`ORDER BY m.embedding <=> query_embedding LIMIT N`, exactly what HNSW wants. Isolating
+predicate by predicate against the planner:
+
+```
+status + type + embedding_status + IS NOT NULL   → Index Scan using idx_memories_embedding
+      + (valid_until IS NULL OR valid_until > …)  → Index Scan using idx_memories_embedding
+      + m.embedding <> zero_vec                   → Sort  ←  full distance sort
+```
+
+**`m.embedding <> zero_vec` is what defeats it.** A `<>` on the indexed column forces
+the planner to recheck every row, so it abandons the ordered index scan and sorts the
+whole candidate set by cosine distance instead.
+
+And the predicate earns nothing:
+
+```
+zero_vectors: 0     with_embedding: 484     total: 484
+```
+
+**There are no zero vectors.** A guard against a condition that has never occurred is
+silently disabling the primary index of the primary feature. It appears **7 times in
+the recall path** and **37 times across `db/*.sql`**.
+
+At 484 memories the sort is free. At 100k it is a full sort of every candidate, three
+times per recall, on the hot path — and recall is what the product is.
+
+**Fix:** enforce the invariant where it belongs — at write time, so a degenerate
+embedding never lands with `embedding_status = 'embedded'` — then drop the runtime
+`<> zero_vec` checks. `embedding_status` already means "this embedding is real"; the
+zero-vector test is a second, costlier answer to a question already answered.
+
+*~1 day including a migration over the 37 sites. **Verify by watching `idx_scan` go
+above zero** — that is the whole acceptance test.*
+
+### 14.2 The tool catalog is re-synced on every tool execution — **money now**
+
+`ToolRegistry.sync_tool_catalog()` upserts **~150 tool definitions** into
+`tool_definitions`. It is awaited from `get_specs()`, `get_mcp_tools()`, and
+`_evaluate_tool_policy()` — and **`_evaluate_tool_policy` runs per tool call.**
+
+So a turn making six tool calls performs six full 150-row catalog upserts, writing
+values that cannot have changed since the process started.
+
+**Fix:** sync once at registry construction and on explicit invalidation (a plugin
+loading, a skill installing). Guard with a dirty flag rather than a timestamp so the
+correctness story stays simple.
+
+*~half a day.*
+
+### 14.3 One LLM call per item, and config re-read inside the loop — **money now**
+
+Covered as §13.3·B2; restated here because it is the largest recurring token cost.
+A connector-cognition pass over `LIMIT 80` items makes **~160 model calls where 2–4
+would do**, and re-reads two config keys per item for **240 needless Postgres round
+trips** per pass. `services/summarization.py:35` has the same per-row shape.
+
+### 14.4 No prompt caching — **money now, and the easiest**
+
+`core/llm.py` contains **zero** occurrences of `cache_control`. The audit measured
+~6.4–7k tokens of stable preamble re-billed on every chat turn — identity, worldview,
+the skill index, tool schemas — all of which are identical turn to turn within a
+session.
+
+This is the cheapest real saving in the document: the content is already stable and
+already assembled in a fixed order. It needs cache breakpoints on the stable prefix,
+and prompt assembly ordered so the volatile part (the user's message, recalled
+memories) comes last.
+
+**Watch for one interaction:** §13's prompt addenda and the interlocutor block are
+per-turn and must sit *after* the cache breakpoint, or they invalidate the prefix
+every turn and the caching buys nothing.
+
+*~1 day. Measure with `query_usage` before and after — the point is a number, not a
+feeling.*
+
+### 14.5 Skill selection scores text in Python — **money and quality**
+
+§13.3·A. Token overlap over 26 skills per turn, in the hot path, producing wrong
+answers. Embeddings replace it at zero marginal cost because the query vector is
+already computed and cached.
+
+### 14.6 The pattern
+
+Three of the five are the same shape: **work repeated per item or per call that could
+be done once**, and one is **a guard against a condition that never occurs**. Neither
+is exotic and neither shows up in a profiler as a hotspot — they show up as a system
+that is uniformly slower and more expensive than it needs to be.
+
+The remaining audit P2 items (unbounded subconscious scans, `fast_recall` declared
+`STABLE` while it writes and performs network I/O, sequential maintenance
+head-of-line blocking, N+1 in summarization) are **still not re-verified**. They
+should be measured the same way before anyone acts on them — the two findings above
+that the audit *did* have were both more specific than reported, and one of its
+alarming claims (P2-1 "never used") turned out to have a one-line cause.
+
 # Sequencing
 
 | # | Item | Effort | Unblocks |
@@ -1524,6 +1636,9 @@ token budget.
 | 12 | **Port** `operator_policy_corrections` (§11.4·5) | ~2d | *replaces* the `positioning.md` §4.5 build |
 | 13 | Deterministic image build (§6.2) | ~2d | — |
 | 13b | **`is_group` on all seven adapters (§12.2)** | **~1d** | the agent can tell a shared room from a private one |
+| 13c | **Prompt caching (§14.4)** | **~1d** | ~6.4–7k tokens stop being re-billed every turn |
+| 13d | Tool-catalog sync once, not per call (§14.2) | ~0.5d | removes a 150-row upsert from every tool call |
+| 13e | Drop `<> zero_vec`; enforce at write (§14.1) | ~1d | the recall index becomes usable before it matters |
 | 14 | Goal origin flag (§10.4) | ~1d | prerequisite for the permission slip |
 | 15 | **Port** `inbound_disposition` (§11.4·6) | ~2d | §10's inbound half, policy already in SQL |
 | 16 | Contact points + purpose gate + STOP (§10) | ~10d | outbound to third parties becomes safe |
