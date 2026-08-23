@@ -133,3 +133,106 @@ def test_the_everyday_floor_does_not_reach_autonomous_turns():
     )
     assert "email_list" in sr.ALWAYS_AVAILABLE_TOOL_NAMES
     assert ToolContext.HEARTBEAT is not None
+
+
+class TestSemanticSelection:
+    """Selection ranks by what a request means, not which words it shares.
+
+    Token overlap needed a hand-written alias list per skill, and the lists
+    misfired in both directions: `council` never activated on the decisions it
+    exists for until `decide` was added, and then fired on "what did we decide
+    last time", which is recall. Embeddings answer "most like which" directly.
+    """
+
+    def test_the_gate_is_the_shape_of_the_distribution_not_a_fixed_cutoff(self):
+        """Absolute cosine cannot separate signal from noise here.
+
+        Measured over the probe: genuine matches span 0.46–0.73 and noise spans
+        0.40–0.54, so any fixed line cuts through both. A peaked distribution is
+        what "about something in particular" looks like.
+        """
+        from services.skill_runtime import _select_by_distribution
+
+        # One clear outlier among many mediocre scores → it is selected.
+        peaked = {f"s{i}": 0.42 + (i % 5) * 0.01 for i in range(25)}
+        peaked["winner"] = 0.75
+        picked = [n for _s, n in _select_by_distribution(peaked, z_threshold=2.0, floor=0.40)]
+        assert picked == ["winner"]
+
+        # A flat distribution means nothing in particular — a greeting.
+        flat = {f"s{i}": 0.50 + (i % 3) * 0.005 for i in range(25)}
+        assert _select_by_distribution(flat, z_threshold=2.0, floor=0.40) == []
+
+    def test_the_absolute_floor_still_backstops_a_peaked_but_weak_run(self):
+        from services.skill_runtime import _select_by_distribution
+
+        weak = {f"s{i}": 0.10 for i in range(25)}
+        weak["tallest_dwarf"] = 0.30
+        assert _select_by_distribution(weak, z_threshold=2.0, floor=0.40) == []
+
+    def test_embedding_text_carries_aliases_as_prose_not_as_tokens(self):
+        """Aliases survive as example phrasings that enrich the vector — they
+        are no longer a lookup table anyone has to populate correctly."""
+        from services.skill_runtime import skill_embedding_text
+
+        class _S:
+            name = "gmail-actions"
+            description = "Read and send mail"
+            aliases = ["email", "inbox"]
+
+        text = skill_embedding_text(_S())
+        assert "gmail actions" in text
+        assert "Read and send mail" in text
+        assert "Also called: email, inbox" in text
+
+
+class TestJargonBackstop:
+    """Embeddings are weakest exactly where identifiers are strongest.
+
+    "pending protected replacement decision for worldview" scores flat against
+    every skill description — max z = 1.53, nothing stands out — because a
+    general embedding model has no representation for Hexis-internal jargon.
+    But it names `protected_replacement_review` almost verbatim, and a tool name
+    is an identifier the system defines rather than a keyword anyone guessed.
+    """
+
+    def _skill(self, name, tools):
+        class _S:
+            pass
+        s = _S()
+        s.name = name
+        s.description = ""
+        s.aliases = []
+        s.bound_tools = tools
+        s.requires_tools = []
+        return s
+
+    def test_internal_jargon_reaches_its_skill_by_tool_name(self):
+        from services.skill_runtime import _explicitly_named, _tokens
+
+        skill = self._skill("memory-exchange", ["protected_replacement_review"])
+        q = "pending protected replacement decision for worldview"
+        assert _explicitly_named(skill, q, _tokens(q))
+
+    def test_naming_the_skill_outright_always_works(self):
+        from services.skill_runtime import _explicitly_named, _tokens
+
+        skill = self._skill("council", ["run_council"])
+        q = "use the council on this"
+        assert _explicitly_named(skill, q, _tokens(q))
+
+    def test_ordinary_english_does_not_trip_it(self):
+        """A weak leading pair must not turn every sentence into a match."""
+        from services.skill_runtime import _explicitly_named, _tokens
+
+        # "promote to staged" → leading pair "promote to"; "to" is not a signal.
+        skill = self._skill("memory-exchange", ["promote_to_staged"])
+        q = "I need to promote to the team that we shipped"
+        assert not _explicitly_named(skill, q, _tokens(q))
+
+    def test_single_word_tools_are_never_a_match(self):
+        from services.skill_runtime import _explicitly_named, _tokens
+
+        skill = self._skill("shell-access", ["shell"])
+        q = "she sells sea shell trinkets"
+        assert not _explicitly_named(skill, q, _tokens(q))

@@ -196,10 +196,17 @@ class TestSkillRuntimeSelection:
         )
         names = [s.name for s in selection.skills]
 
-        assert names == ["core-memory", "research"]
+        # The claim in this test's name: research activates, unrelated
+        # integrations do not. Not an exact roster — under semantic selection a
+        # genuinely related skill activating is the feature working. ("postgres
+        # age docs" also reaching self-inspection, which inspects the live
+        # Postgres schema, is a reasonable read of the request.)
+        assert "research" in names
         assert {"web_search", "web_fetch"} <= selection.allowed_tool_names
         assert "twitter_search" not in selection.allowed_tool_names
         assert "youtube_channel_stats" not in selection.allowed_tool_names
+        assert "twitter-research" not in names
+        assert "youtube-analytics" not in names
 
     async def test_default_heartbeat_keeps_email_digest_gated_by_autonomy_config(self, db_pool):
         from core.tools import ToolContext, create_default_registry

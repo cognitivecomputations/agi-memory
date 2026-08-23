@@ -120,6 +120,9 @@ def _passes_specialized_gate(skill: SkillSpec, query_tokens: set[str]) -> bool:
         "humanizer": {"humanize", "natural", "voice", "rewrite", "prose", "ai"},
         "skill-authoring": {"author", "write", "create", "update", "revise", "skill", "skills", "procedure"},
     }
+    # Only consulted on the lexical fallback path (embedding service down).
+    # Semantic selection needs no gates: a skill that does not match the request
+    # simply does not rank.
     required = gates.get(skill.name)
     return True if required is None else bool(query_tokens & required)
 
@@ -231,6 +234,127 @@ async def _mcp_configs(registry: "ToolRegistry") -> list["MCPServerConfig"]:
         return []
 
 
+async def _semantic_selection_enabled(pool: Any) -> bool:
+    if pool is None:
+        return False
+    try:
+        async with pool.acquire() as conn:
+            return bool(await conn.fetchval(
+                "SELECT COALESCE(get_config_bool('skills.semantic_selection_enabled'), TRUE)"
+            ))
+    except Exception:
+        return False
+
+
+async def _semantic_thresholds(pool: Any) -> tuple[float, float]:
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT COALESCE(get_config_float('skills.semantic_z_threshold'), 2.0) AS z, "
+                "COALESCE(get_config_float('skills.semantic_threshold'), 0.40) AS floor"
+            )
+        return float(row["z"]), float(row["floor"])
+    except Exception:
+        return 2.0, 0.40
+
+
+def _explicitly_named(skill: SkillSpec, lowered_query: str, query_tokens: set[str]) -> bool:
+    """Did the request name this skill, or one of its tools, outright?
+
+    Not a keyword list: these are identifiers the system itself defines, so a
+    match is exact rather than a guess about phrasing. This is the backstop for
+    domain jargon — a query about a "protected replacement decision" names
+    `protected_replacement_review` almost verbatim while scoring flat against
+    every skill description.
+    """
+    if skill.name in query_tokens or skill.name.replace("-", " ") in lowered_query:
+        return True
+    for tool in skill_bound_tools(skill):
+        words = tool.split("_")
+        if len(words) < 2:
+            # Single-word tool names ("shell", "browser") are ordinary English
+            # and would match constantly.
+            continue
+        if " ".join(words) in lowered_query:
+            return True
+        # The leading pair, when both halves are distinctive enough to be
+        # jargon rather than English. "protected replacement" identifies the
+        # tool family even when the request says "decision" instead of
+        # "review"; "promote to" is skipped because "to" is not a signal.
+        head, second = words[0], words[1]
+        if len(head) >= 4 and len(second) >= 4 and f"{head} {second}" in lowered_query:
+            return True
+    return False
+
+
+def skill_embedding_text(skill: SkillSpec) -> str:
+    """What a skill *means*, as text to embed.
+
+    Aliases survive here as example phrasings rather than match tokens: they
+    enrich the vector instead of acting as a lookup table, so nobody has to
+    guess in advance that "book time" implies the calendar.
+    """
+    parts = [skill.name.replace("-", " "), (skill.description or "").strip()]
+    aliases = [a for a in (getattr(skill, "aliases", None) or []) if a]
+    if aliases:
+        parts.append("Also called: " + ", ".join(aliases))
+    return ". ".join(part for part in parts if part)
+
+
+async def _semantic_scores(
+    pool: Any, skills: list[SkillSpec], query: str
+) -> dict[str, float]:
+    """Cosine similarity per skill, one round trip.
+
+    Every skill text plus the query goes to `get_embedding` in a single call and
+    the cosine happens in Postgres. In the steady state this costs no model
+    calls at all: `get_embedding` caches by content hash, and skill descriptions
+    do not change between turns.
+    """
+    if pool is None or not skills or not query.strip():
+        return {}
+    names = [s.name for s in skills]
+    texts = [skill_embedding_text(s) for s in skills]
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT skill_name, similarity FROM rank_skills_by_similarity($1::text[], $2::text[], $3)",
+                names, texts, query[:2000],
+            )
+        return {r["skill_name"]: float(r["similarity"]) for r in rows}
+    except Exception:
+        logger.debug("Semantic skill ranking unavailable; falling back", exc_info=True)
+        return {}
+
+
+def _select_by_distribution(
+    scores: dict[str, float], *, z_threshold: float, floor: float
+) -> list[tuple[float, str]]:
+    """Skills that stand out from the run, ranked.
+
+    The gate is the *shape* of the distribution, not an absolute cutoff.
+    Absolute similarity from the embedding model is compressed and
+    query-dependent — measured, signal spans 0.46–0.73 and noise 0.40–0.54, so
+    any fixed line cuts through both. A peaked distribution means the request is
+    about something in particular; a flat one means it is not, which is the
+    correct read of "hello".
+    """
+    values = list(scores.values())
+    if len(values) < 3:
+        return []
+    mean = sum(values) / len(values)
+    variance = sum((v - mean) ** 2 for v in values) / len(values)
+    sd = variance ** 0.5
+    if sd <= 0:
+        return []
+    picked = [
+        (score, name)
+        for name, score in scores.items()
+        if score >= floor and (score - mean) / sd >= z_threshold
+    ]
+    return sorted(picked, key=lambda item: (-item[0], item[1]))
+
+
 async def select_skills(
     registry: "ToolRegistry",
     tool_context: ToolContext,
@@ -259,20 +383,55 @@ async def select_skills(
     selected_names = {s.name for s in selected}
     q_tokens = _tokens(query)
     considered: list[dict[str, Any]] = []
-    scored = []
-    for candidate in skills:
-        if candidate.name in selected_names:
+    candidates = [s for s in skills if s.name not in selected_names]
+    by_name = {s.name: s for s in candidates}
+
+    ranked: list[tuple[float, str]] = []
+    semantic_used = False
+    pool = getattr(registry, "pool", None)
+    if await _semantic_selection_enabled(pool):
+        scores = await _semantic_scores(pool, candidates, query)
+        if scores:
+            semantic_used = True
+            z_threshold, floor = await _semantic_thresholds(pool)
+            ranked = _select_by_distribution(scores, z_threshold=z_threshold, floor=floor)
+            considered = [
+                {"name": name, "score": round(score, 4), "gated": False}
+                for score, name in sorted(
+                    ((v, k) for k, v in scores.items()), key=lambda i: -i[0]
+                )
+            ]
+
+    if not semantic_used:
+        # Lexical fallback: only when the embedding service is unavailable.
+        for candidate in candidates:
+            gated = not _passes_specialized_gate(candidate, q_tokens)
+            score = _score_skill(candidate, q_tokens)
+            considered.append({"name": candidate.name, "score": score, "gated": gated})
+            if not gated and score >= AUTO_ACTIVATE_SCORE_THRESHOLD:
+                ranked.append((float(score), candidate.name))
+        ranked.sort(key=lambda item: (-item[0], item[1]))
+
+    # Explicit mention is not a similarity question, and it covers what
+    # embeddings are worst at: internal jargon. "protected replacement" and
+    # "HMX" have no useful representation in a general embedding model — the
+    # whole distribution goes flat — but they name a tool exactly, and an exact
+    # name is a precise signal rather than a guessed keyword.
+    lowered = query.lower()
+    already = {name for _score, name in ranked}
+    for candidate in candidates:
+        if candidate.name in already:
             continue
-        gated = not _passes_specialized_gate(candidate, q_tokens)
-        score = _score_skill(candidate, q_tokens)
-        considered.append({"name": candidate.name, "score": score, "gated": gated})
-        if not gated:
-            scored.append((score, candidate))
-    for score, skill in sorted(scored, key=lambda item: (-item[0], item[1].name)):
-        if score < AUTO_ACTIVATE_SCORE_THRESHOLD:
+        if _explicitly_named(candidate, lowered, q_tokens):
+            ranked.insert(0, (1.0, candidate.name))
+            already.add(candidate.name)
+
+    for _score, name in ranked:
+        skill = by_name.get(name)
+        if skill is None or name in selected_names:
             continue
         selected.append(skill)
-        selected_names.add(skill.name)
+        selected_names.add(name)
         if len(selected) >= max_skills:
             break
 

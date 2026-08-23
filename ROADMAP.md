@@ -47,7 +47,7 @@ a selector that scores word overlap means twenty more skills that do not activat
 
 | Item | Effort | Why here |
 |---|---|---|
-| Semantic skill selection (§13.3·A) | ~2d | retires the alias stopgap **before** more skills depend on it |
+| ~~Semantic skill selection (§13.3·A)~~ | ~2d | **done** — z-score gate + identifier backstop; lexical is fallback only |
 | Dead heartbeat actions (§9.1) | ~0.5d | 20% of the action space is a trap |
 | `is_group` on all seven adapters (§12.2) | ~1d | the agent cannot tell a shared room from a private one |
 | Port `capability_probe` + `tool_surface_audit` (§11.4·8) | ~3d | keeps Tier 0 measured instead of audited once |

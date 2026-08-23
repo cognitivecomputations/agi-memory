@@ -1,6 +1,6 @@
 ---
 name: council
-description: Convene an internal council of perspectives to deliberate a hard question before acting
+description: Weigh a hard decision with real tradeoffs — whether to take a deal, walk away, choose between options, or commit to something consequential — by deliberating it from several perspectives before acting
 category: knowledge
 requires:
   tools: [run_council]

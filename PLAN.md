@@ -1753,6 +1753,40 @@ list, not a judgment call).
 
 **A. Skill selection → embeddings.** *The one that matters, and it costs nothing.*
 
+> **Shipped 2026-08-23.** `rank_skills_by_similarity` (db/migrations/0200) embeds
+> every skill text plus the query in one `get_embedding` call and does the cosine in
+> Postgres — no model calls in the steady state, since skill descriptions do not
+> change between turns and the cache is keyed by content hash.
+>
+> **The gate is the shape of the distribution, not a cutoff.** Measured over the
+> probe: genuine matches sit at z = 2.1–3.8 against the run's own mean, non-matches
+> at z = 1.4–1.9. Raw cosine cannot separate them — signal spans 0.46–0.73 and noise
+> 0.40–0.54 — because absolute similarity from this model is compressed and
+> query-dependent. A peaked distribution is what "about something in particular"
+> looks like; a flat one is the right read of "hello". z is scale-free, so it is a
+> property rather than another hand-tuned constant (0201).
+>
+> **Two findings worth keeping.** First, when `council` still missed, the fix was its
+> *description*, not the threshold: it described its machinery ("convene an internal
+> council of perspectives") instead of the situation it serves. Rewritten around the
+> situation, it fires on all three deliberation phrasings and stays out of recall.
+> **Better descriptions now produce better activation** — a feedback loop keyword
+> lists never had.
+>
+> Second, **embeddings are weakest exactly where identifiers are strongest.**
+> "pending protected replacement decision" scores flat against every description
+> (top z = 1.53) because a general model has no representation for Hexis jargon — but
+> it names `protected_replacement_review` almost verbatim. The backstop matches skill
+> and tool *identifiers*, which the system defines, never guessed keywords; the
+> leading-pair fallback requires both halves ≥4 characters so "promote to" cannot
+> trip it.
+>
+> Lexical token overlap survives **only** as a fallback for when the embedding
+> service is down. `STOPWORDS`, `_score_skill` and `_passes_specialized_gate` are no
+> longer on the live path, and aliases became embedded prose rather than match tokens.
+
+
+
 `fast_recall` already embeds the user's message on nearly every turn, and
 `embedding_cache` is keyed by `content_hash` — so the query vector is **already
 computed and cached** before selection runs. Skills are a fixed, tiny set: embed
