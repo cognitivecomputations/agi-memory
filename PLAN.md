@@ -1613,10 +1613,18 @@ consult a list of secrets before speaking; they look at who is in the room. This
 that, and it catches paraphrase and recombination because it inspects the outgoing
 sentence rather than the source rows.
 
-**Still worth doing:** fix `is_group` on the five adapters that never set it
-(`channels/base.py:58` reads it and has no fallback). It no longer gates privacy, but
-it still tells the agent whether the room is shared — which the block above depends on.
-*~1 day.*
+**Fixed 2026-08-23.** All seven adapters now report group context. It was four
+missing rather than five, and two of those already carried the signal under another
+name — Discord had `guild_id` (absent means DM) and Slack had `channel_type` (`im` is
+the only one-to-one shape; `mpim` is a multi-party DM). Matrix needed the platform's
+own convention, since it has no DM flag on the event and a direct room is simply a
+room with two members; WhatsApp needed the `@g.us` JID suffix.
+
+The consequence of the gap was not a leak, since `is_group` no longer gates privacy —
+it was that the agent was told it was speaking one-to-one in rooms other people could
+read, because `channels/base.py:58` reads the flag and defaults to `False` with no
+derivation fallback. `tests/core/test_is_group_coverage.py` pins both the per-adapter
+coverage and each platform's convention.
 
 **Deliberately left in place:** the `sensitivity` columns on `channel_source_items`
 and `connector_source_items`, the recall filters that read them, and the parameter on

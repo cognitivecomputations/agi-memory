@@ -191,6 +191,9 @@ class DiscordAdapter(ChannelAdapter):
             thread_id=thread_id,
             attachments=attachments,
             metadata={
+                # A message with no guild arrived in a DM; anything inside a
+                # guild is a room other people can read.
+                "is_group": message.guild is not None,
                 "guild_id": str(message.guild.id) if message.guild else None,
                 "is_dm": is_dm,
             },
