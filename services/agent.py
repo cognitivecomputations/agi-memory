@@ -592,6 +592,30 @@ def render_interlocutor_block(
     return "\n".join(lines)
 
 
+class SystemPrompt(str):
+    """The system prompt, plus where its cacheable prefix ends.
+
+    Providers bill a stable prefix once and reuse it — OpenAI automatically,
+    Anthropic via an explicit `cache_control` breakpoint. Both need the volatile
+    parts (the clock, who is speaking, this turn's skills) to come *after*
+    everything stable, or the prefix changes every turn and nothing is reused.
+
+    This subclasses `str` so every existing consumer keeps working: it is still
+    the whole prompt. Callers that can exploit the split read `.stable` and
+    `.volatile`.
+    """
+
+    stable: str
+    volatile: str
+
+    def __new__(cls, stable: str, volatile: str = "") -> "SystemPrompt":
+        joined = "\n\n".join(part for part in (stable, volatile) if part)
+        obj = super().__new__(cls, joined)
+        obj.stable = stable
+        obj.volatile = volatile
+        return obj
+
+
 async def build_system_prompt(
     mode: Literal["chat", "heartbeat"],
     registry: "ToolRegistry | None",
@@ -607,24 +631,33 @@ async def build_system_prompt(
     allowed_tool_names: set[str] | None = None,
     prompt_addenda: list[str] | None = None,
 ) -> str:
-    """Build the system prompt for either chat or heartbeat mode."""
+    """Build the system prompt for either chat or heartbeat mode.
+
+    Two accumulators, not one string: everything that is identical turn to turn
+    goes in `stable` so providers can cache it, and everything that changes —
+    the clock, the interlocutor, this turn's skill selection and addenda — goes
+    in `volatile`, which is emitted after it.
+    """
+
+    stable: list[str] = []
+    volatile: list[str] = []
 
     # Base prompt
     if mode == "chat":
-        prompt = load_conversation_prompt().strip()
+        stable.append(load_conversation_prompt().strip())
         if is_group:
             from services.prompt_resources import load_channel_context_prompt
-            prompt += "\n\n" + load_channel_context_prompt().strip()
-        prompt += "\n\n" + render_interlocutor_block(
+            stable.append(load_channel_context_prompt().strip())
+        volatile.append(render_interlocutor_block(
             interlocutor=interlocutor, surface=surface, is_group=is_group
-        )
+        ))
     else:
-        prompt = load_heartbeat_agentic_prompt().strip()
+        stable.append(load_heartbeat_agentic_prompt().strip())
 
     # Heartbeat-specific: task mode guidance
     if mode == "heartbeat" and has_backlog_tasks:
         task_mode_prompt = load_heartbeat_task_mode_prompt().strip()
-        prompt += "\n\n" + task_mode_prompt
+        stable.append(task_mode_prompt)
 
     # Temporal grounding (#55): the conscious mind always knows the current
     # date/time and its own age — computable ground truth, never guessed.
@@ -648,7 +681,7 @@ async def build_system_prompt(
                         f" You first came online on {temporal['born_on']} — "
                         f"{temporal['age_days']} day(s) ago."
                     )
-                prompt += "\n\n## Now\n" + now_line
+                volatile.append("## Now\n" + now_line)
         except Exception:
             logger.debug("Temporal context unavailable for prompt", exc_info=True)
 
@@ -663,7 +696,7 @@ async def build_system_prompt(
                     "SELECT render_active_persona($1::jsonb)", json.dumps(persona)
                 )
             if persona_block:
-                prompt += "\n\n----- ACTIVE PERSONA -----\n\n" + persona_block
+                stable.append("----- ACTIVE PERSONA -----\n\n" + persona_block)
 
     # Skill-first capability surface. Tool schemas ride the structured
     # tool-calling API and full skill instructions come from `use_skill` on
@@ -678,24 +711,21 @@ async def build_system_prompt(
             except Exception:
                 available = []
                 logger.debug("Failed to load skill catalog for prompt", exc_info=True)
-        prompt += "\n\n" + format_skills_prompt(active_skills or [], available or [])
+        volatile.append(format_skills_prompt(active_skills or [], available or []))
 
     # Energy costs, derived from the actual ToolSpecs of this turn's allowed
     # tools (#44) — never hardcoded prose. Heartbeat only: chat is unbudgeted.
     if mode == "heartbeat" and registry is not None and allowed_tool_names:
         costs_block = _format_tool_costs(registry, allowed_tool_names)
         if costs_block:
-            prompt += "\n\n" + costs_block
+            volatile.append(costs_block)
 
     # Personhood modules
     personhood_kind = "group" if (mode == "chat" and is_group) else ("conversation" if mode == "chat" else "heartbeat")
     try:
         personhood = compose_compact_personhood_prompt(personhood_kind)
         if personhood:
-            prompt += (
-                "\n\n----- PERSONHOOD GROUNDING -----\n\n"
-                + personhood
-            )
+            stable.append("----- PERSONHOOD GROUNDING -----\n\n" + personhood)
     except Exception:
         logger.debug("Failed to compose personhood prompt", exc_info=True)
 
@@ -709,7 +739,7 @@ async def build_system_prompt(
             if key not in ("persona", "tools") and value not in (None, "", [], {})
         }
         if runtime_profile:
-            prompt += "\n\n## Agent Profile (Runtime)\n" + json.dumps(runtime_profile, separators=(", ", ": "))
+            stable.append("## Agent Profile (Runtime)\n" + json.dumps(runtime_profile, separators=(", ", ": ")))
 
     # Session addenda: per-request prompt sections the caller resolved
     # (attached-document text, opted-in grounding modules). Turn-scoped —
@@ -717,9 +747,9 @@ async def build_system_prompt(
     for addendum in prompt_addenda or []:
         text = str(addendum or "").strip()
         if text:
-            prompt += "\n\n" + text
+            volatile.append(text)
 
-    return prompt
+    return SystemPrompt("\n\n".join(stable), "\n\n".join(volatile))
 
 
 # ---------------------------------------------------------------------------

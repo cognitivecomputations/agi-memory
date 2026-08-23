@@ -1936,7 +1936,36 @@ A connector-cognition pass over `LIMIT 80` items makes **~160 model calls where 
 would do**, and re-reads two config keys per item for **240 needless Postgres round
 trips** per pass. `services/summarization.py:35` has the same per-row shape.
 
-### 14.4 No prompt caching — **money now, and the easiest**
+### 14.4 No prompt caching — **money now, and the easiest** · *shipped 2026-08-23*
+
+> **What it actually took.** The blocker was not the missing `cache_control` call —
+> it was that **volatile content was interleaved into the middle of the prompt**, so
+> no stable prefix existed to cache. A live `## Now` timestamp sat two-thirds of the
+> way up, and the interlocutor block (added earlier the same day) sat near the top.
+> Either one invalidates everything after it on every turn.
+>
+> `build_system_prompt` now accumulates into two lists and returns a `SystemPrompt`
+> — a `str` subclass carrying `.stable` and `.volatile`, so every existing consumer
+> is unaffected. Volatile parts (`## Now`, the interlocutor block, the skills index,
+> tool costs, addenda) are emitted after everything stable, as a second system
+> message. `_extract_system_parts` keeps the boundary intact through the LLM layer.
+>
+> **Measured on the live instance:** the stable prefix is **26,401 bytes ≈ 6,600
+> tokens**, byte-identical across turns that differ in interlocutor, surface,
+> timestamp, and attached-file addenda. That matches the audit's ~6.4–7k estimate.
+>
+> Providers: OpenAI and compatibles get automatic prefix caching from the reorder
+> alone. Both Anthropic paths — the SDK and the OAuth/setup-token HTTP provider —
+> emit `system` as content blocks with a `cache_control` breakpoint on the last
+> stable block. **Gemini still needs its explicit context-caching API and does not
+> cache yet.**
+>
+> One property is the whole feature, and it is the regression test
+> (`tests/services/test_prompt_caching.py`): **`is_group` legitimately changes the
+> stable half** (different channel context and personhood module), but it is constant
+> within a conversation, which is the scope caching needs.
+
+
 
 `core/llm.py` contains **zero** occurrences of `cache_control`. The audit measured
 ~6.4–7k tokens of stable preamble re-billed on every chat turn — identity, worldview,

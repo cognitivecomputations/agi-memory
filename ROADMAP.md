@@ -36,9 +36,9 @@ precede the feature work rather than following it.
 
 | Item | Effort | Why now |
 |---|---|---|
-| Prompt caching (§14.4) | ~1d | ~6.4–7k tokens re-billed every turn, today |
+| ~~Prompt caching (§14.4)~~ | ~1d | **done** — 6,600-token prefix now cacheable; Gemini still owed |
 | Batch the per-item LLM loops (§13.3·B2) | ~2d | ~160 model calls per pass become 2–4 |
-| Tool-catalog sync once, not per call (§14.2) | ~0.5d | a 150-row upsert on every tool call |
+| ~~Tool-catalog sync once, not per call (§14.2)~~ | ~0.5d | **done** — `3c4c7d3` |
 
 ## Phase 2 — Correct before bigger · ~5.5d
 

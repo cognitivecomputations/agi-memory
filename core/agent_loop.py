@@ -236,9 +236,18 @@ class AgentLoop:
         accounting and stop decisions. Python builds only the *initial*
         messages, then reads the conversation back from the DB each step.
         """
-        messages: list[dict[str, Any]] = [
-            {"role": "system", "content": self.config.system_prompt},
-        ]
+        # Two system messages when the prompt knows where its cacheable prefix
+        # ends (services.agent.SystemPrompt): providers reuse the stable one and
+        # re-read only the volatile one. A plain string still works as before.
+        sp = self.config.system_prompt
+        stable = getattr(sp, "stable", None)
+        volatile = getattr(sp, "volatile", "")
+        if stable:
+            messages: list[dict[str, Any]] = [{"role": "system", "content": stable}]
+            if volatile:
+                messages.append({"role": "system", "content": volatile})
+        else:
+            messages = [{"role": "system", "content": sp}]
         messages.extend(history or [])
         messages.append({"role": "user", "content": user_content if user_content is not None else user_message})
 
