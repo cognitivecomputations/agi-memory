@@ -49,7 +49,7 @@ a selector that scores word overlap means twenty more skills that do not activat
 |---|---|---|
 | ~~Semantic skill selection (§13.3·A)~~ | ~2d | **done** — z-score gate + identifier backstop; lexical is fallback only |
 | ~~Dead heartbeat actions (§9.1)~~ | ~0.5d | **done** — three, not seven; retired as redundant |
-| `is_group` on all seven adapters (§12.2) | ~1d | the agent cannot tell a shared room from a private one |
+| ~~`is_group` on all seven adapters (§12.2)~~ | ~1d | **done** — four were missing; two already had the signal unnamed |
 | Port `capability_probe` + `tool_surface_audit` (§11.4·8) | ~3d | keeps Tier 0 measured instead of audited once |
 
 ## Phase 3 — Become useful · ~10d
@@ -125,16 +125,12 @@ Two rules the phase boundaries encode:
    without a budget still floods, and a disclaimer promising an opt-out that is not
    wired is worse than sending nothing.
 
-**Nine of these are ports, not builds** (§11.4), and four of them *replace* work this
-plan had costed as new: `voice_notes` for §5.1, the retention trio for
-`PLAN.md` §S4.6, `operator_policy_corrections` for §4.5, and `capability_probe`
-for Tier 0's instrumentation. Ports are cheaper than builds but not free — each is a
-Python module plus SQL plus a migration (§11.6), so they are costed at 1–4 days, not
-at zero.
-
-**A note on ports.** Ports are cheaper than builds but not free — each is a Python
-module plus SQL plus a migration (§11.6), so they are costed at 1–4 days, not at zero.
-Prefer taking few properly over many partially.
+**Nine of these are ports, not builds** (§11.4), and four *replace* work this plan had
+costed as new: `voice_notes` for §5.1, the retention trio for §S4.6,
+`operator_policy_corrections` for §S4.5, and `capability_probe` for Tier 0's
+instrumentation. Ports are cheaper than builds but not free — each is a Python module
+plus SQL plus a migration (§11.6), so they are costed at 1–4 days, not at zero. Prefer
+taking few properly over many partially.
 
 **A note on the HTTPS day.** It is worthless alone and the PWA is impossible without
 it, so Phase 4 ships those two as one change rather than as two items.
@@ -147,9 +143,10 @@ Not "the tests pass." Per `HEXIS_EXPERIENCE_BAR.md` #7, drive the real path:
   and no build.
 - The ten-request probe in Tier 0 is a **regression test**: each request activates a
   skill that can actually serve it, and no request lands on `core-memory` alone.
-- Every action in `heartbeat.allowed_actions` has a handler, asserted at startup — and
-  the action distribution over a hundred beats is logged and reviewed, so a dead or
-  never-chosen action is visible rather than inferred.
+- Every action in `heartbeat.allowed_actions` has a handler — asserted by *executing*
+  each one, since the source scan that first counted them was wrong — and the action
+  distribution over a hundred beats is logged and reviewed, so a dead or never-chosen
+  action is visible rather than inferred.
 - Over a month with Slack and email connected, **nobody the agent contacted asks it to
   stop** — and every message it sent can be shown with its purpose, its cost, and the
   relationship budget it came from.
