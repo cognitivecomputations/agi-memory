@@ -13,7 +13,7 @@ Get a running agent in 3 commands.
 
 ## Prerequisites
 
-- [Docker Desktop](https://docs.docker.com/get-docker/) -- installed **and running**
+- A running Docker daemon with Compose -- [Docker Desktop](https://docs.docker.com/get-docker/), or Docker CLI + [Colima](https://github.com/abiosoft/colima) on macOS
 - Local embedding sidecar -- `hexis init` starts it and downloads the ~300M-parameter embedding model on first use
 - For the default command below: a **ChatGPT Plus/Pro subscription** (browser OAuth, no API key). Without one, pick any provider from [Other Providers](#other-providers) instead.
 

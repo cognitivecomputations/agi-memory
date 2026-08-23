@@ -173,12 +173,18 @@ def _stack_root_from_compose(compose_file: Path) -> Path:
 def ensure_docker() -> str:
     docker_bin = shutil.which("docker")
     if not docker_bin:
-        _print_err("Docker is not installed or not on PATH. Install Docker Desktop: https://docs.docker.com/get-docker/")
+        _print_err(
+            "Docker is not installed or not on PATH. Install Docker Desktop, "
+            "or install the Docker CLI and a compatible daemon such as Colima."
+        )
         raise SystemExit(1)
     try:
         subprocess.run([docker_bin, "info"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
     except subprocess.CalledProcessError:
-        _print_err("Docker is installed but not running. Start Docker Desktop and retry.")
+        _print_err(
+            "Docker is installed but no daemon is reachable. Start Docker Desktop "
+            "or run `colima start`, then retry."
+        )
         raise SystemExit(1)
     return docker_bin
 
