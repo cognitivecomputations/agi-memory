@@ -935,38 +935,36 @@ structural guarantee against spam rather than an instruction that might be ignor
 Boundary checks run *before* dispatch on `reach_out_public` and `synthesize`. None of
 this should be traded for anything in the reference implementations.
 
-### 9.1 Seven offered actions have no implementation — **bug, fix first**
+### 9.1 Three offered actions had no implementation · *fixed 2026-08-23*
 
-`heartbeat.allowed_actions` offers 35 actions with configured energy costs.
-`execute_heartbeat_action` implements 28. These seven are advertised, priced, and dead:
+> **Corrected 2026-08-23. This section previously claimed seven, and "20% of the
+> action space is a trap".** Both were wrong, and the way they were wrong is the
+> useful part: the count came from a regex over `WHEN 'x'` in
+> `execute_heartbeat_action`, but the handler shares **multi-literal** branches —
+> `WHEN 'contemplate', 'meditate', 'study', 'debate_internally'` and
+> `WHEN 'inquire_shallow', 'inquire_deep'` — so the regex saw only the first
+> literal of each and reported four implemented actions as dead.
+>
+> Executing each action instead of reading the source gives the real answer:
+> **`fast_ingest`, `hybrid_ingest` and `slow_ingest`** returned
+> `{"success": false, "error": "Unknown action: …"}`. The four cognitive actions all
+> ran.
 
-```
-debate_internally (cost 2)   inquire_deep (cost 6)   study        (cost 2)
-meditate          (cost 1)   fast_ingest  (cost 2)   hybrid_ingest (cost 3)
-slow_ingest       (cost 5)
-```
+`heartbeat.allowed_actions` offers each entry with a configured energy cost, so an
+unimplemented one is indistinguishable from a real capability until it is chosen —
+at which point the beat's entire decision call has been spent picking something
+impossible. It fails loudly and charges no energy, which is right, but the turn is
+gone.
 
-Choosing one returns `{"success": false, "error": "Unknown action: study"}`. It fails
-loudly and does not charge energy — that part is correct — but the beat's entire LLM
-call is spent deciding to do something impossible, and the beat may end having done
-nothing.
+**Resolution: retired rather than implemented** (`db/migrations/0202`). The three were
+also redundant — tools of the same name are bound to the `knowledge-ingest` skill,
+which loads in heartbeat context, so the agent could already ingest by calling a
+tool. One way to do a thing, and it works.
 
-**20% of the advertised action space is a trap**, and it includes `inquire_deep`, the
-second-most-expensive action in the system. The three `*_ingest` entries are the
-strangest: the tools exist and are reachable, and the wiring simply stops at the
-heartbeat.
-
-This is the same pathology as Tier 0 — advertised capability with no path to running —
-and it belongs to the same fix-it-first bucket.
-
-**Fix:** implement them or remove them from `allowed_actions`. Either direction closes
-it. Add a startup assertion that every entry in `allowed_actions` has a handler branch,
-so this cannot silently return. *~half a day either way.*
-
-For `debate_internally` specifically there is a third option: **give it a body.**
-Alex's `deliberation.py` implements adversarial conjecture–attack–verdict reasoning
-(§11.4·9), which is what that action was always supposed to mean. It needs its
-`independence_engine` / `prediction_journal` / fragility dependencies stripped first.
+**The assertion is a test that executes every offered action**
+(`tests/db/test_heartbeat_actions_implemented.py`), not a source scan — because a
+source scan is exactly what produced the wrong count. A handler that dislikes the
+probe's parameters still counts as a handler; only `Unknown action` fails.
 
 ### 9.2 Energy saturates and the surplus is destroyed
 
@@ -1646,6 +1644,10 @@ Together with the five already catalogued here — dead heartbeat actions (§9.1
 bound to no reachable skill (Tier 0), outbound tools that slip the gate (§10.5.2), a
 cooldown config no code reads (§10), an approval flag nobody checks (§11.5) — that is
 **eight instances of one pathology: a mechanism exists and nothing enforces it.**
+
+A corollary earned the hard way in §9.1: **verify by executing, not by reading.** Two
+of the findings in this document were miscounted by grepping source that did not mean
+what the grep assumed. Where an invariant can be checked by running the thing, run it.
 
 The plan's standing answer: **every one of them ends in a startup assertion, not a
 comment.** A checksum that is computed is compared. A flag that is declared is read.
