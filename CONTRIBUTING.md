@@ -14,7 +14,7 @@ Quick version:
 
 ```bash
 git clone https://github.com/QuixiAI/Hexis.git && cd Hexis
-pip install -e . && cp .env.local .env
+pip install -e . && cp .env.example .env
 hexis up && hexis doctor
 pytest tests -q
 ```

@@ -42,6 +42,7 @@ ENV/
 .env
 .env.*
 !.env.local
+!.env.example
 
 # PostgreSQL
 *.sql.gz

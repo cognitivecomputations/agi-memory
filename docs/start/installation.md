@@ -117,7 +117,7 @@ On macOS 13 or newer without Docker Desktop, install and start the optional VZ/V
 git clone https://github.com/QuixiAI/Hexis.git && cd Hexis
 uv venv && source .venv/bin/activate
 uv pip install -e .
-cp .env.local .env   # edit with your settings
+cp .env.example .env   # edit with your settings; never commit .env
 ```
 
 No uv? A plain virtualenv works too: `python3 -m venv .venv && source .venv/bin/activate && pip install -e .`
@@ -130,25 +130,34 @@ pip install -e . --no-build-isolation
 
 ## Environment Configuration
 
-Create a `.env` file (automatically created by `hexis init` for packaged installs):
+Copy the tracked template, then edit only the settings you need. The resulting
+`.env` is ignored by Git:
 
 ```bash
-POSTGRES_DB=hexis_memory
-POSTGRES_USER=hexis_user
-POSTGRES_PASSWORD=hexis_password
-POSTGRES_HOST=localhost
-POSTGRES_PORT=43815
-HEXIS_BIND_ADDRESS=127.0.0.1    # Set to 0.0.0.0 to expose services
+cp .env.example .env
 ```
 
 If port `43815` is already in use, set `POSTGRES_PORT` to any free port.
 
-For LLM API keys (if using API-key providers):
+For a custom OpenAI-compatible server, set its base URL and key in `.env`:
+
+```dotenv
+OPENAI_BASE_URL=https://your-inference-server.example/v1
+OPENAI_API_KEY=replace-with-your-key
+```
+
+Then initialize with the model ID exposed by that server. `--api-key-env` tells
+Hexis which variable to read without putting the secret in shell history:
 
 ```bash
-OPENAI_API_KEY=sk-...           # OpenAI Platform
-ANTHROPIC_API_KEY=sk-ant-...    # Anthropic
+hexis init --provider openai_compatible --model your-model-id --character hexis \
+  --api-key-env OPENAI_API_KEY
 ```
+
+If the server does not authenticate, use a non-secret placeholder such as
+`OPENAI_API_KEY=not-needed`; the OpenAI client still requires a value. Hexis
+stores the endpoint and the environment variable's **name** in PostgreSQL, not
+the key itself.
 
 See [Environment Variables](../operations/environment-variables.md) for the complete reference.
 
