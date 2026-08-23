@@ -1190,6 +1190,9 @@ async def chat_completion(
             raise RuntimeError("Gemini API key is required. Set GEMINI_API_KEY or configure api_key_env.")
 
         client = genai.Client(api_key=api_key)
+        # Gemini 2.5+ implicitly caches repeated prefixes. SystemPrompt emits
+        # the stable half first and the volatile half second; keep that order
+        # intact when flattening the API's single system instruction.
         system_prompt, rest = _extract_system_prompt(messages)
         contents = _messages_to_gemini_contents(rest)
         gemini_tools = _gemini_tools(tools)
@@ -1358,7 +1361,6 @@ async def chat_completion(
             messages=messages,
             tools=tools,
             is_antigravity=(provider == "google-antigravity"),
-            system_prompt=_extract_system_parts(messages)[0] or None,
         )
 
     raise ValueError(f"Unsupported provider: {provider}")
@@ -1397,6 +1399,8 @@ async def stream_chat_completion(
             raise RuntimeError("Gemini API key is required. Set GEMINI_API_KEY or configure api_key_env.")
 
         client = genai.Client(api_key=api_key)
+        # Preserve the stable-prefix/volatile-tail order for Gemini's implicit
+        # caching. The complete instruction still reaches the model.
         system_prompt, rest = _extract_system_prompt(messages)
         contents = _messages_to_gemini_contents(rest)
         gemini_tools = _gemini_tools(tools)
@@ -1421,12 +1425,14 @@ async def stream_chat_completion(
             # Track emitted text so we can compute deltas if the stream is cumulative.
             emitted: str = ""
             calls_by_id: dict[str, dict[str, Any]] = {}
+            last_chunk: Any | None = None
 
             async for chunk in client.aio.models.generate_content_stream(
                 model=model,
                 contents=contents,
                 config=config,
             ):
+                last_chunk = chunk
                 text = getattr(chunk, "text", "") or ""
                 if text:
                     if text.startswith(emitted):
@@ -1451,7 +1457,9 @@ async def stream_chat_completion(
                     }
 
             tool_calls = [v for k, v in calls_by_id.items() if k]
-            return {"content": emitted, "tool_calls": tool_calls, "raw": None}
+            # Gemini reports cached_content_token_count on the final streamed
+            # chunk. Preserve it so record_llm_usage can prove cache hits.
+            return {"content": emitted, "tool_calls": tool_calls, "raw": last_chunk}
 
         return await _retry_on_transient(_do_gemini_stream)
 
@@ -1662,7 +1670,6 @@ async def stream_chat_completion(
         _api_key_data = json.loads(api_key) if api_key else {}
         access_token = _api_key_data.get("token", api_key or "")
         project_id = _api_key_data.get("projectId", "")
-        system_prompt = _extract_system_prompt(messages)[0] or None
         return await stream_google_code_assist_completion(
             endpoint=endpoint or "https://cloudcode-pa.googleapis.com",
             access_token=access_token,
@@ -1671,7 +1678,6 @@ async def stream_chat_completion(
             messages=messages,
             tools=tools,
             is_antigravity=(provider == "google-antigravity"),
-            system_prompt=system_prompt,
             on_text_delta=on_text_delta,
         )
 
@@ -1724,6 +1730,8 @@ async def stream_text_completion(
             raise RuntimeError("Gemini API key is required. Set GEMINI_API_KEY or configure api_key_env.")
 
         client = genai.Client(api_key=api_key)
+        # Preserve the stable-prefix/volatile-tail order for Gemini's implicit
+        # caching. The complete instruction still reaches the model.
         system_prompt, rest = _extract_system_prompt(messages)
         contents = _messages_to_gemini_contents(rest)
         config = gemini_types.GenerateContentConfig(
@@ -1845,7 +1853,6 @@ async def stream_text_completion(
         _api_key_data = json.loads(api_key) if api_key else {}
         access_token = _api_key_data.get("token", api_key or "")
         project_id = _api_key_data.get("projectId", "")
-        system_prompt = _extract_system_prompt(messages)[0] or None
         result = await stream_google_code_assist_completion(
             endpoint=endpoint or "https://cloudcode-pa.googleapis.com",
             access_token=access_token,
@@ -1854,7 +1861,6 @@ async def stream_text_completion(
             messages=messages,
             tools=None,
             is_antigravity=(provider == "google-antigravity"),
-            system_prompt=system_prompt,
         )
         if result["content"]:
             yield result["content"]

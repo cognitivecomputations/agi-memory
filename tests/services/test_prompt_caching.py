@@ -1,20 +1,24 @@
 """The system prompt has a stable prefix that providers can cache.
 
-Providers bill a stable prefix once and reuse it — OpenAI automatically, Anthropic
-via an explicit `cache_control` breakpoint. Both need every volatile part to come
-*after* everything stable. The prompt previously interleaved them: a live `## Now`
-timestamp sat two-thirds of the way up, so the prefix changed on every single turn
-and nothing could ever be reused.
+Providers bill a stable prefix once and reuse it — OpenAI and Gemini 2.5+
+automatically, Anthropic via an explicit `cache_control` breakpoint. All need every
+volatile part to come *after* everything stable. The prompt previously interleaved
+them: a live `## Now` timestamp sat two-thirds of the way up, so the prefix changed
+on every single turn and nothing could ever be reused.
 """
 
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from core import llm
 from core.llm import _anthropic_system_blocks, _extract_system_parts
 from core.providers.anthropic_http import _build_system_prompt
+from core.usage import extract_usage
 from services.agent import SystemPrompt
 
 
@@ -107,3 +111,100 @@ class TestAnthropicBreakpoint:
         oauth = _build_system_prompt("ONE", "setup-token")
         assert isinstance(oauth, str)
         assert oauth.startswith(_CLAUDE_CODE_IDENTITY)
+
+
+class TestGeminiPrefixCaching:
+    @pytest.mark.asyncio
+    async def test_public_api_keeps_stable_prefix_before_volatile_tail(self):
+        response = MagicMock(text="ok", function_calls=[])
+        client = MagicMock()
+        client.aio.models.generate_content = AsyncMock(return_value=response)
+        messages = [
+            {"role": "system", "content": "STABLE"},
+            {"role": "system", "content": "VOLATILE"},
+            {"role": "user", "content": "hello"},
+        ]
+
+        with patch.object(llm.genai, "Client", return_value=client):
+            await llm.chat_completion(
+                provider="gemini",
+                model="gemini-2.5-flash",
+                endpoint=None,
+                api_key="test",
+                messages=messages,
+            )
+
+        config = client.aio.models.generate_content.await_args.kwargs["config"]
+        assert config.system_instruction == "STABLE\n\nVOLATILE"
+
+    @pytest.mark.asyncio
+    async def test_stream_preserves_final_usage_metadata(self):
+        first = SimpleNamespace(text="Hel", function_calls=[])
+        last = SimpleNamespace(
+            text="lo",
+            function_calls=[],
+            usage_metadata=SimpleNamespace(
+                prompt_token_count=7000,
+                candidates_token_count=20,
+                cached_content_token_count=6400,
+            ),
+        )
+
+        async def chunks():
+            yield first
+            yield last
+
+        client = MagicMock()
+        client.aio.models.generate_content_stream = MagicMock(
+            side_effect=lambda **_: chunks()
+        )
+        messages = [
+            {"role": "system", "content": "STABLE"},
+            {"role": "system", "content": "VOLATILE"},
+            {"role": "user", "content": "hello"},
+        ]
+
+        with patch.object(llm.genai, "Client", return_value=client):
+            result = await llm.stream_chat_completion(
+                provider="gemini",
+                model="gemini-2.5-flash",
+                endpoint=None,
+                api_key="test",
+                messages=messages,
+            )
+
+        config = client.aio.models.generate_content_stream.call_args.kwargs["config"]
+        assert config.system_instruction == "STABLE\n\nVOLATILE"
+        assert result["content"] == "Hello"
+        assert result["raw"] is last
+        assert extract_usage("gemini", result["raw"]) == {
+            "input_tokens": 7000,
+            "output_tokens": 20,
+            "cache_read_tokens": 6400,
+            "cache_write_tokens": 0,
+        }
+
+    @pytest.mark.asyncio
+    async def test_code_assist_does_not_override_provider_prompt_assembly(self):
+        messages = [
+            {"role": "system", "content": "STABLE"},
+            {"role": "system", "content": "VOLATILE"},
+            {"role": "user", "content": "hello"},
+        ]
+
+        with patch(
+            "core.providers.google_code_assist.google_code_assist_completion",
+            new_callable=AsyncMock,
+            return_value={"content": "ok", "tool_calls": [], "raw": None},
+        ) as completion:
+            await llm.chat_completion(
+                provider="google-gemini-cli",
+                model="gemini-2.5-flash",
+                endpoint=None,
+                api_key=json.dumps({"token": "test", "projectId": "project"}),
+                messages=messages,
+            )
+
+        kwargs = completion.await_args.kwargs
+        assert kwargs["messages"] == messages
+        assert "system_prompt" not in kwargs

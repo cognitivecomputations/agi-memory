@@ -36,7 +36,7 @@ precede the feature work rather than following it.
 
 | Item | Effort | Why now |
 |---|---|---|
-| ~~Prompt caching (§14.4)~~ | ~1d | **done** — 6,600-token prefix now cacheable; Gemini still owed |
+| ~~Prompt caching (§14.4)~~ | ~1d | **done** — 6,600-token prefix cacheable across OpenAI, Anthropic, and Gemini 2.5+ |
 | ~~Batch the per-item LLM loops (§13.3·B2)~~ | ~2d | **done** — connector cognition batched; summarization deliberately not |
 | ~~Tool-catalog sync once, not per call (§14.2)~~ | ~0.5d | **done** — `3c4c7d3` |
 

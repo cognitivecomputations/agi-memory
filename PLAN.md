@@ -2021,8 +2021,11 @@ trips** per pass. `services/summarization.py:35` has the same per-row shape.
 > Providers: OpenAI and compatibles get automatic prefix caching from the reorder
 > alone. Both Anthropic paths — the SDK and the OAuth/setup-token HTTP provider —
 > emit `system` as content blocks with a `cache_control` breakpoint on the last
-> stable block. **Gemini still needs its explicit context-caching API and does not
-> cache yet.**
+> stable block. Gemini 2.5+ receives the same stable-first sequence and uses the
+> API's automatic implicit caching; its final streamed response is retained so
+> `cached_content_token_count` reaches usage accounting. Explicit cache objects are
+> deliberately not the default: Google bills their storage by time, and caching only
+> the stable system half would leave no system-level slot for Hexis's volatile tail.
 >
 > One property is the whole feature, and it is the regression test
 > (`tests/services/test_prompt_caching.py`): **`is_group` legitimately changes the

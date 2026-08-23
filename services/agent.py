@@ -595,10 +595,11 @@ def render_interlocutor_block(
 class SystemPrompt(str):
     """The system prompt, plus where its cacheable prefix ends.
 
-    Providers bill a stable prefix once and reuse it — OpenAI automatically,
-    Anthropic via an explicit `cache_control` breakpoint. Both need the volatile
-    parts (the clock, who is speaking, this turn's skills) to come *after*
-    everything stable, or the prefix changes every turn and nothing is reused.
+    Providers bill a stable prefix once and reuse it — OpenAI and Gemini 2.5+
+    automatically, Anthropic via an explicit `cache_control` breakpoint. All
+    need the volatile parts (the clock, who is speaking, this turn's skills) to
+    come *after* everything stable, or the prefix changes every turn and nothing
+    is reused.
 
     This subclasses `str` so every existing consumer keeps working: it is still
     the whole prompt. Callers that can exploit the split read `.stable` and
