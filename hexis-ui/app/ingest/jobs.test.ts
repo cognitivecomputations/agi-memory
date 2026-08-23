@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 
-import { isActiveIngestJob, mergeIngestJobs, normalizeIngestJob } from "./jobs";
+import {
+  isActiveIngestJob,
+  mergeIngestJobs,
+  normalizeIngestJob,
+  retainActiveTrackedJobIds,
+} from "./jobs";
 
 describe("ingest job helpers", () => {
   it("normalizes exact DB job rows by deriving display title from payload", () => {
@@ -48,5 +53,24 @@ describe("ingest job helpers", () => {
     expect(merged).toHaveLength(1);
     expect(merged[0].status).toBe("completed");
     expect(merged[0].result?.memories_created).toBe(5);
+  });
+
+  it("preserves tracked state identity when a poll finds no changes", () => {
+    const current = ["job-1"];
+    const exact = new Map([["job-1", { status: "in_progress" }]]);
+
+    expect(retainActiveTrackedJobIds(current, new Set(), exact)).toBe(current);
+  });
+
+  it("stops tracking completed and missing jobs", () => {
+    const current = ["active", "completed", "missing"];
+    const exact = new Map([
+      ["active", { status: "pending" }],
+      ["completed", { status: "completed" }],
+    ]);
+
+    expect(retainActiveTrackedJobIds(current, new Set(["missing"]), exact)).toEqual([
+      "active",
+    ]);
   });
 });
