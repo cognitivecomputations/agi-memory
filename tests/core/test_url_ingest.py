@@ -227,7 +227,6 @@ class TestURLIngestExecution:
                 "mode": "fast",
                 "title": "Example Article",
                 "keep_reason": "Useful technical background",
-                "sensitivity": "private",
             },
             ctx,
         )
@@ -246,7 +245,9 @@ class TestURLIngestExecution:
 
         payload = json.loads(args[0])
         assert payload["title"] == "Example Article"
-        assert payload["sensitivity"] == "private"
+        # Sensitivity marking was removed: discretion is the agent's judgment at
+        # speaking time, informed by who it is talking to, not a stored flag.
+        assert "sensitivity" not in payload
         assert payload["acquired_reason"] == "Useful technical background"
         assert args[1].startswith("url:")
 

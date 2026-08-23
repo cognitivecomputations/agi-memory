@@ -5,6 +5,7 @@ requires:
   tools: [web_search, web_fetch]
   config: [tavily]
 contexts: [heartbeat, chat]
+aliases: [research, look, find, search, investigate, learn, read, web, online, news]
 bound_tools: [web_search, web_fetch, recall, remember, web_summarize, brave_search, firecrawl_scrape]
 ---
 

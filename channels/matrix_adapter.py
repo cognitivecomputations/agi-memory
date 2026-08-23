@@ -173,6 +173,9 @@ class MatrixAdapter(ChannelAdapter):
             reply_to_id=reply_to_id,
             thread_id=thread_id,
             metadata={
+                # Matrix has no DM flag on the event: a direct room is simply a
+                # room with two members. More than that is an audience.
+                "is_group": (room.member_count or 0) > 2,
                 "room_name": room.display_name,
                 "room_member_count": room.member_count,
             },

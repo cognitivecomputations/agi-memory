@@ -648,8 +648,15 @@ class TestApproval:
         assert result.tool_calls_made[0]["denied"] is True
 
     @patch("core.agent_loop.chat_completion")
-    async def test_no_approval_callback_skips_check(self, mock_llm):
-        """If no on_approval callback is set, approval tools are executed normally."""
+    async def test_no_approver_refuses_rather_than_executing(self, mock_llm):
+        """With no approver wired, an approval-required tool is refused.
+
+        This reverses an earlier documented behaviour ("no callback → execute
+        normally"). The absence of someone to ask is not consent: under the old
+        rule every runtime that wired no callback — the heartbeat, the API chat
+        path — ran all 51 approval-flagged tools unattended, including
+        slack_send, email_send, gmail_delete, shell and write_file.
+        """
         spec = ToolSpec(
             name="dangerous_tool",
             description="Needs approval",
@@ -673,9 +680,12 @@ class TestApproval:
         agent = AgentLoop(config)
         result = await agent.run("Run it")
 
-        # Tool should have been executed (no approval check)
-        registry.execute.assert_awaited_once()
+        # Refused, not executed — and the model is told how to proceed.
+        registry.execute.assert_not_awaited()
         assert result.stopped_reason == "completed"
+        refused = [c for c in agent._tool_calls_made if c.get("error") == "no_approver_available"]
+        assert len(refused) == 1
+        assert refused[0]["name"] == "dangerous_tool"
 
 
 # ============================================================================

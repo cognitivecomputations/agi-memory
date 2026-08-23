@@ -140,6 +140,25 @@ class ChatVisualAttachment(BaseModel):
     byte_size: int | None = Field(default=None, ge=0)
 
 
+class ChatAttachment(BaseModel):
+    """A file the user attached to this message.
+
+    Descriptive only — the file's text rides the turn as a prompt addendum
+    and its bytes are already preserved. This travels with the turn so the
+    stored message remembers what came with it, and the chat can redraw the
+    attachment when the conversation is reloaded.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    mime_type: str | None = None
+    byte_size: int | None = Field(default=None, ge=0)
+    kind: str | None = None
+    artifact_id: str | None = None
+    sensitivity: str | None = None
+
+
 class ChatRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -147,6 +166,7 @@ class ChatRequest(BaseModel):
     history: list[dict[str, Any]] | None = None
     prompt_addenda: list[str] | None = None
     visual_attachments: list[ChatVisualAttachment] | None = None
+    attachments: list[ChatAttachment] | None = None
     # Client-held session identity (#71): pass the session_id from a prior
     # turn's `done` event to keep one conversation as one session; omit and
     # the server mints one (returned in `done`).
@@ -158,6 +178,17 @@ class InboxReplyRequest(BaseModel):
 
     message_id: uuid.UUID
     reply: str = Field(min_length=1, max_length=20_000)
+
+
+class AttachmentIngestRequest(BaseModel):
+    """Start ingestion for a file already preserved by POST /api/attachments."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    filename: str | None = None
+    title: str | None = None
+    mode: str = "fast"
+    sensitivity: str | None = None
 
 
 class IngestTextRequest(BaseModel):
@@ -1626,6 +1657,103 @@ async def ingest_url_enqueue(req: IngestUrlRequest):
     return {"accepted": True, "job_id": str(job_id), "url": target, "mode": mode_value}
 
 
+def _normalized_ingest_mode(mode: str | None) -> str:
+    value = (mode or "fast").lower()
+    if value not in ("fast", "slow", "hybrid"):
+        raise HTTPException(status_code=422, detail="mode must be fast, slow, or hybrid")
+    return value
+
+
+def _normalized_sensitivity(sensitivity: str | None) -> str | None:
+    value = (sensitivity or "").strip().lower() or None
+    if value not in (None, "private"):
+        raise HTTPException(status_code=422, detail="sensitivity must be omitted or 'private'")
+    return value
+
+
+async def _preserve_upload_artifact(
+    conn,
+    data: bytes,
+    *,
+    filename: str | None,
+    mime_type: str | None,
+    uploaded_via: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Preserve original bytes as a source artifact (dedup by sha256).
+
+    Upload once: everything downstream — the ingestion job, a re-read for the
+    live turn — works from the preserved artifact rather than another copy of
+    the bytes on the wire.
+    """
+    from services.ingest.artifacts import default_artifact_dir, prepare_artifact_info
+
+    upload_cap = int(await conn.fetchval(
+        "SELECT COALESCE(get_config_int('ingest.upload_max_bytes'), 104857600)"
+    ))
+    if len(data) > upload_cap:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"file is {len(data)} bytes; the upload cap is {upload_cap}. "
+                "Use the CLI for oversized files: hexis ingest --file <path>"
+            ),
+        )
+    max_db_bytes = int(await conn.fetchval(
+        "SELECT COALESCE(get_config_int('ingest.artifact_max_db_bytes'), 26214400)"
+    ))
+    info = prepare_artifact_info(
+        data,
+        original_filename=filename,
+        mime_type=mime_type,
+        metadata={"uploaded_via": uploaded_via},
+        max_db_bytes=max_db_bytes,
+        artifact_dir=default_artifact_dir(),
+    )
+    artifact_raw = await conn.fetchval(
+        """
+        SELECT upsert_source_artifact(
+            $1::text, $2::text, $3::bytea, $4::text, NULL,
+            $5::text, $6::text, $7::bigint, $8::jsonb
+        )
+        """,
+        info["sha256"],
+        info["storage_kind"],
+        info.get("bytes"),
+        info.get("storage_ref"),
+        info.get("original_filename"),
+        info.get("mime_type"),
+        info.get("byte_size"),
+        json.dumps(info.get("metadata") or {}),
+    )
+    artifact = json.loads(artifact_raw) if isinstance(artifact_raw, str) else artifact_raw
+    return info, artifact
+
+
+async def _enqueue_artifact_ingestion(
+    conn,
+    *,
+    artifact_id: str,
+    sha256: str,
+    filename: str | None,
+    title: str | None,
+    mode: str,
+    sensitivity: str | None,
+) -> str:
+    job_id = await conn.fetchval(
+        "SELECT enqueue_ingestion_job('artifact', $1::jsonb, NULL, $2)",
+        json.dumps({
+            "artifact_id": artifact_id,
+            "filename": filename,
+            "title": (title or "").strip() or None,
+            "mode": mode,
+            "sensitivity": sensitivity,
+            "acquisition": "user",
+        }),
+        f"artifact:{sha256}",
+    )
+    return str(job_id)
+
+
 @app.post("/api/ingest/file")
 async def ingest_file_upload(
     file: UploadFile = File(...),
@@ -1633,86 +1761,165 @@ async def ingest_file_upload(
     sensitivity: str | None = Form(None),
     title: str | None = Form(None),
 ):
-    """Ingest an uploaded file (chat drops, the UI Ingest page).
+    """Ingest an uploaded file (the UI Ingest page, API clients).
 
     The original bytes are preserved as a source artifact FIRST, then a
     durable `artifact` job re-reads them through the standard pipeline —
     upload once, survive restarts, inspect failures.
     """
-    from services.ingest.artifacts import default_artifact_dir, prepare_artifact_info
-
     if _pool is None:
         raise HTTPException(status_code=503, detail="database not ready")
-    mode_value = (mode or "fast").lower()
-    if mode_value not in ("fast", "slow", "hybrid"):
-        raise HTTPException(status_code=422, detail="mode must be fast, slow, or hybrid")
-    sensitivity_value = (sensitivity or "").strip().lower() or None
-    if sensitivity_value not in (None, "private"):
-        raise HTTPException(status_code=422, detail="sensitivity must be omitted or 'private'")
+    mode_value = _normalized_ingest_mode(mode)
+    sensitivity_value = _normalized_sensitivity(sensitivity)
 
     data = await file.read()
     if not data:
         raise HTTPException(status_code=422, detail="uploaded file is empty")
 
     async with _pool.acquire() as conn:
-        upload_cap = int(await conn.fetchval(
-            "SELECT COALESCE(get_config_int('ingest.upload_max_bytes'), 104857600)"
-        ))
-        if len(data) > upload_cap:
-            raise HTTPException(
-                status_code=413,
-                detail=(
-                    f"file is {len(data)} bytes; the upload cap is {upload_cap}. "
-                    "Use the CLI for oversized files: hexis ingest --file <path>"
-                ),
-            )
-        max_db_bytes = int(await conn.fetchval(
-            "SELECT COALESCE(get_config_int('ingest.artifact_max_db_bytes'), 26214400)"
-        ))
-        info = prepare_artifact_info(
+        info, artifact = await _preserve_upload_artifact(
+            conn,
             data,
-            original_filename=file.filename,
+            filename=file.filename,
             mime_type=file.content_type,
-            metadata={"uploaded_via": "api"},
-            max_db_bytes=max_db_bytes,
-            artifact_dir=default_artifact_dir(),
+            uploaded_via="api",
         )
-        artifact_raw = await conn.fetchval(
-            """
-            SELECT upsert_source_artifact(
-                $1::text, $2::text, $3::bytea, $4::text, NULL,
-                $5::text, $6::text, $7::bigint, $8::jsonb
-            )
-            """,
-            info["sha256"],
-            info["storage_kind"],
-            info.get("bytes"),
-            info.get("storage_ref"),
-            info.get("original_filename"),
-            info.get("mime_type"),
-            info.get("byte_size"),
-            json.dumps(info.get("metadata") or {}),
-        )
-        artifact = json.loads(artifact_raw) if isinstance(artifact_raw, str) else artifact_raw
-        job_id = await conn.fetchval(
-            "SELECT enqueue_ingestion_job('artifact', $1::jsonb, NULL, $2)",
-            json.dumps({
-                "artifact_id": artifact["artifact_id"],
-                "filename": file.filename,
-                "title": (title or "").strip() or None,
-                "mode": mode_value,
-                "sensitivity": sensitivity_value,
-                "acquisition": "user",
-            }),
-            f"artifact:{info['sha256']}",
+        job_id = await _enqueue_artifact_ingestion(
+            conn,
+            artifact_id=artifact["artifact_id"],
+            sha256=info["sha256"],
+            filename=file.filename,
+            title=title,
+            mode=mode_value,
+            sensitivity=sensitivity_value,
         )
     return {
         "accepted": True,
-        "job_id": str(job_id),
+        "job_id": job_id,
         "artifact_id": artifact["artifact_id"],
         "sha256": info["sha256"],
         "byte_size": info["byte_size"],
         "filename": file.filename,
+        "mode": mode_value,
+    }
+
+
+@app.post("/api/attachments")
+async def prepare_chat_attachment(
+    file: UploadFile = File(...),
+    sensitivity: str | None = Form(None),
+):
+    """Prepare a file the user just attached to a chat message.
+
+    Two things happen here and nothing else: the original bytes are preserved
+    (deduped by hash, so re-attaching the same file costs nothing), and the
+    text is read *now*, within a budget. The text comes back to the composer,
+    which hands it to the turn — so attaching a PDF and asking about it in the
+    same breath simply works.
+
+    Ingestion into memory is deliberately NOT started here. The user has not
+    sent the message yet; a file they attach and then remove should leave no
+    trace in the agent's memory. POST /api/attachments/{id}/ingest starts that
+    when the message is actually sent.
+    """
+    from services.attachments import (
+        DEFAULT_READ_MAX_BYTES,
+        DEFAULT_READ_TIMEOUT_SECONDS,
+        DEFAULT_TEXT_CHARS,
+        attachment_kind,
+        read_attachment_text,
+    )
+
+    if _pool is None:
+        raise HTTPException(status_code=503, detail="database not ready")
+    sensitivity_value = _normalized_sensitivity(sensitivity)
+
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=422, detail="uploaded file is empty")
+
+    async with _pool.acquire() as conn:
+        info, artifact = await _preserve_upload_artifact(
+            conn,
+            data,
+            filename=file.filename,
+            mime_type=file.content_type,
+            uploaded_via="chat_attachment",
+        )
+        text_chars = int(await conn.fetchval(
+            "SELECT COALESCE(get_config_int('ingest.attachment_text_chars'), $1::bigint)",
+            DEFAULT_TEXT_CHARS,
+        ))
+        read_timeout = float(await conn.fetchval(
+            "SELECT COALESCE(get_config_int('ingest.attachment_read_timeout_s'), $1::bigint)",
+            int(DEFAULT_READ_TIMEOUT_SECONDS),
+        ))
+        read_max_bytes = int(await conn.fetchval(
+            "SELECT COALESCE(get_config_int('ingest.attachment_read_max_bytes'), $1::bigint)",
+            DEFAULT_READ_MAX_BYTES,
+        ))
+
+    reading = await read_attachment_text(
+        data,
+        file.filename,
+        mime_type=file.content_type,
+        max_chars=text_chars,
+        timeout_seconds=read_timeout,
+        max_bytes=read_max_bytes,
+    )
+    return {
+        "prepared": True,
+        "artifact_id": artifact["artifact_id"],
+        "sha256": info["sha256"],
+        "filename": file.filename,
+        "mime_type": info.get("mime_type") or file.content_type,
+        "byte_size": info["byte_size"],
+        "kind": attachment_kind(file.filename, file.content_type),
+        "sensitivity": sensitivity_value,
+        **reading.to_dict(),
+    }
+
+
+@app.post("/api/attachments/{artifact_id}/ingest")
+async def ingest_prepared_attachment(artifact_id: str, req: AttachmentIngestRequest):
+    """Start durable ingestion for an already-preserved attachment.
+
+    Called when the message carrying the attachment is sent, so the agent's
+    memory only ever gains files the user actually shared.
+    """
+    if _pool is None:
+        raise HTTPException(status_code=503, detail="database not ready")
+    try:
+        artifact_uuid = str(uuid.UUID(artifact_id))
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(status_code=422, detail="artifact_id must be a UUID")
+    mode_value = _normalized_ingest_mode(req.mode)
+    sensitivity_value = _normalized_sensitivity(req.sensitivity)
+
+    async with _pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT sha256, original_filename FROM source_artifacts "
+            "WHERE id = $1::uuid AND status = 'active'",
+            artifact_uuid,
+        )
+        if row is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"artifact {artifact_id} not found — re-attach the file",
+            )
+        job_id = await _enqueue_artifact_ingestion(
+            conn,
+            artifact_id=artifact_uuid,
+            sha256=row["sha256"],
+            filename=req.filename or row["original_filename"],
+            title=req.title,
+            mode=mode_value,
+            sensitivity=sensitivity_value,
+        )
+    return {
+        "accepted": True,
+        "job_id": job_id,
+        "artifact_id": artifact_uuid,
         "mode": mode_value,
     }
 
@@ -2048,6 +2255,10 @@ async def _stream_chat(req: ChatRequest) -> AsyncIterator[str]:
             visual_attachments=[
                 attachment.model_dump()
                 for attachment in (req.visual_attachments or [])[:8]
+            ],
+            attachments=[
+                attachment.model_dump(exclude_none=True)
+                for attachment in (req.attachments or [])[:16]
             ],
         ):
             if event.event == AgentEvent.PHASE_CHANGE:

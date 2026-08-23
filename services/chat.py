@@ -335,10 +335,16 @@ async def _remember_conversation(
     action_receipts: list[dict[str, Any]] | None = None,
     agent_turn_id: str | None = None,
     surface: str = "chat",
+    attachments: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     if not user_message and not assistant_message:
         return {}
     context: dict[str, Any] = {"metadata": {"type": "conversation"}}
+    # Files the user attached ride the stored message so a reloaded
+    # conversation still shows what came with it (the text itself lives in
+    # the turn's addenda and, durably, in the filing cabinet).
+    if attachments:
+        context["user_metadata"] = {"attachments": attachments}
     if user_label and user_label.strip():
         context["user_label"] = user_label.strip()
     # This turn's appraisal, so the stored turn carries the moment's feeling
@@ -524,6 +530,8 @@ async def chat_turn(
             mode="chat",
             history=history,
             session_id=session_id,
+            user_label=user_label,
+            surface=surface,
             agent_profile=agent_profile,
             is_group=is_group,
             dsn=dsn,
@@ -665,6 +673,7 @@ async def stream_chat_events(
     gateway_payload: dict[str, Any] | None = None,
     on_approval: Callable[[str, dict[str, Any]], Awaitable[bool]] | None = None,
     visual_attachments: list[dict[str, Any]] | None = None,
+    attachments: list[dict[str, Any]] | None = None,
 ) -> AsyncIterator[AgentEventData]:
     """Canonical streaming chat orchestration.
 
@@ -744,6 +753,7 @@ async def stream_chat_events(
                     user_label=user_label,
                     background_dsn=dsn,
                     surface=surface,
+                    attachments=attachments,
                 )
                 yield AgentEventData(
                     event=AgentEvent.PHASE_CHANGE,
@@ -818,6 +828,7 @@ async def stream_chat_events(
                         user_label=user_label,
                         background_dsn=dsn,
                         surface=surface,
+                        attachments=attachments,
                     )
                     yield AgentEventData(
                         event=AgentEvent.PHASE_CHANGE,
@@ -868,6 +879,8 @@ async def stream_chat_events(
             mode="chat",
             history=history,
             session_id=session_id,
+            user_label=user_label,
+            surface=surface,
             agent_profile=agent_profile,
             is_group=is_group,
             dsn=dsn,
@@ -940,6 +953,7 @@ async def stream_chat_events(
                 action_receipts=action_receipts,
                 agent_turn_id=agent_turn_id,
                 surface=surface,
+                attachments=attachments,
             )
             yield AgentEventData(
                 event=AgentEvent.PHASE_CHANGE,

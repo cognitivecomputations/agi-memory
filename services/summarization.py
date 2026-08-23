@@ -26,8 +26,18 @@ async def run_memory_summarization_step(conn) -> dict[str, Any]:
         return {"skipped": True, "reason": "no_pending_summaries"}
 
     llm_config = await load_llm_config(conn, "llm.summarization", fallback_key="llm.subconscious")
+    # Read once per batch: this loader is not cached, so it was re-reading the
+    # prompt file on every row.
+    system_prompt = load_memory_summarization_prompt().strip()
     done = 0
     failed = 0
+    # Deliberately one call per memory rather than a batch (cf. core.llm_batch,
+    # PLAN.md §13.3·B2). Summarization is generation, not classification: each
+    # input runs to 24k characters and each output is a substantial recollection,
+    # so a chunk budget would yield one item per call anyway — and asking for
+    # eight long summaries in one response trades quality for a saving that is
+    # not there. The batching win was in connector_cognition, where eighty short
+    # items were being classified one at a time.
     for row in rows:
         memory_id = row["memory_id"]
         content = row["content"] or ""
@@ -35,7 +45,7 @@ async def run_memory_summarization_step(conn) -> dict[str, Any]:
             doc, _raw = await chat_json(
                 llm_config=llm_config,
                 messages=[
-                    {"role": "system", "content": load_memory_summarization_prompt().strip()},
+                    {"role": "system", "content": system_prompt},
                     {"role": "user", "content": content[:24000]},
                 ],
                 max_tokens=1800,

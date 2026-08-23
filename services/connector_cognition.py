@@ -13,6 +13,7 @@ import re
 from typing import Any
 
 from core.llm_config import load_llm_config
+from core.llm_batch import batch_classify
 from core.llm_json import chat_json
 
 logger = logging.getLogger(__name__)
@@ -304,8 +305,52 @@ def extract_user_model_claims(item: dict[str, Any]) -> list[dict[str, Any]]:
     return _dedupe_claims(claims)
 
 
-async def extract_user_model_claims_llm(conn: Any, item: dict[str, Any]) -> list[dict[str, Any]]:
-    text = _message_body(str(item.get("content") or ""))[:6000]
+_CLAIMS_SYSTEM = (
+    "Extract durable user-model claims from communication history. "
+    "Return JSON only. Claims must be evidence-backed, not generic summary. "
+    "Allowed categories: preference, relationship, commitment, routine, "
+    "judgment_pattern, identity. Include contradictions or supersession only "
+    "when the new evidence directly conflicts with an existing claim. "
+    "Do not create claims for one-off test instructions, jokes, or ephemeral chat filler."
+)
+
+_CLAIMS_OUTPUT_SCHEMA = {
+    "claims": [
+        {
+            "claim_key": "stable lowercase key, e.g. routine:morning_planning",
+            "category": "preference|relationship|commitment|routine|judgment_pattern|identity",
+            "claim": "one sentence phrased as a belief about the user",
+            "confidence": 0.0,
+            "importance": 0.0,
+            "supersedes_claim_key": "optional existing claim_key",
+            "contradicts_claim_keys": ["optional existing claim_key"],
+            "metadata": {"reason": "brief rationale"},
+        }
+    ]
+}
+
+
+def _claims_item_payload(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "connector_id": item.get("connector_id"),
+        "account_key": item.get("account_key"),
+        "provider_item_id": item.get("provider_item_id"),
+        "title": item.get("title"),
+        "timestamp": str(item.get("item_timestamp") or ""),
+        "content": _message_body(str(item.get("content") or ""))[:6000],
+    }
+
+
+def _parse_claims(raw: Any) -> list[dict[str, Any]]:
+    claims = raw.get("claims") if isinstance(raw, dict) else None
+    if not isinstance(claims, list):
+        return []
+    return _dedupe_claims([c for c in claims if isinstance(c, dict)])
+
+
+async def _active_user_model_claims(conn: Any) -> list[dict[str, Any]]:
+    """The existing-claims context. Identical for every item in a run, so it is
+    fetched once per run rather than once per item."""
     rows = await conn.fetch(
         """
         SELECT claim_key, category, claim, confidence, importance
@@ -315,7 +360,7 @@ async def extract_user_model_claims_llm(conn: Any, item: dict[str, Any]) -> list
         LIMIT 80
         """
     )
-    existing = [
+    return [
         {
             "claim_key": row["claim_key"],
             "category": row["category"],
@@ -325,55 +370,42 @@ async def extract_user_model_claims_llm(conn: Any, item: dict[str, Any]) -> list
         }
         for row in rows
     ]
-    llm_config = await load_llm_config(conn, "llm.connector_cognition", fallback_key="llm.subconscious")
-    system = (
-        "Extract durable user-model claims from communication history. "
-        "Return JSON only. Claims must be evidence-backed, not generic summary. "
-        "Allowed categories: preference, relationship, commitment, routine, "
-        "judgment_pattern, identity. Include contradictions or supersession only "
-        "when the new evidence directly conflicts with an existing claim. "
-        "Do not create claims for one-off test instructions, jokes, or ephemeral chat filler."
+
+
+async def extract_user_model_claims_llm_batch(
+    conn: Any, items: list[dict[str, Any]]
+) -> dict[str, list[dict[str, Any]]]:
+    """Claims for a whole batch in as few model calls as the budget allows.
+
+    Keyed by ``source_item_id``. Every item is present: anything the model did
+    not answer for comes back empty rather than missing.
+    """
+    if not items:
+        return {}
+    llm_config = await load_llm_config(
+        conn, "llm.connector_cognition", fallback_key="llm.subconscious"
     )
-    payload = {
-        "source_item": {
-            "connector_id": item.get("connector_id"),
-            "account_key": item.get("account_key"),
-            "provider_item_id": item.get("provider_item_id"),
-            "title": item.get("title"),
-            "timestamp": str(item.get("item_timestamp") or ""),
-            "content": text,
-        },
-        "existing_claims": existing,
-        "output_schema": {
-            "claims": [
-                {
-                    "claim_key": "stable lowercase key, e.g. routine:morning_planning",
-                    "category": "preference|relationship|commitment|routine|judgment_pattern|identity",
-                    "claim": "one sentence phrased as a belief about the user",
-                    "confidence": 0.0,
-                    "importance": 0.0,
-                    "supersedes_claim_key": "optional existing claim_key",
-                    "contradicts_claim_keys": ["optional existing claim_key"],
-                    "metadata": {"reason": "brief rationale"},
-                }
-            ]
-        },
-    }
-    doc, _raw = await chat_json(
+    existing = await _active_user_model_claims(conn)
+    return await batch_classify(
+        items,
         llm_config=llm_config,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-        ],
-        max_tokens=1500,
-        temperature=0.1,
-        response_format={"type": "json_object"},
-        fallback={"claims": []},
+        system=_CLAIMS_SYSTEM,
+        key=lambda it: str(it.get("source_item_id") or ""),
+        item_payload=_claims_item_payload,
+        parse=_parse_claims,
+        fallback=lambda _it: [],
+        shared={"existing_claims": existing},
+        output_hint=_CLAIMS_OUTPUT_SCHEMA,
+        max_tokens=8000,
     )
-    raw_claims = doc.get("claims") if isinstance(doc, dict) else []
-    if not isinstance(raw_claims, list):
-        return []
-    return _dedupe_claims([claim for claim in raw_claims if isinstance(claim, dict)])
+
+
+async def extract_user_model_claims_llm(conn: Any, item: dict[str, Any]) -> list[dict[str, Any]]:
+    """Single-item claims extraction. Retained for callers with one item;
+    the batch path is what the synthesis run uses."""
+    key = str(item.get("source_item_id") or "")
+    out = await extract_user_model_claims_llm_batch(conn, [item])
+    return out.get(key, [])
 
 
 def estimate_connector_item_importance(item: dict[str, Any]) -> dict[str, Any]:
@@ -424,28 +456,78 @@ def estimate_connector_item_importance(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-async def estimate_connector_item_importance_llm(conn: Any, item: dict[str, Any]) -> dict[str, Any]:
-    baseline = estimate_connector_item_importance(item)
-    text = str(item.get("content") or "")[:6000]
-    llm_config = await load_llm_config(conn, "llm.connector_importance", fallback_key="llm.subconscious")
-    system = (
-        "Score a connector item for user-visible importance and route it to suggested actions. "
-        "Return JSON only with score 0..1, label low|normal|important|urgent, reasons array, "
-        "and recommended_actions array. High-stakes safety, finance, legal, health, security, "
-        "deadline, relationship, or explicit user requests should score higher. "
-        "Actions are suggestions only; sending/responding/modifying external state requires authorization."
+_IMPORTANCE_SYSTEM = (
+    "Score a connector item for user-visible importance and route it to suggested actions. "
+    "Return JSON only with score 0..1, label low|normal|important|urgent, reasons array, "
+    "and recommended_actions array. High-stakes safety, finance, legal, health, security, "
+    "deadline, relationship, or explicit user requests should score higher. "
+    "Actions are suggestions only; sending/responding/modifying external state requires authorization."
+)
+
+
+async def estimate_connector_item_importance_llm_batch(
+    conn: Any, items: list[dict[str, Any]]
+) -> dict[str, dict[str, Any]]:
+    """Importance for a whole batch in as few model calls as the budget allows.
+
+    Keyed by ``source_item_id``. An item the model did not score keeps the rules
+    baseline, which is the same answer the per-item path gave on failure.
+    """
+    if not items:
+        return {}
+    llm_config = await load_llm_config(
+        conn, "llm.connector_importance", fallback_key="llm.subconscious"
     )
-    doc, _raw = await chat_json(
+    baselines = {
+        str(it.get("source_item_id") or ""): estimate_connector_item_importance(it)
+        for it in items
+    }
+
+    def _payload(it: dict[str, Any]) -> dict[str, Any]:
+        key = str(it.get("source_item_id") or "")
+        return {
+            "item": {
+                "title": it.get("title"),
+                "content": str(it.get("content") or "")[:6000],
+                "connector_id": it.get("connector_id"),
+                "timestamp": str(it.get("item_timestamp") or ""),
+            },
+            "rules_baseline": baselines.get(key, {}),
+        }
+
+    def _merge(key: str, doc: Any) -> dict[str, Any]:
+        return _merge_importance(baselines.get(key, {}), doc)
+
+    raw = await batch_classify(
+        items,
         llm_config=llm_config,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": json.dumps({"item": item, "rules_baseline": baseline}, default=str)},
-        ],
-        max_tokens=900,
-        temperature=0.1,
-        response_format={"type": "json_object"},
-        fallback=baseline,
+        system=_IMPORTANCE_SYSTEM,
+        key=lambda it: str(it.get("source_item_id") or ""),
+        item_payload=_payload,
+        parse=lambda doc: doc,
+        fallback=lambda it: None,
+        max_tokens=8000,
     )
+    return {
+        key: (_merge(key, doc) if doc is not None else baselines.get(key, {}))
+        for key, doc in raw.items()
+    }
+
+
+async def estimate_connector_item_importance_llm(conn: Any, item: dict[str, Any]) -> dict[str, Any]:
+    """Single-item importance. Retained for callers with one item; the batch
+    path is what the importance run uses."""
+    key = str(item.get("source_item_id") or "")
+    out = await estimate_connector_item_importance_llm_batch(conn, [item])
+    return out.get(key) or estimate_connector_item_importance(item)
+
+
+def _merge_importance(baseline: dict[str, Any], doc: Any) -> dict[str, Any]:
+    """Combine the model's verdict with the rules baseline.
+
+    The score only ever moves up: the rules are a floor, so a model that
+    under-rates something safety- or finance-shaped cannot silently bury it.
+    """
     if not isinstance(doc, dict):
         return baseline
     try:
@@ -485,29 +567,43 @@ async def run_user_model_synthesis_step(conn: Any, *, limit: int | None = None) 
     failed = 0
     claims_created = 0
     llm_used = 0
+
+    # Config is read once per run, not once per item: these cannot change
+    # mid-run, and eighty items previously cost a hundred and sixty round trips
+    # to Postgres for two values.
+    mode = str(await conn.fetchval(
+        "SELECT COALESCE(get_config_text('connector.user_model_synthesis_mode'), 'hybrid')"
+    ) or "hybrid").lower()
+    llm_enabled = bool(await conn.fetchval(
+        "SELECT COALESCE(get_config_bool('connector.user_model_llm_enabled'), TRUE)"
+    ))
+
+    # One model call for the batch rather than one per item.
+    llm_by_item: dict[str, list[dict[str, Any]]] = {}
+    if mode in {"llm", "hybrid"} and llm_enabled:
+        candidates = [it for it in items if isinstance(it, dict)]
+        try:
+            llm_by_item = await extract_user_model_claims_llm_batch(conn, candidates)
+        except Exception as exc:
+            logger.warning("connector user-model LLM synthesis fell back to rules: %s", exc)
+            llm_by_item = {}
+
     for item in items:
         if not isinstance(item, dict):
             continue
         source_item_id = str(item.get("source_item_id") or "")
         try:
-            mode = str(await conn.fetchval(
-                "SELECT COALESCE(get_config_text('connector.user_model_synthesis_mode'), 'hybrid')"
-            ) or "hybrid").lower()
-            llm_enabled = bool(await conn.fetchval(
-                "SELECT COALESCE(get_config_bool('connector.user_model_llm_enabled'), TRUE)"
-            ))
             rules_claims = extract_user_model_claims(item)
-            claims = rules_claims
-            if mode in {"llm", "hybrid"} and llm_enabled:
-                try:
-                    llm_claims = await extract_user_model_claims_llm(conn, item)
-                    if llm_claims:
-                        llm_used += 1
-                        claims = _dedupe_claims([*llm_claims, *([] if mode == "llm" else rules_claims)])
-                except Exception as exc:
-                    logger.warning("connector user-model LLM synthesis fell back to rules: %s", exc)
-                    if mode == "llm":
-                        claims = []
+            llm_claims = llm_by_item.get(source_item_id) or []
+            if llm_claims:
+                llm_used += 1
+                claims = _dedupe_claims([*llm_claims, *([] if mode == "llm" else rules_claims)])
+            elif mode == "llm" and llm_enabled:
+                # Pure-LLM mode says the rules are not a substitute; an item the
+                # model did not answer for gets no claims rather than guessed ones.
+                claims = []
+            else:
+                claims = rules_claims
             result = _json(await conn.fetchval(
                 "SELECT record_user_model_synthesis($1::uuid, $2::jsonb, $3)",
                 source_item_id,
@@ -544,22 +640,30 @@ async def run_connector_importance_step(conn: Any, *, limit: int | None = None) 
     completed = 0
     failed = 0
     notified = 0
+
+    # Read once per run: this cannot change mid-run, and it previously cost one
+    # round trip per item.
+    llm_enabled = bool(await conn.fetchval(
+        "SELECT COALESCE(get_config_bool('connector.importance_llm_enabled'), TRUE)"
+    ))
+
+    # One model call for the batch rather than one per item.
+    estimates: dict[str, dict[str, Any]] = {}
+    if llm_enabled:
+        try:
+            estimates = await estimate_connector_item_importance_llm_batch(
+                conn, [it for it in items if isinstance(it, dict)]
+            )
+        except Exception as exc:
+            logger.warning("connector importance LLM detector fell back to rules: %s", exc)
+            estimates = {}
+
     for item in items:
         if not isinstance(item, dict):
             continue
         source_item_id = str(item.get("source_item_id") or "")
         try:
-            llm_enabled = bool(await conn.fetchval(
-                "SELECT COALESCE(get_config_bool('connector.importance_llm_enabled'), TRUE)"
-            ))
-            if llm_enabled:
-                try:
-                    estimate = await estimate_connector_item_importance_llm(conn, item)
-                except Exception as exc:
-                    logger.warning("connector importance LLM detector fell back to rules: %s", exc)
-                    estimate = estimate_connector_item_importance(item)
-            else:
-                estimate = estimate_connector_item_importance(item)
+            estimate = estimates.get(source_item_id) or estimate_connector_item_importance(item)
             result = _json(await conn.fetchval(
                 """
                 SELECT record_connector_item_importance(

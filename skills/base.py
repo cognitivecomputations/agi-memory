@@ -96,6 +96,11 @@ class SkillSpec:
     category: SkillCategory = SkillCategory.OTHER  # J.1
     os_support: list[str] = field(default_factory=lambda: ["darwin", "linux"])  # J.1
     bound_tools: list[str] = field(default_factory=list)  # J.4: tool names to bind
+    # Words a person would actually use for this skill. Selection scores literal
+    # token overlap against the skill's *name*, so `gmail-actions` scored zero on
+    # "email" and `calendar` scored zero on "book time with Sarah". Aliases are
+    # scored exactly like name tokens — they are the user's vocabulary, not ours.
+    aliases: list[str] = field(default_factory=list)
     contexts: list[SkillContext] = field(
         default_factory=lambda: [SkillContext.HEARTBEAT, SkillContext.CHAT]
     )
@@ -335,6 +340,11 @@ class SkillSpec:
             category=category,
             os_support=list(raw_os),
             bound_tools=list(raw_bound),
+            aliases=[
+                str(a).strip().lower()
+                for a in (metadata.get("aliases") or [])
+                if str(a).strip()
+            ],
             contexts=contexts,
             source=source,
             provenance=dict(raw_provenance),

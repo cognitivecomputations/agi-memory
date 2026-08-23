@@ -83,7 +83,11 @@ class CodeExecutionHandler(ToolHandler):
             category=ToolCategory.CODE,
             energy_cost=3,
             is_read_only=False,
-            requires_approval=False,
+            # Arbitrary Python in this process, with persistent globals and a
+            # bridge to the whole tool registry — there is no sandbox. Until
+            # there is one, a person says yes or it does not run. The gate in
+            # core/agent_loop.py refuses when nobody is available to ask.
+            requires_approval=True,
             supports_parallel=False,
             allowed_contexts={ToolContext.CHAT, ToolContext.HEARTBEAT},
         )

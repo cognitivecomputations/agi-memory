@@ -554,7 +554,10 @@ async def doctor_payload(
                 checks.append({
                     "label": "Workers",
                     "status": "WARN",
-                    "detail": "no worker liveness records yet",
+                    "detail": (
+                        "not running — the heartbeat and maintenance loops are "
+                        "down; start them with `hexis up`"
+                    ),
                 })
             elif missing or stale:
                 details = []

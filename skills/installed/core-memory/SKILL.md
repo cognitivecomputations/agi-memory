@@ -5,7 +5,7 @@ category: system
 requires:
   tools: [recall, search_history, remember]
 contexts: [heartbeat, chat]
-bound_tools: [recall, search_history, remember, add_evidence, belief_history, open_memory, search_documents, open_document, open_documents, load_documents, search_document_chunks, open_document_chunk, load_document_chunks, list_desk, open_desk_item, pin_desk_item, unpin_desk_item, clear_desk, sense_memory_availability, read_journal, write_journal, search_journal, manage_goals, manage_schedule, manage_responsibility, manage_backlog, list_document_fade_requests, resolve_document_fade, associate, trace_why, get_procedures, get_strategies]
+bound_tools: [recall, search_history, remember, add_evidence, belief_history, open_memory, search_documents, open_document, open_documents, load_documents, search_document_chunks, open_document_chunk, load_document_chunks, list_desk, open_desk_item, pin_desk_item, unpin_desk_item, clear_desk, sense_memory_availability, read_journal, write_journal, search_journal, manage_goals, manage_schedule, manage_responsibility, manage_backlog, list_document_fade_requests, resolve_document_fade, associate, explore_concept, explore_subgraph, trace_why, get_procedures, get_strategies]
 ---
 
 # Core Memory and Continuity

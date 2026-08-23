@@ -3456,7 +3456,12 @@ def _print_rich_status(p: dict[str, Any]) -> None:
             parts.append(f"[{style}]{mode}{task_s} {status}[/{style}] [muted]({age_s})[/muted]")
         console.print(f"  [key]Workers  [/key] {', '.join(parts)}")
     else:
-        console.print("  [key]Workers  [/key] [muted]no liveness records[/muted]")
+        # No records at all means nothing is running the loops — say the fix
+        # rather than leaving the reader to decode "no liveness records".
+        console.print(
+            "  [key]Workers  [/key] [warn]not running[/warn] "
+            "[muted](the heartbeat only ticks while they are up — start them with `hexis up`)[/muted]"
+        )
 
     # Memory counts
     memories = p.get("memories", {})
@@ -4736,6 +4741,19 @@ def _handle_ui_container(
 
     console.print("[accent]Starting containerized web dashboard...[/accent]")
     console.print("[muted]Dashboard runs in this terminal. Press Ctrl+C to stop it.[/muted]")
+
+    # The always-on loops come up with the dashboard and stay up after it
+    # closes: someone who only ever runs `hexis ui` still gets an agent that
+    # thinks between visits. Idempotent — a no-op if they are already running.
+    if run_compose(
+        compose_cmd, compose_file, stack_root,
+        ["up", "-d", "heartbeat_worker", "maintenance_worker"], env_file,
+    ) != 0:
+        console.print(
+            "[warn]⚠ Could not start the heartbeat and maintenance workers[/warn] "
+            "[muted]— the dashboard still works, but the agent will not act on its "
+            "own until `hexis up` succeeds.[/muted]"
+        )
 
     # Bring up both the UI and the canonical Python API (hexis-api).
     # The Next.js BFF proxies chat + consent to hexis-api.

@@ -8,8 +8,6 @@ import {
   FilePlus2,
   Globe,
   Loader2,
-  Lock,
-  LockOpen,
   UploadCloud,
   X,
 } from "lucide-react";
@@ -31,7 +29,6 @@ type PendingFile = {
   file: File;
   name: string;
   size: number;
-  sensitivity: "private" | null;
   state: PendingFileState;
   detail?: string;
   jobId?: string;
@@ -52,7 +49,6 @@ export default function IngestPage() {
   const [dragActive, setDragActive] = useState(false);
   const [pasteText, setPasteText] = useState("");
   const [pasteTitle, setPasteTitle] = useState("");
-  const [pastePrivate, setPastePrivate] = useState(false);
   const [pasteBusy, setPasteBusy] = useState(false);
   const [url, setUrl] = useState("");
   const [urlBusy, setUrlBusy] = useState(false);
@@ -156,7 +152,6 @@ export default function IngestPage() {
         file,
         name: file.name,
         size: file.size,
-        sensitivity: null as "private" | null,
         state: "queued" as const,
       })),
     ]);
@@ -175,7 +170,6 @@ export default function IngestPage() {
         const form = new FormData();
         form.append("file", item.file, item.name);
         form.append("mode", mode);
-        if (item.sensitivity) form.append("sensitivity", item.sensitivity);
         const res = await fetch("/api/ingest/file", { method: "POST", body: form });
         if (res.ok) {
           const body = await res.json();
@@ -244,7 +238,6 @@ export default function IngestPage() {
           content,
           title: pasteTitle.trim() || undefined,
           mode,
-          sensitivity: pastePrivate ? "private" : undefined,
         }),
       });
       if (!res.ok) {
@@ -253,7 +246,6 @@ export default function IngestPage() {
       }
       setPasteText("");
       setPasteTitle("");
-      setPastePrivate(false);
       const body = await res.json();
       const job = normalizeIngestJob({
         id: body.job_id,
@@ -441,35 +433,6 @@ export default function IngestPage() {
                   </span>
                   <button
                     type="button"
-                    aria-label={
-                      item.sensitivity === "private"
-                        ? `Make ${item.name} shareable`
-                        : `Mark ${item.name} private`
-                    }
-                    title={
-                      item.sensitivity === "private"
-                        ? "Private: kept out of group conversations and exports."
-                        : "Shareable. Click to mark private."
-                    }
-                    onClick={() =>
-                      setPending((prev) =>
-                        prev.map((p) =>
-                          p.id === item.id
-                            ? { ...p, sensitivity: p.sensitivity === "private" ? null : "private" }
-                            : p
-                        )
-                      )
-                    }
-                    className={`flex-none rounded p-0.5 ${
-                      item.sensitivity === "private"
-                        ? "text-[var(--teal)]"
-                        : "text-[var(--ink-soft)] hover:text-[var(--foreground)]"
-                    }`}
-                  >
-                    {item.sensitivity === "private" ? <Lock size={12} /> : <LockOpen size={12} />}
-                  </button>
-                  <button
-                    type="button"
                     aria-label={`Remove ${item.name}`}
                     title="Remove"
                     onClick={() => setPending((prev) => prev.filter((p) => p.id !== item.id))}
@@ -519,14 +482,6 @@ export default function IngestPage() {
               >
                 {pasteBusy ? "Submitting…" : "Ingest text"}
               </button>
-              <label className="flex items-center gap-1.5 text-xs text-[var(--ink-soft)]">
-                <input
-                  type="checkbox"
-                  checked={pastePrivate}
-                  onChange={(event) => setPastePrivate(event.target.checked)}
-                />
-                Private (kept out of group conversations and exports)
-              </label>
             </div>
           </Card>
 

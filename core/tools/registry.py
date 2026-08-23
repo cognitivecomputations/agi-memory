@@ -87,6 +87,11 @@ class ToolRegistry:
         # Skill directories contributed by plugins; the skill runtime scans
         # these in addition to the bundled/user skill dirs.
         self.extra_skill_dirs: list[Path] = []
+        # The DB catalog mirrors the registered handlers, so it only needs
+        # rewriting when that set changes. It was previously re-synced from
+        # _evaluate_tool_policy — i.e. ~150 upserted rows on *every tool call*.
+        # A flag rather than a TTL: the invalidating events are all explicit.
+        self._catalog_dirty: bool = True
 
     @property
     def hooks(self) -> HookRegistry:
@@ -103,6 +108,7 @@ class ToolRegistry:
         if name in self._handlers:
             logger.warning(f"Overwriting existing handler for tool: {name}")
         self._handlers[name] = handler
+        self._catalog_dirty = True
         logger.debug(f"Registered tool: {name}")
 
     def register_all(self, handlers: list[ToolHandler]) -> None:
@@ -114,9 +120,11 @@ class ToolRegistry:
         """Unregister a tool handler."""
         if name in self._handlers:
             del self._handlers[name]
+            self._catalog_dirty = True
             return True
         if name in self._mcp_handlers:
             del self._mcp_handlers[name]
+            self._catalog_dirty = True
             return True
         return False
 
@@ -126,6 +134,7 @@ class ToolRegistry:
         if name in self._mcp_handlers:
             logger.warning(f"Overwriting existing MCP handler: {name}")
         self._mcp_handlers[name] = handler
+        self._catalog_dirty = True
         logger.debug(f"Registered MCP tool: {name}")
 
     # =========================================================================
@@ -180,14 +189,24 @@ class ToolRegistry:
             payload.append(entry)
         return payload
 
-    async def sync_tool_catalog(self) -> None:
-        """Mirror registered Python drivers into the DB-owned tool catalog."""
+    async def sync_tool_catalog(self, *, force: bool = False) -> None:
+        """Mirror registered Python drivers into the DB-owned tool catalog.
+
+        No-op unless the handler set changed since the last successful sync.
+        Callers on the hot path (policy evaluation runs per tool call) can call
+        this freely; only registration, unregistration, and MCP attachment mark
+        the catalog dirty. On failure the flag stays set, so the next call
+        retries rather than leaving the DB stale.
+        """
+        if not (force or self._catalog_dirty):
+            return
         try:
             async with self.pool.acquire() as conn:
                 await conn.fetchval(
                     "SELECT sync_tool_definitions($1::jsonb)",
                     json.dumps(self._tool_catalog_payload()),
                 )
+            self._catalog_dirty = False
         except Exception:
             logger.debug("Failed to sync DB tool catalog; using in-process registry", exc_info=True)
 

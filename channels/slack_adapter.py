@@ -191,6 +191,9 @@ class SlackAdapter(ChannelAdapter):
             thread_id=thread_ts,
             attachments=attachments,
             metadata={
+                # Slack marks 1:1 DMs as "im"; "channel", "group" and "mpim"
+                # (multi-party DM) all have an audience beyond the sender.
+                "is_group": str(event.get("channel_type") or "").lower() not in ("im", ""),
                 "channel_type": event.get("channel_type"),
             },
         )

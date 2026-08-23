@@ -5,6 +5,7 @@ category: productivity
 requires:
   tools: [calendar_events]
 contexts: [heartbeat, chat]
+aliases: [book, booking, meeting, meet, schedule, scheduling, appointment, availability, free, busy, remind, reminder, invite, reschedule]
 bound_tools: [calendar_events, calendar_create, calendar_update, calendar_delete]
 ---
 

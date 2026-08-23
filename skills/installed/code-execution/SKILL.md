@@ -5,6 +5,7 @@ category: system
 requires:
   tools: [safe_shell, execute_code]
 contexts: [heartbeat, chat]
+aliases: [code, script, compute, calculate, run, python]
 bound_tools: [safe_shell, execute_code, run_script, read_file, write_file, list_directory, glob, grep, edit_file, shell, browser]
 ---
 

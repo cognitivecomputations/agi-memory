@@ -290,6 +290,9 @@ class WhatsAppAdapter(ChannelAdapter):
             message_id=message.get("id", timestamp),
             attachments=attachments,
             metadata={
+                # WhatsApp group JIDs end in @g.us; a 1:1 sender is a bare
+                # number or @s.whatsapp.net.
+                "is_group": str(sender or "").endswith("@g.us"),
                 "message_type": msg_type,
             },
         )

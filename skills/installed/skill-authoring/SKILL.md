@@ -5,6 +5,7 @@ category: system
 requires:
   tools: [propose_skill, author_skill, list_skill_proposals, review_skill_proposal]
 contexts: [heartbeat, chat]
+aliases: [skill, skills, procedure, author, teach, learn]
 bound_tools: [propose_skill, author_skill, list_skill_proposals, review_skill_proposal, list_skills, use_skill, create_tool]
 ---
 

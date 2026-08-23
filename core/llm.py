@@ -662,14 +662,49 @@ def normalize_llm_config(config: dict[str, Any] | None, *, default_model: str = 
 
 
 def _extract_system_prompt(messages: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
+    parts, rest = _extract_system_parts(messages)
+    return "\n\n".join(parts), rest
+
+
+def _extract_system_parts(messages: list[dict[str, Any]]) -> tuple[list[str], list[dict[str, Any]]]:
+    """System messages kept as separate parts, in order.
+
+    Callers assemble the prompt so that everything stable comes first and
+    everything per-turn comes last (see services.agent.SystemPrompt). Providers
+    that can cache a prefix need that boundary preserved rather than flattened,
+    so the parts stay split until the last moment.
+    """
     system_parts: list[str] = []
     rest: list[dict[str, Any]] = []
     for msg in messages:
         if msg.get("role") == "system":
-            system_parts.append(_content_text(msg.get("content")))
+            text = _content_text(msg.get("content"))
+            if text.strip():
+                system_parts.append(text)
         else:
             rest.append(msg)
-    return "\n\n".join([p for p in system_parts if p.strip()]), rest
+    return system_parts, rest
+
+
+def _anthropic_system_blocks(parts: list[str]) -> list[dict[str, Any]] | None:
+    """Anthropic `system` as content blocks, with a cache breakpoint.
+
+    Everything except the final part is the stable prefix, so the breakpoint
+    goes on the last stable block: Anthropic caches up to and including the
+    marked block and re-reads only what follows. With a single part there is
+    nothing to cache against, so it is sent plain.
+    """
+    if not parts:
+        return None
+    if len(parts) == 1:
+        return [{"type": "text", "text": parts[0]}]
+    blocks: list[dict[str, Any]] = []
+    for index, part in enumerate(parts):
+        block: dict[str, Any] = {"type": "text", "text": part}
+        if index == len(parts) - 2:
+            block["cache_control"] = {"type": "ephemeral"}
+        blocks.append(block)
+    return blocks
 
 
 def _content_text(content: Any) -> str:
@@ -1270,14 +1305,15 @@ async def chat_completion(
         if anthropic is None:
             raise RuntimeError("anthropic package is required for Anthropic provider.")
         client = anthropic.AsyncAnthropic(api_key=api_key)
-        system_prompt, rest = _extract_system_prompt(messages)
+        system_parts, rest = _extract_system_parts(messages)
+        system_blocks = _anthropic_system_blocks(system_parts)
         rest = _messages_to_anthropic_messages(rest)
         anthropic_tools = _anthropic_tools(tools)
 
         async def _do_anthropic_completion():
             response = await client.messages.create(
                 model=model,
-                system=system_prompt or None,
+                system=system_blocks,
                 messages=rest,
                 tools=anthropic_tools or None,
                 max_tokens=max_tokens,
@@ -1322,7 +1358,7 @@ async def chat_completion(
             messages=messages,
             tools=tools,
             is_antigravity=(provider == "google-antigravity"),
-            system_prompt=_extract_system_prompt(messages)[0] or None,
+            system_prompt=_extract_system_parts(messages)[0] or None,
         )
 
     raise ValueError(f"Unsupported provider: {provider}")
