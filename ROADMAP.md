@@ -28,7 +28,7 @@ Things the system can currently do harm with. Nothing else matters while these a
 | `execute_code` `requires_approval=True` (§12.1) | — | **done** — `a306dda` |
 | **`execute_code` sandbox (§12.1)** | **~2d** | **owed.** The flag stops it unattended; nothing yet contains it when approved |
 
-## Phase 1 — Stop paying for nothing · ~3.5d
+## Phase 1 — Stop paying for nothing · ~3.5d · **shipped 2026-08-23**
 
 Independent of each other, each under two days, and **every item below runs cheaper
 and faster once they land** — including our own development loop. This is why they
@@ -37,7 +37,7 @@ precede the feature work rather than following it.
 | Item | Effort | Why now |
 |---|---|---|
 | ~~Prompt caching (§14.4)~~ | ~1d | **done** — 6,600-token prefix now cacheable; Gemini still owed |
-| Batch the per-item LLM loops (§13.3·B2) | ~2d | ~160 model calls per pass become 2–4 |
+| ~~Batch the per-item LLM loops (§13.3·B2)~~ | ~2d | **done** — connector cognition batched; summarization deliberately not |
 | ~~Tool-catalog sync once, not per call (§14.2)~~ | ~0.5d | **done** — `3c4c7d3` |
 
 ## Phase 2 — Correct before bigger · ~5.5d

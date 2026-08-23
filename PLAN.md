@@ -1794,6 +1794,26 @@ user-model tests.*
 **B2. Batch the three per-item loops.** *The efficiency half, and it is the reason
 LLM-first is affordable at all.*
 
+> **Shipped 2026-08-23 — two of the three, deliberately.** `core/llm_batch.py`
+> provides `batch_classify`, and both connector-cognition loops use it: one model
+> call for eighty items instead of eighty, the existing-claims context fetched once
+> per run rather than once per item, and the config reads hoisted out of both loops
+> (240 Postgres round trips per pass).
+>
+> **Summarization was not batched, and should not be.** It is generation rather than
+> classification: each input runs to 24k characters, each output is a substantial
+> recollection, and `retention.summarize_batch_size` defaults to 8 — so a chunk
+> budget yields roughly one item per call anyway, while asking for eight long
+> summaries in one response trades quality for a saving that is not there. What was
+> genuinely wasteful there is fixed: `load_memory_summarization_prompt()` is not
+> `lru_cache`d and was being called inside the loop, re-reading the file per row.
+>
+> Two properties the helper enforces, both about refusing to be clever:
+> results are keyed **by item id, never by position** — a reordered or partial
+> response would otherwise attribute one item's verdict to another — and the rules
+> baseline is a **floor** on importance, so a model that under-rates something
+> safety-shaped cannot bury it.
+
 > **Decided 2026-08-23: per-use-case batching on a shared helper. No central queue.**
 >
 > A central micro-batching queue with a debounce window was considered and rejected
