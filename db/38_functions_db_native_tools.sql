@@ -365,7 +365,180 @@ EXCEPTION WHEN OTHERS THEN
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION execute_memory_tool(
+INSERT INTO config_defaults (key, value, description) VALUES
+    ('memory.remember_duplicate_similarity', '0.9'::jsonb,
+     'Trigram similarity that makes a recent remember write equivalent within one chat session'),
+    ('memory.remember_duplicate_window_minutes', '120'::jsonb,
+     'How long remember reuses an equivalent tool-created memory within one chat session')
+ON CONFLICT (key) DO NOTHING;
+
+CREATE OR REPLACE FUNCTION execute_remember_tool(
+    p_args JSONB
+) RETURNS JSONB
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    remember_content TEXT := NULLIF(btrim(COALESCE(p_args->>'content', '')), '');
+    memory_type_value TEXT := COALESCE(NULLIF(p_args->>'type', ''), 'episodic');
+    importance_value FLOAT;
+    memory_id UUID;
+    existing_id UUID;
+    existing_content TEXT;
+    session_uuid UUID := _db_brain_try_uuid(p_args#>>'{_execution_context,session_id}');
+    call_id TEXT := NULLIF(p_args#>>'{_execution_context,call_id}', '');
+    source_references JSONB := NULL;
+    source_attribution JSONB := NULL;
+    source_trust FLOAT := NULL;
+    derived_conversation_source BOOLEAN := FALSE;
+    canonical_content TEXT;
+    duplicate_similarity FLOAT := LEAST(1.0, GREATEST(0.0, COALESCE(
+        get_config_float('memory.remember_duplicate_similarity'), 0.9)));
+    duplicate_window_minutes INT := GREATEST(1, COALESCE(
+        get_config_int('memory.remember_duplicate_window_minutes'), 120));
+    tool_write JSONB;
+    result JSONB;
+BEGIN
+    IF remember_content IS NULL THEN
+        RETURN tool_error('content is required', 'invalid_params');
+    END IF;
+    IF memory_type_value NOT IN ('episodic', 'semantic', 'procedural', 'strategic') THEN
+        RETURN tool_error(format('Invalid memory type: %s', memory_type_value), 'invalid_params');
+    END IF;
+    importance_value := LEAST(1.0, GREATEST(0.0, COALESCE(
+        NULLIF(p_args->>'importance', '')::float, 0.5)));
+    canonical_content := lower(btrim(regexp_replace(remember_content, '[^[:alnum:]]+', ' ', 'g')));
+    tool_write := jsonb_strip_nulls(jsonb_build_object(
+        'source', 'remember_tool',
+        'session_id', CASE WHEN session_uuid IS NULL THEN NULL ELSE session_uuid::text END,
+        'call_id', call_id,
+        'recorded_at', CURRENT_TIMESTAMP
+    ));
+
+    IF jsonb_typeof(p_args->'sources') = 'array'
+       AND jsonb_array_length(p_args->'sources') > 0 THEN
+        source_references := p_args->'sources';
+        source_attribution := source_references->0;
+    ELSIF session_uuid IS NOT NULL THEN
+        source_trust := COALESCE(get_config_float('memory.conversation_turn_trust'), 0.8);
+        source_attribution := jsonb_build_object(
+            'kind', 'conversation',
+            'ref', 'chat_session:' || session_uuid::text,
+            'label', 'current chat session',
+            'observed_at', CURRENT_TIMESTAMP,
+            'trust', source_trust
+        );
+        source_references := jsonb_build_array(source_attribution);
+        derived_conversation_source := TRUE;
+    END IF;
+
+    -- Serialize equivalent writes for one session so parallel/retried calls
+    -- cannot both observe absence and create duplicates.
+    IF session_uuid IS NOT NULL THEN
+        PERFORM pg_advisory_xact_lock(hashtext(session_uuid::text), hashtext(canonical_content));
+        SELECT m.id, m.content
+        INTO existing_id, existing_content
+        FROM memories m
+        WHERE m.type = memory_type_value::memory_type
+          AND m.status = 'active'
+          AND m.created_at >= CURRENT_TIMESTAMP - make_interval(mins => duplicate_window_minutes)
+          AND m.metadata#>>'{tool_write,session_id}' = session_uuid::text
+          AND (
+              lower(btrim(regexp_replace(m.content, '[^[:alnum:]]+', ' ', 'g'))) = canonical_content
+              OR similarity(
+                    lower(btrim(regexp_replace(m.content, '[^[:alnum:]]+', ' ', 'g'))),
+                    canonical_content
+                 ) >= duplicate_similarity
+          )
+        ORDER BY
+            (lower(btrim(regexp_replace(m.content, '[^[:alnum:]]+', ' ', 'g'))) = canonical_content) DESC,
+            similarity(lower(m.content), lower(remember_content)) DESC,
+            m.created_at DESC
+        LIMIT 1
+        FOR UPDATE;
+    END IF;
+
+    IF existing_id IS NOT NULL THEN
+        IF memory_type_value = 'semantic'
+           AND jsonb_typeof(source_references) = 'array' THEN
+            PERFORM add_semantic_source_reference(existing_id, source.value)
+            FROM jsonb_array_elements(source_references) source(value);
+            PERFORM sync_memory_trust(existing_id);
+        END IF;
+        IF jsonb_typeof(COALESCE(p_args->'concepts', '[]'::jsonb)) = 'array' THEN
+            PERFORM link_memory_to_concept(existing_id, value)
+            FROM jsonb_array_elements_text(p_args->'concepts') concept(value);
+        END IF;
+        UPDATE memories
+        SET importance = GREATEST(importance, importance_value),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = existing_id;
+        SELECT jsonb_strip_nulls(jsonb_build_object(
+            'memory_id', m.id::text,
+            'type', m.type::text,
+            'content', left(m.content, 100),
+            'confidence', NULLIF(m.metadata->>'confidence', '')::float,
+            'trust_level', m.trust_level,
+            'reused', TRUE
+        ))
+        INTO result
+        FROM memories m
+        WHERE m.id = existing_id;
+        RETURN tool_success(
+            result,
+            format('Already stored; reused %s memory: %s...', memory_type_value, left(existing_content, 50))
+        );
+    END IF;
+
+    IF memory_type_value = 'semantic' THEN
+        memory_id := create_semantic_memory(
+            remember_content,
+            LEAST(1.0, GREATEST(0.0, COALESCE(NULLIF(p_args->>'confidence', '')::float, 0.5))),
+            NULL,
+            NULL,
+            source_references,
+            importance_value,
+            source_attribution
+        );
+    ELSE
+        memory_id := create_memory(
+            memory_type_value::memory_type,
+            remember_content,
+            importance_value,
+            source_attribution,
+            CASE WHEN derived_conversation_source THEN source_trust ELSE NULL END,
+            jsonb_build_object('tool_write', tool_write)
+        );
+    END IF;
+    UPDATE memories
+    SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{tool_write}', tool_write, TRUE)
+    WHERE id = memory_id;
+    IF jsonb_typeof(COALESCE(p_args->'concepts', '[]'::jsonb)) = 'array' THEN
+        PERFORM link_memory_to_concept(memory_id, value)
+        FROM jsonb_array_elements_text(p_args->'concepts') concept(value);
+    END IF;
+    SELECT jsonb_strip_nulls(jsonb_build_object(
+        'memory_id', m.id::text,
+        'type', m.type::text,
+        'content', left(m.content, 100),
+        'confidence', NULLIF(m.metadata->>'confidence', '')::float,
+        'trust_level', m.trust_level,
+        'reused', FALSE
+    ))
+    INTO result
+    FROM memories m
+    WHERE m.id = memory_id;
+    RETURN tool_success(
+        result,
+        format('Stored %s memory: %s...', memory_type_value, left(remember_content, 50))
+    );
+EXCEPTION WHEN OTHERS THEN
+    RETURN tool_error(SQLERRM);
+END;
+$$;
+
+-- The wrapper below owns remember idempotency while this function retains the
+-- established dispatch for every other memory tool.
+CREATE OR REPLACE FUNCTION _execute_memory_tool_dispatch(
     p_tool_name TEXT,
     p_args JSONB
 ) RETURNS JSONB
@@ -826,5 +999,19 @@ BEGIN
     RETURN tool_error(format('Unsupported memory tool: %s', p_tool_name), 'invalid_params');
 EXCEPTION WHEN OTHERS THEN
     RETURN tool_error(SQLERRM);
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION execute_memory_tool(
+    p_tool_name TEXT,
+    p_args JSONB
+) RETURNS JSONB
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF p_tool_name = 'remember' THEN
+        RETURN execute_remember_tool(p_args);
+    END IF;
+    RETURN _execute_memory_tool_dispatch(p_tool_name, p_args);
 END;
 $$;

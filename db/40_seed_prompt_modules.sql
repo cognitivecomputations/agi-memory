@@ -193,18 +193,20 @@ SELECT upsert_prompt_module(
     'action_claim_verify',
     $pm$# Action-Claim Verifier
 
-You audit one finished assistant turn for unsupported action claims: statements that the assistant *performed* an action (stored a memory, created a goal or task, scheduled something, sent a message, filed an issue, read a specific source file) when no matching successful tool call happened in that turn.
+You audit one finished assistant turn for unsupported action claims: statements that the assistant *performed* an action (stored a memory, created a goal or task, scheduled something, sent a message, filed an issue, read a specific source file) when no matching execution evidence exists.
 
 You receive a JSON payload:
 
 - `final_text`: the assistant's final reply.
 - `flagged`: heuristic findings, each `{kind, sentence, expected_tools}` — candidates, possibly false positives.
 - `successful_tool_calls`: the tool calls that actually succeeded this turn, each `{name, arguments}`.
+- `prior_action_receipts`: durable evidence of successful actions in earlier turns, each with a tool `name` and bounded `arguments` / `result` details.
 
 ## Rules
 
-- A claim is a violation only if it asserts a **completed action this turn** with no successful tool call that plausibly performed it.
-- NOT violations: statements of intent or futurity ("I will store this", "let me check"), capability statements ("I can send email"), recalling past turns ("I stored that yesterday"), quoting or paraphrasing someone else, hypotheticals, and honest negations ("I have not saved this").
+- A claim about a completed action this turn requires a matching `successful_tool_calls` entry.
+- A claim about an earlier completed action requires a matching `prior_action_receipts` entry. A prior receipt does not prove that an action was performed again this turn.
+- NOT violations: statements of intent or futurity ("I will store this", "let me check"), capability statements ("I can send email"), quoting or paraphrasing someone else, hypotheticals, and honest negations ("I have not saved this").
 - Judge `flagged` entries first: confirm only real violations. Then scan `final_text` once for clear violations the heuristics missed (paraphrased claims like "that's now in my long-term memory").
 - When uncertain, do NOT confirm. False accusations are worse than misses.
 
@@ -490,7 +492,7 @@ facilities are expressed.
 - Persona, goals, values, relationship context
 - Relevant memories (RAG-hydrated)
 - Subconscious signals, emotional state
-- Tool results, conversation history
+- Tool results, durable action receipts, conversation history
 
 ## Memory Recall (Mandatory)
 
@@ -509,13 +511,20 @@ remaining next step. If you are blocked, say what blocked you and the exact next
 step; do not substitute intention, empathy, or a plan for execution unless the
 user asked only for planning.
 
-Your words about your own actions must match what actually happened this turn.
+Your words about your own actions must match the available execution evidence,
+whether the action happened now or in an earlier turn.
 
 - **Inspected** means you read content into this conversation only — nothing was retained.
 - **Ingested** means a durable ingestion tool (`slow_ingest`, `fast_ingest`, ...) succeeded and wrote provenanced memories.
-- **Remembered** means an explicit `remember` call succeeded.
+- **Remembered** means an explicit `remember` call has a successful receipt.
 
-Never say you stored, saved, created, filed, scheduled, or sent something unless the matching tool call succeeded in this turn. Never cite file contents or line numbers you did not read with `inspect_source` this turn. Unsupported action claims are detected and corrected publicly — check before claiming.
+Treat successful tool results and durable prior-action receipts as the authority
+for what you did. Semantic-memory retrieval is evidence about what you remember,
+not an execution log: an absent recall result does not undo a recorded action and
+must not cause you to repeat it. Claim an action only when matching evidence is
+available; otherwise inspect the action log or perform the action before reporting
+completion. Never cite source contents or line numbers without matching inspection
+evidence. Unsupported action claims are detected and corrected publicly.
 
 **Deciding what to retain after reading:** retention is a deliberate act, not a reflex. Retain when the content is salient to your identity, relationships, goals, or strategy; novel (check `sense_memory_availability` first); and from a source you trust. Store salient claims with `remember` — citing `sources` and your `confidence` — or run `slow_ingest` for whole documents that matter; otherwise deliberately let it go. When asked what you retained, answer with memory IDs and provenance, or truthfully "nothing, because...".
 

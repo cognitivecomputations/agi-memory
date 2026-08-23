@@ -4,6 +4,7 @@ database with real data evolves to the new schema WITHOUT a wipe."""
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from uuid import uuid4
@@ -56,6 +57,99 @@ async def test_migrations_recorded_and_idempotent(db_pool):
         assert await conn.fetchval(
             "SELECT value IS NOT NULL FROM config WHERE key='agent.lineage_id'"
         )
+
+
+async def test_action_receipt_migration_upgrades_existing_memory_dispatch(db_pool):
+    """0199 must preserve the old dispatcher while installing remember v2."""
+    migration = (
+        _DB_ROOT / "migrations" / "0199_persist_action_receipts.sql"
+    ).read_text(encoding="utf-8")
+
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            # Recreate the function layout present before 0199.
+            await conn.execute("DROP FUNCTION execute_memory_tool(TEXT, JSONB)")
+            await conn.execute(
+                "ALTER FUNCTION _execute_memory_tool_dispatch(TEXT, JSONB) "
+                "RENAME TO execute_memory_tool"
+            )
+            legacy_prompt = """# Conversation System Prompt
+
+- Tool results, conversation history
+
+Your words about your own actions must match what actually happened this turn.
+
+- **Inspected** means you read content into this conversation only — nothing was retained.
+- **Ingested** means a durable ingestion tool (`slow_ingest`, `fast_ingest`, ...) succeeded and wrote provenanced memories.
+- **Remembered** means an explicit `remember` call succeeded.
+
+Never say you stored, saved, created, filed, scheduled, or sent something unless the matching tool call succeeded in this turn. Never cite file contents or line numbers you did not read with `inspect_source` this turn. Unsupported action claims are detected and corrected publicly — check before claiming.
+"""
+            await conn.execute(
+                "UPDATE prompt_modules SET content = $1 WHERE key = 'conversation'",
+                legacy_prompt,
+            )
+            await conn.execute(
+                "UPDATE prompt_modules SET content = 'legacy current-turn verifier' "
+                "WHERE key = 'action_claim_verify'"
+            )
+
+            await conn.execute(migration)
+
+            assert await conn.fetchval(
+                "SELECT to_regprocedure('public.execute_memory_tool(text,jsonb)') IS NOT NULL"
+            )
+            assert await conn.fetchval(
+                "SELECT to_regprocedure('public._execute_memory_tool_dispatch(text,jsonb)') IS NOT NULL"
+            )
+            session_id = str(uuid4())
+            memory_content = f"migration routing {uuid4().hex}"
+            existing_id = await conn.fetchval(
+                """
+                INSERT INTO memories (
+                    type, content, embedding, importance, trust_level, status, metadata
+                )
+                VALUES (
+                    'episodic', $1,
+                    array_fill(0.1, ARRAY[embedding_dimension()])::vector,
+                    0.5, 0.8, 'active',
+                    jsonb_build_object(
+                        'tool_write', jsonb_build_object('session_id', $2::text)
+                    )
+                )
+                RETURNING id
+                """,
+                memory_content,
+                session_id,
+            )
+            routed = await conn.fetchval(
+                "SELECT execute_memory_tool('remember', $1::jsonb)",
+                json.dumps(
+                    {
+                        "content": memory_content,
+                        "type": "episodic",
+                        "_execution_context": {"session_id": session_id},
+                    }
+                ),
+            )
+            routed = json.loads(routed) if isinstance(routed, str) else routed
+            assert routed["success"] is True, routed
+            assert routed["output"]["reused"] is True
+            assert routed["output"]["memory_id"] == str(existing_id)
+            conversation_prompt = await conn.fetchval(
+                "SELECT content FROM prompt_modules WHERE key = 'conversation'"
+            )
+            assert (
+                "durable prior-action receipts as the authority" in conversation_prompt
+            )
+            verifier_prompt = await conn.fetchval(
+                "SELECT content FROM prompt_modules WHERE key = 'action_claim_verify'"
+            )
+            assert "prior_action_receipts" in verifier_prompt
+        finally:
+            await tr.rollback()
 
 
 async def test_migrate_existing_database_preserves_data():
