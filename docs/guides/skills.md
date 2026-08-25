@@ -26,7 +26,11 @@ hexis skills list                    # list installed skills
 hexis skills info daily-briefing     # show skill details
 ```
 
-## Built-in Skills (17)
+## Included Skills
+
+The runtime catalog is the source of truth; use `hexis skills list` to see every
+bundled, user, plugin, and configured MCP skill available in this installation.
+Hexis includes these workflows among others:
 
 | Skill | Category | Description |
 |-------|----------|-------------|
@@ -47,6 +51,12 @@ hexis skills info daily-briefing     # show skill details
 | `github-issues` | productivity | GitHub issues via a skill-bound MCP server |
 | `image-gen` | creative | Image generation with prompt refinement |
 | `humanizer` | communication | Detect and rewrite AI-patterned text |
+| `travel-prep` | productivity | Build a sourced itinerary, checklist, and travel brief without transacting |
+| `inbox-triage` | communication | Propose safe inbox actions and apply only the user's chosen batch |
+| `meeting-follow-up` | productivity | Extract decisions and draft controlled post-meeting actions |
+| `weekly-review` | productivity | Reconcile goals, tasks, commitments, and the week ahead |
+| `expense-capture` | productivity | Save structured, source-linked local expense records |
+| `personal-notes` | knowledge | Work with mounted Obsidian vaults and Bear Markdown exports |
 
 ## Managing Skills
 

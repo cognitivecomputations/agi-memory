@@ -8,6 +8,7 @@ skills. This keeps prompts smaller and makes capability use intentional.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -20,6 +21,8 @@ from skills.loader import load_skills
 if False:  # pragma: no cover - typing only
     from core.tools.config import MCPServerConfig
     from core.tools.registry import ToolRegistry
+
+logger = logging.getLogger(__name__)
 
 
 DISCOVERY_TOOL_NAMES = {"list_skills", "use_skill", "propose_skill", "queue_user_message"}
@@ -453,6 +456,7 @@ async def record_selection(
     pool: Any,
     selection: "SkillSelection",
     *,
+    registry: "ToolRegistry | None" = None,
     session_id: str | None,
     surface: str,
     tool_context: ToolContext,
@@ -480,6 +484,22 @@ async def record_selection(
             )
     except Exception:
         logger.debug("Skill-selection telemetry failed (non-fatal)", exc_info=True)
+
+    if registry is not None:
+        # The selection row records why skills won. The immutable surface audit
+        # records whether their tools actually survived registry + config
+        # resolution. Keep these separate so existing telemetry remains stable.
+        from services.tool_surface_audit import record_tool_surface_decision
+
+        await record_tool_surface_decision(
+            pool,
+            registry=registry,
+            selection=selection,
+            session_id=session_id,
+            surface=surface,
+            tool_context=tool_context,
+            query=query,
+        )
 
 
 async def record_gate_refusal(

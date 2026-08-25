@@ -33,6 +33,7 @@ from services.skill_runtime import (
     record_selection,
     select_skills,
 )
+from services.tool_surface_audit import hash_input_text
 
 if TYPE_CHECKING:
     import asyncpg
@@ -928,6 +929,7 @@ async def run_agent(
     )
     await record_selection(
         pool, skill_selection,
+        registry=registry,
         session_id=session_id, surface=surface,
         tool_context=tool_context, query=skill_query,
     )
@@ -992,6 +994,9 @@ async def run_agent(
             is_group=is_group,
             allowed_tool_names=set(skill_selection.allowed_tool_names),
             active_skill_names=[sk.name for sk in skill_selection.skills],
+            surface=surface,
+            tool_surface_input_hash=hash_input_text(skill_query),
+            available_skill_count=len(skill_selection.available),
         )
     else:
         effective_timeout = timeout_seconds or (300.0 if has_backlog_tasks else 120.0)
@@ -1018,6 +1023,9 @@ async def run_agent(
             context_overrides=context_overrides,
             allowed_tool_names=set(skill_selection.allowed_tool_names),
             active_skill_names=[sk.name for sk in skill_selection.skills],
+            surface=surface,
+            tool_surface_input_hash=hash_input_text(skill_query),
+            available_skill_count=len(skill_selection.available),
         )
 
     # 7. Run agent loop
@@ -1165,6 +1173,7 @@ async def stream_agent(
     )
     await record_selection(
         pool, skill_selection,
+        registry=registry,
         session_id=session_id, surface=surface,
         tool_context=tool_context, query=user_message,
     )
@@ -1230,6 +1239,9 @@ async def stream_agent(
         on_approval=on_approval,
         allowed_tool_names=set(skill_selection.allowed_tool_names),
         active_skill_names=[sk.name for sk in skill_selection.skills],
+        surface=surface,
+        tool_surface_input_hash=hash_input_text(user_message),
+        available_skill_count=len(skill_selection.available),
     )
 
     agent = AgentLoop(loop_config)

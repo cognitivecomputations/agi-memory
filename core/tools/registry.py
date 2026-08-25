@@ -76,6 +76,9 @@ class ToolRegistry:
 
     def __init__(self, pool: "asyncpg.Pool"):
         self.pool = pool
+        # Surfaced in reachability/audit telemetry. Builders update this when
+        # dynamic tools and plugins have been loaded.
+        self.registry_kind = "default"
         self._handlers: dict[str, ToolHandler] = {}
         self._mcp_handlers: dict[str, ToolHandler] = {}
         self._policy = ToolPolicy(pool)
@@ -434,7 +437,7 @@ class ToolRegistry:
 
         except asyncio.TimeoutError:
             result = ToolResult.error_result(
-                f"Tool execution timed out after 120 seconds",
+                "Tool execution timed out after 120 seconds",
                 ToolErrorType.TIMEOUT,
             )
         except asyncio.CancelledError:
@@ -868,4 +871,5 @@ async def create_full_registry(pool: "asyncpg.Pool") -> ToolRegistry:
     except Exception:
         logger.exception("Failed to load plugins")
 
+    registry.registry_kind = "full"
     return registry

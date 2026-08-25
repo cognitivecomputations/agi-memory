@@ -40,7 +40,7 @@ precede the feature work rather than following it.
 | ~~Batch the per-item LLM loops (§13.3·B2)~~ | ~2d | **done** — connector cognition batched; summarization deliberately not |
 | ~~Tool-catalog sync once, not per call (§14.2)~~ | ~0.5d | **done** — `3c4c7d3` |
 
-## Phase 2 — Correct before bigger · ~5.5d
+## Phase 2 — Correct before bigger · ~5.5d · **shipped 2026-08-23**
 
 Debt that gets *multiplied* by everything built on top of it. Adding twenty skills to
 a selector that scores word overlap means twenty more skills that do not activate.
@@ -50,7 +50,7 @@ a selector that scores word overlap means twenty more skills that do not activat
 | ~~Semantic skill selection (§13.3·A)~~ | ~2d | **done** — z-score gate + identifier backstop; lexical is fallback only |
 | ~~Dead heartbeat actions (§9.1)~~ | ~0.5d | **done** — three, not seven; retired as redundant |
 | ~~`is_group` on all seven adapters (§12.2)~~ | ~1d | **done** — four were missing; two already had the signal unnamed |
-| Port `capability_probe` + `tool_surface_audit` (§11.4·8) | ~3d | keeps Tier 0 measured instead of audited once |
+| ~~Port `capability_probe` + `tool_surface_audit` (§11.4·8)~~ | ~3d | **done** — continuous worker/context/tool snapshots + immutable surface decisions |
 
 ## Phase 3 — Become useful · ~10d
 
@@ -58,7 +58,7 @@ The first phase a user would notice. Ordered so each makes the next more valuabl
 
 | Item | Effort | Why in this order |
 |---|---|---|
-| Wave A everyday skills (§4) | ~2d | pure writing over tools that already exist |
+| ~~Wave A everyday skills (§4)~~ | ~2d | **done** — six consent-safe workflows over existing core and optional plugin tools |
 | Port `operator_approval` + Slack actions (§11.4·4) | ~2d | makes Phase 0's fail-closed *livable* — approve from a phone |
 | Automation suggestions (§1) | ~2d | the agent starts proposing instead of waiting |
 | `ask_user` (§2) | ~3d | it stops guessing when it does not know |

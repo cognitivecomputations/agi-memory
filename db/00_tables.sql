@@ -702,6 +702,15 @@ INSERT INTO config_defaults (key, value, description) VALUES
     ('heartbeat.cost_journal_memory', '3'::jsonb, 'Commit a fading memory to the journal before letting it fade')
 ON CONFLICT (key) DO NOTHING;
 
+INSERT INTO config_defaults (key, value, description, source_path) VALUES
+    ('capability_probe.interval_minutes', '15'::jsonb,
+     'Minutes between worker/tool reachability probes.', 'db/00_tables.sql'),
+    ('capability_probe.stale_multiplier', '2'::jsonb,
+     'A capability snapshot is stale after interval_minutes times this multiplier.', 'db/00_tables.sql'),
+    ('tool_surface.audit_enabled', 'true'::jsonb,
+     'Persist an immutable record of each selected and actually reachable tool surface.', 'db/00_tables.sql')
+ON CONFLICT (key) DO NOTHING;
+
 -- Software defects the agent noticed in its own substrate. These are not chat
 -- memories; they are operational facts the heartbeat can revisit, diagnose,
 -- and ask to repair.

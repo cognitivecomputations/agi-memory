@@ -57,6 +57,12 @@ Complete reference for the `hexis` CLI. Install via `uv tool install hexis` (or 
 | `hexis demo [--json]` | Run rollback-only recall/refusal/energy/heartbeat proofs |
 | `hexis maturity [--json]` | Score live capability maturity with evidence and next steps |
 
+`hexis doctor` also reports continuous tool reachability and the immutable
+tool-surface audit. Workers derive reachability from the registry, live tool
+configuration, and loadable skills every 15 minutes by default. A warning includes
+the broken worker/context/tool path or the exact command needed to start measurement;
+these advisory checks never stop the heartbeat.
+
 ### Chat and Memory
 
 | Command | Description |

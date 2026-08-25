@@ -23,6 +23,7 @@ from services.skill_runtime import (
     _passes_specialized_gate,
     _score_skill,
     _tokens,
+    select_skills,
     skill_bound_tools,
 )
 
@@ -40,6 +41,15 @@ class _EveryTool(frozenset):
 ALL_TOOLS = _EveryTool()
 
 
+WAVE_A_REQUESTS = [
+    ("help me prepare for my trip to Lisbon", "travel-prep"),
+    ("triage my inbox and show what can be archived", "inbox-triage"),
+    ("follow up after today's meeting", "meeting-follow-up"),
+    ("run my weekly review", "weekly-review"),
+    ("capture this receipt as an expense", "expense-capture"),
+    ("add this note to my Obsidian vault", "personal-notes"),
+]
+
 # Requests a person would actually make, paired with a skill that must activate.
 REQUESTS = [
     ("what's on my calendar today?", "calendar"),
@@ -50,8 +60,16 @@ REQUESTS = [
     ("how much have I spent on the API this week?", "cost-report"),
     ("who is Manning and what do we owe them?", "crm-lookup"),
     ("should I take this deal or walk away?", "council"),
-]
+] + WAVE_A_REQUESTS
 
+WAVE_A_SKILL_NAMES = {
+    "travel-prep",
+    "inbox-triage",
+    "meeting-follow-up",
+    "weekly-review",
+    "expense-capture",
+    "personal-notes",
+}
 
 def _select(skills, query, max_skills=4):
     tokens = _tokens(query)
@@ -133,6 +151,56 @@ def test_the_everyday_floor_does_not_reach_autonomous_turns():
     )
     assert "email_list" in sr.ALWAYS_AVAILABLE_TOOL_NAMES
     assert ToolContext.HEARTBEAT is not None
+
+
+def test_wave_a_skills_are_chat_only_and_keep_mutations_explicit(chat_skills):
+    """Everyday convenience must not become unrequested background action."""
+    by_name = {skill.name: skill for skill in chat_skills}
+    assert WAVE_A_SKILL_NAMES <= by_name.keys()
+    for name in WAVE_A_SKILL_NAMES:
+        skill = by_name[name]
+        assert skill.contexts == [SkillContext.CHAT]
+        assert skill.bound_tools
+        assert "explicit" in skill.content.lower(), name
+
+
+def test_wave_a_manifests_only_name_real_core_or_plugin_tools(chat_skills):
+    """A typo in a declarative binding is an invisible dead capability."""
+    from core.tools.registry import create_default_registry
+    from plugins.installed.asana.tools import create_asana_tools
+    from plugins.installed.fathom.tools import create_fathom_tools
+    from plugins.installed.todoist.tools import create_todoist_tools
+
+    registry = create_default_registry(None)
+    known = set(registry.list_names())
+    for factory in (create_asana_tools, create_fathom_tools, create_todoist_tools):
+        known.update(handler.spec.name for handler in factory())
+
+    by_name = {skill.name: skill for skill in chat_skills}
+    for name in WAVE_A_SKILL_NAMES:
+        unknown = set(skill_bound_tools(by_name[name])) - known
+        assert not unknown, f"{name} binds unknown tools: {sorted(unknown)}"
+
+
+@pytest.mark.parametrize("query,expected", WAVE_A_REQUESTS)
+@pytest.mark.asyncio
+async def test_wave_a_requests_activate_through_the_full_selector(query, expected):
+    """Exercise selection as the agent loop calls it, including tool exposure."""
+    from core.tools.base import ToolContext
+    from core.tools.registry import create_default_registry
+    from plugins.installed.asana.tools import create_asana_tools
+    from plugins.installed.fathom.tools import create_fathom_tools
+    from plugins.installed.todoist.tools import create_todoist_tools
+
+    registry = create_default_registry(None)
+    for factory in (create_asana_tools, create_fathom_tools, create_todoist_tools):
+        registry.register_all(factory())
+
+    selection = await select_skills(registry, ToolContext.CHAT, query=query)
+    selected = {skill.name: skill for skill in selection.skills}
+    assert expected in selected
+    expected_tools = set(skill_bound_tools(selected[expected])) & set(registry.list_names())
+    assert expected_tools <= selection.allowed_tool_names
 
 
 class TestSemanticSelection:

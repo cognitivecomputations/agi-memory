@@ -469,7 +469,7 @@ class HexisChatApp(App):
         import asyncpg
         from core.agent_api import db_dsn_from_env, get_agent_profile_context
         from core.llm_config import load_llm_config
-        from core.tools import create_default_registry
+        from core.tools import create_full_registry
 
         dsn = None
         i = 0
@@ -502,7 +502,7 @@ class HexisChatApp(App):
                     configured = True  # never block chat on this probe
                 llm_config = await load_llm_config(conn, "llm.chat", fallback_key="llm")
             self.model_name = llm_config.get("model", "") if isinstance(llm_config, dict) else ""
-            self.registry = create_default_registry(self.pool)
+            self.registry = await create_full_registry(self.pool)
             agent_profile = await get_agent_profile_context(self.dsn)
             if isinstance(agent_profile, dict):
                 self.agent_name = agent_profile.get("name", "Hexis")

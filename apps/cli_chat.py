@@ -254,7 +254,7 @@ async def _run_chat(dsn: str, *, verbose: bool = False, debug: bool = False,
     from core.agent_loop import AgentEvent
     from core.cognitive_memory_api import CognitiveMemory
     from core.llm_config import load_llm_config
-    from core.tools import ToolContext, create_default_registry
+    from core.tools import ToolContext, create_full_registry
     from services.chat import _build_system_prompt, _hydrate_chat_history, stream_chat_events
     from rich.table import Table
 
@@ -276,7 +276,7 @@ async def _run_chat(dsn: str, *, verbose: bool = False, debug: bool = False,
         async with pool.acquire() as conn:
             llm_config = await load_llm_config(conn, "llm.chat", fallback_key="llm")
 
-        registry = create_default_registry(pool)
+        registry = await create_full_registry(pool)
         agent_profile = await get_agent_profile_context(dsn)
         system_prompt = await _build_system_prompt(agent_profile, registry)
 

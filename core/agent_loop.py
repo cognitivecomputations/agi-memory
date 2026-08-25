@@ -171,6 +171,10 @@ class AgentLoopConfig:
     allowed_tool_names: set[str] | None = None
     # Names only, for telemetry: which skills were active when a tool was refused.
     active_skill_names: list[str] = field(default_factory=list)
+    # Immutable surface-audit context. The prompt itself is never stored there.
+    surface: str = "chat"
+    tool_surface_input_hash: str = ""
+    available_skill_count: int = 0
 
     # Continuation nudge (Gap 5)
     continuation_prompt: str | None = None
@@ -809,7 +813,11 @@ class AgentLoop:
                     }
                     if newly_bound:
                         cfg.allowed_tool_names.update(newly_bound)
+                        activated_name = str(output.get("name") or "").strip()
+                        if activated_name and activated_name not in cfg.active_skill_names:
+                            cfg.active_skill_names.append(activated_name)
                         tools = await self._load_tools_for_turn()
+                        await self._record_tool_surface_change()
 
         # Should not reach here, but safety net
         return self._make_result(
@@ -913,6 +921,30 @@ class AgentLoop:
             )
         except Exception:
             logger.debug("Gate-refusal telemetry failed (non-fatal)", exc_info=True)
+
+    async def _record_tool_surface_change(self) -> None:
+        """Audit a successful use_skill expansion without retaining user text."""
+        cfg = self.config
+        if cfg.allowed_tool_names is None:
+            return
+        try:
+            from services.tool_surface_audit import record_tool_surface_snapshot
+
+            await record_tool_surface_snapshot(
+                cfg.pool,
+                registry=cfg.registry,
+                allowed_tool_names=set(cfg.allowed_tool_names),
+                active_skill_names=list(cfg.active_skill_names),
+                considered=[],
+                available_skill_count=cfg.available_skill_count,
+                session_id=cfg.session_id,
+                surface=cfg.surface,
+                tool_context=cfg.tool_context,
+                input_text_hash=cfg.tool_surface_input_hash,
+                decision_kind="skill_activation",
+            )
+        except Exception:
+            logger.debug("Tool-surface telemetry failed (non-fatal)", exc_info=True)
 
     async def _build_exec_context(self, call_id: str) -> ToolExecutionContext:
         """Build ToolExecutionContext with config overrides and remaining energy."""

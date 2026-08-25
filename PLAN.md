@@ -795,6 +795,10 @@ reason about its own belief revisions and cannot add milk to your reminders.
   `github`, `todoist_*`, `asana_*`. Travel prep, inbox triage, meeting follow-ups,
   weekly review, expense capture. **Start here — it is a day of writing, not
   engineering, and it is the cheapest visible win in this document.**
+  **Shipped 2026-08-24:** six chat workflows cover those five journeys plus
+  mounted Obsidian/Bear Markdown notes. Each keeps writes, sends, deletes, and
+  external task creation behind an explicit user choice and degrades to core
+  Hexis tools when optional plugins are absent.
 - **Wave B — API-backed tools.** Notion, Spotify, Home Assistant, weather, Trello.
   Each is a `ToolHandler` in `core/tools/` plus a connector-setup flow of the kind
   `services/connector_setup.py` already runs for Gmail.
@@ -1641,10 +1645,10 @@ the sentence being sent — not as a memory column.
 
 - **P0-7** — `core/migrations.py:243` computes a migration checksum and `:251` stores
   it. **Nothing ever compares it.** Nine had already drifted at audit time.
-- **P1-1** — `create_full_registry` is called only by `apps/hexis_mcp_server.py` and
-  tests. The chat and heartbeat runtimes build `create_default_registry`, so plugins
-  and dynamic tools are invisible to the agent itself. **This is Tier 0's finding
-  wearing different clothes** and should be fixed alongside it.
+- **P1-1 — fixed 2026-08-23.** Chat, TUI, CLI chat, manual heartbeats, and worker
+  heartbeats now build `create_full_registry`, so plugin and persisted dynamic tools
+  reach the agent itself. The continuous capability probe measures the resulting
+  registry/config/skill surface and `hexis doctor` reports drift.
 - **P1-6** — **68** `except Exception` blocks followed directly by `pass`, against
   Experience Bar #8's "never a silent `except: pass`."
 

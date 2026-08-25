@@ -398,6 +398,7 @@ class HeartbeatWorker:
     def __init__(self, instance: str | None = None):
         self.instance = instance or os.getenv("HEXIS_INSTANCE")
         self.pool: asyncpg.Pool | None = None
+        self.tool_registry = None
         self.running = False
         self.worker_id: str | None = None
 
@@ -461,6 +462,7 @@ class HeartbeatWorker:
             while self.running:
                 try:
                     await _mark_worker_seen(self.pool, self.worker_id)
+                    await self._probe_capabilities_if_due()
                     if await self._is_agent_terminated():
                         logger.info("Agent is terminated; heartbeat timer exiting.")
                         break
@@ -481,6 +483,21 @@ class HeartbeatWorker:
     def stop(self) -> None:
         self.running = False
         logger.info("HeartbeatWorker (timer) stopping...")
+
+    async def _probe_capabilities_if_due(self) -> dict[str, Any]:
+        if not self.pool or self.tool_registry is None:
+            return {"skipped": True, "reason": "registry_not_ready"}
+        from services.capability_probe import run_probe_if_due
+
+        results = await run_probe_if_due(
+            self.pool,
+            self.tool_registry,
+            worker_name="heartbeat",
+            worker_id=self.worker_id,
+        )
+        if results is None:
+            return {"skipped": True, "reason": "not_due"}
+        return {"measured": len(results)}
 
     async def _is_agent_terminated(self) -> bool:
         if not self.pool:
@@ -757,6 +774,7 @@ class MaintenanceWorker:
 
     def _maintenance_task_runners(self) -> list[tuple[str, Callable[[], Awaitable[Any]]]]:
         return [
+            ("capability_probe", self._probe_capabilities_if_due),
             ("inbox_poll", self._run_inbox_poll),
             ("outbox_delivery", self._run_outbox_delivery),
             ("scheduled_tasks", self._run_scheduled_tasks),
@@ -777,6 +795,21 @@ class MaintenanceWorker:
             ("connector_cognition", self._run_connector_cognition),
             ("ingestion_jobs", self._run_ingestion_jobs),
         ]
+
+    async def _probe_capabilities_if_due(self) -> dict[str, Any]:
+        if not self.pool or self.tool_registry is None:
+            return {"skipped": True, "reason": "registry_not_ready"}
+        from services.capability_probe import run_probe_if_due
+
+        results = await run_probe_if_due(
+            self.pool,
+            self.tool_registry,
+            worker_name="maintenance",
+            worker_id=self.worker_id,
+        )
+        if results is None:
+            return {"skipped": True, "reason": "not_due"}
+        return {"measured": len(results)}
 
     async def _publish_outbox(self, messages: list[dict]) -> None:
         if not messages:
@@ -1249,9 +1282,10 @@ async def _amain(mode: str, instance: str | None = None) -> None:
     mcp_manager = None
     call_processor = ExternalCallProcessor(max_retries=MAX_RETRIES)
     try:
-        from core.tools import create_default_registry, create_mcp_manager
+        from core.tools import create_full_registry, create_mcp_manager
 
-        tool_registry = create_default_registry(consumer_pool)
+        tool_registry = await create_full_registry(consumer_pool)
+        hb_timer.tool_registry = tool_registry
         maint_worker.tool_registry = tool_registry
         call_processor.set_tool_registry(tool_registry)
         logger.info("Tool registry initialized for consumer")

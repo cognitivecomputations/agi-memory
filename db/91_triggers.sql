@@ -78,3 +78,9 @@ CREATE TRIGGER trg_channel_message_source_artifact
     AFTER INSERT ON channel_messages
     FOR EACH ROW
     EXECUTE FUNCTION channel_message_source_artifact_trigger();
+
+DROP TRIGGER IF EXISTS trg_tool_surface_decisions_immutable ON tool_surface_decision_events;
+CREATE TRIGGER trg_tool_surface_decisions_immutable
+    BEFORE UPDATE OR DELETE ON tool_surface_decision_events
+    FOR EACH ROW
+    EXECUTE FUNCTION reject_tool_surface_audit_mutation();

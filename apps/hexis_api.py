@@ -42,7 +42,7 @@ from core.auth.ui_flow import AuthFlowError, auth_flow_coordinator
 from core.cli_api import status_payload_rich
 from core.gateway import EventSource, Gateway
 from core.rabbitmq_bridge import RabbitMQBridge
-from core.tools import create_default_registry
+from core.tools import create_default_registry, create_full_registry
 from services.chat import resolve_prompt_addenda, stream_chat_events
 
 logger = logging.getLogger(__name__)
@@ -1439,7 +1439,7 @@ async def _stream_manual_heartbeat(pool: asyncpg.Pool) -> AsyncIterator[str]:
         async def on_event(event: AgentEventData) -> None:
             await queue.put(event)
 
-        registry = create_default_registry(pool)
+        registry = await create_full_registry(pool)
         context = _extract_heartbeat_context(payload)
         task = asyncio.create_task(
             run_agentic_heartbeat(

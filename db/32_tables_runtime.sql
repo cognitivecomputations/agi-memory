@@ -63,6 +63,54 @@ CREATE TABLE IF NOT EXISTS tool_definitions (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Live truth for the tool surface in each worker process. Unlike the catalog,
+-- this records whether registration, configuration, and skill reachability agree.
+CREATE TABLE IF NOT EXISTS worker_capabilities (
+    worker_name TEXT NOT NULL,
+    worker_id UUID,
+    tool_name TEXT NOT NULL,
+    tool_context TEXT NOT NULL CHECK (tool_context IN ('heartbeat', 'chat', 'mcp')),
+    available BOOLEAN NOT NULL,
+    reason_code TEXT,
+    reason_if_missing TEXT,
+    registry_kind TEXT NOT NULL DEFAULT 'default',
+    last_checked_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (worker_name, tool_context, tool_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_worker_capabilities_checked
+    ON worker_capabilities (last_checked_at DESC);
+CREATE INDEX IF NOT EXISTS idx_worker_capabilities_gaps
+    ON worker_capabilities (worker_name, reason_code, last_checked_at DESC)
+    WHERE available = FALSE;
+
+CREATE TABLE IF NOT EXISTS tool_surface_decision_events (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id UUID,
+    surface TEXT NOT NULL DEFAULT 'chat',
+    tool_context TEXT NOT NULL,
+    decision_kind TEXT NOT NULL DEFAULT 'selection'
+        CHECK (decision_kind IN ('selection', 'skill_activation')),
+    input_text_hash TEXT NOT NULL,
+    selected_skills TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+    considered JSONB NOT NULL DEFAULT '[]'::jsonb,
+    allowed_tools TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+    reachable_tools TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+    unreachable_tools TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+    available_skill_count INT NOT NULL DEFAULT 0,
+    registry_kind TEXT NOT NULL DEFAULT 'default',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_tool_surface_decisions_created
+    ON tool_surface_decision_events (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_tool_surface_decisions_session
+    ON tool_surface_decision_events (session_id, created_at DESC)
+    WHERE session_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_tool_surface_decisions_gaps
+    ON tool_surface_decision_events (created_at DESC)
+    WHERE cardinality(unreachable_tools) > 0;
+
 CREATE TABLE IF NOT EXISTS agent_turns (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     mode TEXT NOT NULL,

@@ -15,7 +15,7 @@ from core.cognitive_memory_api import CognitiveMemory
 from core.llm import normalize_llm_config
 from core.llm_config import load_llm_config
 from core.tools import (
-    create_default_registry,
+    create_full_registry,
     ToolContext,
     ToolExecutionContext,
     ToolRegistry,
@@ -520,7 +520,7 @@ async def chat_turn(
             )
             return {"assistant": assistant_text, "history": new_history}
 
-        registry = create_default_registry(pool)
+        registry = await create_full_registry(pool)
         agent_profile = await get_agent_profile_context(pool=pool)
 
         loop_result = await run_agent(
@@ -710,7 +710,7 @@ async def stream_chat_events(
             pool, user_message, session_id=session_id
         )
         if setup_intent:
-            registry = create_default_registry(pool)
+            registry = await create_full_registry(pool)
             source_channel = "web" if surface == "api" else surface
             run = await run_connector_setup_intent(
                 pool,
@@ -863,7 +863,7 @@ async def stream_chat_events(
                 )
             return
 
-        registry = create_default_registry(pool)
+        registry = await create_full_registry(pool)
         agent_profile = await get_agent_profile_context(pool=pool)
         collected: list[str] = []
         timed_out = False

@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
 
 from core.agent_api import _connect_with_retry, db_dsn_from_env
@@ -645,10 +644,8 @@ async def doctor_payload(
             _min, _max = pool_sizes_from_env(1, 2)
             pool = await asyncpg.create_pool(dsn, min_size=_min, max_size=_max)
             try:
-                from core.tools import create_default_registry
-                from core.tools.config import load_tools_config
-                registry = create_default_registry(pool)
-                config = await load_tools_config(pool)
+                from core.tools import create_full_registry
+                registry = await create_full_registry(pool)
                 all_handlers = registry.list_all()
                 approval_count = sum(1 for h in all_handlers if h.spec.requires_approval)
                 checks.append({
@@ -660,6 +657,87 @@ async def doctor_payload(
                 await pool.close()
         except Exception as exc:
             checks.append({"label": "Tools", "status": "WARN", "detail": str(exc)})
+
+        # 9b. Continuous registry/config/skill reachability snapshots. This is
+        # advisory: absence or staleness explains what to start, never blocks.
+        try:
+            raw = await conn.fetchval("SELECT capability_reachability_health()")
+            health = json.loads(raw) if isinstance(raw, str) else (raw or {})
+            measured = int(health.get("measured_pairs") or 0)
+            gaps = int(health.get("unexpected_gaps") or 0)
+            stale = int(health.get("stale_pairs") or 0)
+            if measured == 0:
+                checks.append({
+                    "label": "Tool reachability",
+                    "status": "WARN",
+                    "detail": "not measured yet — start workers with `hexis up`, then rerun doctor",
+                })
+            elif gaps or stale:
+                examples = ", ".join(
+                    f"{item.get('worker')}/{item.get('context')}:{item.get('tool')}"
+                    for item in (health.get("gap_examples") or [])
+                    if isinstance(item, dict)
+                )
+                detail_parts = []
+                if gaps:
+                    detail_parts.append(f"{gaps} unexpected gap(s)" + (f" ({examples})" if examples else ""))
+                if stale:
+                    detail_parts.append(f"{stale} stale measurement(s); restart workers with `hexis up`")
+                checks.append({
+                    "label": "Tool reachability",
+                    "status": "WARN",
+                    "detail": "; ".join(detail_parts),
+                })
+            else:
+                checks.append({
+                    "label": "Tool reachability",
+                    "status": "OK",
+                    "detail": (
+                        f"{health.get('available_pairs', 0)}/{measured} worker/context/tool "
+                        f"pairs reachable; 0 unexpected gaps"
+                    ),
+                })
+        except Exception as exc:
+            checks.append({
+                "label": "Tool reachability",
+                "status": "WARN",
+                "detail": f"measurement unavailable ({exc}); run `hexis migrate`",
+            })
+
+        # 9c. Immutable decision ledger: proves what each turn requested versus
+        # what the runtime could actually expose.
+        try:
+            raw = await conn.fetchval("SELECT tool_surface_audit_health()")
+            health = json.loads(raw) if isinstance(raw, str) else (raw or {})
+            decisions = int(health.get("decisions_7d") or 0)
+            decisions_with_gaps = int(health.get("decisions_with_gaps") or 0)
+            if decisions == 0:
+                checks.append({
+                    "label": "Tool surface audit",
+                    "status": "WARN",
+                    "detail": "no audited turns in the last 7 days — use `hexis chat`, then rerun doctor",
+                })
+            elif decisions_with_gaps:
+                checks.append({
+                    "label": "Tool surface audit",
+                    "status": "WARN",
+                    "detail": (
+                        f"{decisions_with_gaps}/{decisions} recent decision(s) requested tools "
+                        "the runtime could not expose; check Tool reachability above"
+                    ),
+                })
+            else:
+                checks.append({
+                    "label": "Tool surface audit",
+                    "status": "OK",
+                    "detail": f"{decisions} decision(s) in 7d; every selected tool was callable",
+                })
+        except Exception as exc:
+            checks.append({
+                "label": "Tool surface audit",
+                "status": "WARN",
+                "detail": f"audit unavailable ({exc}); run `hexis migrate`",
+            })
 
         # 10. Skills
         try:
