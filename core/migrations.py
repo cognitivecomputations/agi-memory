@@ -40,6 +40,54 @@ _ADVISORY_LOCK_KEY = 0x48584D31  # "HXM1"
 _NO_TX_DIRECTIVE = re.compile(r"^\s*--\s*migrate:\s*no-transaction\b", re.IGNORECASE)
 
 
+class MigrationChecksumError(RuntimeError):
+    """An applied migration no longer matches its recorded source."""
+
+
+def _migration_checksum(path: Path) -> str:
+    sql = path.read_text(encoding="utf-8")
+    return hashlib.sha256(sql.encode("utf-8")).hexdigest()
+
+
+async def _checksum_mismatches(
+    conn: asyncpg.Connection, table: str, files: list[Path]
+) -> list[dict[str, str]]:
+    recorded = {
+        row["version"]: row["checksum"]
+        for row in await conn.fetch(f"SELECT version, checksum FROM {table}")
+    }
+    mismatches: list[dict[str, str]] = []
+    for path in files:
+        version = path.stem
+        if version not in recorded:
+            continue
+        current = _migration_checksum(path)
+        stored = recorded[version]
+        if stored != current:
+            mismatches.append(
+                {
+                    "version": version,
+                    "recorded_checksum": stored or "NULL",
+                    "current_checksum": current,
+                }
+            )
+    return mismatches
+
+
+def _checksum_error(mismatches: list[dict[str, str]]) -> MigrationChecksumError:
+    details = "; ".join(
+        f"{item['version']} (recorded {item['recorded_checksum']}, "
+        f"current {item['current_checksum']})"
+        for item in mismatches
+    )
+    return MigrationChecksumError(
+        "Applied migration checksum mismatch: "
+        f"{details}. Applied migrations are immutable. Restore the exact applied "
+        "file and put any correction in a new forward migration; do not rewrite "
+        "schema_migrations by hand."
+    )
+
+
 async def _ensure_table(conn: asyncpg.Connection) -> str:
     """Return the qualified bookkeeping table, preserving legacy installs.
 
@@ -58,9 +106,7 @@ async def _ensure_table(conn: asyncpg.Connection) -> str:
         # Self-heal (#77 homecoming): the ledger belongs in public. Only the
         # runner can move its own table — a migration moving it mid-run pulls
         # the floor out from under the INSERT that records that migration.
-        await conn.execute(
-            "ALTER TABLE ag_catalog.schema_migrations SET SCHEMA public"
-        )
+        await conn.execute("ALTER TABLE ag_catalog.schema_migrations SET SCHEMA public")
         logger.info("moved schema_migrations from ag_catalog to public (#77)")
         return "public.schema_migrations"
 
@@ -171,7 +217,7 @@ async def _relocate_stranded_objects(conn: asyncpg.Connection) -> None:
         kind = {"S": "SEQUENCE", "v": "VIEW", "m": "MATERIALIZED VIEW"}.get(
             rel["relkind"], "TABLE"
         )
-        await conn.execute(f'ALTER {kind} {qualified} SET SCHEMA public')
+        await conn.execute(f"ALTER {kind} {qualified} SET SCHEMA public")
         logger.warning(
             "schema guard: moved stranded ag_catalog.%s to public (#77)", name
         )
@@ -240,7 +286,7 @@ async def apply_pending_migrations(
             if version in done:
                 continue
             sql = path.read_text(encoding="utf-8")
-            checksum = hashlib.sha256(sql.encode("utf-8")).hexdigest()
+            checksum = _migration_checksum(path)
             start = time.monotonic()
             await _prepare_conn(conn)
             if _is_no_transaction(sql):
@@ -278,8 +324,14 @@ async def apply_pending_migrations(
                     json.dumps({"version": version, "checksum": checksum}),
                 )
             except Exception:
-                logger.debug("change_journal unavailable for %s", version, exc_info=True)
+                logger.debug(
+                    "change_journal unavailable for %s", version, exc_info=True
+                )
             applied.append(version)
+
+        mismatches = await _checksum_mismatches(conn, table, files)
+        if mismatches:
+            raise _checksum_error(mismatches)
 
         # Postcondition (#77): the schema this runner just wrote must be the
         # schema connections resolve. Stale ag_catalog twins shadowed public
@@ -319,12 +371,14 @@ async def apply_pending_migrations(
 async def migration_status(
     conn: asyncpg.Connection, *, migrations_dir: Path | None = None
 ) -> dict:
-    """{'applied': [...], 'pending': [...]} in filename order."""
+    """Applied, pending, and checksum-drifted migrations in filename order."""
     migrations_dir = migrations_dir or MIGRATIONS_DIR
+    files = _list_migration_files(migrations_dir)
     table = await _ensure_table(conn)
     done = {r["version"] for r in await conn.fetch(f"SELECT version FROM {table}")}
-    versions = [p.stem for p in _list_migration_files(migrations_dir)]
+    versions = [p.stem for p in files]
     return {
         "applied": [v for v in versions if v in done],
         "pending": [v for v in versions if v not in done],
+        "drifted": await _checksum_mismatches(conn, table, files),
     }

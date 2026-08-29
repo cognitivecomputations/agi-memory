@@ -14,10 +14,7 @@ depends = ["setup:python", "setup:ui", "setup:docker"]
 [tasks."setup:python"]
 hide = true
 run = '''
-if [ ! -x .venv/bin/python ]; then
-  uv venv --python 3.12
-fi
-uv pip install --python .venv/bin/python -e .
+uv sync --locked --inexact --python 3.12
 if [ ! -f .env ]; then
   cp .env.local .env
 fi

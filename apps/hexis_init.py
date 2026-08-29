@@ -317,7 +317,14 @@ def _default_stack_services(
             # single tokens, so anything else is noise.
             if name and " " not in name and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name):
                 services.append(name)
-    return services or list(_FALLBACK_STACK_SERVICES)
+    resolved = services or list(_FALLBACK_STACK_SERVICES)
+    try:
+        from apps.hexis_cli import _host_managed_compose_workers
+
+        host_managed = _host_managed_compose_workers()
+    except Exception:
+        host_managed = set()
+    return [name for name in resolved if name not in host_managed]
 
 
 def _dsn_is_local(dsn: str) -> bool:
@@ -344,7 +351,9 @@ def _ensure_stack_running(args: argparse.Namespace) -> Path:
     up on its own. Every service in the default profile has to be running.
     """
     from apps.hexis_cli import (
+        _ensure_installed_host_services_running,
         _find_compose_file,
+        _host_managed_compose_workers,
         _stack_root_from_compose,
         ensure_compose,
         ensure_docker,
@@ -364,6 +373,7 @@ def _ensure_stack_running(args: argparse.Namespace) -> Path:
     env_file = resolve_env_file(stack_root)
 
     expected = _default_stack_services(compose_cmd, compose_file, stack_root, env_file)
+    host_managed_workers = _host_managed_compose_workers()
     rc, out = _run_compose_capture(
         compose_cmd, compose_file, stack_root,
         ["ps", "--services", "--filter", "status=running"], env_file,
@@ -371,6 +381,15 @@ def _ensure_stack_running(args: argparse.Namespace) -> Path:
     running = set(out.split()) if rc == 0 else set()
     missing = [name for name in expected if name not in running]
     if not missing:
+        if host_managed_workers:
+            workers_ok, workers_error = _ensure_installed_host_services_running()
+            if not workers_ok:
+                err_console.print(
+                    "[fail]Docker is ready, but the installed host workers did not "
+                    f"start: {workers_error}[/fail]\nRun `hexis service logs`, fix the "
+                    "reported cause, then run `hexis init` again."
+                )
+                raise SystemExit(1)
         console.print("[ok]\u2714[/ok] Docker stack already running")
         return stack_root
 
@@ -380,11 +399,23 @@ def _ensure_stack_running(args: argparse.Namespace) -> Path:
         console.print("[muted]Starting Docker stack...[/muted]")
         if not is_source:
             # pip install path: pull images first
-            run_compose(compose_cmd, compose_file, stack_root, ["pull"], env_file)
-    rc = run_compose(compose_cmd, compose_file, stack_root, ["up", "-d"], env_file)
+            pull_args = ["pull", *expected] if host_managed_workers else ["pull"]
+            run_compose(compose_cmd, compose_file, stack_root, pull_args, env_file)
+    up_args = ["up", "-d", *expected] if host_managed_workers else ["up", "-d"]
+    rc = run_compose(compose_cmd, compose_file, stack_root, up_args, env_file)
     if rc != 0:
         err_console.print("[fail]Failed to start Docker stack.[/fail]")
         raise SystemExit(1)
+
+    if host_managed_workers:
+        workers_ok, workers_error = _ensure_installed_host_services_running()
+        if not workers_ok:
+            err_console.print(
+                "[fail]Docker started, but the installed host workers did not: "
+                f"{workers_error}[/fail]\nRun `hexis service logs`, fix the reported "
+                "cause, then run `hexis init` again."
+            )
+            raise SystemExit(1)
 
     console.print("[ok]\u2714[/ok] Docker stack started")
     return stack_root

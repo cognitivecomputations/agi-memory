@@ -31,10 +31,16 @@ Hexis is a Postgres-native cognitive architecture that wraps any LLM with persis
 | Understand the architecture | [Concepts overview](concepts/index.md) |
 | Choose a character for my agent | [Character cards](guides/character-cards.md) |
 | Ingest documents into memory | [Ingestion guide](guides/ingestion.md) |
+| Move an agent to another machine | [Mind portability](guides/mind-portability.md) |
+| Reproduce the public memory benchmark | [Public Memory Benchmark](guides/memory-benchmark.md) |
 | Enable autonomous heartbeat | [Heartbeat guide](guides/heartbeat.md) |
 | Set up Discord/Telegram/Slack | [Channels](integrations/channels/index.md) |
+| Audit or pause outbound messages | [Outbound Safety](guides/outbound-safety.md) |
 | Connect external tools (HubSpot, Todoist, etc.) | [External integrations](integrations/external/index.md) |
 | Deploy to production | [Production deployment](operations/production.md) |
+| Install Hexis on a phone | [Secure Phone and PWA Access](operations/secure-remote-access.md) |
+| Pair a computer for private Mac apps, commands, or screen capture | [Companion Nodes](operations/companion-nodes.md) |
+| Run execution tools on another machine | [Execution Backends](operations/execution-backends.md) |
 | Troubleshoot a problem | [Troubleshooting](operations/troubleshooting.md) |
 | Prove core behavior and inspect maturity | [Capability Proof and Maturity](guides/alive-demo.md) |
 | Understand the CLI | [CLI reference](reference/cli.md) |

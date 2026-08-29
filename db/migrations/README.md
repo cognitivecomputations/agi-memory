@@ -14,6 +14,9 @@ wiping data**. `current schema = baseline + all migrations`.
   not how you ship a schema change anymore.
 
 Each applied file is recorded in the `schema_migrations` table and never re-run.
+Its SHA-256 is checked on every migration startup and by `hexis migrate --status`;
+changing an applied file fails loudly with the exact mismatched hashes and directs
+the operator to restore it and write a new forward migration.
 
 ## Writing one
 

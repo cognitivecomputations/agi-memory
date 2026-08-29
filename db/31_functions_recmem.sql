@@ -1559,8 +1559,6 @@ CREATE OR REPLACE FUNCTION recmem_subconscious_vector_hits(
     confidence FLOAT,
     retrieval_source TEXT
 ) AS $$
-DECLARE
-    zero_vec vector := COALESCE(p_zero_vec, array_fill(0.0::float, ARRAY[embedding_dimension()])::vector);
 BEGIN
     RETURN QUERY
     WITH chunk_best AS (
@@ -1606,7 +1604,6 @@ BEGIN
           AND s.embedding_status = 'embedded'
           AND c.embedding_status = 'embedded'
           AND c.embedding IS NOT NULL
-          AND c.embedding <> zero_vec
           AND (NOT p_exclude_sensitive
                OR COALESCE(s.source_attribution->>'sensitivity', '') <> 'private')
         ORDER BY s.id, c.embedding <=> p_query_embedding, c.chunk_index
@@ -1626,7 +1623,6 @@ BEGIN
         WHERE s.status = 'active'
           AND s.embedding_status = 'embedded'
           AND s.embedding IS NOT NULL
-          AND s.embedding <> zero_vec
           AND (NOT p_exclude_sensitive
                OR COALESCE(s.source_attribution->>'sensitivity', '') <> 'private')
     ),
@@ -1712,7 +1708,6 @@ CREATE OR REPLACE FUNCTION recmem_recall_context(
 ) AS $$
 DECLARE
     query_embedding vector;
-    zero_vec vector;
     strength_weight FLOAT;
     intensity_weight FLOAT;
     recency_weight FLOAT;
@@ -1726,7 +1721,6 @@ DECLARE
     affective_state JSONB;
 BEGIN
     query_embedding := (get_embedding(ARRAY[ensure_embedding_prefix(p_query, 'search_query')]))[1];
-    zero_vec := array_fill(0.0::float, ARRAY[embedding_dimension()])::vector;
     -- The unified ranker (#96, completing #57's "unification, first step"):
     -- recmem's tier skeleton with fast_recall's full scoring transplanted —
     -- associations, episode-temporal binding, mood congruence, trust floor,
@@ -1762,8 +1756,7 @@ BEGIN
         FROM recmem_subconscious_vector_hits(
             query_embedding,
             GREATEST(COALESCE(p_k_sub, 10), 0),
-            p_exclude_sensitive,
-            zero_vec
+            p_exclude_sensitive
         )
     ),
     recent_unembedded AS (
@@ -1805,7 +1798,8 @@ BEGIN
          WHERE m.status = 'active'
            AND (m.valid_until IS NULL OR m.valid_until > CURRENT_TIMESTAMP)
            AND m.type = 'episodic'
-           AND m.embedding IS NOT NULL AND m.embedding <> zero_vec
+           AND m.embedding_status = 'embedded'
+           AND m.embedding IS NOT NULL
            AND (NOT p_exclude_sensitive
                 OR COALESCE(m.source_attribution->>'sensitivity', '') <> 'private')
          ORDER BY m.embedding <=> query_embedding
@@ -1816,7 +1810,8 @@ BEGIN
          WHERE m.status = 'active'
            AND (m.valid_until IS NULL OR m.valid_until > CURRENT_TIMESTAMP)
            AND m.type = 'semantic'
-           AND m.embedding IS NOT NULL AND m.embedding <> zero_vec
+           AND m.embedding_status = 'embedded'
+           AND m.embedding IS NOT NULL
            AND (NOT p_exclude_sensitive
                 OR COALESCE(m.source_attribution->>'sensitivity', '') <> 'private')
          ORDER BY m.embedding <=> query_embedding
@@ -1827,7 +1822,8 @@ BEGIN
          WHERE m.status = 'active'
            AND (m.valid_until IS NULL OR m.valid_until > CURRENT_TIMESTAMP)
            AND m.type::text IN ('procedural', 'strategic', 'worldview', 'goal')
-           AND m.embedding IS NOT NULL AND m.embedding <> zero_vec
+           AND m.embedding_status = 'embedded'
+           AND m.embedding IS NOT NULL
            AND (NOT p_exclude_sensitive
                 OR COALESCE(m.source_attribution->>'sensitivity', '') <> 'private')
          ORDER BY m.embedding <=> query_embedding
@@ -1975,8 +1971,8 @@ BEGIN
         JOIN memories m ON m.id = c.mem_id
         WHERE m.status = 'active'
           AND (m.valid_until IS NULL OR m.valid_until > CURRENT_TIMESTAMP)
+          AND m.embedding_status = 'embedded'
           AND m.embedding IS NOT NULL
-          AND m.embedding <> zero_vec
           AND m.trust_level >= min_trust
           AND (NOT p_exclude_sensitive
                OR COALESCE(m.source_attribution->>'sensitivity', '') <> 'private')

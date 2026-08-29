@@ -25,7 +25,7 @@ Connect your Hexis agent to WhatsApp via the Meta Business Cloud API.
 
 ```bash
 hexis channels setup whatsapp
-hexis up --profile active
+hexis up
 hexis channels status
 ```
 

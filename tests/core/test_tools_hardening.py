@@ -1,3 +1,4 @@
+import asyncio
 import sys
 import types
 from types import SimpleNamespace
@@ -260,6 +261,42 @@ async def test_execute_batch_parallel_energy_budget(monkeypatch):
     assert results[0].success is True
     assert results[1].success is False
     assert results[1].error_type == ToolErrorType.INSUFFICIENT_ENERGY
+
+
+@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.core
+async def test_registry_propagates_turn_cancellation(monkeypatch):
+    handler = DummyHandler("blocking_tool", cost=0, supports_parallel=False)
+    handler._spec.execution_timeout_seconds = None
+
+    async def _block(_arguments, _context):
+        await asyncio.Event().wait()
+        return ToolResult.success_result({"ok": True})
+
+    monkeypatch.setattr(handler, "execute", _block)
+    registry = ToolRegistry(pool=object())
+    registry.register(handler)
+
+    async def _allow(*args, **kwargs):
+        return PolicyCheckResult.allow()
+
+    async def _config():
+        return ToolsConfig()
+
+    monkeypatch.setattr(registry._policy, "check_all", _allow)
+    monkeypatch.setattr(registry, "get_config", _config)
+    task = asyncio.create_task(
+        registry.execute(
+            "blocking_tool",
+            {},
+            ToolExecutionContext(tool_context=ToolContext.CHAT, call_id="cancel"),
+        )
+    )
+    await asyncio.sleep(0)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
 
 
 @pytest.mark.asyncio(loop_scope="session")

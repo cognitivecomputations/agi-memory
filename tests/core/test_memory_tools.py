@@ -9,6 +9,7 @@ flattened into source_* keys. The former Python fallback was deleted.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 from uuid import uuid4
 
@@ -16,11 +17,13 @@ import pytest
 
 from core.tools.base import ToolContext, ToolExecutionContext
 from core.tools.memory import (
+    DiffMemoryHistoryHandler,
     GetStrategiesHandler,
     LoadDocumentsHandler,
     OpenDocumentHandler,
     OpenDocumentsHandler,
     QueueUserMessageHandler,
+    RecallAtTimeHandler,
     RecallHandler,
     RememberHandler,
     SearchDocumentsHandler,
@@ -31,13 +34,14 @@ from tests.utils import get_test_identifier
 pytestmark = [pytest.mark.asyncio(loop_scope="session")]
 
 
-def _ctx(db_pool) -> ToolExecutionContext:
+def _ctx(db_pool, *, is_group: bool = False) -> ToolExecutionContext:
     registry = MagicMock()
     registry.pool = db_pool
     return ToolExecutionContext(
         tool_context=ToolContext.CHAT,
         call_id="test-call",
         registry=registry,
+        is_group=is_group,
     )
 
 
@@ -68,6 +72,83 @@ class TestRecallThroughDbDispatcher:
             assert hits, result.output
             # The plain-query path is the hybrid retriever, which labels rows.
             assert hits[0].get("retrieval_source"), hits[0]
+        finally:
+            await _cleanup(db_pool, marker)
+
+
+class TestTemporalMemoryTools:
+    async def test_temporal_tools_are_registered_with_situational_contracts(self):
+        from core.tools.memory import create_memory_tools
+
+        handlers = {handler.spec.name: handler for handler in create_memory_tools()}
+        assert {"recall_at_time", "diff_memory_history"} <= handlers.keys()
+        assert handlers["recall_at_time"].spec.parameters["required"] == [
+            "query",
+            "as_of",
+        ]
+        assert handlers["diff_memory_history"].spec.parameters["required"] == [
+            "query",
+            "from_time",
+        ]
+        assert "as of" in handlers["recall_at_time"].spec.description.lower()
+        assert (
+            "what changed" in handlers["diff_memory_history"].spec.description.lower()
+        )
+
+    async def test_handlers_expose_historical_snapshot_and_diff_with_citations(
+        self, db_pool, ensure_embedding_service
+    ):
+        marker = get_test_identifier("temporaltools")
+        now = datetime.now(timezone.utc)
+        created_at = now - timedelta(days=2)
+        try:
+            async with db_pool.acquire() as conn:
+                memory_id = await conn.fetchval(
+                    """
+                    INSERT INTO memories (
+                        type, content, embedding, embedding_status,
+                        created_at, valid_from, source_attribution, trust_level
+                    ) VALUES (
+                        'semantic', $1,
+                        array_fill(0.1, ARRAY[embedding_dimension()])::vector,
+                        'embedded', $2, $2,
+                        '{"kind":"user_testimony","label":"Temporal tool test"}'::jsonb,
+                        0.8
+                    ) RETURNING id
+                    """,
+                    f"The temporal tool marker is {marker}",
+                    created_at,
+                )
+
+            snapshot = await RecallAtTimeHandler().execute(
+                {
+                    "query": f"temporal tool marker {marker}",
+                    "as_of": (now - timedelta(days=1)).isoformat(),
+                    "min_score": 0,
+                },
+                _ctx(db_pool),
+            )
+            changed = await DiffMemoryHistoryHandler().execute(
+                {
+                    "query": f"temporal tool marker {marker}",
+                    "from_time": (now - timedelta(days=3)).isoformat(),
+                    "to_time": now.isoformat(),
+                    "min_score": 0,
+                },
+                _ctx(db_pool),
+            )
+
+            assert snapshot.success, snapshot.error
+            hit = next(
+                item
+                for item in snapshot.output["memories"]
+                if item["memory_id"] == str(memory_id)
+            )
+            assert hit["citation_id"] == f"mem-{memory_id}"
+            assert changed.success, changed.error
+            assert str(memory_id) in {
+                item["memory_id"] for item in changed.output["added"]
+            }
         finally:
             await _cleanup(db_pool, marker)
 
@@ -205,7 +286,7 @@ class TestProvenanceTooling:
         assert handler.validate({"query": "recover from heartbeat failures"}) == []
         assert handler.validate({"situation": "recover from heartbeat failures"}) == []
 
-    def test_remember_schema_supports_sources_and_confidence(self):
+    async def test_remember_schema_supports_sources_and_confidence(self):
         spec = RememberHandler().spec
         props = spec.parameters["properties"]
         assert "confidence" in props
@@ -213,7 +294,7 @@ class TestProvenanceTooling:
         source_props = props["sources"]["items"]["properties"]
         assert {"kind", "ref", "label", "author", "trust"} <= set(source_props)
 
-    def test_add_evidence_handler_registered(self):
+    async def test_add_evidence_handler_registered(self):
         from core.tools.memory import AddEvidenceHandler, create_memory_tools
 
         names = [handler.spec.name for handler in create_memory_tools()]
@@ -225,7 +306,7 @@ class TestProvenanceTooling:
 
 
 class TestBeliefHistoryTool:
-    def test_belief_history_handler_registered(self):
+    async def test_belief_history_handler_registered(self):
         from core.tools.memory import BeliefHistoryHandler, create_memory_tools
 
         names = [handler.spec.name for handler in create_memory_tools()]

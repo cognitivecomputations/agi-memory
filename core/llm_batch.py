@@ -87,6 +87,7 @@ async def batch_classify(
     max_tokens: int = 4000,
     chunk_chars: int = DEFAULT_CHUNK_CHARS,
     temperature: float = 0.1,
+    provenance: dict[str, str] | None = None,
 ) -> dict[str, R]:
     """Classify every item, in as few model calls as the budget allows.
 
@@ -132,12 +133,20 @@ async def batch_classify(
             raw = verdicts.get(item_key)
             if raw is None:
                 results[item_key] = fallback(item)
+                if provenance is not None:
+                    provenance[item_key] = "fallback"
                 continue
             try:
                 results[item_key] = parse(raw)
+                if provenance is not None:
+                    provenance[item_key] = "llm"
             except Exception:
-                logger.debug("Batch verdict unparseable for %s", item_key, exc_info=True)
+                logger.debug(
+                    "Batch verdict unparseable for %s", item_key, exc_info=True
+                )
                 results[item_key] = fallback(item)
+                if provenance is not None:
+                    provenance[item_key] = "fallback"
 
     return results
 

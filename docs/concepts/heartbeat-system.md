@@ -28,13 +28,13 @@ Without a heartbeat, an AI agent is purely reactive -- it only does things when 
 
 ### The Loop
 
-1. **Initialize** -- Regenerate energy (+10/hour, max 20)
+1. **Initialize** -- Regenerate from elapsed time, decay stored surplus, and apply the prior outcome multiplier
 2. **Observe** -- Check environment, pending events, user presence, scheduled tasks
 3. **Orient** -- Review active goals, gather context (memories, clusters, identity, worldview, emotional state)
 4. **Decide** -- LLM call with full context and action budget
 5. **Act** -- Execute chosen actions within energy budget
 6. **Record** -- Store heartbeat as episodic memory; the finished turn also mirrors into the conscious-episode substrate (`subconscious_units`), where the maintenance worker's extraction sweep can selectively promote salient facts to durable memory
-7. **Wait** -- Sleep until next heartbeat
+7. **Wait** -- Schedule the next beat from live drive urgency
 
 ### Energy as Constraint
 
@@ -49,6 +49,12 @@ Energy makes action intentional. The agent can't do everything every heartbeat -
 | **5** | Send messages, run council |
 
 The budget forces trade-offs: "Do I research this or reach out to the user? Do I consolidate memories or pursue a goal?" These trade-offs are what make choices meaningful.
+
+The normal reserve is 20 by default, while unused capacity can bank to 60.
+Stored energy above the reserve decays rather than disappearing at a hard cap.
+Ordinary beats use one reserve; actionable backlog can draw up to two. Useful,
+durably verified outcomes improve the next regeneration multiplier, while an
+empty or failed beat lowers it.
 
 ### Context Restrictions
 
@@ -73,7 +79,9 @@ If the worker crashes, no state is lost. The next poll picks up where things lef
 ## Key Design Decisions
 
 - **Database drives scheduling** -- `should_run_heartbeat()` decides timing, not the worker
+- **Cadence follows state** -- drive urgency determines `next_heartbeat_at` within configured bounds
 - **Energy is not compute cost** -- it's situational consequence (see [Energy Model](../reference/energy-model.md))
+- **Outcomes are receipt-backed** -- durable results and verified feedback, not summaries, shape regeneration
 - **Actions are batch-executed** -- all heartbeat actions in one DB call for atomicity
 - **Heartbeat as memory** -- every heartbeat becomes an episodic memory, enabling self-reflection
 

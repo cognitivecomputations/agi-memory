@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import logging
 import inspect
-import os
 import smtplib
 import ssl
 import uuid
@@ -24,6 +23,7 @@ from core.integration_reliability import (
 )
 
 from .base import (
+    OutboundSpec,
     ToolCategory,
     ToolContext,
     ToolErrorType,
@@ -71,11 +71,15 @@ async def _gmail_setup_required_result(context: ToolExecutionContext) -> ToolRes
             maybe_result = execute("gmail_setup_status", {}, status_context)
             if inspect.isawaitable(maybe_result):
                 maybe_result = await maybe_result
-            if isinstance(maybe_result, ToolResult) and isinstance(maybe_result.output, dict):
+            if isinstance(maybe_result, ToolResult) and isinstance(
+                maybe_result.output, dict
+            ):
                 output = dict(maybe_result.output)
                 display = maybe_result.display_output or display
         except Exception:
-            logger.debug("Could not attach Gmail setup status to auth failure", exc_info=True)
+            logger.debug(
+                "Could not attach Gmail setup status to auth failure", exc_info=True
+            )
 
     if not isinstance(output.get("ui"), dict):
         try:
@@ -87,7 +91,9 @@ async def _gmail_setup_required_result(context: ToolExecutionContext) -> ToolRes
                 next_step=output.get("next_step") or display,
             )
         except Exception:
-            logger.debug("Could not build Gmail setup UI for auth failure", exc_info=True)
+            logger.debug(
+                "Could not build Gmail setup UI for auth failure", exc_info=True
+            )
 
     return ToolResult(
         success=False,
@@ -171,6 +177,13 @@ class EmailSendHandler(ToolHandler):
             is_read_only=False,
             requires_approval=True,
             optional=True,
+            outbound=OutboundSpec(
+                recipient_arg="to",
+                additional_recipient_args=("cc",),
+                body_arg="body",
+                html_body_arg="html_body",
+                channel="email",
+            ),
             allowed_contexts={ToolContext.HEARTBEAT, ToolContext.CHAT},
         )
 
@@ -327,6 +340,12 @@ class SendGridEmailHandler(ToolHandler):
             is_read_only=False,
             requires_approval=True,
             optional=True,
+            outbound=OutboundSpec(
+                recipient_arg="to",
+                body_arg="body",
+                html_body_arg="html_body",
+                channel="email",
+            ),
             allowed_contexts={ToolContext.HEARTBEAT, ToolContext.CHAT},
         )
 
@@ -512,7 +531,8 @@ class EmailListHandler(ToolHandler):
                 return ToolResult(
                     success=True,
                     output={"emails": [], "count": 0, "label": label},
-                    display_output=f"No emails in {label}" + (" (unread)" if unread_only else ""),
+                    display_output=f"No emails in {label}"
+                    + (" (unread)" if unread_only else ""),
                 )
 
             # Fetch metadata for each message
@@ -521,21 +541,30 @@ class EmailListHandler(ToolHandler):
                 msg = (
                     service.users()
                     .messages()
-                    .get(userId="me", id=msg_stub["id"], format="metadata",
-                         metadataHeaders=["From", "Subject", "Date", "To"])
+                    .get(
+                        userId="me",
+                        id=msg_stub["id"],
+                        format="metadata",
+                        metadataHeaders=["From", "Subject", "Date", "To"],
+                    )
                     .execute()
                 )
-                headers = {h["name"]: h["value"] for h in msg.get("payload", {}).get("headers", [])}
-                emails.append({
-                    "id": msg["id"],
-                    "thread_id": msg.get("threadId"),
-                    "from": headers.get("From", ""),
-                    "to": headers.get("To", ""),
-                    "subject": headers.get("Subject", "(No subject)"),
-                    "date": headers.get("Date", ""),
-                    "snippet": msg.get("snippet", ""),
-                    "unread": "UNREAD" in msg.get("labelIds", []),
-                })
+                headers = {
+                    h["name"]: h["value"]
+                    for h in msg.get("payload", {}).get("headers", [])
+                }
+                emails.append(
+                    {
+                        "id": msg["id"],
+                        "thread_id": msg.get("threadId"),
+                        "from": headers.get("From", ""),
+                        "to": headers.get("To", ""),
+                        "subject": headers.get("Subject", "(No subject)"),
+                        "date": headers.get("Date", ""),
+                        "snippet": msg.get("snippet", ""),
+                        "unread": "UNREAD" in msg.get("labelIds", []),
+                    }
+                )
 
             display_lines = []
             for e in emails:
@@ -637,7 +666,9 @@ class EmailReadHandler(ToolHandler):
             )
 
             # Extract headers
-            headers = {h["name"]: h["value"] for h in msg.get("payload", {}).get("headers", [])}
+            headers = {
+                h["name"]: h["value"] for h in msg.get("payload", {}).get("headers", [])
+            }
 
             # Extract body
             body_text = _extract_body(msg.get("payload", {}))
@@ -780,21 +811,30 @@ class EmailSearchHandler(ToolHandler):
                 msg = (
                     service.users()
                     .messages()
-                    .get(userId="me", id=msg_stub["id"], format="metadata",
-                         metadataHeaders=["From", "Subject", "Date", "To"])
+                    .get(
+                        userId="me",
+                        id=msg_stub["id"],
+                        format="metadata",
+                        metadataHeaders=["From", "Subject", "Date", "To"],
+                    )
                     .execute()
                 )
-                headers = {h["name"]: h["value"] for h in msg.get("payload", {}).get("headers", [])}
-                results.append({
-                    "id": msg["id"],
-                    "thread_id": msg.get("threadId"),
-                    "from": headers.get("From", ""),
-                    "to": headers.get("To", ""),
-                    "subject": headers.get("Subject", "(No subject)"),
-                    "date": headers.get("Date", ""),
-                    "snippet": msg.get("snippet", ""),
-                    "unread": "UNREAD" in msg.get("labelIds", []),
-                })
+                headers = {
+                    h["name"]: h["value"]
+                    for h in msg.get("payload", {}).get("headers", [])
+                }
+                results.append(
+                    {
+                        "id": msg["id"],
+                        "thread_id": msg.get("threadId"),
+                        "from": headers.get("From", ""),
+                        "to": headers.get("To", ""),
+                        "subject": headers.get("Subject", "(No subject)"),
+                        "date": headers.get("Date", ""),
+                        "snippet": msg.get("snippet", ""),
+                        "unread": "UNREAD" in msg.get("labelIds", []),
+                    }
+                )
 
             display_lines = [f"Search results for: {query}", ""]
             for r in results:
@@ -826,7 +866,9 @@ def _extract_body(payload: dict[str, Any]) -> str:
 
     # Simple text part
     if mime_type == "text/plain" and payload.get("body", {}).get("data"):
-        return base64.urlsafe_b64decode(payload["body"]["data"]).decode("utf-8", errors="replace")
+        return base64.urlsafe_b64decode(payload["body"]["data"]).decode(
+            "utf-8", errors="replace"
+        )
 
     # Multipart — recurse into parts, prefer text/plain
     parts = payload.get("parts", [])
@@ -836,9 +878,13 @@ def _extract_body(payload: dict[str, Any]) -> str:
     for part in parts:
         part_mime = part.get("mimeType", "")
         if part_mime == "text/plain" and part.get("body", {}).get("data"):
-            plain_text += base64.urlsafe_b64decode(part["body"]["data"]).decode("utf-8", errors="replace")
+            plain_text += base64.urlsafe_b64decode(part["body"]["data"]).decode(
+                "utf-8", errors="replace"
+            )
         elif part_mime == "text/html" and part.get("body", {}).get("data"):
-            html_text += base64.urlsafe_b64decode(part["body"]["data"]).decode("utf-8", errors="replace")
+            html_text += base64.urlsafe_b64decode(part["body"]["data"]).decode(
+                "utf-8", errors="replace"
+            )
         elif part_mime.startswith("multipart/"):
             # Nested multipart
             nested = _extract_body(part)
@@ -850,6 +896,7 @@ def _extract_body(payload: dict[str, Any]) -> str:
     if html_text:
         # Strip HTML tags as a fallback
         import re
+
         clean = re.sub(r"<[^>]+>", " ", html_text)
         clean = re.sub(r"\s+", " ", clean).strip()
         return clean
@@ -864,12 +911,14 @@ def _extract_attachments(payload: dict[str, Any]) -> list[dict[str, Any]]:
     def _walk(part: dict[str, Any]) -> None:
         filename = part.get("filename")
         if filename:
-            attachments.append({
-                "filename": filename,
-                "mime_type": part.get("mimeType", ""),
-                "size": part.get("body", {}).get("size", 0),
-                "attachment_id": part.get("body", {}).get("attachmentId"),
-            })
+            attachments.append(
+                {
+                    "filename": filename,
+                    "mime_type": part.get("mimeType", ""),
+                    "size": part.get("body", {}).get("size", 0),
+                    "attachment_id": part.get("body", {}).get("attachmentId"),
+                }
+            )
         for sub in part.get("parts", []):
             _walk(sub)
 
@@ -979,7 +1028,11 @@ class IngestEmailsHandler(ToolHandler):
             messages = resp.get("messages", [])
             if not messages:
                 return ToolResult.success_result(
-                    {"emails_ingested": 0, "contacts_created": 0, "contacts_updated": 0},
+                    {
+                        "emails_ingested": 0,
+                        "contacts_created": 0,
+                        "contacts_updated": 0,
+                    },
                     display_output="No new emails to ingest",
                 )
 
@@ -1013,6 +1066,7 @@ class IngestEmailsHandler(ToolHandler):
 
                         # Check for duplicate via content hash
                         import hashlib
+
                         content_hash = hashlib.sha256(
                             f"{msg_stub['id']}:{subject}".encode()
                         ).hexdigest()
@@ -1027,15 +1081,17 @@ class IngestEmailsHandler(ToolHandler):
 
                         # 3. Store as episodic memory
                         content = f"Email from {sender}: {subject}\n\n{snippet}"
-                        source_attr = json.dumps({
-                            "kind": "email",
-                            "sender": sender,
-                            "to": to,
-                            "subject": subject,
-                            "date": date,
-                            "gmail_id": msg_stub["id"],
-                            "content_hash": content_hash,
-                        })
+                        source_attr = json.dumps(
+                            {
+                                "kind": "email",
+                                "sender": sender,
+                                "to": to,
+                                "subject": subject,
+                                "date": date,
+                                "gmail_id": msg_stub["id"],
+                                "content_hash": content_hash,
+                            }
+                        )
 
                         await conn.fetchval(
                             "SELECT create_episodic_memory($1, NULL, $2, NULL, 0.0, CURRENT_TIMESTAMP, 0.5, $3)",
@@ -1048,7 +1104,10 @@ class IngestEmailsHandler(ToolHandler):
                         # 4. Extract and upsert contact
                         match = re.match(r"(.+?)\s*<(.+?)>", sender)
                         if match:
-                            name, email = match.group(1).strip().strip('"'), match.group(2).strip()
+                            name, email = (
+                                match.group(1).strip().strip('"'),
+                                match.group(2).strip(),
+                            )
                         elif "@" in sender:
                             email = sender.strip()
                             name = email.split("@")[0]
@@ -1058,14 +1117,20 @@ class IngestEmailsHandler(ToolHandler):
                         upsert_raw = await conn.fetchval(
                             "SELECT upsert_contact($1, $2, 'email')", name, email
                         )
-                        upsert = json.loads(upsert_raw) if isinstance(upsert_raw, str) else (upsert_raw or {})
+                        upsert = (
+                            json.loads(upsert_raw)
+                            if isinstance(upsert_raw, str)
+                            else (upsert_raw or {})
+                        )
                         if upsert.get("created"):
                             contacts_created += 1
                         elif "id" in upsert:
                             contacts_updated += 1
 
                     except Exception as e:
-                        logger.debug("Failed to ingest email %s: %s", msg_stub.get("id"), e)
+                        logger.debug(
+                            "Failed to ingest email %s: %s", msg_stub.get("id"), e
+                        )
                         continue
 
             summary = {
@@ -1118,7 +1183,9 @@ def create_email_tools(
 
     # Only add SendGrid if API key resolver is provided
     if sendgrid_api_key_resolver:
-        tools.append(SendGridEmailHandler(sendgrid_api_key_resolver, sendgrid_from_email))
+        tools.append(
+            SendGridEmailHandler(sendgrid_api_key_resolver, sendgrid_from_email)
+        )
 
     # Gmail read tools (always registered; auth checked at execution time)
     tools.append(EmailListHandler(gmail_credentials_resolver))

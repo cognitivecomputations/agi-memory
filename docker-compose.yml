@@ -1,9 +1,9 @@
 # Dev watch config (`hexis dev`, or `docker compose watch`): source edits sync
 # into the running containers and restart them; restarted workers re-apply any
 # pending db/migrations on startup, so schema deltas flow automatically too.
-# pyproject.toml changes rebuild the image (dependency layer). This section is
-# inert unless a watch session is running. Sync is used instead of bind mounts
-# on purpose — bind mounts misbehave on macOS external drives (see db note).
+# pyproject.toml or uv.lock changes rebuild the image dependency layer. This
+# section is inert unless a watch session is running. Sync is used instead of
+# bind mounts on purpose — bind mounts misbehave on macOS external drives.
 x-dev-watch: &dev-watch
   - path: ./core
     target: /app/core
@@ -33,9 +33,12 @@ x-dev-watch: &dev-watch
     action: sync+restart
   - path: ./pyproject.toml
     action: rebuild
+  - path: ./uv.lock
+    action: rebuild
 
 services:
   db:
+    image: ghcr.io/quixiai/hexis-brain:${HEXIS_IMAGE_TAG:-latest}
     build:
       context: .
       dockerfile: ops/Dockerfile.db
@@ -143,6 +146,7 @@ services:
   #     - public
 
   heartbeat_worker:
+    image: ghcr.io/quixiai/hexis-worker:${HEXIS_IMAGE_TAG:-latest}
     build:
       context: .
       dockerfile: ops/Dockerfile.worker
@@ -183,6 +187,7 @@ services:
       - public
 
   maintenance_worker:
+    image: ghcr.io/quixiai/hexis-worker:${HEXIS_IMAGE_TAG:-latest}
     build:
       context: .
       dockerfile: ops/Dockerfile.worker
@@ -223,6 +228,7 @@ services:
       - public
 
   api:
+    image: ghcr.io/quixiai/hexis-worker:${HEXIS_IMAGE_TAG:-latest}
     build:
       context: .
       dockerfile: ops/Dockerfile.worker
@@ -230,8 +236,6 @@ services:
     restart: unless-stopped
     develop:
       watch: *dev-watch
-    profiles:
-      - active
     command: ["hexis-api", "--host", "0.0.0.0", "--port", "43817"]
     depends_on:
       db:
@@ -240,6 +244,10 @@ services:
         condition: service_healthy
     ports:
       - "${HEXIS_BIND_ADDRESS:-127.0.0.1}:${HEXIS_API_PORT:-43817}:43817"
+    # Speech synthesis stays on the host loopback sidecar. Native Linux needs
+    # the same host-gateway mapping Docker Desktop provides automatically.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:43817/health', timeout=3).read()"]
       interval: 10s
@@ -255,6 +263,7 @@ services:
       EMBEDDING_MODEL_ID: ${EMBEDDING_MODEL_ID:-unsloth/embeddinggemma-300m}
       EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-768}
       HEXIS_CORS_ORIGINS: ${HEXIS_CORS_ORIGINS:-http://localhost:3477,http://localhost:3000}
+      HEXIS_TTS_URL: ${HEXIS_TTS_URL:-http://host.docker.internal:42667}
       RABBITMQ_MANAGEMENT_URL: http://rabbitmq:15672
       RABBITMQ_USER: ${RABBITMQ_DEFAULT_USER:-hexis}
       RABBITMQ_PASSWORD: ${RABBITMQ_DEFAULT_PASS:-hexis_password}
@@ -274,6 +283,7 @@ services:
       - public
 
   channel_worker:
+    image: ghcr.io/quixiai/hexis-channels:${HEXIS_IMAGE_TAG:-latest}
     build:
       context: .
       dockerfile: ops/Dockerfile.channels
@@ -281,8 +291,6 @@ services:
     restart: unless-stopped
     develop:
       watch: *dev-watch
-    profiles:
-      - active
     command: ["hexis-channels"]
     depends_on:
       db:
@@ -325,6 +333,34 @@ services:
       # writes back, so this is read-write; the store's .lock files serialize
       # host/container access. Also exposes user skills (~/.hexis/skills).
       - ~/.hexis:/root/.hexis
+    networks:
+      - private
+      - public
+
+  ui:
+    image: ghcr.io/quixiai/hexis-ui:${HEXIS_IMAGE_TAG:-latest}
+    build:
+      context: .
+      dockerfile: ops/Dockerfile.ui
+    container_name: hexis_ui
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    ports:
+      - "${HEXIS_BIND_ADDRESS:-127.0.0.1}:${HEXIS_UI_PORT:-3477}:3477"
+    environment:
+      HEXIS_DATABASE_URL: postgresql://${POSTGRES_USER:-hexis_user}:${POSTGRES_PASSWORD:-hexis_password}@db:5432/${POSTGRES_DB:-hexis_memory}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-hexis_user}:${POSTGRES_PASSWORD:-hexis_password}@db:5432/${POSTGRES_DB:-hexis_memory}
+      HEXIS_API_URL: http://api:43817
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      XAI_API_KEY: ${XAI_API_KEY:-}
+      HEXIS_LLM_CONSCIOUS_API_KEY: ${HEXIS_LLM_CONSCIOUS_API_KEY:-}
+      HEXIS_LLM_SUBCONSCIOUS_API_KEY: ${HEXIS_LLM_SUBCONSCIOUS_API_KEY:-}
     networks:
       - private
       - public

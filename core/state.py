@@ -27,6 +27,16 @@ async def run_heartbeat(conn) -> dict[str, Any] | None:
     return _coerce_json(raw)
 
 
+async def has_pending_inbound_disposition_wake(conn) -> bool:
+    """Whether a fresh operator correction should bypass active-hour cadence."""
+    try:
+        raw = await conn.fetchval("SELECT has_pending_inbound_disposition_wake()")
+        return raw is True or (isinstance(raw, str) and raw.strip().lower() == "true")
+    except Exception:
+        # Migration skew retains the established heartbeat cadence.
+        return False
+
+
 async def apply_heartbeat_decision(
     conn,
     *,
@@ -45,7 +55,9 @@ async def apply_heartbeat_decision(
     return _coerce_json(raw)
 
 
-async def run_maintenance_if_due(conn, stats_hint: dict[str, Any] | None = None) -> dict[str, Any] | None:
+async def run_maintenance_if_due(
+    conn, stats_hint: dict[str, Any] | None = None
+) -> dict[str, Any] | None:
     raw = await conn.fetchval(
         "SELECT run_maintenance_if_due($1::jsonb)",
         json.dumps(stats_hint or {}),

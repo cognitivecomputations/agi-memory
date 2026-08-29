@@ -112,7 +112,6 @@ CREATE OR REPLACE FUNCTION tool_config_enabled(
     p_optional BOOLEAN DEFAULT FALSE
 ) RETURNS BOOLEAN
 LANGUAGE plpgsql
-STABLE
 AS $$
 DECLARE
     cfg JSONB := COALESCE(get_config('tools'), '{}'::jsonb);
@@ -195,7 +194,6 @@ CREATE OR REPLACE FUNCTION evaluate_tool_call(
     p_context JSONB DEFAULT '{}'::jsonb
 ) RETURNS JSONB
 LANGUAGE plpgsql
-STABLE
 AS $$
 DECLARE
     tool tool_definitions%ROWTYPE;
@@ -206,6 +204,10 @@ DECLARE
     cost INT;
     max_per_tool INT;
     boundary TEXT;
+    approval_ok BOOLEAN := FALSE;
+    approval_request UUID;
+    purpose_goal_id UUID;
+    assigned_energy_multiplier DOUBLE PRECISION;
 BEGIN
     SELECT * INTO tool FROM tool_definitions WHERE name = p_tool_name;
     IF NOT FOUND THEN
@@ -220,6 +222,32 @@ BEGIN
     END IF;
 
     cost := COALESCE(NULLIF(cfg #>> ARRAY['costs', tool.name], '')::int, tool.default_energy_cost);
+    -- A user-assigned goal is the durable permission slip for autonomous
+    -- effort.  Only declared outbound tools can use this path; adding model
+    -- arguments to an unrelated tool cannot manufacture a discount.
+    IF tool.metadata ? 'outbound'
+       AND lower(COALESCE(p_arguments->>'purpose_kind', '')) = 'goal' THEN
+        BEGIN
+            purpose_goal_id := NULLIF(p_arguments->>'purpose_reference', '')::uuid;
+        EXCEPTION WHEN OTHERS THEN
+            purpose_goal_id := NULL;
+        END;
+        IF purpose_goal_id IS NOT NULL AND EXISTS (
+            SELECT 1 FROM memories
+            WHERE id = purpose_goal_id
+              AND type = 'goal'
+              AND goal_origin = 'user_request'::goal_source
+        ) THEN
+            assigned_energy_multiplier := LEAST(
+                GREATEST(
+                    COALESCE(get_config_float('outbound.assigned_goal_energy_multiplier'), 0.25),
+                    0
+                ),
+                1
+            );
+            cost := CEIL(cost * assigned_energy_multiplier)::integer;
+        END IF;
+    END IF;
     IF ctx = 'heartbeat' AND p_context ? 'energy_available' THEN
         BEGIN energy_available := NULLIF(p_context->>'energy_available', '')::int;
         EXCEPTION WHEN OTHERS THEN energy_available := NULL; END;
@@ -239,7 +267,32 @@ BEGIN
         RETURN jsonb_build_object('allowed', false, 'reason', 'Boundary restriction: ' || boundary, 'error_type', 'boundary_violation', 'energy_cost', cost);
     END IF;
 
-    IF tool.requires_approval AND ctx <> 'chat' AND NOT is_tool_approved(tool.name) THEN
+    IF tool.requires_approval AND NULLIF(p_context->>'approval_request_id', '') IS NOT NULL THEN
+        BEGIN
+            approval_request := (p_context->>'approval_request_id')::uuid;
+            approval_ok := consume_operator_tool_approval(
+                approval_request, tool.name, p_arguments, p_context
+            );
+        EXCEPTION WHEN OTHERS THEN
+            approval_ok := FALSE;
+        END;
+    END IF;
+
+    IF tool.requires_approval
+       AND NULLIF(p_context->>'approval_request_id', '') IS NOT NULL
+       AND NOT approval_ok THEN
+        RETURN jsonb_build_object(
+            'allowed', false,
+            'reason', format('The operator approval proof for tool %L is invalid, expired, mismatched, or already consumed', tool.name),
+            'error_type', 'approval_required',
+            'energy_cost', cost
+        );
+    END IF;
+
+    IF tool.requires_approval
+       AND ctx <> 'chat'
+       AND NOT is_tool_approved(tool.name)
+       AND NOT approval_ok THEN
         RETURN jsonb_build_object('allowed', false, 'reason', format('Tool %L requires approval for autonomous use', tool.name), 'error_type', 'approval_required', 'energy_cost', cost);
     END IF;
 
@@ -248,7 +301,8 @@ BEGIN
         'energy_cost', cost,
         'supports_parallel', tool.supports_parallel,
         'execution_kind', tool.execution_kind,
-        'driver', tool.driver
+        'driver', tool.driver,
+        'operator_approval_request_id', CASE WHEN approval_ok THEN approval_request::text ELSE NULL END
     );
 END;
 $$;
@@ -258,7 +312,6 @@ CREATE OR REPLACE FUNCTION plan_tool_batch(
     p_context JSONB DEFAULT '{}'::jsonb
 ) RETURNS JSONB
 LANGUAGE plpgsql
-STABLE
 AS $$
 DECLARE
     call JSONB;

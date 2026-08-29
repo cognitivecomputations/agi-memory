@@ -59,4 +59,4 @@ def test_a_raising_callback_denies_rather_than_allows():
     src = inspect.getsource(AgentLoop)
     idx = src.index("await cfg.on_approval(tool_name, arguments)")
     after = src[idx: idx + 400]
-    assert "approved = False" in after, "an exception in the approver must deny"
+    assert "decision = False" in after, "an exception in the approver must deny"

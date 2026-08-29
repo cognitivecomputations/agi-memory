@@ -72,6 +72,7 @@ async def test_channel_connector_manifests_are_first_class_and_honest(db_pool):
             "app_mentions:read",
             "channels:history",
             "chat:write",
+            "im:write",
         ]
 
         telegram_alias = _j(await conn.fetchval(

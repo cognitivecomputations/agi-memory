@@ -26,6 +26,7 @@ class _Connection:
             "kind": "user",
             "intent": "check_in",
             "message": "Would you like me to prepare the report?",
+            "payload": {},
         }
 
     async def fetchval(self, query: str, message_id: uuid.UUID):

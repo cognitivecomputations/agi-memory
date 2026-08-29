@@ -27,6 +27,9 @@ type StatusData = {
   configured?: boolean;
   energy?: number;
   max_energy?: number;
+  energy_reserve?: number;
+  energy_capacity?: number;
+  next_regen_multiplier?: number;
   mood?: string;
   valence?: number;
   arousal?: number;
@@ -223,7 +226,7 @@ export default function Dashboard() {
 
         <section className="grid border-x border-b border-[var(--outline)] bg-white sm:grid-cols-2 xl:grid-cols-4">
           <Metric icon={Activity} label="Heartbeat" value={heartbeatState} detail={formatRelativeTime(status.last_heartbeat_at)} />
-          <Metric icon={Zap} label="Energy" value={`${status.energy ?? 0} / ${status.max_energy ?? 20}`} detail={`${status.heartbeat_count ?? 0} completed`} />
+          <Metric icon={Zap} label="Energy" value={`${status.energy ?? 0} / ${status.energy_capacity ?? status.max_energy ?? 20}`} detail={`reserve ${status.energy_reserve ?? status.max_energy ?? 20} · ${status.heartbeat_count ?? 0} completed`} />
           <Metric icon={HeartPulse} label="Emotion" value={status.mood || "Unknown"} detail={status.arousal != null ? `arousal ${status.arousal.toFixed(2)}` : "No reading"} />
           <Metric icon={Brain} label="Memory" value={totalMemories.toLocaleString()} detail={`${status.memory_health?.length || 0} types`} />
         </section>

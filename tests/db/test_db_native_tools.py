@@ -57,7 +57,58 @@ async def test_execute_goals_tool_create_and_list(db_pool):
 
             assert created["success"] is True
             assert created["output"]["title"] == "DB-native goal"
+            assert created["output"]["origin"] == "derived"
             assert listed["success"] is True
+        finally:
+            await tr.rollback()
+
+
+async def test_execute_goals_tool_uses_trusted_origin_not_source_text(db_pool):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            await _stub_get_embedding(conn)
+            payload = _coerce_json(
+                await conn.fetchval(
+                    "SELECT execute_goals_tool($1::jsonb, 'external'::goal_source)",
+                    json.dumps(
+                        {
+                            "action": "create",
+                            "title": "Trusted-origin DB goal",
+                            "source": "user_request",
+                        }
+                    ),
+                )
+            )
+            assert payload["success"] is True
+            assert payload["output"]["origin"] == "external"
+            assert (
+                await conn.fetchval(
+                    "SELECT goal_origin::text FROM memories WHERE id = $1::uuid",
+                    payload["output"]["goal_id"],
+                )
+                == "external"
+            )
+        finally:
+            await tr.rollback()
+
+
+async def test_raw_goal_insert_cannot_infer_authority_from_metadata(db_pool):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            origin = await conn.fetchval("""
+                INSERT INTO memories (type, content, metadata)
+                VALUES (
+                    'goal',
+                    'Raw goal origin probe',
+                    '{"source": "user_request", "priority": "queued"}'::jsonb
+                )
+                RETURNING goal_origin::text
+                """)
+            assert origin == "derived"
         finally:
             await tr.rollback()
 

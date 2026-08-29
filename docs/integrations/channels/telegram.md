@@ -23,7 +23,7 @@ Connect your Hexis agent to Telegram.
 
 ```bash
 hexis channels setup telegram
-hexis up --profile active
+hexis up
 hexis channels status
 ```
 

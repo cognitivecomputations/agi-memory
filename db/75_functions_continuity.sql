@@ -110,7 +110,7 @@ BEGIN
     -- fear of a storm is not fear for one's life.
     IF instinct_count > 0
        AND jsonb_typeof(emo) = 'object'
-       AND COALESCE(emo->>'primary_emotion', '') ~* '(fear|alarm|dread|terror|anxiet|panic)'
+       AND emotion_family_serves(emo->>'family', 'continuity_drive')
        AND COALESCE((emo->>'intensity')::float, 0.0) >= 0.6 THEN
         intensity := GREATEST(intensity, (emo->>'intensity')::float);
     END IF;

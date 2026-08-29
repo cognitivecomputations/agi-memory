@@ -3,7 +3,7 @@
 -- filing cabinet (doc archived, chunks removed, artifact bytes released).
 -- Agent-acquired sources (acquisition='agent') gain a daily autonomous
 -- pass: archive when idle, escalate to a user fade request when heavily
--- referenced. All gated on retention.enabled (ships dark).
+-- referenced. All gated on retention.enabled (enabled by default; still a kill switch).
 SET search_path = public, ag_catalog, "$user";
 
 INSERT INTO config_defaults (key, value, description) VALUES

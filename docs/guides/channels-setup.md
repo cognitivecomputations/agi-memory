@@ -18,7 +18,7 @@ Connect your Hexis agent to messaging platforms (Discord, Telegram, Slack, Signa
 hexis channels setup discord
 
 # Start additional live channel workers (part of active profile)
-hexis up --profile active
+hexis up
 
 # Check status
 hexis channels status
@@ -41,7 +41,7 @@ This interactive command stores the required credentials (bot token, phone numbe
 The channel worker runs as part of the `active` Docker Compose profile:
 
 ```bash
-docker compose --profile active up -d
+docker compose up -d
 ```
 
 Or start a specific channel:
@@ -56,6 +56,60 @@ hexis channels start --channel discord
 hexis channels status          # show session counts per channel
 hexis channels status --json   # JSON output
 ```
+
+### 4. Identify the Operator (Optional)
+
+Each setup wizard can record your exact platform user ID or phone number. In a
+private conversation, that identity may create standing instructions such as
+“Always cite the source.” Other allowed participants can chat normally but
+cannot write, inspect, or revoke operator policy. Group messages never gain
+operator authority, even when you sent them.
+
+Slack uses `channel.slack.operator_user_id`; iMessage uses
+`channel.imessage.operator_recipient`; the other channels use
+`channel.<type>.operator_user_id`. Leave the prompt blank if that channel
+should never manage standing policy.
+
+## Optional: Central Inbound Routing
+
+By default, the established adapter allowlists and reply behavior remain active. To
+make inbound routing centrally auditable, enable the DB-owned policy:
+
+```sql
+SELECT set_config('channel.disposition.enabled', 'true'::jsonb);
+```
+
+The change applies to running channel workers. Allowed direct conversations continue
+normally. Messages outside the live channel allowlist are observed without a reply;
+empty messages drop; configured trigger words and native mentions engage; and a fresh
+identity-verified operator correction can wake an unpaused heartbeat. Every decision
+is visible in `inbound_disposition_events`.
+
+Trigger and continuation gates are opt-in per channel. For example:
+
+```sql
+SELECT set_config('channel.imessage.disposition.trigger_word', '"hexis"'::jsonb);
+SELECT set_config(
+  'channel.imessage.disposition.continuation_window_seconds',
+  '300'::jsonb
+);
+```
+
+Set the master switch back to `false` at any time to restore legacy routing. No worker
+restart is required in either direction.
+
+## Outbound Safety
+
+Every person-facing send—provider tool, formal outbox delivery, or direct channel
+reply—passes the same database-owned policy. Third-party sends require a backed
+purpose, draw from a per-person/per-channel attention budget, and identify the agent
+and principal. Replies are free. A recipient's STOP applies immediately across every
+known channel; START or UNSTOP is the only way to reverse it.
+
+Open **Outbound** in the dashboard to inspect purposes, costs, disclosure form,
+delivery outcomes, unanswered-contact counts, and budget strain. The same page can
+pause all outbound communication or one person without erasing recipient opt-outs.
+See [Outbound Safety](outbound-safety.md) for the full operator workflow.
 
 ## Architecture
 
@@ -86,4 +140,5 @@ See individual channel pages under [Integrations > Channels](../integrations/cha
 ## Related
 
 - [Channels overview](../integrations/channels/index.md) -- comparison matrix and individual channel docs
+- [Outbound Safety](outbound-safety.md) -- purpose, cadence, STOP, ledger, and kill switches
 - [Docker Compose](../operations/docker-compose.md) -- profiles and services

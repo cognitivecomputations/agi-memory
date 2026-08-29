@@ -112,6 +112,7 @@ class AgentEvent(str, Enum):
     LLM_RESPONSE = "llm_response"
     CLAIM_FLAGGED = "claim_flagged"
     UI_ARTIFACT = "ui_artifact"
+    QUESTION = "question"
 
 
 @dataclass
@@ -152,11 +153,14 @@ class AgentLoopConfig:
     # Session
     session_id: str | None = None
     is_group: bool = False
+    is_operator: bool = False
     heartbeat_id: str | None = None
 
     # Callbacks
     on_event: Callable[[AgentEventData], Awaitable[None]] | None = None
-    on_approval: Callable[[str, dict[str, Any]], Awaitable[bool]] | None = None
+    on_approval: (
+        Callable[[str, dict[str, Any]], Awaitable[bool | dict[str, Any]]] | None
+    ) = None
 
     # Planning phases (Gap 1)
     enable_planning: bool = False
@@ -642,11 +646,54 @@ class AgentLoop:
                     )
                     continue
 
+                spec = cfg.registry.get_spec(tool_name)
+
+                # STOP is above every other communication gate, including the
+                # act of asking the operator to approve a provider send. The
+                # registry repeats the full authorization just before delivery,
+                # so this is a no-side-effect ordering preflight rather than the
+                # final policy decision.
+                if spec and spec.outbound is not None:
+                    outbound_refusal = await cfg.registry.preflight_outbound_controls(
+                        spec, arguments
+                    )
+                    if outbound_refusal is not None:
+                        await self._record_tool_result(
+                            call_id,
+                            {
+                                "tool_name": tool_name,
+                                "arguments": arguments,
+                                "success": False,
+                                "error": outbound_refusal.error,
+                                "error_type": (
+                                    outbound_refusal.error_type.value
+                                    if outbound_refusal.error_type
+                                    else None
+                                ),
+                                "energy_spent": 0,
+                                "model_output": outbound_refusal.to_model_output(),
+                            },
+                        )
+                        self._tool_calls_made.append(
+                            {
+                                "id": call_id,
+                                "name": tool_name,
+                                "arguments": arguments,
+                                "success": False,
+                                "error": "outbound_control_blocked",
+                                "energy_spent": 0,
+                            }
+                        )
+                        await self._record_gate_refusal(
+                            tool_name, "outbound_control_blocked"
+                        )
+                        continue
+
                 # Approval gate. A tool marked `requires_approval` needs a person
                 # to say yes. When no approver is wired — the heartbeat, the API
                 # chat path — that is not permission, it is the absence of anyone
                 # to ask, so the call is refused rather than waved through.
-                spec = cfg.registry.get_spec(tool_name)
+                approval_evidence: dict[str, Any] = {}
                 if spec and spec.requires_approval:
                     await self._emit(
                         AgentEvent.APPROVAL_REQUEST,
@@ -692,13 +739,36 @@ class AgentLoop:
                         continue
 
                     try:
-                        approved = await cfg.on_approval(tool_name, arguments)
+                        decision = await cfg.on_approval(tool_name, arguments)
                     except Exception:
                         logger.warning(
                             "Approval callback raised for %s; treating as denied",
-                            tool_name, exc_info=True,
+                            tool_name,
+                            exc_info=True,
                         )
-                        approved = False
+                        decision = False
+
+                    if isinstance(decision, dict):
+                        approved = bool(
+                            decision.get("approved") and decision.get("request_id")
+                        )
+                        approval_evidence = {
+                            "request_id": decision.get("request_id"),
+                            "channel": decision.get("approval_channel"),
+                        }
+                        denial_reason = str(
+                            decision.get("reason")
+                            or (
+                                "Approval returned no exact request proof."
+                                if decision.get("approved")
+                                else f"Approval ended with status {decision.get('status') or 'denied'}."
+                            )
+                        )
+                        if decision.get("next_step"):
+                            denial_reason += f" Next: {decision['next_step']}"
+                    else:
+                        approved = bool(decision)
+                        denial_reason = "The user denied this tool call."
 
                     if not approved:
                         await self._record_tool_result(
@@ -709,7 +779,10 @@ class AgentLoop:
                                 "success": False,
                                 "error": "denied",
                                 "energy_spent": 0,
-                                "model_output": f"Tool call '{tool_name}' was denied by the user.",
+                                "model_output": (
+                                    f"Tool call '{tool_name}' was not approved. "
+                                    f"{denial_reason}"
+                                ),
                             },
                         )
                         self._tool_calls_made.append(
@@ -726,7 +799,9 @@ class AgentLoop:
                         continue
 
                 # Build execution context
-                exec_ctx = await self._build_exec_context(call_id)
+                exec_ctx = await self._build_exec_context(
+                    call_id, approval_evidence=approval_evidence
+                )
 
                 await self._emit(
                     AgentEvent.TOOL_START,
@@ -763,6 +838,7 @@ class AgentLoop:
                         "energy_spent", self._energy_spent + result.energy_spent
                     )
                 )
+                await self._append_tool_visual_context(result.metadata)
 
                 await self._emit(
                     AgentEvent.TOOL_RESULT,
@@ -814,7 +890,10 @@ class AgentLoop:
                     if newly_bound:
                         cfg.allowed_tool_names.update(newly_bound)
                         activated_name = str(output.get("name") or "").strip()
-                        if activated_name and activated_name not in cfg.active_skill_names:
+                        if (
+                            activated_name
+                            and activated_name not in cfg.active_skill_names
+                        ):
                             cfg.active_skill_names.append(activated_name)
                         tools = await self._load_tools_for_turn()
                         await self._record_tool_surface_change()
@@ -946,24 +1025,53 @@ class AgentLoop:
         except Exception:
             logger.debug("Tool-surface telemetry failed (non-fatal)", exc_info=True)
 
-    async def _build_exec_context(self, call_id: str) -> ToolExecutionContext:
+    async def _build_exec_context(
+        self,
+        call_id: str,
+        *,
+        approval_evidence: dict[str, Any] | None = None,
+    ) -> ToolExecutionContext:
         """Build ToolExecutionContext with config overrides and remaining energy."""
         cfg = self.config
         remaining_energy: int | None = None
         if cfg.energy_budget is not None:
             remaining_energy = max(0, cfg.energy_budget - self._energy_spent)
 
+        async def emit_tool_event(event_name: str, data: dict[str, Any]) -> None:
+            try:
+                event = AgentEvent(event_name)
+            except ValueError:
+                logger.warning("Tool emitted unknown agent event %s", event_name)
+                return
+            await self._emit(event, data)
+
         ctx = ToolExecutionContext(
             tool_context=cfg.tool_context,
             call_id=call_id,
             session_id=cfg.session_id,
             is_group=cfg.is_group,
+            is_operator=cfg.is_operator,
+            surface=cfg.surface,
+            event_callback=emit_tool_event,
             heartbeat_id=cfg.heartbeat_id,
             energy_available=remaining_energy,
             allow_network=True,
             allow_shell=False,
             allow_file_read=True,
             allow_file_write=False,
+            action_approved=bool(
+                approval_evidence and approval_evidence.get("request_id")
+            ),
+            approval_request_id=(
+                str(approval_evidence.get("request_id"))
+                if approval_evidence and approval_evidence.get("request_id")
+                else None
+            ),
+            approval_channel=(
+                str(approval_evidence.get("channel"))
+                if approval_evidence and approval_evidence.get("channel")
+                else None
+            ),
         )
 
         # Apply overrides from ToolsConfig
@@ -1086,6 +1194,28 @@ class AgentLoop:
         parsed = json.loads(raw) if isinstance(raw, str) else raw
         return parsed if isinstance(parsed, dict) else {}
 
+    async def _append_tool_visual_context(self, metadata: dict[str, Any]) -> None:
+        """Put trusted tool images into the DB-owned model conversation."""
+        attachments = metadata.get("model_visual_attachments")
+        if not isinstance(attachments, list):
+            return
+        for attachment in attachments[:4]:
+            if not isinstance(attachment, dict):
+                continue
+            data_url = str(attachment.get("data_url") or "")
+            mime_type = str(attachment.get("mime_type") or "").lower()
+            if not data_url.startswith("data:image/") or not mime_type.startswith(
+                "image/"
+            ):
+                continue
+            async with self.config.pool.acquire() as conn:
+                await conn.fetchval(
+                    "SELECT append_agent_visual_message($1::uuid, $2, $3)",
+                    self._turn_id,
+                    str(attachment.get("name") or "tool image"),
+                    data_url,
+                )
+
     async def _enforce_action_claims(self, result: AgentLoopResult) -> None:
         """Correct action claims unsupported by a call or durable prior receipt.
 
@@ -1121,7 +1251,7 @@ class AgentLoop:
                 return
 
             summary = "; ".join(
-                f"{f.get('kind', 'action')}: \"{(f.get('sentence') or '')[:160]}\""
+                f'{f.get("kind", "action")}: "{(f.get("sentence") or "")[:160]}"'
                 for f in findings[:5]
             )
             correction = (

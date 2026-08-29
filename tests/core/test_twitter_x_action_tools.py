@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from uuid import uuid4
 
 import pytest
 
@@ -17,7 +18,9 @@ def _j(value):
     return json.loads(value) if isinstance(value, str) else value
 
 
-async def test_twitter_x_post_heartbeat_requires_connector_action_policy(db_pool, monkeypatch, tmp_path):
+async def test_twitter_x_post_heartbeat_requires_connector_action_policy(
+    db_pool, monkeypatch, tmp_path
+):
     import core.auth.store as auth_store
     import services.twitter_x as twitter_x
 
@@ -62,7 +65,8 @@ async def test_twitter_x_post_heartbeat_requires_connector_action_policy(db_pool
     assert "twitter_x/post" in denied.error
 
     async def fake_post_twitter_x(**kwargs):
-        assert kwargs["text"] == "Status update from Hexis test."
+        assert kwargs["text"].startswith("Status update from Hexis test.")
+        assert "Reply STOP" in kwargs["text"]
         return {
             "sent": True,
             "connector_id": "twitter_x",
@@ -73,8 +77,17 @@ async def test_twitter_x_post_heartbeat_requires_connector_action_policy(db_pool
 
     monkeypatch.setattr(twitter_x, "post_twitter_x", fake_post_twitter_x)
     async with db_pool.acquire() as conn:
-        policy = _j(await conn.fetchval(
+        goal_id = await conn.fetchval(
             """
+            INSERT INTO memories(type, goal_origin, content, importance, trust_level, status, metadata)
+            VALUES ('goal', 'user_request', $1, 0.7, 0.8, 'active', '{"priority":"active"}'::jsonb)
+            RETURNING id
+            """,
+            f"Twitter/X policy test {uuid4()}",
+        )
+        policy = _j(
+            await conn.fetchval(
+                """
             SELECT grant_connector_action_policy(
                 'twitter_x',
                 'post',
@@ -89,7 +102,13 @@ async def test_twitter_x_post_heartbeat_requires_connector_action_policy(db_pool
                 'user'
             )
             """
-        ))
+            )
+        )
+
+    call_args.update(
+        purpose_kind="goal",
+        purpose_reference=str(goal_id),
+    )
 
     allowed = await registry.execute("twitter_x_post", call_args, ctx)
 
@@ -102,8 +121,16 @@ async def test_twitter_x_post_heartbeat_requires_connector_action_policy(db_pool
             ORDER BY created_at DESC
             """
         )
-        await conn.execute("DELETE FROM connector_action_audit WHERE context->>'call_id' = 'twitter-x-post-policy'")
-        await conn.execute("DELETE FROM connector_action_policies WHERE source_session_id = 'twitter-x-post-policy'")
+        await conn.execute(
+            "DELETE FROM connector_action_audit WHERE context->>'call_id' = 'twitter-x-post-policy'"
+        )
+        await conn.execute(
+            "DELETE FROM connector_action_policies WHERE source_session_id = 'twitter-x-post-policy'"
+        )
+        await conn.execute(
+            "DELETE FROM outbound_events WHERE request_key LIKE 'tool:twitter-x-post-policy:%'"
+        )
+        await conn.execute("DELETE FROM memories WHERE id = $1", goal_id)
 
     assert allowed.success
     assert allowed.output["tweet_id"] == "tweet-1"
@@ -111,5 +138,6 @@ async def test_twitter_x_post_heartbeat_requires_connector_action_policy(db_pool
     assert audits[0]["connector_id"] == "twitter_x"
     assert audits[0]["account_key"] == "x:123"
     assert audits[0]["action_kind"] == "post"
-    assert audits[0]["target"] == "Status update from Hexis test."
+    assert audits[0]["target"].startswith("Status update from Hexis test.")
+    assert "Reply STOP" in audits[0]["target"]
     assert audits[0]["decision"] == "allowed"

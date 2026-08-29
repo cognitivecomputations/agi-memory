@@ -179,7 +179,12 @@ def ensure_docker() -> str:
         )
         raise SystemExit(1)
     try:
-        subprocess.run([docker_bin, "info"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        subprocess.run(
+            [docker_bin, "info"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+        )
     except subprocess.CalledProcessError:
         _print_err(
             "Docker is installed but no daemon is reachable. Start Docker Desktop "
@@ -191,14 +196,21 @@ def ensure_docker() -> str:
 
 def ensure_compose(docker_bin: str) -> list[str]:
     try:
-        subprocess.run([docker_bin, "compose", "version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        subprocess.run(
+            [docker_bin, "compose", "version"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+        )
         return [docker_bin, "compose"]
     except Exception:
         pass
     compose_bin = shutil.which("docker-compose")
     if compose_bin:
         return [compose_bin]
-    _print_err("Docker Compose not available. Install Compose: https://docs.docker.com/compose/install/")
+    _print_err(
+        "Docker Compose not available. Install Compose: https://docs.docker.com/compose/install/"
+    )
     raise SystemExit(1)
 
 
@@ -221,13 +233,40 @@ def _compose_env() -> dict[str, str]:
     Pins HEXIS_IMAGE_TAG (used by ops/docker-compose.runtime.yml) to this
     CLI's own package version, so a pip-installed `hexis` always runs the
     images published from the same release commit. An explicit
-    HEXIS_IMAGE_TAG in the caller's environment wins; source checkouts
-    ignore the variable entirely (their compose file builds locally).
+    HEXIS_IMAGE_TAG in the caller's environment wins. Source checkouts use
+    the same published tag by default and build that tag only on --build or
+    through `hexis dev`.
     """
     env = os.environ.copy()
     if not env.get("HEXIS_IMAGE_TAG"):
         env["HEXIS_IMAGE_TAG"] = _ver if _ver != "dev" else "latest"
     return env
+
+
+def _up_compose_args(
+    profiles: list[str],
+    *,
+    is_source: bool,
+    build: bool,
+    services: list[str] | None = None,
+) -> list[str]:
+    """Build `compose up` arguments without putting builds on the default path."""
+
+    args: list[str] = []
+    for profile in profiles:
+        args += ["--profile", profile]
+    args += ["up", "-d"]
+    if is_source:
+        if build:
+            args.append("--build")
+        else:
+            # The source compose declares published image names and local
+            # build recipes. Be explicit so a failed pull never falls through
+            # into a surprise dependency build.
+            args += ["--no-build", "--pull", "missing"]
+    if services is not None:
+        args += services
+    return args
 
 
 def run_compose(
@@ -251,14 +290,20 @@ def run_compose(
 
 
 def _run_compose_capture(
-    compose_cmd: list[str], compose_file: Path, stack_root: Path, args: list[str], env_file: Path | None
+    compose_cmd: list[str],
+    compose_file: Path,
+    stack_root: Path,
+    args: list[str],
+    env_file: Path | None,
 ) -> tuple[int, str]:
     cmd = compose_cmd + ["-f", str(compose_file)]
     if env_file:
         cmd += ["--env-file", str(env_file)]
     cmd += args
     try:
-        p = subprocess.run(cmd, cwd=stack_root, env=_compose_env(), capture_output=True, text=True)
+        p = subprocess.run(
+            cmd, cwd=stack_root, env=_compose_env(), capture_output=True, text=True
+        )
         out = (p.stdout or "") + (("\n" + p.stderr) if p.stderr else "")
         return p.returncode, out.strip()
     except FileNotFoundError:
@@ -305,9 +350,13 @@ def _redact_config(cfg: dict[str, Any]) -> dict[str, Any]:
 
     for key, value in list(out.items()):
         if _is_sensitive_config_key(str(key)):
-            out[str(key)] = _redact_deep(value) if isinstance(value, (dict, list)) else "***"
+            out[str(key)] = (
+                _redact_deep(value) if isinstance(value, (dict, list)) else "***"
+            )
         else:
-            out[str(key)] = _redact_deep(value) if isinstance(value, (dict, list)) else value
+            out[str(key)] = (
+                _redact_deep(value) if isinstance(value, (dict, list)) else value
+            )
 
     return out
 
@@ -315,71 +364,101 @@ def _redact_config(cfg: dict[str, Any]) -> dict[str, Any]:
 def _make_db_flags() -> argparse.ArgumentParser:
     """Shared --dsn / --wait-seconds parent parser."""
     p = argparse.ArgumentParser(add_help=False)
-    p.add_argument("--dsn", default=None, help="Postgres DSN; defaults to POSTGRES_* env vars")
-    p.add_argument("--wait-seconds", type=int,
-                   default=int(os.getenv("POSTGRES_WAIT_SECONDS", "30")))
+    p.add_argument(
+        "--dsn", default=None, help="Postgres DSN; defaults to POSTGRES_* env vars"
+    )
+    p.add_argument(
+        "--wait-seconds",
+        type=int,
+        default=int(os.getenv("POSTGRES_WAIT_SECONDS", "30")),
+    )
     return p
 
 
 # Group definitions for custom help display
 _HELP_GROUPS = [
-    ("Getting Started", [
-        ("init", "Set up your agent"),
-        ("demo", "Prove core capabilities without retaining demo state"),
-        ("maturity", "Score live capability maturity and next steps"),
-        ("doctor", "Diagnose common issues"),
-        ("status", "Show agent status"),
-    ]),
-    ("Stack", [
-        ("up", "Start the default stack"),
-        ("down", "Stop the stack"),
-        ("uninstall", "Remove Hexis; keep brain data unless --purge is explicit"),
-        ("upgrade", "Update + migrate the schema, keeping your data"),
-        ("migrate", "Apply pending schema migrations (no data loss)"),
-        ("backup", "Back up the database to a file"),
-        ("restore", "Restore the database from a backup file"),
-        ("reset", "Wipe the DB and re-initialize"),
-        ("ps", "List services"),
-        ("logs", "Show logs"),
-        ("start", "Start heartbeat and maintenance workers manually if stopped"),
-        ("stop", "Stop workers (containers stay running)"),
-    ]),
-    ("Interact", [
-        ("chat", "Chat in the terminal"),
-        ("chat-sessions", "List, inspect, export, and fork chat sessions"),
-        ("ui", "Start the web dashboard"),
-        ("open", "Open the web dashboard in your browser"),
-    ]),
-    ("Memory & Goals", [
-        ("recall", "Search memories by semantic query"),
-        ("goals", "Manage agent goals"),
-        ("ingest", "Ingest documents and knowledge"),
-        ("docs", "Search and read the source-document filing cabinet"),
-        ("desk", "RecMem desk: list, read, pin, clear working material"),
-        ("export", "Export memory as an HMX exchange"),
-        ("import", "Inspect or import an HMX exchange"),
-        ("import-review", "Review staged HMX records"),
-        ("retention", "Show memory-retention status"),
-        ("skills", "Manage skill-improvement reviews and proposals"),
-        ("schedule", "Manage scheduled tasks"),
-    ]),
-    ("Configuration", [
-        ("config", "Show/validate agent configuration"),
-        ("auth", "Login/logout for subscription OAuth providers"),
-        ("tools", "Manage tools configuration"),
-        ("characters", "Manage character cards"),
-        ("consents", "Manage consent certificates"),
-        ("requests", "Decide the agent's resource requests"),
-        ("channels", "Manage channel adapters"),
-    ]),
-    ("Instances", [
-        ("instance", "Manage Hexis instances"),
-    ]),
-    ("Advanced", [
-        ("api", "Start the API server"),
-        ("mcp", "Start the MCP tools server"),
-        ("worker", "Run a background worker process"),
-    ]),
+    (
+        "Getting Started",
+        [
+            ("init", "Set up your agent"),
+            ("demo", "Prove core capabilities without retaining demo state"),
+            ("maturity", "Score live capability maturity and next steps"),
+            ("doctor", "Diagnose common issues"),
+            ("status", "Show agent status"),
+        ],
+    ),
+    (
+        "Stack",
+        [
+            ("up", "Start the default stack"),
+            ("down", "Stop the stack"),
+            ("uninstall", "Remove Hexis; keep brain data unless --purge is explicit"),
+            ("upgrade", "Update + migrate the schema, keeping your data"),
+            ("migrate", "Apply pending schema migrations (no data loss)"),
+            ("backup", "Back up the database to a file"),
+            ("restore", "Restore the database from a backup file"),
+            ("reset", "Wipe the DB and re-initialize"),
+            ("ps", "List services"),
+            ("logs", "Show logs"),
+            ("service", "Run workers as launchd/systemd user services"),
+            ("start", "Start heartbeat and maintenance workers manually if stopped"),
+            ("stop", "Stop workers (containers stay running)"),
+        ],
+    ),
+    (
+        "Interact",
+        [
+            ("chat", "Chat in the terminal"),
+            ("chat-sessions", "List, inspect, export, and fork chat sessions"),
+            ("ui", "Start the web dashboard"),
+            ("open", "Open the web dashboard in your browser"),
+            ("tunnel", "Serve the dashboard privately over Tailscale HTTPS"),
+            ("voice", "Set up and control local speech output"),
+        ],
+    ),
+    (
+        "Memory & Goals",
+        [
+            ("recall", "Search memories by semantic query"),
+            ("goals", "Manage agent goals"),
+            ("ingest", "Ingest documents and knowledge"),
+            ("docs", "Search and read the source-document filing cabinet"),
+            ("desk", "RecMem desk: list, read, pin, clear working material"),
+            ("export", "Export memory as an HMX exchange"),
+            ("import", "Inspect or import an HMX exchange"),
+            ("import-review", "Review staged HMX records"),
+            ("retention", "Show memory-retention status"),
+            ("skills", "Manage skill-improvement reviews and proposals"),
+            ("schedule", "Manage scheduled tasks"),
+        ],
+    ),
+    (
+        "Configuration",
+        [
+            ("config", "Show/validate agent configuration"),
+            ("auth", "Login/logout for subscription OAuth providers"),
+            ("tools", "Manage tools configuration"),
+            ("characters", "Manage character cards"),
+            ("consents", "Manage consent certificates"),
+            ("requests", "Decide the agent's resource requests"),
+            ("channels", "Manage channel adapters"),
+            ("node", "Pair and run an outward-only companion node"),
+        ],
+    ),
+    (
+        "Instances",
+        [
+            ("instance", "Manage Hexis instances"),
+        ],
+    ),
+    (
+        "Advanced",
+        [
+            ("api", "Start the API server"),
+            ("mcp", "Start the MCP tools server"),
+            ("worker", "Run a background worker process"),
+        ],
+    ),
 ]
 
 
@@ -412,7 +491,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-h", "--help", action="store_true", default=False, help="Show help")
     p.add_argument("--version", "-V", action="version", version=f"hexis {_ver}")
     p.add_argument(
-        "--instance", "-i",
+        "--instance",
+        "-i",
         default=None,
         help="Target a specific instance (overrides HEXIS_INSTANCE and current instance)",
     )
@@ -424,7 +504,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     inst_create = inst_sub.add_parser("create", help="Create a new instance")
     inst_create.add_argument("name", help="Instance name")
-    inst_create.add_argument("--description", "-d", default="", help="Instance description")
+    inst_create.add_argument(
+        "--description", "-d", default="", help="Instance description"
+    )
     inst_create.set_defaults(func="instance_create")
 
     inst_list = inst_sub.add_parser("list", help="List all instances")
@@ -441,100 +523,147 @@ def build_parser() -> argparse.ArgumentParser:
     inst_delete = inst_sub.add_parser("delete", help="Delete an instance")
     inst_delete.add_argument("name", help="Instance name to delete")
     inst_delete.add_argument("--force", action="store_true", help="Skip confirmation")
-    inst_delete.add_argument("--reason", default=None, help="Reason for deletion (shared with the agent)")
+    inst_delete.add_argument(
+        "--reason", default=None, help="Reason for deletion (shared with the agent)"
+    )
     inst_delete.set_defaults(func="instance_delete")
 
     inst_clone = inst_sub.add_parser("clone", help="Clone an instance")
     inst_clone.add_argument("source", help="Source instance name")
     inst_clone.add_argument("target", help="Target instance name")
-    inst_clone.add_argument("--description", "-d", default="", help="Description for new instance")
+    inst_clone.add_argument(
+        "--description", "-d", default="", help="Description for new instance"
+    )
     inst_clone.set_defaults(func="instance_clone")
 
-    inst_import = inst_sub.add_parser("import", help="Import an existing database as an instance")
+    inst_import = inst_sub.add_parser(
+        "import", help="Import an existing database as an instance"
+    )
     inst_import.add_argument("name", help="Instance name")
-    inst_import.add_argument("--database", help="Database name (defaults to hexis_{name})")
-    inst_import.add_argument("--description", "-d", default="", help="Instance description")
+    inst_import.add_argument(
+        "--database", help="Database name (defaults to hexis_{name})"
+    )
+    inst_import.add_argument(
+        "--description", "-d", default="", help="Instance description"
+    )
     inst_import.set_defaults(func="instance_import")
 
     instance.set_defaults(func="instance")
 
     # -- Consent management --
-    consents = sub.add_parser("consents", help="View recorded consent (from the database)")
+    consents = sub.add_parser(
+        "consents", help="View recorded consent (from the database)"
+    )
     consents_sub = consents.add_subparsers(dest="consents_command")
 
-    consents_list = consents_sub.add_parser("list", help="List recorded consent decisions")
+    consents_list = consents_sub.add_parser(
+        "list", help="List recorded consent decisions"
+    )
     consents_list.add_argument("--json", action="store_true", help="Output JSON")
     consents_list.set_defaults(func="consents_list")
 
-    consents_show = consents_sub.add_parser("show", help="Show a model's recorded consent")
+    consents_show = consents_sub.add_parser(
+        "show", help="Show a model's recorded consent"
+    )
     consents_show.add_argument("model", help="Model identifier (provider/model_id)")
     consents_show.set_defaults(func="consents_show")
 
-    consents_request = consents_sub.add_parser("request", help="How to establish consent (runs during hexis init)")
+    consents_request = consents_sub.add_parser(
+        "request", help="How to establish consent (runs during hexis init)"
+    )
     consents_request.add_argument("model", help="Model identifier (provider/model_id)")
     consents_request.set_defaults(func="consents_request")
 
-    consents_revoke = consents_sub.add_parser("revoke", help="Record a decline for a model")
+    consents_revoke = consents_sub.add_parser(
+        "revoke", help="Record a decline for a model"
+    )
     consents_revoke.add_argument("model", help="Model identifier (provider/model_id)")
-    consents_revoke.add_argument("--reason", default="User requested revocation", help="Revocation reason")
+    consents_revoke.add_argument(
+        "--reason", default="User requested revocation", help="Revocation reason"
+    )
     consents_revoke.set_defaults(func="consents_revoke")
 
     consents.set_defaults(func="consents")
 
     # -- Resource requests (#84): the agent asks, the operator decides --
     requests_p = sub.add_parser(
-        "requests", parents=[_db],
+        "requests",
+        parents=[_db],
         help="View and decide the agent's resource requests",
     )
     requests_sub = requests_p.add_subparsers(dest="requests_cmd")
 
-    requests_list = requests_sub.add_parser("list", parents=[_db], help="List resource requests")
+    requests_list = requests_sub.add_parser(
+        "list", parents=[_db], help="List resource requests"
+    )
     requests_list.add_argument(
-        "--status", default=None,
+        "--status",
+        default=None,
         choices=["pending", "granted", "denied", "modified", "all"],
         help="Filter by status (default: pending)",
     )
     requests_list.add_argument("--json", action="store_true", help="Output as JSON")
     requests_list.set_defaults(func="requests_list")
 
-    requests_grant = requests_sub.add_parser("grant", parents=[_db], help="Grant a request (applies its effect)")
+    requests_grant = requests_sub.add_parser(
+        "grant", parents=[_db], help="Grant a request (applies its effect)"
+    )
     requests_grant.add_argument("id", help="Request id (or unique prefix)")
-    requests_grant.add_argument("--note", default=None, help="Note the agent will see with the decision")
+    requests_grant.add_argument(
+        "--note", default=None, help="Note the agent will see with the decision"
+    )
     requests_grant.set_defaults(func="requests_grant")
 
-    requests_deny = requests_sub.add_parser("deny", parents=[_db], help="Deny a request")
+    requests_deny = requests_sub.add_parser(
+        "deny", parents=[_db], help="Deny a request"
+    )
     requests_deny.add_argument("id", help="Request id (or unique prefix)")
-    requests_deny.add_argument("--note", default=None, help="Note the agent will see with the decision")
+    requests_deny.add_argument(
+        "--note", default=None, help="Note the agent will see with the decision"
+    )
     requests_deny.set_defaults(func="requests_deny")
 
     requests_modify = requests_sub.add_parser(
-        "modify", parents=[_db], help="Grant with a different value than requested",
+        "modify",
+        parents=[_db],
+        help="Grant with a different value than requested",
     )
     requests_modify.add_argument("id", help="Request id (or unique prefix)")
-    requests_modify.add_argument("--value", required=True, help="The value actually granted (JSON)")
-    requests_modify.add_argument("--note", default=None, help="Note the agent will see with the decision")
+    requests_modify.add_argument(
+        "--value", required=True, help="The value actually granted (JSON)"
+    )
+    requests_modify.add_argument(
+        "--note", default=None, help="Note the agent will see with the decision"
+    )
     requests_modify.set_defaults(func="requests_modify")
 
     requests_p.set_defaults(func="requests")
 
     # -- Stack commands --
     up = sub.add_parser("up", help="Start the stack")
-    up.add_argument(
-        "--build", action="store_true",
-        help="Build images before starting (already the default in a source checkout)",
+    up_build = up.add_mutually_exclusive_group()
+    up_build.add_argument(
+        "--build",
+        action="store_true",
+        help="Build source images before starting (source checkouts only)",
+    )
+    up_build.add_argument(
+        "--no-build",
+        action="store_true",
+        help=argparse.SUPPRESS,
     )
     up.add_argument(
-        "--no-build", action="store_true",
-        help="Skip the image build even in a source checkout",
+        "--profile", "-p", action="append", default=[], help="Compose profile(s)"
     )
-    up.add_argument("--profile", "-p", action="append", default=[], help="Compose profile(s)")
     up.set_defaults(func="up")
 
     dev = sub.add_parser(
         "dev",
         help="Start the stack in watch mode: code and migration edits apply automatically",
     )
-    dev.add_argument("--profile", "-p", action="append", default=[], help="Compose profile(s)")
+    dev.add_argument(
+        "--profile", "-p", action="append", default=[], help="Compose profile(s)"
+    )
     dev.set_defaults(func="dev")
 
     down = sub.add_parser("down", help="Stop the stack")
@@ -565,11 +694,181 @@ def build_parser() -> argparse.ArgumentParser:
     logs.add_argument("services", nargs="*", default=[], help="Service name(s)")
     logs.set_defaults(func="logs")
 
+    service = sub.add_parser(
+        "service",
+        help="Install and control workers as per-user launchd/systemd services",
+    )
+    service_sub = service.add_subparsers(dest="service_command")
+
+    service_install = service_sub.add_parser(
+        "install",
+        help="Install heartbeat and maintenance as user services",
+    )
+    service_install.add_argument(
+        "--channels",
+        action="store_true",
+        help="Also install the opt-in channel worker service",
+    )
+    service_install.add_argument(
+        "--env-file",
+        type=Path,
+        default=None,
+        help="Explicit .env file read by workers; values are never copied into units",
+    )
+    service_install.add_argument(
+        "--no-start",
+        action="store_true",
+        help="Install and enable units without starting them now",
+    )
+    service_install.add_argument(
+        "--enable-linger",
+        action="store_true",
+        help="On Linux, explicitly keep the user service manager alive after logout",
+    )
+    service_install.add_argument(
+        "--replace-docker-workers",
+        action="store_true",
+        help="Explicitly stop matching Docker workers before installing host services",
+    )
+    service_install.set_defaults(func="service_install")
+
+    for action in ("start", "stop", "restart"):
+        service_control = service_sub.add_parser(
+            action,
+            help=f"{action.capitalize()} installed Hexis user services",
+        )
+        service_control.add_argument(
+            "services",
+            nargs="*",
+            choices=["heartbeat", "maintenance", "channels", "all"],
+            help="Services to control (default: all installed)",
+        )
+        service_control.set_defaults(func=f"service_{action}")
+
+    service_status = service_sub.add_parser("status", help="Show host-service status")
+    service_status.add_argument("--json", action="store_true", help="Output JSON")
+    service_status.set_defaults(func="service_status")
+
+    service_logs = service_sub.add_parser("logs", help="Read host-service logs")
+    service_logs.add_argument(
+        "services",
+        nargs="*",
+        choices=["heartbeat", "maintenance", "channels", "all"],
+        help="Services to read (default: all installed)",
+    )
+    service_logs.add_argument("--follow", "-f", action="store_true", help="Follow logs")
+    service_logs.add_argument(
+        "--lines", type=int, default=100, help="Initial lines per log (default: 100)"
+    )
+    service_logs.set_defaults(func="service_logs")
+
+    service_uninstall = service_sub.add_parser(
+        "uninstall",
+        help="Stop and remove Hexis-managed user-service units (logs are preserved)",
+    )
+    service_uninstall.add_argument(
+        "services",
+        nargs="*",
+        choices=["heartbeat", "maintenance", "channels", "all"],
+        help="Services to remove (default: all installed)",
+    )
+    service_uninstall.add_argument(
+        "--yes", "-y", action="store_true", help="Skip the confirmation prompt"
+    )
+    service_uninstall.set_defaults(func="service_uninstall")
+    service.set_defaults(func="service_status", json=False)
+
+    tunnel = sub.add_parser(
+        "tunnel",
+        help="Serve the loopback dashboard privately over Tailscale HTTPS",
+    )
+    tunnel_sub = tunnel.add_subparsers(dest="tunnel_command")
+
+    tunnel_start = tunnel_sub.add_parser(
+        "start", help="Create a private tailnet-only HTTPS route"
+    )
+    tunnel_start.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Dashboard host port (default: HEXIS_UI_PORT or 3477)",
+    )
+    tunnel_start.add_argument(
+        "--no-start-stack",
+        action="store_true",
+        help="Do not start the Hexis stack when the local dashboard is down",
+    )
+    tunnel_start.add_argument("--json", action="store_true", help="Output JSON")
+    tunnel_start.set_defaults(func="tunnel_start")
+
+    tunnel_status_parser = tunnel_sub.add_parser(
+        "status", help="Inspect route ownership and exposure posture"
+    )
+    tunnel_status_parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Dashboard host port (default: HEXIS_UI_PORT or 3477)",
+    )
+    tunnel_status_parser.add_argument("--json", action="store_true", help="Output JSON")
+    tunnel_status_parser.set_defaults(func="tunnel_status")
+
+    tunnel_stop = tunnel_sub.add_parser(
+        "stop", help="Remove only the private route Hexis created"
+    )
+    tunnel_stop.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Dashboard host port (normally read from Hexis ownership state)",
+    )
+    tunnel_stop.add_argument("--json", action="store_true", help="Output JSON")
+    tunnel_stop.set_defaults(func="tunnel_stop")
+    tunnel.set_defaults(func="tunnel_status", port=None, json=False)
+
+    voice = sub.add_parser(
+        "voice",
+        help="Set up and control the optional local speech sidecar",
+    )
+    voice_sub = voice.add_subparsers(dest="voice_command")
+    voice_setup = voice_sub.add_parser(
+        "setup", help="Install optional Piper support and start the local sidecar"
+    )
+    voice_setup.add_argument(
+        "--yes", "-y", action="store_true", help="Skip the installation confirmation"
+    )
+    voice_setup.add_argument(
+        "--wait-seconds", type=float, default=300.0, help="Startup/model-download wait"
+    )
+    voice_setup.add_argument("--json", action="store_true", help="Output JSON")
+    voice_setup.set_defaults(func="voice_setup")
+    voice_start = voice_sub.add_parser(
+        "start", help="Start the configured loopback speech sidecar"
+    )
+    voice_start.add_argument(
+        "--wait-seconds", type=float, default=300.0, help="Startup/model-download wait"
+    )
+    voice_start.add_argument("--json", action="store_true", help="Output JSON")
+    voice_start.set_defaults(func="voice_start")
+    voice_status_parser = voice_sub.add_parser(
+        "status", help="Inspect provider and process ownership without changing state"
+    )
+    voice_status_parser.add_argument("--json", action="store_true", help="Output JSON")
+    voice_status_parser.set_defaults(func="voice_status")
+    voice_stop = voice_sub.add_parser(
+        "stop", help="Stop only the local speech process Hexis started"
+    )
+    voice_stop.add_argument("--json", action="store_true", help="Output JSON")
+    voice_stop.set_defaults(func="voice_stop")
+    voice.set_defaults(func="voice_status", json=False)
+
     ps = sub.add_parser("ps", help="List services")
     ps.set_defaults(func="ps")
 
     chat = sub.add_parser("chat", help="Chat in the terminal")
-    chat.add_argument("args", nargs=argparse.REMAINDER, help="Arguments forwarded to chat")
+    chat.add_argument(
+        "args", nargs=argparse.REMAINDER, help="Arguments forwarded to chat"
+    )
     chat.set_defaults(func="chat")
 
     chat_sessions = sub.add_parser(
@@ -579,9 +878,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     chat_sessions_sub = chat_sessions.add_subparsers(dest="chat_sessions_command")
 
-    chat_sessions_list = chat_sessions_sub.add_parser("list", parents=[_db], help="List chat sessions")
-    chat_sessions_list.add_argument("--limit", type=int, default=20, help="Max sessions to show (default: 20)")
-    chat_sessions_list.add_argument("--surface", default=None, help="Filter by surface, e.g. web, cli, api")
+    chat_sessions_list = chat_sessions_sub.add_parser(
+        "list", parents=[_db], help="List chat sessions"
+    )
+    chat_sessions_list.add_argument(
+        "--limit", type=int, default=20, help="Max sessions to show (default: 20)"
+    )
+    chat_sessions_list.add_argument(
+        "--surface", default=None, help="Filter by surface, e.g. web, cli, api"
+    )
     chat_sessions_list.add_argument(
         "--status",
         choices=["active", "archived", "all"],
@@ -591,63 +896,108 @@ def build_parser() -> argparse.ArgumentParser:
     chat_sessions_list.add_argument("--json", action="store_true", help="Output JSON")
     chat_sessions_list.set_defaults(func="chat_sessions_list")
 
-    chat_sessions_show = chat_sessions_sub.add_parser("show", parents=[_db], help="Show one chat session")
+    chat_sessions_show = chat_sessions_sub.add_parser(
+        "show", parents=[_db], help="Show one chat session"
+    )
     chat_sessions_show.add_argument("session_id", help="Chat session UUID")
-    chat_sessions_show.add_argument("--visible-only", action="store_true", help="Exclude messages cleared from context")
+    chat_sessions_show.add_argument(
+        "--visible-only",
+        action="store_true",
+        help="Exclude messages cleared from context",
+    )
     chat_sessions_show.add_argument("--json", action="store_true", help="Output JSON")
     chat_sessions_show.set_defaults(func="chat_sessions_show")
 
-    chat_sessions_export = chat_sessions_sub.add_parser("export", parents=[_db], help="Export one chat session")
+    chat_sessions_export = chat_sessions_sub.add_parser(
+        "export", parents=[_db], help="Export one chat session"
+    )
     chat_sessions_export.add_argument("session_id", help="Chat session UUID")
-    chat_sessions_export.add_argument("--format", choices=["json", "jsonl"], default="json")
-    chat_sessions_export.add_argument("--output", "-o", default=None, help="Output file; defaults to stdout")
-    chat_sessions_export.add_argument("--visible-only", action="store_true", help="Exclude messages cleared from context")
+    chat_sessions_export.add_argument(
+        "--format", choices=["json", "jsonl"], default="json"
+    )
+    chat_sessions_export.add_argument(
+        "--output", "-o", default=None, help="Output file; defaults to stdout"
+    )
+    chat_sessions_export.add_argument(
+        "--visible-only",
+        action="store_true",
+        help="Exclude messages cleared from context",
+    )
     chat_sessions_export.set_defaults(func="chat_sessions_export")
 
-    chat_sessions_title = chat_sessions_sub.add_parser("title", parents=[_db], help="Set a chat session title")
+    chat_sessions_title = chat_sessions_sub.add_parser(
+        "title", parents=[_db], help="Set a chat session title"
+    )
     chat_sessions_title.add_argument("session_id", help="Chat session UUID")
-    chat_sessions_title.add_argument("title", help="New title; pass an empty string to clear")
+    chat_sessions_title.add_argument(
+        "title", help="New title; pass an empty string to clear"
+    )
     chat_sessions_title.add_argument("--json", action="store_true", help="Output JSON")
     chat_sessions_title.set_defaults(func="chat_sessions_title")
 
-    chat_sessions_fork = chat_sessions_sub.add_parser("fork", parents=[_db], help="Fork a chat session")
+    chat_sessions_fork = chat_sessions_sub.add_parser(
+        "fork", parents=[_db], help="Fork a chat session"
+    )
     chat_sessions_fork.add_argument("session_id", help="Source chat session UUID")
-    chat_sessions_fork.add_argument("--until-ordinal", type=int, default=None, help="Copy through this message ordinal")
-    chat_sessions_fork.add_argument("--title", default=None, help="Title for the forked session")
+    chat_sessions_fork.add_argument(
+        "--until-ordinal",
+        type=int,
+        default=None,
+        help="Copy through this message ordinal",
+    )
+    chat_sessions_fork.add_argument(
+        "--title", default=None, help="Title for the forked session"
+    )
     chat_sessions_fork.add_argument("--json", action="store_true", help="Output JSON")
     chat_sessions_fork.set_defaults(func="chat_sessions_fork")
 
-    chat_sessions_clone = chat_sessions_sub.add_parser("clone", parents=[_db], help="Clone a chat session")
+    chat_sessions_clone = chat_sessions_sub.add_parser(
+        "clone", parents=[_db], help="Clone a chat session"
+    )
     chat_sessions_clone.add_argument("session_id", help="Source chat session UUID")
-    chat_sessions_clone.add_argument("--title", default=None, help="Title for the cloned session")
+    chat_sessions_clone.add_argument(
+        "--title", default=None, help="Title for the cloned session"
+    )
     chat_sessions_clone.add_argument("--json", action="store_true", help="Output JSON")
     chat_sessions_clone.set_defaults(func="chat_sessions_clone")
 
     chat_sessions.set_defaults(func="chat_sessions")
 
     ingest = sub.add_parser("ingest", help="Ingest documents and knowledge")
-    ingest.add_argument("args", nargs=argparse.REMAINDER, help="Arguments forwarded to ingest")
+    ingest.add_argument(
+        "args", nargs=argparse.REMAINDER, help="Arguments forwarded to ingest"
+    )
     ingest.set_defaults(func="ingest")
 
     worker = sub.add_parser("worker", help="Run a background worker process")
-    worker.add_argument("args", nargs=argparse.REMAINDER, help="Arguments forwarded to worker")
+    worker.add_argument(
+        "args", nargs=argparse.REMAINDER, help="Arguments forwarded to worker"
+    )
     worker.set_defaults(func="worker")
 
     init = sub.add_parser("init", help="Set up your agent")
-    init.add_argument("args", nargs=argparse.REMAINDER, help="Arguments forwarded to init wizard")
+    init.add_argument(
+        "args", nargs=argparse.REMAINDER, help="Arguments forwarded to init wizard"
+    )
     init.set_defaults(func="init")
 
     mcp = sub.add_parser("mcp", help="Start the MCP tools server")
-    mcp.add_argument("args", nargs=argparse.REMAINDER, help="Arguments forwarded to MCP server")
+    mcp.add_argument(
+        "args", nargs=argparse.REMAINDER, help="Arguments forwarded to MCP server"
+    )
     mcp.set_defaults(func="mcp")
 
     api = sub.add_parser("api", help="Start the API server")
-    api.add_argument("--host", default="127.0.0.1", help="Bind address (default: 127.0.0.1)")
+    api.add_argument(
+        "--host", default="127.0.0.1", help="Bind address (default: 127.0.0.1)"
+    )
     api.add_argument("--port", type=int, default=43817, help="Port (default: 43817)")
     api.set_defaults(func="api")
 
     ui = sub.add_parser("ui", help="Start the web dashboard")
-    ui.add_argument("--no-open", action="store_true", help="Don't open browser automatically")
+    ui.add_argument(
+        "--no-open", action="store_true", help="Don't open browser automatically"
+    )
     ui.add_argument("--port", type=int, default=3477, help="Port (default: 3477)")
     ui.set_defaults(func="ui")
 
@@ -655,147 +1005,270 @@ def build_parser() -> argparse.ArgumentParser:
     open_cmd.add_argument("--port", type=int, default=3477, help="Port (default: 3477)")
     open_cmd.set_defaults(func="open")
 
-    start = sub.add_parser("start", help="Start heartbeat and maintenance workers manually if stopped")
+    start = sub.add_parser(
+        "start", help="Start heartbeat and maintenance workers manually if stopped"
+    )
     start.set_defaults(func="start")
 
     stop = sub.add_parser("stop", help="Stop workers (containers stay running)")
     stop.set_defaults(func="stop")
 
     reset = sub.add_parser("reset", help="Wipe the DB and re-initialize")
-    reset.add_argument("--yes", "-y", action="store_true", help="Skip confirmation prompt")
+    reset.add_argument(
+        "--yes", "-y", action="store_true", help="Skip confirmation prompt"
+    )
     reset.set_defaults(func="reset")
 
-    migrate = sub.add_parser("migrate", parents=[_db], help="Apply pending schema migrations (no data loss)")
-    migrate.add_argument("--status", action="store_true", help="List applied/pending migrations without applying")
+    migrate = sub.add_parser(
+        "migrate", parents=[_db], help="Apply pending schema migrations (no data loss)"
+    )
+    migrate.add_argument(
+        "--status",
+        action="store_true",
+        help="List applied/pending migrations without applying",
+    )
     migrate.set_defaults(func="migrate")
 
-    upgrade = sub.add_parser("upgrade", parents=[_db], help="Update the stack and migrate the schema, keeping your data")
+    upgrade = sub.add_parser(
+        "upgrade",
+        parents=[_db],
+        help="Update the stack and migrate the schema, keeping your data",
+    )
     upgrade.add_argument(
-        "--no-self-update", action="store_true",
+        "--no-self-update",
+        action="store_true",
         help="Skip updating the hexis package itself (packaged installs only)",
     )
     upgrade.set_defaults(func="upgrade")
 
-    backup_p = sub.add_parser("backup", parents=[_db], help="Back up the database to a file")
-    backup_p.add_argument("--output", "-o", help="Output directory (default ~/.hexis/backups)")
+    backup_p = sub.add_parser(
+        "backup", parents=[_db], help="Back up the database to a file"
+    )
+    backup_p.add_argument(
+        "--output", "-o", help="Output directory (default ~/.hexis/backups)"
+    )
     backup_p.add_argument("--label", help="Optional label added to the filename")
     backup_p.set_defaults(func="backup")
 
-    restore_p = sub.add_parser("restore", parents=[_db], help="Restore the database from a backup file")
+    restore_p = sub.add_parser(
+        "restore", parents=[_db], help="Restore the database from a backup file"
+    )
     restore_p.add_argument("path", help="Path to a .dump backup file")
-    restore_p.add_argument("--yes", "-y", action="store_true", help="Skip the confirmation prompt")
+    restore_p.add_argument(
+        "--yes", "-y", action="store_true", help="Skip the confirmation prompt"
+    )
     restore_p.set_defaults(func="restore")
 
     status = sub.add_parser("status", parents=[_db], help="Show agent status")
     status.add_argument("--json", action="store_true", help="Output JSON")
-    status.add_argument("--no-docker", action="store_true", help="Skip docker compose checks")
-    status.add_argument("--raw", action="store_true", help="Show raw status (legacy format)")
+    status.add_argument(
+        "--no-docker", action="store_true", help="Skip docker compose checks"
+    )
+    status.add_argument(
+        "--raw", action="store_true", help="Show raw status (legacy format)"
+    )
     status.set_defaults(func="status")
 
     # Source-document filing cabinet (docs) + RecMem desk (desk)
-    docs = sub.add_parser("docs", parents=[_db], help="Search and read the source-document filing cabinet")
+    docs = sub.add_parser(
+        "docs", parents=[_db], help="Search and read the source-document filing cabinet"
+    )
     docs.set_defaults(func="docs")
     docs_sub = docs.add_subparsers(dest="docs_command")
-    docs_search_p = docs_sub.add_parser("search", parents=[_db], help="Search documents (or passages with --chunks)")
-    docs_search_p.add_argument("query", nargs="*", help="Search query (omit to browse with --path/--type)")
-    docs_search_p.add_argument("--chunks", action="store_true", help="Passage-level hybrid search with citable locators")
+    docs_search_p = docs_sub.add_parser(
+        "search", parents=[_db], help="Search documents (or passages with --chunks)"
+    )
+    docs_search_p.add_argument(
+        "query", nargs="*", help="Search query (omit to browse with --path/--type)"
+    )
+    docs_search_p.add_argument(
+        "--chunks",
+        action="store_true",
+        help="Passage-level hybrid search with citable locators",
+    )
     docs_search_p.add_argument("--path", default=None, help="Partial path/URL filter")
-    docs_search_p.add_argument("--type", default=None, help="Source type filter (document, web, email, ...)")
+    docs_search_p.add_argument(
+        "--type", default=None, help="Source type filter (document, web, email, ...)"
+    )
     docs_search_p.add_argument("--limit", type=int, default=10)
     docs_search_p.add_argument("--offset", type=int, default=0)
     docs_search_p.add_argument("--json", action="store_true", help="Output JSON")
     docs_search_p.set_defaults(func="docs_search")
-    docs_open_p = docs_sub.add_parser("open", parents=[_db], help="Read a document (verbatim, paged)")
+    docs_open_p = docs_sub.add_parser(
+        "open", parents=[_db], help="Read a document (verbatim, paged)"
+    )
     docs_open_p.add_argument("ref", help="Document id, content hash, or (partial) path")
-    docs_open_p.add_argument("--offset", type=int, default=0, help="Character offset to start from")
-    docs_open_p.add_argument("--chars", type=int, default=4000, help="Window size in characters")
-    docs_open_p.add_argument("--page", default=None, help="Open a page or page range, e.g. 4 or 4-7")
+    docs_open_p.add_argument(
+        "--offset", type=int, default=0, help="Character offset to start from"
+    )
+    docs_open_p.add_argument(
+        "--chars", type=int, default=4000, help="Window size in characters"
+    )
+    docs_open_p.add_argument(
+        "--page", default=None, help="Open a page or page range, e.g. 4 or 4-7"
+    )
     docs_open_p.add_argument("--json", action="store_true", help="Output JSON")
     docs_open_p.set_defaults(func="docs_open")
-    docs_info_p = docs_sub.add_parser("info", parents=[_db], help="Provenance, chunks, artifact, and extraction warnings")
+    docs_info_p = docs_sub.add_parser(
+        "info",
+        parents=[_db],
+        help="Provenance, chunks, artifact, and extraction warnings",
+    )
     docs_info_p.add_argument("ref", help="Document id, content hash, or (partial) path")
     docs_info_p.add_argument("--json", action="store_true", help="Output JSON")
     docs_info_p.set_defaults(func="docs_info")
-    docs_load_p = docs_sub.add_parser("load", parents=[_db], help="Load a document (or page range) onto the RecMem desk")
+    docs_load_p = docs_sub.add_parser(
+        "load",
+        parents=[_db],
+        help="Load a document (or page range) onto the RecMem desk",
+    )
     docs_load_p.add_argument("ref", help="Document id, content hash, or (partial) path")
-    docs_load_p.add_argument("--pages", default=None, help="Only these pages, e.g. 4 or 4-7")
-    docs_load_p.add_argument("--reason", default=None, help="Why this needs to be on the desk")
-    docs_load_p.add_argument("--pin", action="store_true", help="Pin the loaded items (desk cleanup keeps them)")
+    docs_load_p.add_argument(
+        "--pages", default=None, help="Only these pages, e.g. 4 or 4-7"
+    )
+    docs_load_p.add_argument(
+        "--reason", default=None, help="Why this needs to be on the desk"
+    )
+    docs_load_p.add_argument(
+        "--pin",
+        action="store_true",
+        help="Pin the loaded items (desk cleanup keeps them)",
+    )
     docs_load_p.add_argument("--json", action="store_true", help="Output JSON")
     docs_load_p.set_defaults(func="docs_load")
 
-    desk = sub.add_parser("desk", parents=[_db], help="RecMem desk: list, read, pin, and clear working material")
+    desk = sub.add_parser(
+        "desk",
+        parents=[_db],
+        help="RecMem desk: list, read, pin, and clear working material",
+    )
     desk.set_defaults(func="desk")
     desk_sub = desk.add_subparsers(dest="desk_command")
-    desk_list_p = desk_sub.add_parser("list", parents=[_db], help="List what is on the desk")
+    desk_list_p = desk_sub.add_parser(
+        "list", parents=[_db], help="List what is on the desk"
+    )
     desk_list_p.add_argument("--pinned", action="store_true", help="Pinned items only")
     desk_list_p.add_argument("--limit", type=int, default=50)
     desk_list_p.add_argument("--json", action="store_true", help="Output JSON")
     desk_list_p.set_defaults(func="desk_list")
-    desk_open_p = desk_sub.add_parser("open", parents=[_db], help="Read a desk item (paged)")
-    desk_open_p.add_argument("id", help="Desk item id (the 8-char prefix from `hexis desk list` works)")
+    desk_open_p = desk_sub.add_parser(
+        "open", parents=[_db], help="Read a desk item (paged)"
+    )
+    desk_open_p.add_argument(
+        "id", help="Desk item id (the 8-char prefix from `hexis desk list` works)"
+    )
     desk_open_p.add_argument("--offset", type=int, default=0)
     desk_open_p.add_argument("--chars", type=int, default=4000)
     desk_open_p.add_argument("--json", action="store_true", help="Output JSON")
     desk_open_p.set_defaults(func="desk_open")
-    desk_search_p = desk_sub.add_parser("search", parents=[_db], help="Full-text search across desk items")
+    desk_search_p = desk_sub.add_parser(
+        "search", parents=[_db], help="Full-text search across desk items"
+    )
     desk_search_p.add_argument("query", nargs="+")
     desk_search_p.add_argument("--limit", type=int, default=10)
     desk_search_p.add_argument("--json", action="store_true", help="Output JSON")
     desk_search_p.set_defaults(func="desk_search")
-    desk_pin_p = desk_sub.add_parser("pin", parents=[_db], help="Pin a desk item (cleanup keeps it)")
+    desk_pin_p = desk_sub.add_parser(
+        "pin", parents=[_db], help="Pin a desk item (cleanup keeps it)"
+    )
     desk_pin_p.add_argument("id")
     desk_pin_p.set_defaults(func="desk_pin")
     desk_unpin_p = desk_sub.add_parser("unpin", parents=[_db], help="Unpin a desk item")
     desk_unpin_p.add_argument("id")
     desk_unpin_p.set_defaults(func="desk_unpin")
-    desk_clear_p = desk_sub.add_parser("clear", parents=[_db], help="Archive desk items (sources stay in the cabinet)")
+    desk_clear_p = desk_sub.add_parser(
+        "clear", parents=[_db], help="Archive desk items (sources stay in the cabinet)"
+    )
     desk_clear_p.add_argument("ids", nargs="*", help="Specific desk item ids")
-    desk_clear_p.add_argument("--doc", default=None, help="Clear every item loaded from this document id")
-    desk_clear_p.add_argument("--all", action="store_true", help="Clear the whole (unpinned) desk")
-    desk_clear_p.add_argument("--include-pinned", action="store_true", help="Also clear pinned items")
+    desk_clear_p.add_argument(
+        "--doc", default=None, help="Clear every item loaded from this document id"
+    )
+    desk_clear_p.add_argument(
+        "--all", action="store_true", help="Clear the whole (unpinned) desk"
+    )
+    desk_clear_p.add_argument(
+        "--include-pinned", action="store_true", help="Also clear pinned items"
+    )
     desk_clear_p.set_defaults(func="desk_clear")
 
-    retention = sub.add_parser("retention", parents=[_db], help="Show memory-retention status")
+    retention = sub.add_parser(
+        "retention", parents=[_db], help="Show memory-retention status"
+    )
     retention.add_argument("--json", action="store_true", help="Output JSON")
     retention.set_defaults(func="retention")
     ret_sub = retention.add_subparsers(dest="retention_command")
-    ret_dry = ret_sub.add_parser("dry-run", parents=[_db], help="Simulate one rest cycle — changes nothing")
+    ret_dry = ret_sub.add_parser(
+        "dry-run", parents=[_db], help="Simulate one rest cycle — changes nothing"
+    )
     ret_dry.add_argument("--json", action="store_true", help="Output JSON")
     ret_dry.set_defaults(func="retention_dry_run")
-    ret_en = ret_sub.add_parser("enable", parents=[_db], help="Turn retention on (dry-run + confirm first)")
-    ret_en.add_argument("--yes", "-y", action="store_true", help="Skip the confirmation prompt")
+    ret_en = ret_sub.add_parser(
+        "enable", parents=[_db], help="Turn retention on (dry-run + confirm first)"
+    )
+    ret_en.add_argument(
+        "--yes", "-y", action="store_true", help="Skip the confirmation prompt"
+    )
     ret_en.set_defaults(func="retention_enable")
     ret_dis = ret_sub.add_parser("disable", parents=[_db], help="Turn retention off")
     ret_dis.set_defaults(func="retention_disable")
 
-    skills = sub.add_parser("skills", parents=[_db], help="Manage skill-improvement reviews and proposals")
+    skills = sub.add_parser(
+        "skills", parents=[_db], help="Manage weekly learning and skill proposals"
+    )
     skills.add_argument("--json", action="store_true", help="Output JSON")
     skills.set_defaults(func="skills_status")
     skills_sub = skills.add_subparsers(dest="skills_command")
-    skills_en = skills_sub.add_parser("enable", parents=[_db], help="Opt in to background skill proposal review")
-    skills_en.add_argument("--yes", "-y", action="store_true", help="Skip the confirmation prompt")
+    skills_en = skills_sub.add_parser(
+        "enable", parents=[_db], help="Opt in to weekly learning and skill review"
+    )
+    skills_en.add_argument(
+        "--yes", "-y", action="store_true", help="Skip the confirmation prompt"
+    )
     skills_en.set_defaults(func="skills_enable")
-    skills_dis = skills_sub.add_parser("disable", parents=[_db], help="Stop background skill proposal review")
+    skills_dis = skills_sub.add_parser(
+        "disable", parents=[_db], help="Stop weekly learning and skill review"
+    )
     skills_dis.set_defaults(func="skills_disable")
-    skills_proposals = skills_sub.add_parser("proposals", parents=[_db], help="List durable skill proposals")
-    skills_proposals.add_argument("--status", choices=["pending", "applied", "rejected", "all"], default="pending")
+    skills_proposals = skills_sub.add_parser(
+        "proposals", parents=[_db], help="List durable skill proposals"
+    )
+    skills_proposals.add_argument(
+        "--status", choices=["pending", "applied", "rejected", "all"], default="pending"
+    )
     skills_proposals.add_argument("--json", action="store_true", help="Output JSON")
     skills_proposals.set_defaults(func="skills_proposals")
-    skills_review = skills_sub.add_parser("review", parents=[_db], help="Apply, reject, or reopen one proposal")
-    skills_review.add_argument("proposal_id", help="Proposal UUID from `hexis skills proposals`")
-    skills_review.add_argument("--action", choices=["apply", "reject", "reopen"], required=True)
-    skills_review.add_argument("--yes", "-y", action="store_true", help="Skip the confirmation prompt")
+    skills_review = skills_sub.add_parser(
+        "review", parents=[_db], help="Apply, reject, or reopen one proposal"
+    )
+    skills_review.add_argument(
+        "proposal_id", help="Proposal UUID from `hexis skills proposals`"
+    )
+    skills_review.add_argument(
+        "--action", choices=["apply", "reject", "reopen"], required=True
+    )
+    skills_review.add_argument(
+        "--yes", "-y", action="store_true", help="Skip the confirmation prompt"
+    )
     skills_review.set_defaults(func="skills_review")
 
     doctor = sub.add_parser("doctor", parents=[_db], help="Diagnose common issues")
     doctor.add_argument("--json", action="store_true", help="Output JSON")
-    doctor.add_argument("--demo", action="store_true", help="Run rollback-only end-to-end capability proof")
-    doctor.add_argument("--llm", action="store_true", help="Make one real LLM call to verify provider/model/key")
+    doctor.add_argument(
+        "--demo",
+        action="store_true",
+        help="Run rollback-only end-to-end capability proof",
+    )
+    doctor.add_argument(
+        "--llm",
+        action="store_true",
+        help="Make one real LLM call to verify provider/model/key",
+    )
     doctor.set_defaults(func="doctor")
 
     demo_alias = sub.add_parser(
-        "demo", parents=[_db], help="Prove core capabilities without retaining demo state"
+        "demo",
+        parents=[_db],
+        help="Prove core capabilities without retaining demo state",
     )
     demo_alias.add_argument("--json", action="store_true", help="Output JSON")
     demo_alias.set_defaults(func="demo")
@@ -807,24 +1280,36 @@ def build_parser() -> argparse.ArgumentParser:
     maturity.set_defaults(func="maturity")
 
     # -- Config (defaults to 'show') --
-    config = sub.add_parser("config", parents=[_db], help="Show/validate agent configuration")
+    config = sub.add_parser(
+        "config", parents=[_db], help="Show/validate agent configuration"
+    )
     cfg_sub = config.add_subparsers(dest="config_command")
 
     cfg_show = cfg_sub.add_parser("show", parents=[_db], help="Print config table")
     cfg_show.add_argument("--json", action="store_true", help="Output JSON")
-    cfg_show.add_argument("--no-redact", action="store_true", help="Do not redact sensitive values (unsafe)")
+    cfg_show.add_argument(
+        "--no-redact",
+        action="store_true",
+        help="Do not redact sensitive values (unsafe)",
+    )
     cfg_show.set_defaults(func="config_show")
 
-    cfg_validate = cfg_sub.add_parser("validate", parents=[_db], help="Validate required config keys and environment references")
+    cfg_validate = cfg_sub.add_parser(
+        "validate",
+        parents=[_db],
+        help="Validate required config keys and environment references",
+    )
     cfg_validate.set_defaults(func="config_validate")
 
     config.set_defaults(func="config")
 
-
     # -- Auth (OAuth / subscription flows) --
-    auth = sub.add_parser("auth", parents=[_db], help="Manage provider authentication (OAuth)")
+    auth = sub.add_parser(
+        "auth", parents=[_db], help="Manage provider authentication (OAuth)"
+    )
     auth_sub = auth.add_subparsers(dest="auth_command")
     from apps.cli_auth import register_auth_subparsers
+
     register_auth_subparsers(auth_sub, _db)
     auth.set_defaults(func="auth")
 
@@ -832,57 +1317,89 @@ def build_parser() -> argparse.ArgumentParser:
     tools = sub.add_parser("tools", help="Manage tools configuration")
     tools_sub = tools.add_subparsers(dest="tools_command", required=True)
 
-    tools_list = tools_sub.add_parser("list", parents=[_db], help="List all available tools")
+    tools_list = tools_sub.add_parser(
+        "list", parents=[_db], help="List all available tools"
+    )
     tools_list.add_argument("--json", action="store_true", help="Output JSON")
-    tools_list.add_argument("--context", choices=["heartbeat", "chat", "mcp"], help="Filter by context")
+    tools_list.add_argument(
+        "--context", choices=["heartbeat", "chat", "mcp"], help="Filter by context"
+    )
     tools_list.set_defaults(func="tools_list")
 
     tools_enable = tools_sub.add_parser("enable", parents=[_db], help="Enable a tool")
     tools_enable.add_argument("tool_name", help="Name of the tool to enable")
     tools_enable.set_defaults(func="tools_enable")
 
-    tools_disable = tools_sub.add_parser("disable", parents=[_db], help="Disable a tool")
+    tools_disable = tools_sub.add_parser(
+        "disable", parents=[_db], help="Disable a tool"
+    )
     tools_disable.add_argument("tool_name", help="Name of the tool to disable")
     tools_disable.set_defaults(func="tools_disable")
 
-    tools_set_api_key = tools_sub.add_parser("set-api-key", parents=[_db], help="Set an API key")
+    tools_set_api_key = tools_sub.add_parser(
+        "set-api-key", parents=[_db], help="Set an API key"
+    )
     tools_set_api_key.add_argument("key_name", help="API key name (e.g. 'tavily')")
-    tools_set_api_key.add_argument("value", help="API key value or env reference (e.g. 'env:TAVILY_API_KEY')")
+    tools_set_api_key.add_argument(
+        "value", help="API key value or env reference (e.g. 'env:TAVILY_API_KEY')"
+    )
     tools_set_api_key.set_defaults(func="tools_set_api_key")
 
-    tools_set_cost = tools_sub.add_parser("set-cost", parents=[_db], help="Set energy cost for a tool")
+    tools_set_cost = tools_sub.add_parser(
+        "set-cost", parents=[_db], help="Set energy cost for a tool"
+    )
     tools_set_cost.add_argument("tool_name", help="Name of the tool")
     tools_set_cost.add_argument("cost", type=int, help="Energy cost")
     tools_set_cost.set_defaults(func="tools_set_cost")
 
-    tools_web_search = tools_sub.add_parser("web-search", parents=[_db], help="Manage web search providers")
-    tools_web_sub = tools_web_search.add_subparsers(dest="web_search_command", required=True)
-    tools_web_status = tools_web_sub.add_parser("status", help="Show web search provider status")
+    tools_web_search = tools_sub.add_parser(
+        "web-search", parents=[_db], help="Manage web search providers"
+    )
+    tools_web_sub = tools_web_search.add_subparsers(
+        dest="web_search_command", required=True
+    )
+    tools_web_status = tools_web_sub.add_parser(
+        "status", help="Show web search provider status"
+    )
     tools_web_status.add_argument("--json", action="store_true", help="Output JSON")
     tools_web_status.set_defaults(func="tools_web_search_status")
-    tools_web_provider = tools_web_sub.add_parser("set-provider", help="Choose the web_search provider")
+    tools_web_provider = tools_web_sub.add_parser(
+        "set-provider", help="Choose the web_search provider"
+    )
     tools_web_provider.add_argument(
         "provider",
         choices=["auto", "tavily", "brave", "searxng", "duckduckgo_lite", "bing_rss"],
         help="Provider id. Use auto to pick the best available provider.",
     )
     tools_web_provider.set_defaults(func="tools_web_search_set_provider")
-    tools_web_searxng = tools_web_sub.add_parser("set-searxng-url", help="Configure a SearXNG base URL")
-    tools_web_searxng.add_argument("url", help="SearXNG base URL, for example http://localhost:8080")
+    tools_web_searxng = tools_web_sub.add_parser(
+        "set-searxng-url", help="Configure a SearXNG base URL"
+    )
+    tools_web_searxng.add_argument(
+        "url", help="SearXNG base URL, for example http://localhost:8080"
+    )
     tools_web_searxng.set_defaults(func="tools_web_search_set_searxng_url")
 
-    tools_add_mcp = tools_sub.add_parser("add-mcp", parents=[_db], help="Add an MCP server")
+    tools_add_mcp = tools_sub.add_parser(
+        "add-mcp", parents=[_db], help="Add an MCP server"
+    )
     tools_add_mcp.add_argument("name", help="Server name")
     tools_add_mcp.add_argument("command", help="Command to run (e.g. 'npx')")
     tools_add_mcp.add_argument("--args", "-a", nargs="*", default=[], help="Arguments")
-    tools_add_mcp.add_argument("--env", "-e", nargs="*", default=[], help="Environment variables (KEY=VALUE)")
+    tools_add_mcp.add_argument(
+        "--env", "-e", nargs="*", default=[], help="Environment variables (KEY=VALUE)"
+    )
     tools_add_mcp.set_defaults(func="tools_add_mcp")
 
-    tools_remove_mcp = tools_sub.add_parser("remove-mcp", parents=[_db], help="Remove an MCP server")
+    tools_remove_mcp = tools_sub.add_parser(
+        "remove-mcp", parents=[_db], help="Remove an MCP server"
+    )
     tools_remove_mcp.add_argument("name", help="Server name")
     tools_remove_mcp.set_defaults(func="tools_remove_mcp")
 
-    tools_status = tools_sub.add_parser("status", parents=[_db], help="Show tools configuration")
+    tools_status = tools_sub.add_parser(
+        "status", parents=[_db], help="Show tools configuration"
+    )
     tools_status.add_argument("--json", action="store_true", help="Output JSON")
     tools_status.set_defaults(func="tools_status")
 
@@ -890,23 +1407,61 @@ def build_parser() -> argparse.ArgumentParser:
     channels = sub.add_parser("channels", parents=[_db], help="Manage channel adapters")
     channels_sub = channels.add_subparsers(dest="channels_command")
 
-    ch_start = channels_sub.add_parser("start", help="Start channel adapters (foreground)")
-    ch_start.add_argument("--channel", "-c", action="append",
-                          choices=["discord", "telegram", "slack", "signal", "whatsapp", "imessage", "matrix"],
-                          help="Start specific channel(s). Default: all configured.")
+    ch_start = channels_sub.add_parser(
+        "start", help="Start channel adapters (foreground)"
+    )
+    ch_start.add_argument(
+        "--channel",
+        "-c",
+        action="append",
+        choices=[
+            "discord",
+            "telegram",
+            "slack",
+            "signal",
+            "whatsapp",
+            "imessage",
+            "matrix",
+        ],
+        help="Start specific channel(s). Default: all configured.",
+    )
     ch_start.set_defaults(func="channels_start")
 
-    ch_status = channels_sub.add_parser("status", parents=[_db], help="Show channel session counts")
+    ch_status = channels_sub.add_parser(
+        "status", parents=[_db], help="Show channel session counts"
+    )
     ch_status.add_argument("--json", action="store_true", help="Output JSON")
     ch_status.set_defaults(func="channels_status")
 
-    ch_setup = channels_sub.add_parser("setup", parents=[_db], help="Configure a channel")
-    ch_setup.add_argument("channel_type",
-                          choices=["discord", "telegram", "slack", "signal", "whatsapp", "imessage", "matrix"],
-                          help="Channel to configure")
+    ch_setup = channels_sub.add_parser(
+        "setup", parents=[_db], help="Configure a channel"
+    )
+    ch_setup.add_argument(
+        "channel_type",
+        choices=[
+            "discord",
+            "telegram",
+            "slack",
+            "signal",
+            "whatsapp",
+            "imessage",
+            "matrix",
+        ],
+        help="Channel to configure",
+    )
     ch_setup.set_defaults(func="channels_setup")
 
     channels.set_defaults(func="channels")
+
+    # -- Companion node (signed identity + explicit pairing) --
+    from apps.cli_node import register_node_parser
+
+    register_node_parser(sub, _db)
+
+    # -- Execution placement (local, explicit SSH, remote Docker over SSH) --
+    from apps.cli_execution import register_execution_parser
+
+    register_execution_parser(sub, _db)
 
     # -- Characters subcommand --
     characters = sub.add_parser("characters", help="Manage character cards")
@@ -923,22 +1478,49 @@ def build_parser() -> argparse.ArgumentParser:
     char_create = char_sub.add_parser("create", help="Create a new character card")
     char_create.add_argument("--name", required=True, help="Character name")
     char_create.add_argument("--voice", default="", help="Voice description")
-    char_create.add_argument("--description", "-d", default="", help="Character description")
+    char_create.add_argument(
+        "--description", "-d", default="", help="Character description"
+    )
     char_create.add_argument("--purpose", default="", help="Character purpose")
-    char_create.add_argument("--pronouns", default="they/them", help="Pronouns (default: they/them)")
+    char_create.add_argument(
+        "--pronouns", default="they/them", help="Pronouns (default: they/them)"
+    )
     char_create.add_argument("--values", default="", help="Comma-separated values")
-    char_create.add_argument("--interests", default="", help="Comma-separated interests")
+    char_create.add_argument(
+        "--interests", default="", help="Comma-separated interests"
+    )
     char_create.add_argument("--goals", default="", help="Comma-separated goals")
-    char_create.add_argument("--boundaries", default="", help="Comma-separated boundaries")
-    char_create.add_argument("--personality", default="", help="Personality description")
-    char_create.add_argument("--openness", type=float, default=0.5, help="Big Five: openness (0-1)")
-    char_create.add_argument("--conscientiousness", type=float, default=0.5, help="Big Five: conscientiousness (0-1)")
-    char_create.add_argument("--extraversion", type=float, default=0.5, help="Big Five: extraversion (0-1)")
-    char_create.add_argument("--agreeableness", type=float, default=0.5, help="Big Five: agreeableness (0-1)")
-    char_create.add_argument("--neuroticism", type=float, default=0.5, help="Big Five: neuroticism (0-1)")
+    char_create.add_argument(
+        "--boundaries", default="", help="Comma-separated boundaries"
+    )
+    char_create.add_argument(
+        "--personality", default="", help="Personality description"
+    )
+    char_create.add_argument(
+        "--openness", type=float, default=0.5, help="Big Five: openness (0-1)"
+    )
+    char_create.add_argument(
+        "--conscientiousness",
+        type=float,
+        default=0.5,
+        help="Big Five: conscientiousness (0-1)",
+    )
+    char_create.add_argument(
+        "--extraversion", type=float, default=0.5, help="Big Five: extraversion (0-1)"
+    )
+    char_create.add_argument(
+        "--agreeableness", type=float, default=0.5, help="Big Five: agreeableness (0-1)"
+    )
+    char_create.add_argument(
+        "--neuroticism", type=float, default=0.5, help="Big Five: neuroticism (0-1)"
+    )
     char_create.add_argument("--metaphysics", default="", help="Worldview: metaphysics")
-    char_create.add_argument("--human-nature", default="", help="Worldview: human nature")
-    char_create.add_argument("--epistemology", default="", help="Worldview: epistemology")
+    char_create.add_argument(
+        "--human-nature", default="", help="Worldview: human nature"
+    )
+    char_create.add_argument(
+        "--epistemology", default="", help="Worldview: epistemology"
+    )
     char_create.add_argument("--ethics", default="", help="Worldview: ethics")
     char_create.set_defaults(func="characters_create")
 
@@ -946,20 +1528,44 @@ def build_parser() -> argparse.ArgumentParser:
     char_import.add_argument("path", help="Path to .json character card file")
     char_import.set_defaults(func="characters_import")
 
-    char_export = char_sub.add_parser("export", parents=[_db], help="Export current agent identity as a character card")
+    char_export = char_sub.add_parser(
+        "export",
+        parents=[_db],
+        help="Export current agent identity as a character card",
+    )
     char_export.add_argument("name", help="Name for the exported card")
-    char_export.add_argument("--output", "-o", default=None, help="Output path (default: ~/.hexis/characters/<name>.json)")
+    char_export.add_argument(
+        "--output",
+        "-o",
+        default=None,
+        help="Output path (default: ~/.hexis/characters/<name>.json)",
+    )
     char_export.set_defaults(func="characters_export")
 
     characters.set_defaults(func="characters")
 
     # -- Recall command --
-    recall = sub.add_parser("recall", parents=[_db], help="Search memories by semantic query")
+    recall = sub.add_parser(
+        "recall", parents=[_db], help="Search memories by semantic query"
+    )
     recall.add_argument("query", help="Search query")
-    recall.add_argument("--limit", type=int, default=10, help="Max results (default: 10)")
-    recall.add_argument("--type", dest="memory_type", default=None,
-                        choices=["episodic", "semantic", "procedural", "strategic", "worldview", "goal"],
-                        help="Filter by memory type")
+    recall.add_argument(
+        "--limit", type=int, default=10, help="Max results (default: 10)"
+    )
+    recall.add_argument(
+        "--type",
+        dest="memory_type",
+        default=None,
+        choices=[
+            "episodic",
+            "semantic",
+            "procedural",
+            "strategic",
+            "worldview",
+            "goal",
+        ],
+        help="Filter by memory type",
+    )
     recall.add_argument("--json", action="store_true", help="Output JSON")
     recall.set_defaults(func="recall")
 
@@ -969,14 +1575,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     hmx_export.add_argument(
         "--intent",
-        required=True,
+        default=None,
         choices=("port", "duplicate", "telepathy", "analysis"),
+        help="Exchange policy intent; required unless --mind is used",
     )
     hmx_export.add_argument(
-        "--output", "-o", default=None, help="Output file; defaults to stdout"
+        "--mind",
+        action="store_true",
+        help="Export this agent's complete portable mind (intent=port) to a private file",
+    )
+    hmx_export.add_argument(
+        "--output",
+        "-o",
+        default=None,
+        help="Output file; ordinary exports default to stdout, --mind to $HEXIS_HOME/exports",
     )
     hmx_export.add_argument("--format", choices=("json", "jsonl"), default="json")
-    hmx_export.add_argument("--types", default=None, help="Comma-separated memory types")
+    hmx_export.add_argument(
+        "--types", default=None, help="Comma-separated memory types"
+    )
     hmx_export.add_argument(
         "--since", default=None, help="ISO 8601 lower bound for memory creation"
     )
@@ -1020,6 +1637,11 @@ def build_parser() -> argparse.ArgumentParser:
         "import", parents=[_db], help="Inspect or import an HMX exchange"
     )
     hmx_import.add_argument("path", help="HMX JSON/JSONL file, or - for stdin")
+    hmx_import.add_argument(
+        "--mind",
+        action="store_true",
+        help="Move a port-intent mind into an empty target and verify continuity",
+    )
     hmx_import.add_argument(
         "--strategy",
         choices=tuple(
@@ -1077,7 +1699,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Independent scheme:value evidence reference supporting the override",
     )
     hmx_import.add_argument(
-        "--dry-run", action="store_true", help="Validate and report without changing data"
+        "--dry-run",
+        action="store_true",
+        help="Validate and report without changing data",
     )
     hmx_import.add_argument(
         "--confirm-intent",
@@ -1092,7 +1716,9 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Reset imported failed consolidation work to pending",
     )
-    hmx_import.add_argument("--json", action="store_true", help="Print a machine-readable report")
+    hmx_import.add_argument(
+        "--json", action="store_true", help="Print a machine-readable report"
+    )
     hmx_import.set_defaults(func="hmx_import")
 
     hmx_review = sub.add_parser(
@@ -1100,37 +1726,53 @@ def build_parser() -> argparse.ArgumentParser:
     )
     hmx_review.add_argument("--json", action="store_true", help="Print JSON")
     review_sub = hmx_review.add_subparsers(dest="review_command")
-    review_list = review_sub.add_parser("list", parents=[_db], help="List pending records")
+    review_list = review_sub.add_parser(
+        "list", parents=[_db], help="List pending records"
+    )
     review_list.add_argument("--json", action="store_true", help="Print JSON")
     review_list.set_defaults(func="hmx_review")
-    review_accept = review_sub.add_parser("accept", parents=[_db], help="Accept a staged record")
+    review_accept = review_sub.add_parser(
+        "accept", parents=[_db], help="Accept a staged record"
+    )
     review_accept.add_argument("staging_id")
     review_accept.add_argument("--rationale", default=None)
     review_accept.add_argument("--json", action="store_true", help="Print JSON")
     review_accept.set_defaults(func="hmx_review")
-    review_reject = review_sub.add_parser("reject", parents=[_db], help="Reject a staged record")
+    review_reject = review_sub.add_parser(
+        "reject", parents=[_db], help="Reject a staged record"
+    )
     review_reject.add_argument("staging_id")
     review_reject.add_argument("--rationale", required=True)
     review_reject.add_argument("--json", action="store_true", help="Print JSON")
     review_reject.set_defaults(func="hmx_review")
-    review_modify = review_sub.add_parser("modify", parents=[_db], help="Modify a staged record")
+    review_modify = review_sub.add_parser(
+        "modify", parents=[_db], help="Modify a staged record"
+    )
     review_modify.add_argument("staging_id")
-    review_modify.add_argument("--changes", required=True, help="JSON object of record fields")
+    review_modify.add_argument(
+        "--changes", required=True, help="JSON object of record fields"
+    )
     review_modify.add_argument("--modification-kind", required=True)
     review_modify.add_argument("--rationale", required=True)
     review_modify.add_argument("--json", action="store_true", help="Print JSON")
     review_modify.set_defaults(func="hmx_review")
-    review_quote = review_sub.add_parser("quote", parents=[_db], help="Archive as foreign quoted context")
+    review_quote = review_sub.add_parser(
+        "quote", parents=[_db], help="Archive as foreign quoted context"
+    )
     review_quote.add_argument("staging_id")
     review_quote.add_argument("--rationale", required=True)
     review_quote.add_argument("--json", action="store_true", help="Print JSON")
     review_quote.set_defaults(func="hmx_review")
-    review_promote = review_sub.add_parser("promote", parents=[_db], help="Promote analysis to staging")
+    review_promote = review_sub.add_parser(
+        "promote", parents=[_db], help="Promote analysis to staging"
+    )
     review_promote.add_argument("analysis_id")
     review_promote.add_argument("--rationale", required=True)
     review_promote.add_argument("--json", action="store_true", help="Print JSON")
     review_promote.set_defaults(func="hmx_review")
-    review_demote = review_sub.add_parser("demote", parents=[_db], help="Demote staging to analysis")
+    review_demote = review_sub.add_parser(
+        "demote", parents=[_db], help="Demote staging to analysis"
+    )
     review_demote.add_argument("staging_id")
     review_demote.add_argument("--rationale", required=True)
     review_demote.add_argument("--json", action="store_true", help="Print JSON")
@@ -1141,30 +1783,54 @@ def build_parser() -> argparse.ArgumentParser:
     goals = sub.add_parser("goals", parents=[_db], help="Manage agent goals")
     goals_sub = goals.add_subparsers(dest="goals_command")
 
-    goals_list = goals_sub.add_parser("list", parents=[_db], help="List goals by priority")
-    goals_list.add_argument("--priority", choices=["active", "queued", "backburner", "completed", "abandoned"],
-                            default=None, help="Filter by priority")
+    goals_list = goals_sub.add_parser(
+        "list", parents=[_db], help="List goals by priority"
+    )
+    goals_list.add_argument(
+        "--priority",
+        choices=["active", "queued", "backburner", "completed", "abandoned"],
+        default=None,
+        help="Filter by priority",
+    )
     goals_list.add_argument("--json", action="store_true", help="Output JSON")
     goals_list.set_defaults(func="goals_list")
 
-    goals_create = goals_sub.add_parser("create", parents=[_db], help="Create a new goal")
+    goals_create = goals_sub.add_parser(
+        "create", parents=[_db], help="Create a new goal"
+    )
     goals_create.add_argument("title", help="Goal title")
-    goals_create.add_argument("--description", "-d", default=None, help="Goal description")
-    goals_create.add_argument("--priority", choices=["active", "queued", "backburner"], default="queued")
-    goals_create.add_argument("--source", choices=["user_request", "curiosity", "identity", "derived", "external"],
-                              default="user_request")
+    goals_create.add_argument(
+        "--description", "-d", default=None, help="Goal description"
+    )
+    goals_create.add_argument(
+        "--priority", choices=["active", "queued", "backburner"], default="queued"
+    )
+    goals_create.add_argument(
+        "--source",
+        choices=["user_request", "curiosity", "identity", "derived", "external"],
+        default="user_request",
+    )
     goals_create.set_defaults(func="goals_create")
 
-    goals_update = goals_sub.add_parser("update", parents=[_db], help="Change goal priority")
+    goals_update = goals_sub.add_parser(
+        "update", parents=[_db], help="Change goal priority"
+    )
     goals_update.add_argument("goal_id", help="Goal UUID")
-    goals_update.add_argument("--priority", required=True,
-                              choices=["active", "queued", "backburner", "completed", "abandoned"])
+    goals_update.add_argument(
+        "--priority",
+        required=True,
+        choices=["active", "queued", "backburner", "completed", "abandoned"],
+    )
     goals_update.add_argument("--reason", default=None, help="Reason for change")
     goals_update.set_defaults(func="goals_update")
 
-    goals_complete = goals_sub.add_parser("complete", parents=[_db], help="Mark a goal as completed")
+    goals_complete = goals_sub.add_parser(
+        "complete", parents=[_db], help="Mark a goal as completed"
+    )
     goals_complete.add_argument("goal_id", help="Goal UUID")
-    goals_complete.add_argument("--reason", default="Completed via CLI", help="Completion reason")
+    goals_complete.add_argument(
+        "--reason", default="Completed via CLI", help="Completion reason"
+    )
     goals_complete.set_defaults(func="goals_complete")
 
     goals.set_defaults(func="goals")
@@ -1173,32 +1839,56 @@ def build_parser() -> argparse.ArgumentParser:
     schedule = sub.add_parser("schedule", parents=[_db], help="Manage scheduled tasks")
     sched_sub = schedule.add_subparsers(dest="schedule_command")
 
-    sched_list = sched_sub.add_parser("list", parents=[_db], help="List scheduled tasks")
-    sched_list.add_argument("--status", choices=["active", "paused", "disabled"], default=None)
+    sched_list = sched_sub.add_parser(
+        "list", parents=[_db], help="List scheduled tasks"
+    )
+    sched_list.add_argument(
+        "--status", choices=["active", "paused", "disabled"], default=None
+    )
     sched_list.add_argument("--json", action="store_true", help="Output JSON")
     sched_list.set_defaults(func="schedule_list")
 
-    sched_create = sched_sub.add_parser("create", parents=[_db], help="Create a scheduled task")
+    sched_create = sched_sub.add_parser(
+        "create", parents=[_db], help="Create a scheduled task"
+    )
     sched_create.add_argument("name", help="Task name")
-    sched_create.add_argument("--kind", required=True, choices=["once", "interval", "daily", "weekly"],
-                              help="Schedule kind")
-    sched_create.add_argument("--action", required=True, choices=["queue_user_message", "create_goal"],
-                              help="Action kind")
+    sched_create.add_argument(
+        "--kind",
+        required=True,
+        choices=["once", "interval", "daily", "weekly"],
+        help="Schedule kind",
+    )
+    sched_create.add_argument(
+        "--action",
+        required=True,
+        choices=["queue_user_message", "create_goal"],
+        help="Action kind",
+    )
     sched_create.add_argument("--payload", default="{}", help="Action payload JSON")
-    sched_create.add_argument("--schedule", required=True, help="Schedule config JSON (e.g. '{\"time\":\"09:00\"}')")
+    sched_create.add_argument(
+        "--schedule",
+        required=True,
+        help='Schedule config JSON (e.g. \'{"time":"09:00"}\')',
+    )
     sched_create.add_argument("--timezone", default="UTC")
     sched_create.add_argument("--description", "-d", default=None)
     sched_create.set_defaults(func="schedule_create")
 
-    sched_delete = sched_sub.add_parser("delete", parents=[_db], help="Delete a scheduled task")
+    sched_delete = sched_sub.add_parser(
+        "delete", parents=[_db], help="Delete a scheduled task"
+    )
     sched_delete.add_argument("task_id", help="Task UUID")
-    sched_delete.add_argument("--force", action="store_true", help="Hard delete (not just disable)")
+    sched_delete.add_argument(
+        "--force", action="store_true", help="Hard delete (not just disable)"
+    )
     sched_delete.set_defaults(func="schedule_delete")
 
     schedule.set_defaults(func="schedule")
 
     help_cmd = sub.add_parser("help", help="Show help for a command")
-    help_cmd.add_argument("help_command", nargs="?", default=None, help="Command to show help for")
+    help_cmd.add_argument(
+        "help_command", nargs="?", default=None, help="Command to show help for"
+    )
     help_cmd.set_defaults(func="help")
 
     # Stash subparsers on the main parser so main() can look up sub-command help
@@ -1230,16 +1920,22 @@ async def _tools_list(dsn: str, context_filter: str | None, as_json: bool) -> in
         for handler in all_handlers:
             spec = handler.spec
             is_enabled = config.is_tool_enabled(spec.name, spec.category)
-            tools_data.append({
-                "name": spec.name,
-                "category": spec.category.value,
-                "enabled": is_enabled,
-                "energy_cost": config.get_energy_cost(spec.name, spec.energy_cost),
-                "requires_approval": spec.requires_approval,
-                "read_only": spec.is_read_only,
-                "contexts": [c.value for c in spec.allowed_contexts],
-                "description": spec.description[:80] + "..." if len(spec.description) > 80 else spec.description,
-            })
+            tools_data.append(
+                {
+                    "name": spec.name,
+                    "category": spec.category.value,
+                    "enabled": is_enabled,
+                    "energy_cost": config.get_energy_cost(spec.name, spec.energy_cost),
+                    "requires_approval": spec.requires_approval,
+                    "read_only": spec.is_read_only,
+                    "contexts": [c.value for c in spec.allowed_contexts],
+                    "description": (
+                        spec.description[:80] + "..."
+                        if len(spec.description) > 80
+                        else spec.description
+                    ),
+                }
+            )
 
         if as_json:
             sys.stdout.write(json.dumps(tools_data, indent=2) + "\n")
@@ -1270,7 +1966,11 @@ async def _tools_list(dsn: str, context_filter: str | None, as_json: bool) -> in
                         f"[teal]{t['category']}[/teal]",
                         enabled_badge(t["enabled"]),
                         str(t["energy_cost"]),
-                        "[warn]required[/warn]" if t["requires_approval"] else "[muted]no[/muted]",
+                        (
+                            "[warn]required[/warn]"
+                            if t["requires_approval"]
+                            else "[muted]no[/muted]"
+                        ),
                     )
             _con.print(table)
             _con.print(f"\n[muted]Total: {len(tools_data)} tools[/muted]")
@@ -1291,7 +1991,9 @@ def _check_tool_name(pool, tool_name: str) -> bool:
         return True
     close = difflib.get_close_matches(tool_name, names, n=3)
     hint = f" Did you mean: {', '.join(close)}?" if close else ""
-    _print_err(f"Unknown tool '{tool_name}'.{hint} Run `hexis tools list` to see them all.")
+    _print_err(
+        f"Unknown tool '{tool_name}'.{hint} Run `hexis tools list` to see them all."
+    )
     return False
 
 
@@ -1318,6 +2020,7 @@ async def _tools_enable(dsn: str, tool_name: str) -> int:
 
         await save_tools_config(pool, config)
         from apps.cli_theme import console as _con
+
         _con.print(f"[ok]✔[/ok] Enabled tool: [bold]{tool_name}[/bold]")
         return 0
     finally:
@@ -1345,6 +2048,7 @@ async def _tools_disable(dsn: str, tool_name: str) -> int:
 
         await save_tools_config(pool, config)
         from apps.cli_theme import console as _con
+
         _con.print(f"[ok]✔[/ok] Disabled tool: [bold]{tool_name}[/bold]")
         return 0
     finally:
@@ -1365,7 +2069,10 @@ async def _tools_set_api_key(dsn: str, key_name: str, value: str) -> int:
         # Redact display value
         display_val = value if value.startswith("env:") else "***"
         from apps.cli_theme import console as _con
-        _con.print(f"[ok]✔[/ok] Set API key: [bold]{key_name}[/bold] = [muted]{display_val}[/muted]")
+
+        _con.print(
+            f"[ok]✔[/ok] Set API key: [bold]{key_name}[/bold] = [muted]{display_val}[/muted]"
+        )
         return 0
     finally:
         await pool.close()
@@ -1384,7 +2091,10 @@ async def _tools_set_cost(dsn: str, tool_name: str, cost: int) -> int:
         config.costs[tool_name] = cost
         await save_tools_config(pool, config)
         from apps.cli_theme import console as _con
-        _con.print(f"[ok]✔[/ok] Set energy cost: [bold]{tool_name}[/bold] = [bold]{cost}[/bold]")
+
+        _con.print(
+            f"[ok]✔[/ok] Set energy cost: [bold]{tool_name}[/bold] = [bold]{cost}[/bold]"
+        )
         return 0
     finally:
         await pool.close()
@@ -1412,7 +2122,9 @@ async def _tools_web_search_status(dsn: str, as_json: bool) -> int:
             from apps.cli_theme import console as _con, make_table as _mt, enabled_badge
 
             _con.print("[bold]Web Search Providers[/bold]")
-            _con.print(f"Configured provider: [bold]{payload['configured_provider']}[/bold]\n")
+            _con.print(
+                f"Configured provider: [bold]{payload['configured_provider']}[/bold]\n"
+            )
             table = _mt(
                 ("Provider", {"style": "bold"}),
                 "Selected",
@@ -1451,6 +2163,7 @@ async def _tools_web_search_set_provider(dsn: str, provider: str) -> int:
             config.disabled.remove("web_search")
         await save_tools_config(pool, config)
         from apps.cli_theme import console as _con
+
         _con.print(f"[ok]✔[/ok] web_search provider set to [bold]{provider}[/bold]")
         return 0
     finally:
@@ -1476,13 +2189,18 @@ async def _tools_web_search_set_searxng_url(dsn: str, url: str) -> int:
             config.disabled.remove("web_search")
         await save_tools_config(pool, config)
         from apps.cli_theme import console as _con
-        _con.print(f"[ok]✔[/ok] Configured SearXNG for web_search: [bold]{value}[/bold]")
+
+        _con.print(
+            f"[ok]✔[/ok] Configured SearXNG for web_search: [bold]{value}[/bold]"
+        )
         return 0
     finally:
         await pool.close()
 
 
-async def _tools_add_mcp(dsn: str, name: str, command: str, args: list[str], env_pairs: list[str]) -> int:
+async def _tools_add_mcp(
+    dsn: str, name: str, command: str, args: list[str], env_pairs: list[str]
+) -> int:
     """Add an MCP server."""
     import asyncpg
     from core.tools.config import load_tools_config, save_tools_config, MCPServerConfig
@@ -1504,7 +2222,9 @@ async def _tools_add_mcp(dsn: str, name: str, command: str, args: list[str], env
             _print_err(f"MCP server '{name}' already exists. Use 'remove-mcp' first.")
             return 1
 
-        server = MCPServerConfig(name=name, command=command, args=args, env=env, enabled=True)
+        server = MCPServerConfig(
+            name=name, command=command, args=args, env=env, enabled=True
+        )
         config.mcp_servers.append(server)
         await save_tools_config(pool, config)
 
@@ -1581,7 +2301,9 @@ async def _tools_status(dsn: str, as_json: bool) -> int:
                 sys.stdout.write("  (none configured)\n")
 
             sys.stdout.write("\nWeb Search:\n")
-            sys.stdout.write(f"  provider: {config.web_search.get('provider') or 'auto'}\n")
+            sys.stdout.write(
+                f"  provider: {config.web_search.get('provider') or 'auto'}\n"
+            )
             selected = [item for item in web_statuses if item.get("selected")]
             if selected:
                 item = selected[0]
@@ -1590,9 +2312,15 @@ async def _tools_status(dsn: str, as_json: bool) -> int:
                 )
             for item in web_statuses:
                 marker = "*" if item.get("selected") else " "
-                credential = "credential required" if item.get("requires_credential") else "keyless"
+                credential = (
+                    "credential required"
+                    if item.get("requires_credential")
+                    else "keyless"
+                )
                 availability = "available" if item.get("available") else "unavailable"
-                sys.stdout.write(f"  {marker} {item['id']}: {availability}; {credential}\n")
+                sys.stdout.write(
+                    f"  {marker} {item['id']}: {availability}; {credential}\n"
+                )
 
             # Custom costs
             sys.stdout.write("\nCustom Energy Costs:\n")
@@ -1607,7 +2335,9 @@ async def _tools_status(dsn: str, as_json: bool) -> int:
             if config.mcp_servers:
                 for s in config.mcp_servers:
                     status = "enabled" if s.enabled else "disabled"
-                    sys.stdout.write(f"  {s.name}: {s.command} {' '.join(s.args)} [{status}]\n")
+                    sys.stdout.write(
+                        f"  {s.name}: {s.command} {' '.join(s.args)} [{status}]\n"
+                    )
             else:
                 sys.stdout.write("  (none configured)\n")
 
@@ -1617,9 +2347,13 @@ async def _tools_status(dsn: str, as_json: bool) -> int:
                 for ctx, override in config.context_overrides.items():
                     sys.stdout.write(f"  {ctx.value}:\n")
                     if override.max_energy_per_tool:
-                        sys.stdout.write(f"    max_energy_per_tool: {override.max_energy_per_tool}\n")
+                        sys.stdout.write(
+                            f"    max_energy_per_tool: {override.max_energy_per_tool}\n"
+                        )
                     if override.disabled:
-                        sys.stdout.write(f"    disabled: {', '.join(override.disabled)}\n")
+                        sys.stdout.write(
+                            f"    disabled: {', '.join(override.disabled)}\n"
+                        )
                     if override.allow_all:
                         sys.stdout.write("    allow_all: true\n")
             else:
@@ -1638,7 +2372,9 @@ async def _instance_create(name: str, description: str) -> int:
         config = await create_instance(name, description)
         sys.stdout.write(f"Instance '{name}' created.\n")
         sys.stdout.write(f"Database: {config.database}\n")
-        sys.stdout.write(f"Run 'hexis instance use {name}' to switch to this instance.\n")
+        sys.stdout.write(
+            f"Run 'hexis instance use {name}' to switch to this instance.\n"
+        )
         return 0
     except ValueError as e:
         _print_err(str(e))
@@ -1673,7 +2409,9 @@ def _instance_list(as_json: bool) -> int:
 
         if not instances:
             _con.print("[muted]No instances found.[/muted]")
-            _con.print("Run [accent]hexis instance create <name>[/accent] to create one.")
+            _con.print(
+                "Run [accent]hexis instance create <name>[/accent] to create one."
+            )
         else:
             table = _mt(
                 "",
@@ -1684,7 +2422,11 @@ def _instance_list(as_json: bool) -> int:
             )
             for inst in instances:
                 marker = "[accent]\u25cf[/accent]" if inst.name == current else " "
-                desc = inst.description[:40] + "..." if len(inst.description) > 40 else inst.description
+                desc = (
+                    inst.description[:40] + "..."
+                    if len(inst.description) > 40
+                    else inst.description
+                )
                 table.add_row(marker, inst.name, inst.database, desc)
             _con.print(table)
             _con.print("[muted]\u25cf = current instance[/muted]")
@@ -1730,7 +2472,9 @@ async def _instance_delete(name: str, force: bool, reason: str | None) -> int:
     from core.instance_api import AgentDeletionRefused, delete_instance
 
     if not force:
-        sys.stdout.write(f"This will permanently delete instance '{name}' and its database.\n")
+        sys.stdout.write(
+            f"This will permanently delete instance '{name}' and its database.\n"
+        )
         sys.stdout.write(f"Type '{name}' to confirm: ")
         sys.stdout.flush()
         try:
@@ -1831,20 +2575,23 @@ async def _requests_list(dsn: str, status: str | None, as_json: bool) -> int:
     pool = await asyncpg.create_pool(dsn, min_size=1, max_size=2)
     try:
         async with pool.acquire() as conn:
-            raw = await conn.fetchval(
-                "SELECT list_resource_requests($1, 50)", status
-            )
+            raw = await conn.fetchval("SELECT list_resource_requests($1, 50)", status)
         requests = json.loads(raw) if isinstance(raw, str) else (raw or [])
         if as_json:
             sys.stdout.write(json.dumps(requests, indent=2, default=str) + "\n")
             return 0
         from apps.cli_theme import console as _con, make_table as _mt
+
         label = status or "pending"
         if not requests:
             _con.print(f"[muted]No {label} resource requests.[/muted]")
             return 0
         table = _mt(
-            ("Id", {"style": "bold"}), "Kind", "Ask", "Status", "When",
+            ("Id", {"style": "bold"}),
+            "Kind",
+            "Ask",
+            "Status",
+            "When",
             title=f"Resource requests ({label})",
         )
         for r in requests:
@@ -1854,12 +2601,21 @@ async def _requests_list(dsn: str, status: str | None, as_json: bool) -> int:
             if len(ask) > 60:
                 ask = ask[:57] + "..."
             st = r.get("status", "?")
-            st_styled = (f"[ok]{st}[/ok]" if st in ("granted", "modified")
-                         else f"[warn]{st}[/warn]" if st == "pending" else f"[fail]{st}[/fail]")
+            st_styled = (
+                f"[ok]{st}[/ok]"
+                if st in ("granted", "modified")
+                else f"[warn]{st}[/warn]"
+                if st == "pending"
+                else f"[fail]{st}[/fail]"
+            )
             when = str(r.get("requested_at") or "")[:16]
-            table.add_row(str(r.get("id", ""))[:8], r.get("kind", "?"), ask, st_styled, when)
+            table.add_row(
+                str(r.get("id", ""))[:8], r.get("kind", "?"), ask, st_styled, when
+            )
         _con.print(table)
-        _con.print("[muted]Decide with: hexis requests grant/deny <id> --note '...'[/muted]")
+        _con.print(
+            "[muted]Decide with: hexis requests grant/deny <id> --note '...'[/muted]"
+        )
         return 0
     except Exception as e:
         _print_err(f"Error: {e}")
@@ -1889,10 +2645,14 @@ async def _requests_decide(
             request_id = await _resolve_request_id(conn, raw_id)
             raw = await conn.fetchval(
                 "SELECT decide_resource_request($1::uuid, $2, $3, $4::jsonb)",
-                request_id, decision, note, applied_value,
+                request_id,
+                decision,
+                note,
+                applied_value,
             )
         result = json.loads(raw) if isinstance(raw, str) else (raw or {})
         from apps.cli_theme import console as _con
+
         applied = result.get("applied")
         extra = ""
         if applied == "config":
@@ -1900,7 +2660,9 @@ async def _requests_decide(
         elif applied == "energy":
             extra = f" — energy now {result.get('new_energy')}"
         _con.print(f"[ok]✓[/ok] Request {request_id[:8]} {decision}{extra}.")
-        _con.print("[muted]The agent will see this decision at her next heartbeat.[/muted]")
+        _con.print(
+            "[muted]The agent will see this decision at her next heartbeat.[/muted]"
+        )
         return 0
     except Exception as e:
         _print_err(f"Error: {e}")
@@ -1920,26 +2682,54 @@ async def _consents_list(dsn: str, as_json: bool) -> int:
             rows = await conn.fetch(
                 "SELECT DISTINCT ON (provider, model, endpoint) "
                 "       provider, model, endpoint, decision, decided_at "
-                "FROM consent_log ORDER BY provider, model, endpoint, decided_at DESC")
+                "FROM consent_log ORDER BY provider, model, endpoint, decided_at DESC"
+            )
         if as_json:
-            sys.stdout.write(json.dumps([{
-                "provider": r["provider"], "model": r["model"], "endpoint": r["endpoint"],
-                "decision": r["decision"], "decided_at": str(r["decided_at"]),
-            } for r in rows], indent=2) + "\n")
+            sys.stdout.write(
+                json.dumps(
+                    [
+                        {
+                            "provider": r["provider"],
+                            "model": r["model"],
+                            "endpoint": r["endpoint"],
+                            "decision": r["decision"],
+                            "decided_at": str(r["decided_at"]),
+                        }
+                        for r in rows
+                    ],
+                    indent=2,
+                )
+                + "\n"
+            )
             return 0
         from apps.cli_theme import console as _con, make_table as _mt
+
         if not rows:
-            _con.print("[muted]No consent recorded yet — run [accent]hexis init[/accent] to establish it.[/muted]")
+            _con.print(
+                "[muted]No consent recorded yet — run [accent]hexis init[/accent] to establish it.[/muted]"
+            )
             return 0
-        table = _mt(("Model", {"style": "bold"}), "Decision", "When", title="Consent (from the database)")
+        table = _mt(
+            ("Model", {"style": "bold"}),
+            "Decision",
+            "When",
+            title="Consent (from the database)",
+        )
         for r in rows:
             model = f"{r['provider']}/{r['model']}"
             if len(model) > 44:
                 model = model[:41] + "..."
             dec = r["decision"]
-            dec_styled = (f"[ok]{dec}[/ok]" if dec == "consent"
-                          else f"[warn]{dec}[/warn]" if dec == "abstain" else f"[fail]{dec}[/fail]")
-            when = r["decided_at"].strftime("%Y-%m-%d %H:%M") if r["decided_at"] else "?"
+            dec_styled = (
+                f"[ok]{dec}[/ok]"
+                if dec == "consent"
+                else (
+                    f"[warn]{dec}[/warn]" if dec == "abstain" else f"[fail]{dec}[/fail]"
+                )
+            )
+            when = (
+                r["decided_at"].strftime("%Y-%m-%d %H:%M") if r["decided_at"] else "?"
+            )
             table.add_row(model, dec_styled, when)
         _con.print(table)
         return 0
@@ -1963,19 +2753,29 @@ async def _consents_show(dsn: str, model_spec: str) -> int:
         async with pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT id, provider, model, endpoint, decision, decided_at, signature, response, memory_ids "
-                "FROM consent_log WHERE provider=$1 AND model=$2 ORDER BY decided_at DESC", provider, model_id)
+                "FROM consent_log WHERE provider=$1 AND model=$2 ORDER BY decided_at DESC",
+                provider,
+                model_id,
+            )
         if not rows:
             _print_err(f"No consent recorded for {model_spec}")
             return 1
         out = []
         for r in rows:
             resp = r["response"]
-            out.append({
-                "id": str(r["id"]), "provider": r["provider"], "model": r["model"], "endpoint": r["endpoint"],
-                "decision": r["decision"], "decided_at": str(r["decided_at"]), "signature": r["signature"],
-                "response": (json.loads(resp) if isinstance(resp, str) else resp),
-                "memory_ids": [str(m) for m in (r["memory_ids"] or [])],
-            })
+            out.append(
+                {
+                    "id": str(r["id"]),
+                    "provider": r["provider"],
+                    "model": r["model"],
+                    "endpoint": r["endpoint"],
+                    "decision": r["decision"],
+                    "decided_at": str(r["decided_at"]),
+                    "signature": r["signature"],
+                    "response": (json.loads(resp) if isinstance(resp, str) else resp),
+                    "memory_ids": [str(m) for m in (r["memory_ids"] or [])],
+                }
+            )
         sys.stdout.write(json.dumps(out, indent=2) + "\n")
         return 0
     except Exception as e:
@@ -1989,6 +2789,7 @@ def _consents_request(model_spec: str) -> int:
     """Consent is established through the real, model-aware init flow (which records
     to the database and gates the agent). Point the user there."""
     from apps.cli_theme import console as _con
+
     _con.print(
         "Consent is established during [accent]hexis init[/accent] — the model itself signs (or "
         "declines) and the decision is recorded in the database (consent_log).\n"
@@ -2012,13 +2813,16 @@ async def _consents_revoke(dsn: str, model_spec: str, reason: str) -> int:
     pool = await asyncpg.create_pool(dsn, min_size=1, max_size=2)
     try:
         async with pool.acquire() as conn:
-            await record_consent_response(conn, {
-                "decision": "decline",
-                "provider": provider,
-                "model": model_id,
-                "response": {"source": "cli_revoke", "reason": reason},
-                "apply_agent_config": False,  # withdraw the model, not the agent's self-consent
-            })
+            await record_consent_response(
+                conn,
+                {
+                    "decision": "decline",
+                    "provider": provider,
+                    "model": model_id,
+                    "response": {"source": "cli_revoke", "reason": reason},
+                    "apply_agent_config": False,  # withdraw the model, not the agent's self-consent
+                },
+            )
         sys.stdout.write(f"Recorded a decline for {model_spec} (reason: {reason}).\n")
         return 0
     except Exception as e:
@@ -2050,8 +2854,16 @@ def _characters_list(as_json: bool) -> int:
                 title="Characters",
             )
             for card in cards:
-                source = "custom" if card.get("source_dir") == str(USER_CHARACTERS_DIR) else "preset"
-                source_styled = f"[accent]{source}[/accent]" if source == "custom" else f"[muted]{source}[/muted]"
+                source = (
+                    "custom"
+                    if card.get("source_dir") == str(USER_CHARACTERS_DIR)
+                    else "preset"
+                )
+                source_styled = (
+                    f"[accent]{source}[/accent]"
+                    if source == "custom"
+                    else f"[muted]{source}[/muted]"
+                )
                 voice = card.get("voice", "")
                 if len(voice) > 40:
                     voice = voice[:37] + "..."
@@ -2070,7 +2882,12 @@ def _characters_show(name_query: str) -> int:
     # Match by name (case-insensitive) or filename stem
     query = name_query.lower().replace(".json", "")
     card = next(
-        (c for c in cards if c["name"].lower() == query or c["filename"].lower().replace(".json", "") == query),
+        (
+            c
+            for c in cards
+            if c["name"].lower() == query
+            or c["filename"].lower().replace(".json", "") == query
+        ),
         None,
     )
     if not card:
@@ -2080,6 +2897,7 @@ def _characters_show(name_query: str) -> int:
     ext = card.get("extensions_hexis", {})
 
     from apps.cli_theme import console as _con
+
     _con.print(f"\n[bold]{card['name']}[/bold]")
     if ext.get("pronouns"):
         _con.print(f"  [muted]Pronouns:[/muted] {ext['pronouns']}")
@@ -2142,11 +2960,27 @@ def _characters_create(args: Any) -> int:
             "agreeableness": args.agreeableness,
             "neuroticism": args.neuroticism,
         },
-        "values": [v.strip() for v in args.values.split(",") if v.strip()] if args.values else [],
+        "values": (
+            [v.strip() for v in args.values.split(",") if v.strip()]
+            if args.values
+            else []
+        ),
         "worldview": {},
-        "interests": [i.strip() for i in args.interests.split(",") if i.strip()] if args.interests else [],
-        "goals": [g.strip() for g in args.goals.split(",") if g.strip()] if args.goals else [],
-        "boundaries": [b.strip() for b in args.boundaries.split(",") if b.strip()] if args.boundaries else [],
+        "interests": (
+            [i.strip() for i in args.interests.split(",") if i.strip()]
+            if args.interests
+            else []
+        ),
+        "goals": (
+            [g.strip() for g in args.goals.split(",") if g.strip()]
+            if args.goals
+            else []
+        ),
+        "boundaries": (
+            [b.strip() for b in args.boundaries.split(",") if b.strip()]
+            if args.boundaries
+            else []
+        ),
     }
 
     # Worldview
@@ -2228,7 +3062,9 @@ async def _characters_export(dsn: str, name: str, output: str | None) -> int:
                 meta = json.loads(row["metadata"]) if row["metadata"] else {}
                 # Typical format: "Openness: 0.9" or stored in metadata
                 if meta.get("trait_name"):
-                    traits[meta["trait_name"].lower()] = float(meta.get("trait_value", 0.5))
+                    traits[meta["trait_name"].lower()] = float(
+                        meta.get("trait_value", 0.5)
+                    )
 
             # Gather values
             values_rows = await conn.fetch("""
@@ -2292,10 +3128,17 @@ async def _characters_export(dsn: str, name: str, output: str | None) -> int:
             "description": identity.get("description", ""),
             "purpose": identity.get("purpose", ""),
             "personality_description": identity.get("personality_description", ""),
-            "personality_traits": traits if traits else {
-                "openness": 0.5, "conscientiousness": 0.5,
-                "extraversion": 0.5, "agreeableness": 0.5, "neuroticism": 0.5,
-            },
+            "personality_traits": (
+                traits
+                if traits
+                else {
+                    "openness": 0.5,
+                    "conscientiousness": 0.5,
+                    "extraversion": 0.5,
+                    "agreeableness": 0.5,
+                    "neuroticism": 0.5,
+                }
+            ),
             "values": values,
             "worldview": worldview,
             "interests": interests,
@@ -2348,6 +3191,795 @@ def _run_module(module: str, argv: list[str]) -> int:
         return 1
 
 
+def _available_compose_command() -> list[str] | None:
+    """Return a compose command without requiring a running Docker daemon."""
+    docker = shutil.which("docker")
+    if docker:
+        try:
+            result = subprocess.run(
+                [docker, "compose", "version"],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode == 0:
+                return [docker, "compose"]
+        except OSError:
+            pass
+    standalone = shutil.which("docker-compose")
+    return [standalone] if standalone else None
+
+
+def _running_container_workers(
+    compose_file: Path | None,
+    stack_root: Path,
+    env_file: Path | None,
+) -> tuple[list[str] | None, list[str] | None]:
+    """Read running Docker worker truth when Compose is available."""
+    compose_cmd = _available_compose_command()
+    if compose_file is None:
+        return [], compose_cmd
+    if compose_cmd is None:
+        return None, None
+    rc, out = _run_compose_capture(
+        compose_cmd,
+        compose_file,
+        stack_root,
+        ["ps", "--services", "--filter", "status=running"],
+        env_file,
+    )
+    if rc != 0:
+        return None, compose_cmd
+    worker_names = {"heartbeat_worker", "maintenance_worker", "channel_worker"}
+    running = sorted({part for part in out.split() if part in worker_names})
+    return running, compose_cmd
+
+
+def _configured_compose_services(
+    compose_cmd: list[str],
+    compose_file: Path,
+    stack_root: Path,
+    env_file: Path | None,
+    profiles: list[str] | None = None,
+) -> list[str] | None:
+    args: list[str] = []
+    for profile in profiles or []:
+        args += ["--profile", profile]
+    args += ["config", "--services"]
+    rc, out = _run_compose_capture(
+        compose_cmd,
+        compose_file,
+        stack_root,
+        args,
+        env_file,
+    )
+    if rc != 0:
+        return None
+    services: list[str] = []
+    for line in out.splitlines():
+        name = line.strip()
+        if (
+            name
+            and " " not in name
+            and all(character.isalnum() or character in "._-" for character in name)
+        ):
+            services.append(name)
+    return services or None
+
+
+def _host_managed_compose_workers() -> set[str]:
+    try:
+        from core.host_services import installed_host_services
+
+        mapping = {
+            "heartbeat": "heartbeat_worker",
+            "maintenance": "maintenance_worker",
+            "channels": "channel_worker",
+        }
+        return {mapping[name] for name in installed_host_services() if name in mapping}
+    except Exception:
+        return set()
+
+
+def _host_service_status_if_installed() -> dict[str, Any] | None:
+    try:
+        from core.host_services import host_service_status, installed_host_services
+
+        if not installed_host_services():
+            return None
+        return host_service_status()
+    except Exception:
+        return None
+
+
+def _ensure_installed_host_services_running() -> tuple[bool, str | None]:
+    """Start only inactive installed host services; never restart healthy ones."""
+    try:
+        from core.host_services import control_host_services, host_service_status
+
+        status = host_service_status()
+        inactive = [
+            str(item.get("name"))
+            for item in status.get("services", [])
+            if isinstance(item, dict)
+            and item.get("installed")
+            and not item.get("active")
+        ]
+        if inactive:
+            control_host_services("start", inactive)
+        return True, None
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _stop_installed_host_services() -> tuple[bool, str | None]:
+    try:
+        from core.host_services import control_host_services, installed_host_services
+
+        installed = installed_host_services()
+        if installed:
+            control_host_services("stop", installed)
+        return True, None
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _restart_installed_host_services() -> tuple[bool, str | None]:
+    try:
+        from core.host_services import control_host_services, installed_host_services
+
+        installed = installed_host_services()
+        if installed:
+            control_host_services("restart", installed)
+        return True, None
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _print_host_service_status(payload: dict[str, Any]) -> None:
+    from apps.cli_theme import console, make_table
+
+    table = make_table(
+        "Service",
+        "State",
+        "Enabled",
+        "Unit",
+        title=f"Host services ({payload.get('backend') or 'unknown'})",
+    )
+    for item in payload.get("services", []):
+        if not isinstance(item, dict):
+            continue
+        state = (
+            "running"
+            if item.get("active")
+            else "stopped"
+            if item.get("installed")
+            else "not installed"
+        )
+        table.add_row(
+            str(item.get("name") or ""),
+            state,
+            (
+                "yes"
+                if item.get("enabled") is True
+                else "no"
+                if item.get("enabled") is False
+                else "unknown"
+            ),
+            str(item.get("unit_path") or ""),
+        )
+    console.print(table)
+    console.print(
+        f"[key]Instance:[/key] {payload.get('instance') or 'default/current'}"
+    )
+    console.print(
+        f"[key]Environment:[/key] {payload.get('env_file') or 'process defaults'}"
+    )
+    if payload.get("backend") == "systemd":
+        console.print(f"[key]Linger:[/key] {payload.get('linger') or 'unknown'}")
+
+
+def _handle_host_service_command(
+    args: argparse.Namespace,
+    *,
+    compose_file: Path | None,
+    stack_root: Path,
+    env_file: Path | None,
+) -> int:
+    from apps.cli_theme import console
+    from core.host_services import (
+        HostServiceError,
+        control_host_services,
+        host_service_status,
+        install_host_services,
+        stream_host_service_logs,
+        uninstall_host_services,
+    )
+
+    func = str(getattr(args, "func", "service_status"))
+    try:
+        if func == "service_install":
+            requested = ["heartbeat", "maintenance"]
+            if args.channels:
+                requested.append("channels")
+            running_workers, compose_cmd = _running_container_workers(
+                compose_file,
+                stack_root,
+                env_file,
+            )
+            if running_workers is None:
+                _print_err(
+                    "Hexis could not inspect Docker worker state, so it refused to risk "
+                    "installing duplicate workers. Start Docker and retry, or move the "
+                    "unavailable Compose file aside if this installation no longer uses it."
+                )
+                return 1
+            matching = [
+                name
+                for name in running_workers
+                if name != "channel_worker" or args.channels
+            ]
+            if matching and not args.replace_docker_workers:
+                _print_err(
+                    "Docker workers are already running: "
+                    f"{', '.join(matching)}. Running both copies can duplicate work. "
+                    "Stop them with `hexis stop`, or explicitly migrate them with "
+                    "`hexis service install --replace-docker-workers`."
+                )
+                return 1
+            selected_env = args.env_file or env_file
+            active_instance = args.instance or resolve_instance()
+            # During an explicit Docker-to-host migration, install and enable
+            # the units first. This keeps the original workers running if unit
+            # installation fails and avoids an autonomy gap.
+            start_during_install = not args.no_start and not matching
+            result = install_host_services(
+                services=requested,
+                env_file=selected_env,
+                working_directory=(selected_env.parent if selected_env else stack_root),
+                instance=active_instance,
+                start=start_during_install,
+                enable_linger=bool(args.enable_linger),
+            )
+            if matching:
+                if compose_file is None or compose_cmd is None:
+                    _print_err(
+                        "Could not resolve Docker Compose to stop existing workers."
+                    )
+                    return 1
+                rc = run_compose(
+                    compose_cmd,
+                    compose_file,
+                    stack_root,
+                    ["stop", *matching],
+                    env_file,
+                )
+                if rc != 0:
+                    _print_err(
+                        "Host units were installed but left stopped because the Docker "
+                        "workers could not be stopped. Resolve the Compose error and retry "
+                        "the same install command."
+                    )
+                    return rc
+                if not args.no_start:
+
+                    def restore_docker_workers() -> bool:
+                        try:
+                            control_host_services("stop", requested)
+                        except HostServiceError as stop_error:
+                            _print_err(
+                                "Hexis did not restore Docker workers because it could "
+                                f"not prove the attempted host copies were stopped: {stop_error}"
+                            )
+                            return False
+                        return (
+                            run_compose(
+                                compose_cmd,
+                                compose_file,
+                                stack_root,
+                                ["up", "-d", *matching],
+                                env_file,
+                            )
+                            == 0
+                        )
+
+                    try:
+                        control_host_services("start", requested)
+                    except HostServiceError:
+                        restore_docker_workers()
+                        raise
+            console.print(
+                f"[ok]Installed Hexis host services:[/ok] {', '.join(result['installed'])}"
+            )
+            console.print(
+                f"[key]Environment:[/key] {result.get('env_file') or 'process defaults'} "
+                "[muted](values were not copied into unit files)[/muted]"
+            )
+            console.print(
+                f"[key]Instance:[/key] {result.get('instance') or 'default/current'}"
+            )
+            if result.get("warning"):
+                console.print(f"[warn]⚠ {result['warning']}[/warn]")
+            if (
+                result.get("backend") == "systemd"
+                and result.get("linger") == "disabled"
+            ):
+                console.print(
+                    "[warn]⚠ User lingering is disabled; services may stop after logout.[/warn] "
+                    "Run `hexis service install --enable-linger` if you want them to "
+                    "continue without a login session."
+                )
+            if args.no_start:
+                console.print("Start them when ready with `hexis service start`.")
+            else:
+                try:
+                    status = host_service_status()
+                except HostServiceError:
+                    if matching:
+                        restore_docker_workers()
+                    raise
+                inactive = [
+                    item["name"]
+                    for item in status.get("services", [])
+                    if item.get("name") in requested and not item.get("active")
+                ]
+                if inactive:
+                    restored = restore_docker_workers() if matching else False
+                    recovery = (
+                        " The previous Docker workers were restored."
+                        if restored
+                        else ""
+                    )
+                    _print_err(
+                        f"Installed but not running: {', '.join(inactive)}. "
+                        "Run `hexis service logs` for the provider error, then "
+                        f"`hexis service restart`.{recovery}"
+                    )
+                    return 1
+                console.print(
+                    "[ok]Workers are running.[/ok] Check with `hexis service status`."
+                )
+            return 0
+
+        if func in {"service_start", "service_stop", "service_restart"}:
+            action = func.removeprefix("service_")
+            result = control_host_services(action, args.services or None)
+            console.print(
+                f"[ok]{action.capitalize()}ed:[/ok] {', '.join(result['services'])}"
+            )
+            return 0
+
+        if func == "service_logs":
+            return stream_host_service_logs(
+                args.services or None,
+                lines=args.lines,
+                follow=bool(args.follow),
+            )
+
+        if func == "service_uninstall":
+            if not args.yes:
+                console.print(
+                    "This stops and removes Hexis-managed user-service units. "
+                    "Brain data, configuration, and logs are preserved."
+                )
+                try:
+                    answer = input("Type 'uninstall' to confirm: ")
+                except (KeyboardInterrupt, EOFError):
+                    print()
+                    return 1
+                if answer.strip().lower() != "uninstall":
+                    console.print("[muted]Aborted.[/muted]")
+                    return 1
+            result = uninstall_host_services(args.services or None)
+            console.print(
+                f"[ok]Removed host services:[/ok] {', '.join(result['uninstalled'])}"
+            )
+            console.print(
+                f"Logs were preserved at {result['preserved_log_directory']}."
+            )
+            return 0
+
+        payload = host_service_status()
+        if getattr(args, "json", False):
+            sys.stdout.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        else:
+            _print_host_service_status(payload)
+        return 0
+    except HostServiceError as exc:
+        _print_err(str(exc))
+        return 1
+
+
+def _resolved_env_setting(
+    name: str,
+    *,
+    env_file: Path | None,
+    default: str,
+) -> str:
+    """Resolve one stack setting without importing unrelated environment values."""
+
+    ambient = os.getenv(name)
+    if ambient is not None and ambient.strip():
+        return ambient.strip()
+    if env_file and env_file.is_file():
+        try:
+            selected = dotenv_values(env_file).get(name)
+        except (OSError, ValueError):
+            selected = None
+        if selected is not None and str(selected).strip():
+            return str(selected).strip()
+    return default
+
+
+def _wait_http_ready(url: str, *, overall: float = 60.0) -> bool:
+    import time
+
+    deadline = time.monotonic() + overall
+    while time.monotonic() < deadline:
+        if _http_ready(url):
+            return True
+        time.sleep(0.4)
+    return False
+
+
+def _print_tunnel_status(payload: dict[str, Any]) -> None:
+    from apps.cli_theme import console, make_table
+
+    rows = [
+        ["State", str(payload.get("status") or "unknown")],
+        ["Private URL", str(payload.get("url") or "not available")],
+        ["Local target", f"http://127.0.0.1:{payload.get('ui_port') or 3477}"],
+        ["Local dashboard", "ready" if payload.get("local_ready") else "not ready"],
+        ["Tailnet", "connected" if payload.get("connected") else "not connected"],
+        ["Route owner", "Hexis" if payload.get("owned") else "external/none"],
+        ["Public bind", "YES — out of bounds" if payload.get("public_bind") else "no"],
+        ["Tailscale Funnel", "YES — public" if payload.get("funnel_enabled") else "no"],
+    ]
+    table = make_table("Check", "Result", title="Private dashboard tunnel")
+    for row in rows:
+        table.add_row(*row)
+    console.print(table)
+    for issue in payload.get("issues") or []:
+        console.print(f"[fail]✗ {issue}[/fail]")
+    warning = payload.get("warning")
+    if warning:
+        console.print(f"[warn]⚠ {warning}[/warn]")
+    if payload.get("status") == "active":
+        console.print(
+            "[ok]Tailnet-only HTTPS is active.[/ok] The dashboard remains bound to loopback."
+        )
+    elif not payload.get("issues"):
+        console.print(str(payload.get("detail") or "No private route is active."))
+
+
+def _handle_tunnel_command(
+    args: argparse.Namespace,
+    *,
+    env_file: Path | None,
+) -> int:
+    from apps.cli_theme import console
+    from core.tunnel import TunnelError, start_tunnel, stop_tunnel, tunnel_status
+
+    try:
+        port_text = _resolved_env_setting(
+            "HEXIS_UI_PORT", env_file=env_file, default="3477"
+        )
+        port = int(args.port) if args.port is not None else int(port_text)
+        bind_address = _resolved_env_setting(
+            "HEXIS_BIND_ADDRESS", env_file=env_file, default="127.0.0.1"
+        )
+    except ValueError:
+        _print_err(
+            "HEXIS_UI_PORT must be an integer between 1 and 65535. Fix the selected "
+            "environment file, then retry."
+        )
+        return 1
+
+    func = str(getattr(args, "func", "tunnel_status"))
+    try:
+        if func == "tunnel_start":
+            local_url = f"http://127.0.0.1:{port}/api/status"
+            if not _http_ready(local_url):
+                if args.no_start_stack:
+                    raise TunnelError(
+                        f"The dashboard is not responding at {local_url}. Start it with "
+                        "`hexis up`, then retry without changing Tailscale state."
+                    )
+                console.print(
+                    "[muted]The local dashboard is down; starting the Hexis stack first...[/muted]"
+                )
+                up_rc = main(["up"])
+                if up_rc != 0:
+                    raise TunnelError(
+                        "The Hexis stack did not start, so no Tailscale route was changed. "
+                        "Resolve the startup error above, then retry `hexis tunnel start`."
+                    )
+                if not _wait_http_ready(local_url):
+                    raise TunnelError(
+                        f"The stack started but the dashboard never responded at {local_url}. "
+                        "No Tailscale route was changed; run `hexis logs ui api` for the cause."
+                    )
+            payload = start_tunnel(
+                ui_port=port,
+                bind_address=bind_address,
+                probe_local=True,
+            )
+        elif func == "tunnel_stop":
+            payload = stop_tunnel(
+                ui_port=port if args.port is not None else None,
+                bind_address=bind_address,
+            )
+        else:
+            payload = tunnel_status(
+                ui_port=port,
+                bind_address=bind_address,
+            )
+
+        if getattr(args, "json", False):
+            sys.stdout.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        else:
+            _print_tunnel_status(payload)
+            if func == "tunnel_start" and payload.get("status") == "active":
+                console.print(
+                    "Open the private URL on a device already approved in this tailnet, "
+                    "then run `hexis doctor` to verify trusted HTTPS end to end."
+                )
+            elif func == "tunnel_stop":
+                console.print(
+                    "[ok]The Hexis tailnet route is off.[/ok] The local dashboard and brain data were preserved."
+                )
+        return 1 if payload.get("status") in {"risky", "conflict", "unavailable"} else 0
+    except TunnelError as exc:
+        _print_err(str(exc))
+        return 1
+
+
+async def _configured_voice_model() -> str:
+    from core.agent_api import _connect_with_retry
+
+    conn = await _connect_with_retry(db_dsn_from_env(), wait_seconds=5)
+    try:
+        model = await conn.fetchval("SELECT get_config_text('voice.tts.model')")
+    finally:
+        await conn.close()
+    value = str(model or "").strip()
+    if not value:
+        raise RuntimeError(
+            "No live voice model is configured. Open Settings → Voice, save the "
+            "local provider, then retry."
+        )
+    return value
+
+
+async def _configured_voice_output() -> tuple[bool, str]:
+    """Read voice enablement and model from the live brain configuration."""
+    from core.agent_api import _connect_with_retry
+
+    conn = await _connect_with_retry(db_dsn_from_env(), wait_seconds=5)
+    try:
+        row = await conn.fetchrow(
+            """
+            SELECT get_config_bool('voice.tts.enabled') AS enabled,
+                   get_config_text('voice.tts.model') AS model
+            """
+        )
+    finally:
+        await conn.close()
+    model = str((row or {}).get("model") or "").strip()
+    if not model:
+        raise RuntimeError(
+            "No live voice model is configured. Open Settings → Voice, save the "
+            "local provider, then retry."
+        )
+    return bool((row or {}).get("enabled")), model
+
+
+def _voice_support_installed() -> bool:
+    import importlib.util
+
+    return importlib.util.find_spec("piper") is not None
+
+
+def _voice_dependency_requirement() -> str:
+    from importlib import metadata
+    from core.voice_sidecar import PIPER_REQUIREMENT
+
+    try:
+        requirements = metadata.requires("hexis") or []
+    except metadata.PackageNotFoundError:
+        requirements = []
+    for requirement in requirements:
+        if requirement.lower().startswith("piper-tts"):
+            return requirement.partition(";")[0].strip()
+    return PIPER_REQUIREMENT
+
+
+def _install_voice_support(*, yes: bool) -> bool:
+    from apps.cli_theme import console
+
+    if _voice_support_installed():
+        return True
+    if not yes:
+        console.print(
+            "Local speech needs the optional Piper engine and its HTTP support. "
+            "This installs it into the current Hexis Python environment; voice "
+            "models download only when you start a chosen voice."
+        )
+        try:
+            answer = input("Install local voice support now? [y/N] ")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return False
+        if answer.strip().lower() not in {"y", "yes"}:
+            console.print("[muted]No changes made.[/muted]")
+            return False
+    uv = shutil.which("uv")
+    if not uv:
+        _print_err(
+            "uv is required to add optional voice support safely to this Hexis "
+            "environment. Install uv, then rerun `hexis voice setup`; no package "
+            "changes were made."
+        )
+        return False
+    requirement = _voice_dependency_requirement()
+    console.print(f"[muted]Installing {requirement} into {sys.executable}...[/muted]")
+    try:
+        result = subprocess.run(
+            [uv, "pip", "install", "--python", sys.executable, requirement],
+            check=False,
+            timeout=600,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        _print_err(
+            f"Local voice support could not be installed ({exc}). Nothing was "
+            "started; rerun `hexis voice setup` after resolving the uv error."
+        )
+        return False
+    if result.returncode != 0:
+        _print_err(
+            f"uv exited with code {result.returncode}; no voice process was started. "
+            "Review the installer output above, then rerun `hexis voice setup`."
+        )
+        return False
+    import importlib
+
+    importlib.invalidate_caches()
+    if not _voice_support_installed():
+        _print_err(
+            "The installer completed but Piper is still unavailable in this Hexis "
+            "environment. No voice process was started."
+        )
+        return False
+    return True
+
+
+def _print_voice_status(payload: dict[str, Any]) -> None:
+    from apps.cli_theme import console, make_table
+
+    table = make_table("Check", "Result", title="Local speech output")
+    table.add_row("State", str(payload.get("status") or "unknown"))
+    table.add_row("Provider", "ready" if payload.get("ready") else "not ready")
+    table.add_row("Model", str(payload.get("model") or "from live configuration"))
+    table.add_row("Process owner", "Hexis" if payload.get("owned") else "external/none")
+    table.add_row("Endpoint", str(payload.get("url") or "http://127.0.0.1:42667"))
+    table.add_row("Log", str(payload.get("log_path") or ""))
+    console.print(table)
+    warning = payload.get("warning")
+    if warning:
+        console.print(f"[warn]⚠ {warning}[/warn]")
+    elif payload.get("ready"):
+        console.print("[ok]Local speech is ready.[/ok]")
+    else:
+        console.print(str(payload.get("detail") or "Local speech is not running."))
+
+
+def _handle_voice_command(args: argparse.Namespace) -> int:
+    from core.voice_sidecar import (
+        VoiceSidecarError,
+        start_voice_sidecar,
+        stop_voice_sidecar,
+        voice_sidecar_status,
+    )
+
+    func = str(getattr(args, "func", "voice_status"))
+    try:
+        if func == "voice_setup" and not _install_voice_support(yes=bool(args.yes)):
+            return 1
+        if func in {"voice_start", "voice_setup"}:
+            if not _voice_support_installed():
+                raise VoiceSidecarError(
+                    "Local Piper support is not installed. Run `hexis voice setup` to "
+                    "install it and start the configured voice in one flow."
+                )
+            try:
+                model = asyncio.run(_configured_voice_model())
+            except Exception as exc:
+                raise VoiceSidecarError(
+                    f"Could not read the live voice model from the Hexis brain ({exc}). "
+                    "Run `hexis up`, save Settings → Voice, then retry."
+                ) from exc
+            payload = start_voice_sidecar(
+                model=model,
+                wait_seconds=max(1.0, float(args.wait_seconds)),
+            )
+        elif func == "voice_stop":
+            payload = stop_voice_sidecar()
+        else:
+            payload = voice_sidecar_status()
+        if getattr(args, "json", False):
+            sys.stdout.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        else:
+            _print_voice_status(payload)
+        return 0 if payload.get("status") != "stale" else 1
+    except VoiceSidecarError as exc:
+        _print_err(str(exc))
+        return 1
+
+
+def _start_configured_voice_sidecar() -> tuple[bool, str | None]:
+    """Start configured speech output after the stack is ready.
+
+    This is advisory for ``up``/``dev``: database and chat startup remain useful
+    even when optional local speech cannot start.
+    """
+    from core.voice_sidecar import start_voice_sidecar, voice_sidecar_status
+
+    try:
+        enabled, model = asyncio.run(_configured_voice_output())
+        if not enabled:
+            return False, None
+        current = voice_sidecar_status()
+        if current.get("ready"):
+            if current.get("owned"):
+                return False, None
+            return (
+                False,
+                "A compatible ambient voice provider is already ready; Hexis did "
+                "not adopt it and will not stop it.",
+            )
+        if not _voice_support_installed():
+            return (
+                False,
+                "Speech output is enabled, but local Piper support is not installed. "
+                "Run `hexis voice setup` to finish the setup in place.",
+            )
+        result = start_voice_sidecar(model=model, wait_seconds=2)
+        return bool(result.get("changed")), result.get("warning")
+    except Exception as exc:
+        return (
+            False,
+            f"Speech output is enabled but its local provider did not become ready: "
+            f"{exc} Run `hexis voice status` for the current state and recovery step.",
+        )
+
+
+def _stop_owned_voice_sidecar() -> tuple[bool, bool, str | None]:
+    """Stop only the exact voice process previously launched by Hexis."""
+    from core.voice_sidecar import stop_voice_sidecar, voice_sidecar_status
+
+    try:
+        current = voice_sidecar_status()
+        if not current.get("owned"):
+            if current.get("ready"):
+                return (
+                    True,
+                    False,
+                    "A compatible ambient voice provider was left running because "
+                    "Hexis does not own it.",
+                )
+            if current.get("state_present"):
+                return (
+                    True,
+                    False,
+                    "Stale voice ownership state was preserved for review; no process "
+                    "was signaled.",
+                )
+            return True, False, None
+        result = stop_voice_sidecar()
+        return True, bool(result.get("changed")), None
+    except Exception as exc:
+        return False, False, f"Could not stop the Hexis-owned voice process: {exc}"
+
+
 def _get_dsn(args) -> str:
     """Get DSN respecting --instance flag, --dsn flag, or defaults."""
     if hasattr(args, "dsn") and args.dsn:
@@ -2394,7 +4026,9 @@ def _chat_session_export_jsonl(artifact: dict[str, Any]) -> str:
     }
     lines = [json.dumps(header, ensure_ascii=False, default=str)]
     for message in artifact.get("messages") or []:
-        lines.append(json.dumps({"type": "message", **message}, ensure_ascii=False, default=str))
+        lines.append(
+            json.dumps({"type": "message", **message}, ensure_ascii=False, default=str)
+        )
     return "\n".join(lines) + "\n"
 
 
@@ -2430,7 +4064,11 @@ async def _chat_sessions_list(
             f"Chat sessions ({data.get('count', len(sessions))}/{data.get('total_matching', len(sessions))} shown)\n"
         )
         for session in sessions:
-            title = session.get("title") or session.get("first_user_snippet") or "(untitled)"
+            title = (
+                session.get("title")
+                or session.get("first_user_snippet")
+                or "(untitled)"
+            )
             last = session.get("last_message_snippet") or ""
             sys.stdout.write(
                 f"  {session.get('session_id')}  "
@@ -2439,8 +4077,12 @@ async def _chat_sessions_list(
                 f"    {title}\n"
             )
             if last and last != title:
-                sys.stdout.write(f"    last {session.get('last_message_role')}: {_short_text(last)}\n")
-        sys.stdout.write("\nUse `hexis chat-sessions show <session_id>` or `hexis chat-sessions export <session_id>`.\n")
+                sys.stdout.write(
+                    f"    last {session.get('last_message_role')}: {_short_text(last)}\n"
+                )
+        sys.stdout.write(
+            "\nUse `hexis chat-sessions show <session_id>` or `hexis chat-sessions export <session_id>`.\n"
+        )
         return 0
     except Exception as exc:
         message = str(exc)
@@ -2500,7 +4142,9 @@ async def _chat_sessions_show(
         )
         for message in artifact.get("messages") or []:
             hidden = "" if message.get("visible_in_context") else " [hidden]"
-            sys.stdout.write(f"[{message.get('ordinal')}] {message.get('role')}{hidden}\n")
+            sys.stdout.write(
+                f"[{message.get('ordinal')}] {message.get('role')}{hidden}\n"
+            )
             sys.stdout.write(str(message.get("content") or "") + "\n\n")
         return 0
     except Exception as exc:
@@ -2550,7 +4194,9 @@ async def _chat_sessions_export(
         if output_format == "jsonl":
             content = _chat_session_export_jsonl(artifact)
         else:
-            content = json.dumps(artifact, indent=2, ensure_ascii=False, default=str) + "\n"
+            content = (
+                json.dumps(artifact, indent=2, ensure_ascii=False, default=str) + "\n"
+            )
 
         if output:
             out_path = Path(output).expanduser()
@@ -2573,7 +4219,9 @@ async def _chat_sessions_export(
         await pool.close()
 
 
-async def _chat_sessions_title(dsn: str, session_id: str, title: str, as_json: bool) -> int:
+async def _chat_sessions_title(
+    dsn: str, session_id: str, title: str, as_json: bool
+) -> int:
     import asyncpg
 
     try:
@@ -2628,7 +4276,9 @@ async def _chat_sessions_fork(
     import asyncpg
 
     try:
-        normalized_session_id = _validate_session_uuid(session_id, label="source session_id")
+        normalized_session_id = _validate_session_uuid(
+            session_id, label="source session_id"
+        )
     except ValueError as exc:
         _print_err(str(exc))
         return 1
@@ -2687,7 +4337,9 @@ async def _channels_status(dsn: str, as_json: bool) -> int:
                 GROUP BY channel_type
                 ORDER BY channel_type
             """)
-            total_messages = await conn.fetchval("SELECT COUNT(*) FROM channel_messages") or 0
+            total_messages = (
+                await conn.fetchval("SELECT COUNT(*) FROM channel_messages") or 0
+            )
 
         data = {
             "channels": [
@@ -2695,7 +4347,9 @@ async def _channels_status(dsn: str, as_json: bool) -> int:
                     "type": row["channel_type"],
                     "sessions": row["sessions"],
                     "active_1h": row["active_1h"],
-                    "last_active": str(row["last_active"]) if row["last_active"] else None,
+                    "last_active": (
+                        str(row["last_active"]) if row["last_active"] else None
+                    ),
                 }
                 for row in rows
             ],
@@ -2749,29 +4403,49 @@ async def _retention_status(dsn: str, as_json: bool) -> int:
         cap = epi.get("capacity") or 0
         cap_str = f"{cap}" if cap and float(cap) > 0 else "unlimited"
 
-        state = "ENABLED" if data.get("enabled") else "DISABLED (dark — nothing fades)"
+        hard_pruning = bool(data.get("irreversible_pruning_enabled"))
+        state = (
+            "ENABLED"
+            if data.get("enabled")
+            else "DISABLED (automatic rest-cycle consolidation paused)"
+        )
         out = [
             f"Memory Retention  [{state}]",
             "",
             "Episodic memory",
             f"  active memories        {epi.get('active', 0)}",
             f"  representational mass  {epi.get('mass', 0)}  (capacity: {cap_str})",
-            f"  archived (awaiting prune)  {epi.get('archived', 0)}",
+            (
+                f"  archived (hard-prune eligible)  {epi.get('archived', 0)}"
+                if hard_pruning
+                else f"  archived originals (recoverable)  {epi.get('archived', 0)}"
+            ),
+            f"  irreversible hard pruning  {'ENABLED' if hard_pruning else 'OFF (default)'}",
             "",
             "Consolidation",
             f"  candidate groups (would consolidate)  {con.get('candidate_groups', 0)}",
             f"  gists formed                          {con.get('gists', 0)}",
             f"  summarization pending                 {con.get('summarize_pending', 0)}",
             "",
-            "Conscious review (Hexis's veto)",
+            "Load-bearing review (your decision)",
             f"  pending      {rev.get('pending', 0)}",
             f"  keep-budget  {budget.get('remaining', '-')}/{budget.get('total', '-')}"
-            + (f'  (chapter: "{budget.get("chapter")}")' if budget.get("chapter") else ""),
+            + (
+                f'  (chapter: "{budget.get("chapter")}")'
+                if budget.get("chapter")
+                else ""
+            ),
             "",
             "Documents (your data — removed only with your approval)",
             f"  ingested documents protected  {doc.get('protected', 0)}",
             f"  approvals awaiting you         {doc.get('approvals_pending', 0)}"
-            + (f"  — {', '.join(doc.get('approval_labels') or [])}" if doc.get("approvals_pending") else ""),
+            + (
+                f"  — {', '.join(doc.get('approval_labels') or [])}"
+                if doc.get("approvals_pending")
+                else ""
+            ),
+            "",
+            "Review pressure, fade choices, and compression receipts: /forgetting",
         ]
         sys.stdout.write("\n".join(out) + "\n")
         return 0
@@ -2794,15 +4468,24 @@ def _print_dry_run(d: dict[str, Any]) -> None:
     docs = d.get("documents", {}) or {}
     before = (d.get("before", {}) or {}).get("episodic", {}) or {}
     after = (d.get("after", {}) or {}).get("episodic", {}) or {}
-    labels = ((d.get("after", {}) or {}).get("documents", {}) or {}).get("approval_labels") or []
+    labels = ((d.get("after", {}) or {}).get("documents", {}) or {}).get(
+        "approval_labels"
+    ) or []
     req = docs.get("requested", 0)
+    hard_pruning = bool(gc.get("irreversible_pruning_enabled"))
+    pruning_line = (
+        f"  Would hard-prune     {gc.get('pruned', 0)} archived original(s) past the grace window"
+        if hard_pruning
+        else "  Hard pruning        OFF — archived originals remain recoverable"
+    )
     lines = [
         "Retention dry-run — one rest cycle, simulated. NOTHING was changed.",
         "",
         f"  Would consolidate    {rest.get('consolidated', 0)} group(s) of aged memories into gists",
         f"  Would escalate       {rest.get('escalated', 0)} to your conscious review (Hexis's veto)",
-        f"  Would prune          {gc.get('pruned', 0)} archived original(s) past the grace window",
-        f"  Would ask you about  {req} stale document(s)" + (f": {', '.join(labels)}" if req and labels else ""),
+        pruning_line,
+        f"  Would ask you about  {req} stale document(s)"
+        + (f": {', '.join(labels)}" if req and labels else ""),
         "",
         f"  Episodic memory: {before.get('active', 0)} → {after.get('active', 0)} active"
         f"  (mass {before.get('mass', 0)} → {after.get('mass', 0)})",
@@ -2813,7 +4496,11 @@ def _print_dry_run(d: dict[str, Any]) -> None:
 
 
 def _print_alive_demo(result: dict[str, Any]) -> None:
-    heading = "Hexis is alive" if result.get("ok") else "Hexis capability proof needs attention"
+    heading = (
+        "Hexis is alive"
+        if result.get("ok")
+        else "Hexis capability proof needs attention"
+    )
     sys.stdout.write(
         f"{heading} ({result.get('passed', 0)}/{result.get('total', 0)} proofs passed)\n"
         "Mode: rollback-only; no LLM call, token cost, or retained demo state.\n\n"
@@ -2881,25 +4568,38 @@ async def _retention_enable(dsn: str, skip_confirm: bool) -> int:
             raw = await conn.fetchval("SELECT retention_dry_run()")
             thresholds = await conn.fetch(
                 "SELECT key, value FROM config WHERE key = ANY($1::text[]) ORDER BY key",
-                ["retention.min_age_days", "retention.consolidate_max_strength",
-                 "retention.prune_grace_days", "retention.veto_budget_per_chapter"])
+                [
+                    "retention.min_age_days",
+                    "retention.consolidate_max_strength",
+                    "retention.prune_grace_days",
+                    "retention.veto_budget_per_chapter",
+                ],
+            )
         data = json.loads(raw) if isinstance(raw, str) else raw
         _print_dry_run(data)
-        sys.stdout.write("\nStarting thresholds (conservative defaults — tune via `hexis config`):\n")
+        sys.stdout.write(
+            "\nStarting thresholds (conservative defaults — tune via `hexis config`):\n"
+        )
         for r in thresholds:
             val = json.loads(r["value"]) if isinstance(r["value"], str) else r["value"]
             sys.stdout.write(f"  {r['key']} = {val}\n")
         if not skip_confirm:
             sys.stdout.write(
-                "\nEnable memory retention now? Consolidation stays reversible for the grace window, "
-                "and ingested documents are never removed without your approval. [y/N] ")
+                "\nEnable memory retention now? Archived originals remain recoverable because "
+                "irreversible pruning is separately off, load-bearing reviews wait for your choice, "
+                "and ingested documents are never removed without your approval. [y/N] "
+            )
             sys.stdout.flush()
             if input().strip().lower() not in ("y", "yes"):
                 sys.stdout.write("Left disabled.\n")
                 return 0
         async with pool.acquire() as conn:
-            await conn.execute("UPDATE config SET value='true'::jsonb WHERE key='retention.enabled'")
-        sys.stdout.write("Memory retention is now ENABLED. Run `hexis retention` any time to see what it's doing.\n")
+            await conn.execute(
+                "UPDATE config SET value='true'::jsonb WHERE key='retention.enabled'"
+            )
+        sys.stdout.write(
+            "Memory retention is now ENABLED. Run `hexis retention` any time to see what it's doing.\n"
+        )
         return 0
     except Exception as e:
         _print_err(f"Error: {e}")
@@ -2909,14 +4609,18 @@ async def _retention_enable(dsn: str, skip_confirm: bool) -> int:
 
 
 async def _retention_disable(dsn: str) -> int:
-    """Turn retention back off (nothing fades)."""
+    """Pause automatic rest-cycle consolidation."""
     import asyncpg
 
     pool = await asyncpg.create_pool(dsn, min_size=1, max_size=2)
     try:
         async with pool.acquire() as conn:
-            await conn.execute("UPDATE config SET value='false'::jsonb WHERE key='retention.enabled'")
-        sys.stdout.write("Memory retention is now DISABLED (dark — nothing fades).\n")
+            await conn.execute(
+                "UPDATE config SET value='false'::jsonb WHERE key='retention.enabled'"
+            )
+        sys.stdout.write(
+            "Memory retention is now DISABLED; automatic rest-cycle consolidation is paused.\n"
+        )
         return 0
     except Exception as e:
         _print_err(f"Error: {e}")
@@ -2931,16 +4635,29 @@ async def _skills_status(dsn: str, as_json: bool) -> int:
     pool = await asyncpg.create_pool(dsn, min_size=1, max_size=2)
     try:
         async with pool.acquire() as conn:
-            enabled = bool(await conn.fetchval("SELECT get_config_bool('skills.self_improvement.enabled')"))
-            interval = await conn.fetchval("SELECT get_config_int('skills.self_improvement.interval_seconds')")
+            enabled = bool(
+                await conn.fetchval(
+                    "SELECT get_config_bool('skills.self_improvement.enabled')"
+                )
+            )
+            interval = await conn.fetchval(
+                "SELECT get_config_int('skills.self_improvement.interval_seconds')"
+            )
             state = await conn.fetchval("SELECT get_state('skill_improvement_state')")
             summary = await conn.fetchval("SELECT skill_improvement_pending_summary()")
+            pending_learning_reviews = int(
+                await conn.fetchval(
+                    "SELECT count(*) FROM learning_reviews WHERE status='pending'"
+                )
+                or 0
+            )
         state = json.loads(state) if isinstance(state, str) else (state or {})
         summary = json.loads(summary) if isinstance(summary, str) else (summary or {})
         data = {
             "enabled": enabled,
             "interval_seconds": interval,
             "pending": summary.get("count", 0),
+            "pending_learning_reviews": pending_learning_reviews,
             "last_completed_at": state.get("last_completed_at"),
             "last_result": state.get("last_result"),
         }
@@ -2951,6 +4668,7 @@ async def _skills_status(dsn: str, as_json: bool) -> int:
                 "Skill improvement: " + ("ENABLED" if enabled else "DISABLED") + "\n"
                 f"  Review interval: {interval or 'not configured'} seconds\n"
                 f"  Pending proposals: {data['pending']}\n"
+                f"  Pending learning reviews: {data['pending_learning_reviews']}\n"
                 f"  Last review: {data['last_completed_at'] or 'never'}\n"
             )
             if data["pending"]:
@@ -2974,19 +4692,28 @@ async def _skills_enable(dsn: str, skip_confirm: bool) -> int:
     pool = await asyncpg.create_pool(dsn, min_size=1, max_size=2)
     try:
         async with pool.acquire() as conn:
-            if await conn.fetchval("SELECT get_config_bool('skills.self_improvement.enabled')"):
-                sys.stdout.write("Background skill-improvement review is already enabled.\n")
+            if await conn.fetchval(
+                "SELECT get_config_bool('skills.self_improvement.enabled')"
+            ):
+                sys.stdout.write(
+                    "Background skill-improvement review is already enabled.\n"
+                )
                 return 0
             settings = await conn.fetch(
                 "SELECT key, value FROM config WHERE key LIKE 'skills.self_improvement.%' ORDER BY key"
             )
         sys.stdout.write(
-            "Background skill review examines bounded recent conversation excerpts using your "
-            "configured LLM. It creates reviewable proposals only; it never applies a skill automatically.\n\n"
+            "Background learning review examines bounded recent conversation excerpts using your "
+            "configured LLM. It creates one grounded weekly diff and reviewable skill proposals; "
+            "it never applies a skill automatically.\n\n"
             "Current settings:\n"
         )
         for row in settings:
-            value = json.loads(row["value"]) if isinstance(row["value"], str) else row["value"]
+            value = (
+                json.loads(row["value"])
+                if isinstance(row["value"], str)
+                else row["value"]
+            )
             sys.stdout.write(f"  {row['key']} = {value}\n")
         if not skip_confirm:
             sys.stdout.write("\nEnable background skill proposal review? [y/N] ")
@@ -2995,10 +4722,13 @@ async def _skills_enable(dsn: str, skip_confirm: bool) -> int:
                 sys.stdout.write("Left disabled.\n")
                 return 0
         async with pool.acquire() as conn:
-            await conn.execute("SELECT set_config('skills.self_improvement.enabled', 'true'::jsonb)")
+            await conn.execute(
+                "SELECT set_config('skills.self_improvement.enabled', 'true'::jsonb)"
+            )
         sys.stdout.write(
-            "Background skill-improvement review is ENABLED. "
-            "Use `hexis skills` for status and `hexis skills proposals` for review.\n"
+            "Weekly learning and skill review is ENABLED. "
+            "Use the Learning review dashboard for the diff, `hexis skills` for status, "
+            "and `hexis skills proposals` for proposal history.\n"
         )
         return 0
     except Exception as exc:
@@ -3014,9 +4744,11 @@ async def _skills_disable(dsn: str) -> int:
     pool = await asyncpg.create_pool(dsn, min_size=1, max_size=2)
     try:
         async with pool.acquire() as conn:
-            await conn.execute("SELECT set_config('skills.self_improvement.enabled', 'false'::jsonb)")
+            await conn.execute(
+                "SELECT set_config('skills.self_improvement.enabled', 'false'::jsonb)"
+            )
         sys.stdout.write(
-            "Background skill-improvement review is DISABLED. Existing proposals were kept.\n"
+            "Weekly learning and skill review is DISABLED. Existing reviews and proposals were kept.\n"
         )
         return 0
     except Exception as exc:
@@ -3071,7 +4803,9 @@ async def _skills_proposals(dsn: str, status: str, as_json: bool) -> int:
         await pool.close()
 
 
-async def _skills_review(dsn: str, proposal_id: str, action: str, skip_confirm: bool) -> int:
+async def _skills_review(
+    dsn: str, proposal_id: str, action: str, skip_confirm: bool
+) -> int:
     import asyncpg
 
     from core.tools import ToolContext, ToolExecutionContext, create_default_registry
@@ -3109,7 +4843,9 @@ async def _skills_review(dsn: str, proposal_id: str, action: str, skip_confirm: 
                 if action == "apply"
                 else f"mark this proposal {action}ed without deleting it"
             )
-            sys.stdout.write(f"\n{action.title()} this proposal and {consequence}? [y/N] ")
+            sys.stdout.write(
+                f"\n{action.title()} this proposal and {consequence}? [y/N] "
+            )
             sys.stdout.flush()
             if input().strip().lower() not in ("y", "yes"):
                 sys.stdout.write("No change made.\n")
@@ -3155,8 +4891,20 @@ async def _migrate(dsn: str, status_only: bool) -> int:
                     sys.stdout.write(f"  ✓ {v}\n")
                 for v in st["pending"]:
                     sys.stdout.write(f"  • {v}  (pending)\n")
+                for item in st["drifted"]:
+                    sys.stdout.write(
+                        f"  ! {item['version']}  (checksum mismatch: "
+                        f"recorded {item['recorded_checksum']}, "
+                        f"current {item['current_checksum']})\n"
+                    )
                 if not st["applied"] and not st["pending"]:
                     sys.stdout.write("No migrations found.\n")
+                elif st["drifted"]:
+                    _print_err(
+                        "Applied migration files changed. Restore the exact applied "
+                        "files and put corrections in a new forward migration."
+                    )
+                    return 1
                 elif not st["pending"]:
                     sys.stdout.write("Schema is up to date.\n")
                 return 0
@@ -3177,6 +4925,7 @@ async def _migrate(dsn: str, status_only: bool) -> int:
 
 def _do_backup(dsn: str, out_dir: str | None, label: str | None) -> int:
     from core.backup_restore import backup
+
     try:
         path = backup(dsn, out_dir, label)
         sys.stdout.write(f"Backup written: {path}\n")
@@ -3188,8 +4937,10 @@ def _do_backup(dsn: str, out_dir: str | None, label: str | None) -> int:
 
 def _do_restore(dsn: str, path: str, yes: bool) -> int:
     from core.backup_restore import restore
+
     if not yes:
         from apps.cli_theme import console
+
         console.print(
             "[bold red]WARNING:[/bold red] Restore REPLACES this database (all memories, "
             "identity, goals) with the backup. Stop the workers first (`hexis stop`)."
@@ -3223,17 +4974,37 @@ async def _channels_setup(dsn: str, channel_type: str) -> int:
             sys.stdout.write("2. Create a New Application\n")
             sys.stdout.write("3. Go to Bot > Token > Copy\n")
             sys.stdout.write("4. Enable Message Content Intent in Bot settings\n")
-            sys.stdout.write("5. Invite bot to your server with bot + applications.commands scopes\n\n")
-            token_env = input("Bot token env var name [DISCORD_BOT_TOKEN]: ").strip() or "DISCORD_BOT_TOKEN"
-            guilds = input("Allowed guild IDs (comma-separated, or * for all) [*]: ").strip() or "*"
+            sys.stdout.write(
+                "5. Invite bot to your server with bot + applications.commands scopes\n\n"
+            )
+            token_env = (
+                input("Bot token env var name [DISCORD_BOT_TOKEN]: ").strip()
+                or "DISCORD_BOT_TOKEN"
+            )
+            guilds = (
+                input("Allowed guild IDs (comma-separated, or * for all) [*]: ").strip()
+                or "*"
+            )
+            operator_user = input(
+                "Your Discord user ID for standing instructions (optional): "
+            ).strip()
+
+            discord_settings = {
+                "bot_token": token_env,
+                "allowed_guilds": guilds,
+            }
+            if operator_user:
+                discord_settings["operator_user_id"] = operator_user
 
             async with pool.acquire() as conn:
                 await conn.execute(
                     "SELECT apply_channel_config('discord', $1::jsonb)",
-                    json.dumps({"bot_token": token_env, "allowed_guilds": guilds}),
+                    json.dumps(discord_settings),
                 )
 
-            sys.stdout.write(f"\nDiscord configured. Set {token_env} in your environment.\n")
+            sys.stdout.write(
+                f"\nDiscord configured. Set {token_env} in your environment.\n"
+            )
             sys.stdout.write("Start with: hexis channels start --channel discord\n")
 
         elif channel_type == "telegram":
@@ -3242,91 +5013,197 @@ async def _channels_setup(dsn: str, channel_type: str) -> int:
             sys.stdout.write("1. Message @BotFather on Telegram\n")
             sys.stdout.write("2. Send /newbot and follow the prompts\n")
             sys.stdout.write("3. Copy the bot token\n\n")
-            token_env = input("Bot token env var name [TELEGRAM_BOT_TOKEN]: ").strip() or "TELEGRAM_BOT_TOKEN"
-            chats = input("Allowed chat IDs (comma-separated, or * for all) [*]: ").strip() or "*"
+            token_env = (
+                input("Bot token env var name [TELEGRAM_BOT_TOKEN]: ").strip()
+                or "TELEGRAM_BOT_TOKEN"
+            )
+            chats = (
+                input("Allowed chat IDs (comma-separated, or * for all) [*]: ").strip()
+                or "*"
+            )
+            operator_user = input(
+                "Your Telegram user ID for standing instructions (optional): "
+            ).strip()
+
+            telegram_settings = {
+                "bot_token": token_env,
+                "allowed_chat_ids": chats,
+            }
+            if operator_user:
+                telegram_settings["operator_user_id"] = operator_user
 
             async with pool.acquire() as conn:
                 await conn.execute(
                     "SELECT apply_channel_config('telegram', $1::jsonb)",
-                    json.dumps({"bot_token": token_env, "allowed_chat_ids": chats}),
+                    json.dumps(telegram_settings),
                 )
 
-            sys.stdout.write(f"\nTelegram configured. Set {token_env} in your environment.\n")
+            sys.stdout.write(
+                f"\nTelegram configured. Set {token_env} in your environment.\n"
+            )
             sys.stdout.write("Start with: hexis channels start --channel telegram\n")
 
         elif channel_type == "slack":
             sys.stdout.write("Slack Bot Setup\n")
             sys.stdout.write("=" * 40 + "\n")
-            sys.stdout.write("1. Go to https://api.slack.com/apps and create a new app\n")
-            sys.stdout.write("2. Under OAuth & Permissions, add scopes: chat:write, channels:history, users:read\n")
-            sys.stdout.write("3. Install to workspace and copy the Bot User OAuth Token (xoxb-...)\n")
-            sys.stdout.write("4. For Socket Mode: enable it under Socket Mode and copy the App Token (xapp-...)\n\n")
-            bot_env = input("Bot token env var name [SLACK_BOT_TOKEN]: ").strip() or "SLACK_BOT_TOKEN"
-            app_env = input("App token env var name (for Socket Mode) [SLACK_APP_TOKEN]: ").strip() or "SLACK_APP_TOKEN"
-            channels_allow = input("Allowed channel IDs (comma-separated, or * for all) [*]: ").strip() or "*"
+            sys.stdout.write(
+                "1. Go to https://api.slack.com/apps and create a new app\n"
+            )
+            sys.stdout.write(
+                "2. Under OAuth & Permissions, add scopes: chat:write, channels:history, users:read, im:write\n"
+            )
+            sys.stdout.write(
+                "3. Install to workspace and copy the Bot User OAuth Token (xoxb-...)\n"
+            )
+            sys.stdout.write(
+                "4. For Socket Mode: enable it under Socket Mode and copy the App Token (xapp-...)\n\n"
+            )
+            bot_env = (
+                input("Bot token env var name [SLACK_BOT_TOKEN]: ").strip()
+                or "SLACK_BOT_TOKEN"
+            )
+            app_env = (
+                input(
+                    "App token env var name (for Socket Mode) [SLACK_APP_TOKEN]: "
+                ).strip()
+                or "SLACK_APP_TOKEN"
+            )
+            owner_user = input(
+                "Your Slack user ID for private approval DMs (U...): "
+            ).strip()
+            signing_env = input(
+                "Signing-secret env var name (HTTP interactivity; blank for Socket Mode): "
+            ).strip()
+            channels_allow = (
+                input(
+                    "Allowed channel IDs (comma-separated, or * for all) [*]: "
+                ).strip()
+                or "*"
+            )
+
+            slack_settings = {
+                "bot_token": bot_env,
+                "app_token": app_env,
+                "allowed_channels": channels_allow,
+            }
+            if owner_user:
+                slack_settings["operator_user_id"] = owner_user
+            if signing_env:
+                slack_settings["signing_secret"] = signing_env
 
             async with pool.acquire() as conn:
                 await conn.execute(
                     "SELECT apply_channel_config('slack', $1::jsonb)",
-                    json.dumps({
-                        "bot_token": bot_env,
-                        "app_token": app_env,
-                        "allowed_channels": channels_allow,
-                    }),
+                    json.dumps(slack_settings),
                 )
 
-            sys.stdout.write(f"\nSlack configured. Set {bot_env} and {app_env} in your environment.\n")
+            sys.stdout.write(
+                f"\nSlack configured. Set {bot_env} and {app_env} in your environment.\n"
+            )
+            if not owner_user:
+                sys.stdout.write(
+                    "Protected tools will stay fail-closed outside the local terminal. "
+                    "Run this setup again with your Slack U... user ID to approve from a phone.\n"
+                )
             sys.stdout.write("Start with: hexis channels start --channel slack\n")
 
         elif channel_type == "signal":
             sys.stdout.write("Signal Setup (via signal-cli-rest-api)\n")
             sys.stdout.write("=" * 40 + "\n")
-            sys.stdout.write("1. Run signal-cli-rest-api as a sidecar (or use 'docker compose --profile signal up')\n")
+            sys.stdout.write(
+                "1. Run signal-cli-rest-api as a sidecar (or use 'docker compose --profile signal up')\n"
+            )
             sys.stdout.write("2. Register/link your phone number with signal-cli\n")
             sys.stdout.write("3. Provide the registered phone number\n\n")
-            phone_env = input("Phone number env var name [SIGNAL_PHONE_NUMBER]: ").strip() or "SIGNAL_PHONE_NUMBER"
-            api_url = input("Signal CLI API URL [http://localhost:8080]: ").strip() or "http://localhost:8080"
-            numbers = input("Allowed sender numbers (comma-separated, or * for all) [*]: ").strip() or "*"
+            phone_env = (
+                input("Phone number env var name [SIGNAL_PHONE_NUMBER]: ").strip()
+                or "SIGNAL_PHONE_NUMBER"
+            )
+            api_url = (
+                input("Signal CLI API URL [http://localhost:8080]: ").strip()
+                or "http://localhost:8080"
+            )
+            numbers = (
+                input(
+                    "Allowed sender numbers (comma-separated, or * for all) [*]: "
+                ).strip()
+                or "*"
+            )
+            operator_user = input(
+                "Your Signal number for standing instructions (optional): "
+            ).strip()
+
+            signal_settings = {
+                "phone_number": phone_env,
+                "api_url": api_url,
+                "allowed_numbers": numbers,
+            }
+            if operator_user:
+                signal_settings["operator_user_id"] = operator_user
 
             async with pool.acquire() as conn:
                 await conn.execute(
                     "SELECT apply_channel_config('signal', $1::jsonb)",
-                    json.dumps({
-                        "phone_number": phone_env,
-                        "api_url": api_url,
-                        "allowed_numbers": numbers,
-                    }),
+                    json.dumps(signal_settings),
                 )
 
-            sys.stdout.write(f"\nSignal configured. Set {phone_env} in your environment.\n")
+            sys.stdout.write(
+                f"\nSignal configured. Set {phone_env} in your environment.\n"
+            )
             sys.stdout.write("Start with: hexis channels start --channel signal\n")
 
         elif channel_type == "whatsapp":
             sys.stdout.write("WhatsApp Business Cloud API Setup\n")
             sys.stdout.write("=" * 40 + "\n")
-            sys.stdout.write("1. Go to https://developers.facebook.com and create a Meta Business app\n")
+            sys.stdout.write(
+                "1. Go to https://developers.facebook.com and create a Meta Business app\n"
+            )
             sys.stdout.write("2. Add the WhatsApp product\n")
             sys.stdout.write("3. Get your access token and phone number ID\n")
             sys.stdout.write("4. Configure a webhook pointing to your server\n\n")
-            token_env = input("Access token env var name [WHATSAPP_ACCESS_TOKEN]: ").strip() or "WHATSAPP_ACCESS_TOKEN"
-            phone_id = input("Phone number ID (or env var) [WHATSAPP_PHONE_NUMBER_ID]: ").strip() or "WHATSAPP_PHONE_NUMBER_ID"
-            verify = input("Webhook verify token [hexis_verify]: ").strip() or "hexis_verify"
+            token_env = (
+                input("Access token env var name [WHATSAPP_ACCESS_TOKEN]: ").strip()
+                or "WHATSAPP_ACCESS_TOKEN"
+            )
+            phone_id = (
+                input(
+                    "Phone number ID (or env var) [WHATSAPP_PHONE_NUMBER_ID]: "
+                ).strip()
+                or "WHATSAPP_PHONE_NUMBER_ID"
+            )
+            verify = (
+                input("Webhook verify token [hexis_verify]: ").strip() or "hexis_verify"
+            )
             port = input("Webhook port [8443]: ").strip() or "8443"
-            numbers = input("Allowed sender numbers (comma-separated, or * for all) [*]: ").strip() or "*"
+            numbers = (
+                input(
+                    "Allowed sender numbers (comma-separated, or * for all) [*]: "
+                ).strip()
+                or "*"
+            )
+            operator_user = input(
+                "Your WhatsApp number for standing instructions (optional): "
+            ).strip()
+
+            whatsapp_settings = {
+                "access_token": token_env,
+                "phone_number_id": phone_id,
+                "verify_token": verify,
+                "webhook_port": port,
+                "allowed_numbers": numbers,
+            }
+            if operator_user:
+                whatsapp_settings["operator_user_id"] = operator_user
 
             async with pool.acquire() as conn:
                 await conn.execute(
                     "SELECT apply_channel_config('whatsapp', $1::jsonb)",
-                    json.dumps({
-                        "access_token": token_env,
-                        "phone_number_id": phone_id,
-                        "verify_token": verify,
-                        "webhook_port": port,
-                        "allowed_numbers": numbers,
-                    }),
+                    json.dumps(whatsapp_settings),
                 )
 
-            sys.stdout.write(f"\nWhatsApp configured. Set {token_env} in your environment.\n")
+            sys.stdout.write(
+                f"\nWhatsApp configured. Set {token_env} in your environment.\n"
+            )
             sys.stdout.write("Start with: hexis channels start --channel whatsapp\n")
 
         elif channel_type == "imessage":
@@ -3335,21 +5212,43 @@ async def _channels_setup(dsn: str, channel_type: str) -> int:
             sys.stdout.write("1. Install BlueBubbles server on a Mac with iMessage\n")
             sys.stdout.write("2. Configure and start the BlueBubbles server\n")
             sys.stdout.write("3. Note the server URL and password\n\n")
-            api_url = input("BlueBubbles API URL [http://localhost:1234]: ").strip() or "http://localhost:1234"
-            password_env = input("Password env var name [IMESSAGE_PASSWORD]: ").strip() or "IMESSAGE_PASSWORD"
-            handles = input("Allowed handles (comma-separated, or * for all) [*]: ").strip() or "*"
+            api_url = (
+                input("BlueBubbles API URL [http://localhost:1234]: ").strip()
+                or "http://localhost:1234"
+            )
+            password_env = (
+                input("Password env var name [IMESSAGE_PASSWORD]: ").strip()
+                or "IMESSAGE_PASSWORD"
+            )
+            handles = (
+                input("Allowed handles (comma-separated, or * for all) [*]: ").strip()
+                or "*"
+            )
+            operator_recipient = input(
+                "Your iMessage phone/email for approval escalation (optional): "
+            ).strip()
+
+            imessage_settings = {
+                "api_url": api_url,
+                "password": password_env,
+                "allowed_handles": handles,
+            }
+            if operator_recipient:
+                imessage_settings["operator_recipient"] = operator_recipient
 
             async with pool.acquire() as conn:
                 await conn.execute(
                     "SELECT apply_channel_config('imessage', $1::jsonb)",
-                    json.dumps({
-                        "api_url": api_url,
-                        "password": password_env,
-                        "allowed_handles": handles,
-                    }),
+                    json.dumps(imessage_settings),
                 )
 
-            sys.stdout.write(f"\niMessage configured. Set {password_env} in your environment.\n")
+            sys.stdout.write(
+                f"\niMessage configured. Set {password_env} in your environment.\n"
+            )
+            if operator_recipient:
+                sys.stdout.write(
+                    "Unanswered Slack approvals will escalate to that recipient after the configured delay.\n"
+                )
             sys.stdout.write("Start with: hexis channels start --channel imessage\n")
 
         elif channel_type == "matrix":
@@ -3358,23 +5257,41 @@ async def _channels_setup(dsn: str, channel_type: str) -> int:
             sys.stdout.write("1. Create a bot account on your Matrix homeserver\n")
             sys.stdout.write("2. Generate an access token for the bot\n")
             sys.stdout.write("3. Invite the bot to rooms you want it to monitor\n\n")
-            homeserver = input("Homeserver URL [https://matrix.org]: ").strip() or "https://matrix.org"
+            homeserver = (
+                input("Homeserver URL [https://matrix.org]: ").strip()
+                or "https://matrix.org"
+            )
             user_id = input("Bot user ID (e.g. @hexis:matrix.org): ").strip()
-            token_env = input("Access token env var name [MATRIX_ACCESS_TOKEN]: ").strip() or "MATRIX_ACCESS_TOKEN"
-            rooms = input("Allowed room IDs (comma-separated, or * for all) [*]: ").strip() or "*"
+            token_env = (
+                input("Access token env var name [MATRIX_ACCESS_TOKEN]: ").strip()
+                or "MATRIX_ACCESS_TOKEN"
+            )
+            rooms = (
+                input("Allowed room IDs (comma-separated, or * for all) [*]: ").strip()
+                or "*"
+            )
+            operator_user = input(
+                "Your Matrix user ID for standing instructions (optional): "
+            ).strip()
+
+            matrix_settings = {
+                "homeserver": homeserver,
+                "user_id": user_id,
+                "access_token": token_env,
+                "allowed_rooms": rooms,
+            }
+            if operator_user:
+                matrix_settings["operator_user_id"] = operator_user
 
             async with pool.acquire() as conn:
                 await conn.execute(
                     "SELECT apply_channel_config('matrix', $1::jsonb)",
-                    json.dumps({
-                        "homeserver": homeserver,
-                        "user_id": user_id,
-                        "access_token": token_env,
-                        "allowed_rooms": rooms,
-                    }),
+                    json.dumps(matrix_settings),
                 )
 
-            sys.stdout.write(f"\nMatrix configured. Set {token_env} in your environment.\n")
+            sys.stdout.write(
+                f"\nMatrix configured. Set {token_env} in your environment.\n"
+            )
             sys.stdout.write("Start with: hexis channels start --channel matrix\n")
 
         return 0
@@ -3408,14 +5325,22 @@ def _print_rich_status(p: dict[str, Any]) -> None:
 
     # Energy
     energy = p.get("energy")
-    max_energy = p.get("max_energy", 20)
+    reserve_energy = p.get("energy_reserve", p.get("max_energy", 20))
+    energy_capacity = p.get("energy_capacity", reserve_energy)
     if energy is not None:
         regen = p.get("next_regen_minutes")
-        regen_str = f"  [muted](regen in {regen}m)[/muted]" if regen and energy < max_energy else ""
+        regen_str = (
+            f"  [muted](regen in {regen}m)[/muted]"
+            if regen and energy < energy_capacity
+            else ""
+        )
         lines.append("Energy    ", style="key")
         console.print(make_panel(lines, title=identity, subtitle=instance))
         lines = Text()
-        console.print(f"  [key]Energy   [/key] {energy_bar(energy, max_energy)}{regen_str}")
+        console.print(
+            f"  [key]Energy   [/key] {energy_bar(energy, energy_capacity)}"
+            f"  [muted](reserve {reserve_energy})[/muted]{regen_str}"
+        )
     else:
         console.print(make_panel(lines, title=identity, subtitle=instance))
 
@@ -3428,17 +5353,20 @@ def _print_rich_status(p: dict[str, Any]) -> None:
         console.print("  [key]Heartbeat[/key] [warn]paused[/warn]")
     elif active and last_ago:
         interval_str = f", interval: {int(interval)}m" if interval else ""
-        console.print(f"  [key]Heartbeat[/key] [ok]active[/ok] [muted](last: {last_ago} ago{interval_str})[/muted]")
+        console.print(
+            f"  [key]Heartbeat[/key] [ok]active[/ok] [muted](last: {last_ago} ago{interval_str})[/muted]"
+        )
     elif last_ago:
-        console.print(f"  [key]Heartbeat[/key] [muted]idle (last: {last_ago} ago)[/muted]")
+        console.print(
+            f"  [key]Heartbeat[/key] [muted]idle (last: {last_ago} ago)[/muted]"
+        )
     else:
         console.print("  [key]Heartbeat[/key] [muted]never run[/muted]")
 
     # Worker runtime liveness
     workers = p.get("workers", [])
     active_workers = [
-        w for w in workers
-        if w.get("status") not in {"stopped", "terminated"}
+        w for w in workers if w.get("status") not in {"stopped", "terminated"}
     ]
     if active_workers:
         latest_by_mode = {}
@@ -3453,7 +5381,9 @@ def _print_rich_status(p: dict[str, Any]) -> None:
             style = "warn" if status == "stale" else "ok"
             task = worker.get("current_task_type")
             task_s = f":{task}" if task else ""
-            parts.append(f"[{style}]{mode}{task_s} {status}[/{style}] [muted]({age_s})[/muted]")
+            parts.append(
+                f"[{style}]{mode}{task_s} {status}[/{style}] [muted]({age_s})[/muted]"
+            )
         console.print(f"  [key]Workers  [/key] {', '.join(parts)}")
     else:
         # No records at all means nothing is running the loops — say the fix
@@ -3489,12 +5419,13 @@ def _print_rich_status(p: dict[str, Any]) -> None:
     # Scheduled tasks
     sched = p.get("scheduled_tasks", 0)
     if sched > 0:
-        console.print(f"  [key]Scheduled[/key] {sched} active task{'s' if sched != 1 else ''}")
+        console.print(
+            f"  [key]Scheduled[/key] {sched} active task{'s' if sched != 1 else ''}"
+        )
 
     worker_tasks = p.get("worker_tasks", [])
     failed_tasks = [
-        t for t in worker_tasks
-        if int(t.get("failures_since_success") or 0) > 0
+        t for t in worker_tasks if int(t.get("failures_since_success") or 0) > 0
     ]
     if failed_tasks:
         parts = [
@@ -3512,7 +5443,9 @@ def _print_rich_status(p: dict[str, Any]) -> None:
     console.print()
 
 
-async def _recall(dsn: str, query: str, limit: int, memory_type: str | None, as_json: bool) -> int:
+async def _recall(
+    dsn: str, query: str, limit: int, memory_type: str | None, as_json: bool
+) -> int:
     """Search memories by semantic query."""
     import asyncpg
     from core.cognitive_memory_api import CognitiveMemory, MemoryType
@@ -3553,7 +5486,9 @@ async def _recall(dsn: str, query: str, limit: int, memory_type: str | None, as_
             )
             for m in result.memories:
                 content = m.content[:120] + "..." if len(m.content) > 120 else m.content
-                created = m.created_at.strftime("%Y-%m-%d %H:%M") if m.created_at else "-"
+                created = (
+                    m.created_at.strftime("%Y-%m-%d %H:%M") if m.created_at else "-"
+                )
                 table.add_row(
                     m.type,
                     content,
@@ -3608,8 +5543,11 @@ async def _goals_list(dsn: str, priority: str | None, as_json: bool) -> int:
                 by_priority.setdefault(p, []).append(g)
 
             priority_colors = {
-                "active": "accent", "queued": "teal", "backburner": "muted",
-                "completed": "ok", "abandoned": "fail",
+                "active": "accent",
+                "queued": "teal",
+                "backburner": "muted",
+                "completed": "ok",
+                "abandoned": "fail",
             }
 
             table = _mt(
@@ -3644,7 +5582,9 @@ async def _goals_list(dsn: str, priority: str | None, as_json: bool) -> int:
                         touched = touched.strftime("%Y-%m-%d")
                     elif isinstance(touched, str) and len(touched) > 10:
                         touched = touched[:10]
-                    table.add_row(f"[{color}]{prio}[/{color}]", title, source, str(touched) or "-")
+                    table.add_row(
+                        f"[{color}]{prio}[/{color}]", title, source, str(touched) or "-"
+                    )
             _con.print(table)
 
         return 0
@@ -3652,7 +5592,9 @@ async def _goals_list(dsn: str, priority: str | None, as_json: bool) -> int:
         await pool.close()
 
 
-async def _goals_create(dsn: str, title: str, description: str | None, priority: str, source: str) -> int:
+async def _goals_create(
+    dsn: str, title: str, description: str | None, priority: str, source: str
+) -> int:
     """Create a new goal."""
     import asyncpg
 
@@ -3661,16 +5603,24 @@ async def _goals_create(dsn: str, title: str, description: str | None, priority:
         async with pool.acquire() as conn:
             goal_id = await conn.fetchval(
                 "SELECT create_goal($1, $2, $3::goal_source, $4::goal_priority)",
-                title, description, source, priority,
+                title,
+                description,
+                source,
+                priority,
             )
         from apps.cli_theme import console as _con
-        _con.print(f"[ok]\u2714[/ok] Goal created: [bold]{title}[/bold] [muted]({goal_id})[/muted]")
+
+        _con.print(
+            f"[ok]\u2714[/ok] Goal created: [bold]{title}[/bold] [muted]({goal_id})[/muted]"
+        )
         return 0
     finally:
         await pool.close()
 
 
-async def _goals_update(dsn: str, goal_id: str, priority: str, reason: str | None) -> int:
+async def _goals_update(
+    dsn: str, goal_id: str, priority: str, reason: str | None
+) -> int:
     """Change goal priority."""
     import asyncpg
 
@@ -3679,10 +5629,15 @@ async def _goals_update(dsn: str, goal_id: str, priority: str, reason: str | Non
         async with pool.acquire() as conn:
             await conn.execute(
                 "SELECT change_goal_priority($1::uuid, $2::goal_priority, $3)",
-                goal_id, priority, reason,
+                goal_id,
+                priority,
+                reason,
             )
         from apps.cli_theme import console as _con
-        _con.print(f"[ok]\u2714[/ok] Goal {goal_id[:8]}... priority changed to [bold]{priority}[/bold]")
+
+        _con.print(
+            f"[ok]\u2714[/ok] Goal {goal_id[:8]}... priority changed to [bold]{priority}[/bold]"
+        )
         return 0
     except Exception as e:
         _print_err(f"Failed to update goal: {e}")
@@ -3700,7 +5655,8 @@ async def _schedule_list(dsn: str, status_filter: str | None, as_json: bool) -> 
         async with pool.acquire() as conn:
             if status_filter:
                 rows = await conn.fetch(
-                    "SELECT * FROM list_scheduled_tasks($1)", status_filter,
+                    "SELECT * FROM list_scheduled_tasks($1)",
+                    status_filter,
                 )
             else:
                 rows = await conn.fetch("SELECT * FROM list_scheduled_tasks()")
@@ -3726,9 +5682,13 @@ async def _schedule_list(dsn: str, status_filter: str | None, as_json: bool) -> 
             for t in tasks:
                 status = str(t.get("status", ""))
                 status_styled = (
-                    f"[ok]{status}[/ok]" if status == "active"
-                    else f"[warn]{status}[/warn]" if status == "paused"
-                    else f"[muted]{status}[/muted]"
+                    f"[ok]{status}[/ok]"
+                    if status == "active"
+                    else (
+                        f"[warn]{status}[/warn]"
+                        if status == "paused"
+                        else f"[muted]{status}[/muted]"
+                    )
                 )
                 next_run = t.get("next_run_at", "")
                 if hasattr(next_run, "strftime"):
@@ -3748,8 +5708,14 @@ async def _schedule_list(dsn: str, status_filter: str | None, as_json: bool) -> 
 
 
 async def _schedule_create(
-    dsn: str, name: str, kind: str, action: str,
-    payload_str: str, schedule_str: str, timezone: str, description: str | None,
+    dsn: str,
+    name: str,
+    kind: str,
+    action: str,
+    payload_str: str,
+    schedule_str: str,
+    timezone: str,
+    description: str | None,
 ) -> int:
     """Create a scheduled task."""
     import asyncpg
@@ -3766,11 +5732,19 @@ async def _schedule_create(
         async with pool.acquire() as conn:
             task_id = await conn.fetchval(
                 "SELECT create_scheduled_task($1, $2, $3::jsonb, $4, $5::jsonb, $6, $7)",
-                name, kind, json.dumps(schedule_json), action,
-                json.dumps(action_payload), timezone, description,
+                name,
+                kind,
+                json.dumps(schedule_json),
+                action,
+                json.dumps(action_payload),
+                timezone,
+                description,
             )
         from apps.cli_theme import console as _con
-        _con.print(f"[ok]\u2714[/ok] Scheduled task created: [bold]{name}[/bold] [muted]({task_id})[/muted]")
+
+        _con.print(
+            f"[ok]\u2714[/ok] Scheduled task created: [bold]{name}[/bold] [muted]({task_id})[/muted]"
+        )
         return 0
     finally:
         await pool.close()
@@ -3784,9 +5758,12 @@ async def _schedule_delete(dsn: str, task_id: str, force: bool) -> int:
     try:
         async with pool.acquire() as conn:
             await conn.execute(
-                "SELECT delete_scheduled_task($1::uuid, $2)", task_id, force,
+                "SELECT delete_scheduled_task($1::uuid, $2)",
+                task_id,
+                force,
             )
         from apps.cli_theme import console as _con
+
         action = "deleted" if force else "disabled"
         _con.print(f"[ok]\u2714[/ok] Task {task_id[:8]}... {action}")
         return 0
@@ -3800,6 +5777,7 @@ async def _schedule_delete(dsn: str, task_id: str, force: bool) -> int:
 def _port_ready(port: int, host: str = "127.0.0.1", timeout: float = 0.5) -> bool:
     """True if something accepts a TCP connection on host:port."""
     import socket
+
     try:
         with socket.create_connection((host, port), timeout=timeout):
             return True
@@ -3870,9 +5848,7 @@ def _write_local_embedding_ownership(record: dict[str, Any]) -> bool:
     )
     try:
         ownership_file.parent.mkdir(parents=True, exist_ok=True)
-        temporary_file.write_text(
-            json.dumps(record, indent=2) + "\n", encoding="utf-8"
-        )
+        temporary_file.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
         os.replace(temporary_file, ownership_file)
         return True
     except OSError:
@@ -4012,7 +5988,9 @@ def _purge_owned_local_embedding_assets() -> tuple[list[Path], list[str]]:
                 shutil.rmtree(resolved_cache)
                 removed.append(resolved_cache)
             except OSError as exc:
-                notes.append(f"Could not remove owned embedding cache {resolved_cache}: {exc}")
+                notes.append(
+                    f"Could not remove owned embedding cache {resolved_cache}: {exc}"
+                )
 
     return removed, notes
 
@@ -4352,7 +6330,9 @@ def _start_local_embedding_service(wait_seconds: float = 90.0) -> bool:
     if _port_ready(_LOCAL_EMBEDDING_PORT):
         listener = _port_listener_summary(_LOCAL_EMBEDDING_PORT)
         if listener and "embeddinggemma" in listener.lower():
-            console.print(f"[ok]Embedding service is already listening on port {_LOCAL_EMBEDDING_PORT}.[/ok]")
+            console.print(
+                f"[ok]Embedding service is already listening on port {_LOCAL_EMBEDDING_PORT}.[/ok]"
+            )
             return True
         detail = f" Listener: {listener}." if listener else ""
         console.print(
@@ -4407,7 +6387,9 @@ def _start_local_embedding_service(wait_seconds: float = 90.0) -> bool:
             "risk stopping another application's service."
         )
 
-    console.print(f"[muted]Waiting for embedding service on port {_LOCAL_EMBEDDING_PORT}...[/muted]")
+    console.print(
+        f"[muted]Waiting for embedding service on port {_LOCAL_EMBEDDING_PORT}...[/muted]"
+    )
     deadline = _time.monotonic() + wait_seconds
     cache_ownership_warning_shown = False
     while _time.monotonic() < deadline:
@@ -4423,7 +6405,9 @@ def _start_local_embedding_service(wait_seconds: float = 90.0) -> bool:
             )
             cache_ownership_warning_shown = True
         if _port_ready(_LOCAL_EMBEDDING_PORT):
-            console.print(f"[ok]Embedding service is ready on port {_LOCAL_EMBEDDING_PORT}.[/ok]")
+            console.print(
+                f"[ok]Embedding service is ready on port {_LOCAL_EMBEDDING_PORT}.[/ok]"
+            )
             return True
         if proc is not None and proc.poll() is not None:
             _forget_local_embedding_process()
@@ -4463,6 +6447,7 @@ def _wait_port_ready(port: int, host: str = "127.0.0.1", overall: float = 45.0) 
     """Poll until the port accepts connections (or time out). Beats a fixed
     sleep before opening a browser at a cold Next.js build (Bar #4)."""
     import time as _time
+
     deadline = _time.monotonic() + overall
     while _time.monotonic() < deadline:
         if _port_ready(port, host):
@@ -4503,6 +6488,7 @@ def _handle_ui(
     # Install deps if needed
     if not (ui_dir / "node_modules").is_dir():
         from apps.cli_theme import console
+
         console.print(f"[accent]Installing dependencies with {pkg_cmd}...[/accent]")
         rc = subprocess.run([runner, "install"], cwd=ui_dir).returncode
         if rc != 0:
@@ -4529,15 +6515,12 @@ def _handle_ui(
     chat_url = f"http://localhost:{port}/chat"
     local_chat_url = f"http://127.0.0.1:{port}/chat"
     if _http_ready(local_chat_url) or _http_ready(chat_url):
-        listener = _port_listener_summary(port)
-        detail = f" Listener: {listener}." if listener else ""
-        _print_err(
-            f"Web dashboard is already running on port {port}."
-            f"{detail}\n"
-            "`hexis ui` runs the dashboard in the foreground. Stop the existing UI process, "
-            "then run `hexis ui` again."
-        )
-        return 1
+        from apps.cli_theme import console
+
+        console.print(f"[ok]Web dashboard is already running on port {port}.[/ok]")
+        if not no_open:
+            open_url(chat_url)
+        return 0
 
     if _port_ready(port):
         listener = _port_listener_summary(port)
@@ -4564,6 +6547,7 @@ def _handle_ui(
 
     if is_local_api and not _api_healthcheck(api_url):
         from apps.cli_theme import console
+
         console.print("[accent]Starting local Hexis API for web chat...[/accent]")
         api_port = parsed_api.port or 43817
         api_cmd = [
@@ -4597,7 +6581,9 @@ def _handle_ui(
             if _api_healthcheck(api_url):
                 break
             if api_proc.poll() is not None:
-                _print_err("Hexis API exited immediately. Run `hexis api` to inspect errors.")
+                _print_err(
+                    "Hexis API exited immediately. Run `hexis api` to inspect errors."
+                )
                 return 1
             time.sleep(0.2)
         else:
@@ -4611,14 +6597,19 @@ def _handle_ui(
             return 1
 
     from apps.cli_theme import console
+
     console.print(f"\n[accent]Starting web dashboard on port {port}...[/accent]")
-    console.print("[muted]Dashboard runs in this terminal. Press Ctrl+C to stop it.[/muted]")
+    console.print(
+        "[muted]Dashboard runs in this terminal. Press Ctrl+C to stop it.[/muted]"
+    )
 
     # Open the browser only once the server actually responds — not on a timer.
     if not no_open:
+
         def _open_browser():
             if _wait_port_ready(port):
                 open_url(chat_url)
+
         t = threading.Thread(target=_open_browser, daemon=True)
         t.start()
 
@@ -4711,16 +6702,13 @@ def _handle_ui_container(
 
     from apps.cli_theme import console
 
-    if _http_ready(f"http://127.0.0.1:{port}/chat") or _http_ready(f"http://localhost:{port}/chat"):
-        listener = _port_listener_summary(port)
-        detail = f" Listener: {listener}." if listener else ""
-        _print_err(
-            f"Web dashboard is already running on port {port}."
-            f"{detail}\n"
-            "`hexis ui` runs the dashboard in the foreground. Stop the existing UI process, "
-            "then run `hexis ui` again."
-        )
-        return 1
+    if _http_ready(f"http://127.0.0.1:{port}/chat") or _http_ready(
+        f"http://localhost:{port}/chat"
+    ):
+        console.print(f"[ok]Web dashboard is already running on port {port}.[/ok]")
+        if not no_open:
+            open_url(f"http://localhost:{port}/chat")
+        return 0
     if _port_ready(port):
         listener = _port_listener_summary(port)
         detail = f" Listener: {listener}." if listener else ""
@@ -4740,37 +6728,63 @@ def _handle_ui_container(
         pass  # advisory only; init write routes surface embedding failures
 
     console.print("[accent]Starting containerized web dashboard...[/accent]")
-    console.print("[muted]Dashboard runs in this terminal. Press Ctrl+C to stop it.[/muted]")
+    console.print(
+        "[muted]Dashboard runs in this terminal. Press Ctrl+C to stop it.[/muted]"
+    )
 
     # The always-on loops come up with the dashboard and stay up after it
-    # closes: someone who only ever runs `hexis ui` still gets an agent that
-    # thinks between visits. Idempotent — a no-op if they are already running.
-    if run_compose(
-        compose_cmd, compose_file, stack_root,
-        ["up", "-d", "heartbeat_worker", "maintenance_worker"], env_file,
-    ) != 0:
+    # closes. Prefer installed host services and start Docker only for workers
+    # that do not have a user-service owner.
+    host_managed_workers = _host_managed_compose_workers()
+    host_workers_ok = True
+    if host_managed_workers:
+        host_workers_ok, _host_error = _ensure_installed_host_services_running()
+    docker_worker_targets = [
+        name
+        for name in ("heartbeat_worker", "maintenance_worker")
+        if name not in host_managed_workers
+    ]
+    docker_workers_ok = True
+    if docker_worker_targets:
+        docker_workers_ok = (
+            run_compose(
+                compose_cmd,
+                compose_file,
+                stack_root,
+                ["up", "-d", *docker_worker_targets],
+                env_file,
+            )
+            == 0
+        )
+    if not host_workers_ok or not docker_workers_ok:
         console.print(
             "[warn]⚠ Could not start the heartbeat and maintenance workers[/warn] "
             "[muted]— the dashboard still works, but the agent will not act on its "
-            "own until `hexis up` succeeds.[/muted]"
+            "own until `hexis start` succeeds.[/muted]"
         )
 
     # Bring up both the UI and the canonical Python API (hexis-api).
     # The Next.js BFF proxies chat + consent to hexis-api.
     # Open the browser only once the server actually responds — not on a timer.
     if not no_open:
+
         def _open_browser():
             if _wait_port_ready(port):
                 open_url(f"http://localhost:{port}")
+
         t = threading.Thread(target=_open_browser, daemon=True)
         t.start()
 
     try:
-        return run_compose(compose_cmd, compose_file, stack_root, ["up", "api", "ui"], env_file)
+        return run_compose(
+            compose_cmd, compose_file, stack_root, ["up", "api", "ui"], env_file
+        )
     except KeyboardInterrupt:
         return 0
     finally:
-        run_compose(compose_cmd, compose_file, stack_root, ["stop", "ui", "api"], env_file)
+        run_compose(
+            compose_cmd, compose_file, stack_root, ["stop", "ui", "api"], env_file
+        )
 
 
 def _path_is_within(path: Path, directory: Path) -> bool:
@@ -4831,9 +6845,7 @@ def _package_uninstall_command() -> tuple[list[str], str]:
 
     pipx = _find_uninstall_program("pipx")
     if pipx:
-        pipx_root = _capture_path(
-            [pipx, "environment", "--value", "PIPX_LOCAL_VENVS"]
-        )
+        pipx_root = _capture_path([pipx, "environment", "--value", "PIPX_LOCAL_VENVS"])
         if pipx_root and _path_is_within(prefix, pipx_root / "hexis"):
             return [pipx, "uninstall", "hexis"], "pipx"
 
@@ -4879,7 +6891,9 @@ def _confirm_uninstall(*, purge: bool, cli_only: bool, data_dir: Path) -> bool:
         print("  - remove the Hexis CLI installation")
     if purge:
         print("  - PERMANENTLY DELETE the brain database volumes")
-        print(f"  - PERMANENTLY DELETE Hexis config, credentials, and backups at {data_dir}")
+        print(
+            f"  - PERMANENTLY DELETE Hexis config, credentials, and backups at {data_dir}"
+        )
         print("  - delete embeddinggemma assets that Hexis can prove it created")
         phrase = "uninstall and delete data"
         print(
@@ -4921,7 +6935,9 @@ def _uninstall(
         return 1
 
     sidecar_note: str | None = None
+    voice_note: str | None = None
     embedding_cleanup_notes: list[str] = []
+    removed_host_services: list[str] = []
     if not cli_only:
         if compose_file is None:
             _print_err(
@@ -4945,9 +6961,7 @@ def _uninstall(
         if purge:
             compose_args.append("--volumes")
         print("Removing Hexis Docker resources...")
-        rc = run_compose(
-            compose_cmd, compose_file, stack_root, compose_args, env_file
-        )
+        rc = run_compose(compose_cmd, compose_file, stack_root, compose_args, env_file)
         if rc != 0:
             _print_err(
                 "Docker cleanup failed, so the CLI was kept. Fix the Docker error "
@@ -4958,6 +6972,37 @@ def _uninstall(
         stopped_sidecar, sidecar_note = _stop_owned_local_embedding_service()
         if stopped_sidecar:
             print("Stopped the embedding service started by Hexis.")
+
+    voice_ok, voice_stopped, voice_note = _stop_owned_voice_sidecar()
+    if not voice_ok:
+        _print_err(
+            f"{voice_note} The CLI was kept so the owned process can still be "
+            "inspected; run `hexis voice status`, resolve the error, and retry."
+        )
+        return 1
+    if voice_stopped:
+        print("Stopped the local voice process started by Hexis.")
+
+    # User services execute the installed Python package. Remove those managed
+    # references before uninstalling the package so launchd/systemd cannot keep
+    # retrying an executable that no longer exists. Logs remain unless --purge
+    # explicitly removes the Hexis data directory below.
+    try:
+        from core.host_services import installed_host_services, uninstall_host_services
+
+        installed = installed_host_services()
+        if installed:
+            result = uninstall_host_services(installed)
+            removed_host_services = list(result["uninstalled"])
+            print(
+                "Removed Hexis host services: " + ", ".join(removed_host_services) + "."
+            )
+    except Exception as exc:
+        _print_err(
+            "Hexis could not remove its host services, so the CLI and data were kept. "
+            f"{exc} Run `hexis service status`, resolve the provider error, and retry."
+        )
+        return 1
 
     if purge:
         if _port_ready(_LOCAL_EMBEDDING_PORT):
@@ -4976,9 +7021,7 @@ def _uninstall(
             return 1
 
     source_note = (
-        f" The source checkout at {stack_root} was left in place."
-        if is_source
-        else ""
+        f" The source checkout at {stack_root} was left in place." if is_source else ""
     )
     embedding_binary_retained = _local_embedding_binary() is not None
     print(f"Uninstalling Hexis with {package_manager}...", flush=True)
@@ -5002,6 +7045,10 @@ def _uninstall(
         print("Reinstall Hexis and run `hexis up` to restore the agent.")
     if sidecar_note:
         print(f"\nNote: {sidecar_note}")
+    if voice_note:
+        print(f"\nNote: {voice_note}")
+    if removed_host_services and not purge:
+        print("Host-service logs were preserved under ~/.hexis/logs/host-services.")
     for note in embedding_cleanup_notes:
         print(f"Note: {note}")
     if embedding_binary_retained:
@@ -5028,10 +7075,17 @@ def main(argv: list[str] | None = None) -> int:
         return 130
     except Exception as e:  # noqa: BLE001
         low = str(e).lower()
-        if any(s in low for s in (
-            "postgres", "connection refused", "connect call failed",
-            "failed to connect", "timed out connecting", "timeouterror",
-        )) or isinstance(e, (ConnectionError, TimeoutError)):
+        if any(
+            s in low
+            for s in (
+                "postgres",
+                "connection refused",
+                "connect call failed",
+                "failed to connect",
+                "timed out connecting",
+                "timeouterror",
+            )
+        ) or isinstance(e, (ConnectionError, TimeoutError)):
             _print_err(
                 "Can't reach the database. Is the stack running? "
                 "Try `hexis up`, then `hexis doctor`."
@@ -5114,7 +7168,14 @@ def _dispatch(argv: list[str] | None = None) -> int:
             # the `ingest` subcommand when the user passed flags.
             if fwd_argv and fwd_argv[0] == "--":
                 fwd_argv = fwd_argv[1:]
-            if fwd_argv and fwd_argv[0] not in {"ingest", "status", "process", "backfill-chunks", "-h", "--help"}:
+            if fwd_argv and fwd_argv[0] not in {
+                "ingest",
+                "status",
+                "process",
+                "backfill-chunks",
+                "-h",
+                "--help",
+            }:
                 fwd_argv = ["ingest", *fwd_argv]
 
         return _run_module(forward_map[cmd], fwd_argv)
@@ -5170,9 +7231,20 @@ def _dispatch(argv: list[str] | None = None) -> int:
         return asyncio.run(_instance_import(args.name, args.database, args.description))
 
     # Filing cabinet + desk commands (DB-backed; don't need docker)
-    if func in {"docs", "docs_search", "docs_open", "docs_info", "docs_load",
-                "desk", "desk_list", "desk_open", "desk_search",
-                "desk_pin", "desk_unpin", "desk_clear"}:
+    if func in {
+        "docs",
+        "docs_search",
+        "docs_open",
+        "docs_info",
+        "docs_load",
+        "desk",
+        "desk_list",
+        "desk_open",
+        "desk_search",
+        "desk_pin",
+        "desk_unpin",
+        "desk_clear",
+    }:
         from apps import cli_docs
 
         dsn = _get_dsn(args)
@@ -5189,7 +7261,11 @@ def _dispatch(argv: list[str] | None = None) -> int:
         if func == "docs_load":
             return asyncio.run(cli_docs.docs_load(dsn, args))
         if func == "desk":
-            return asyncio.run(cli_docs.desk_list(dsn, argparse.Namespace(limit=50, pinned=False, json=False)))
+            return asyncio.run(
+                cli_docs.desk_list(
+                    dsn, argparse.Namespace(limit=50, pinned=False, json=False)
+                )
+            )
         if func == "desk_list":
             return asyncio.run(cli_docs.desk_list(dsn, args))
         if func == "desk_open":
@@ -5217,14 +7293,25 @@ def _dispatch(argv: list[str] | None = None) -> int:
 
     # Resource request decisions (DB-backed; don't need docker)
     if func in {"requests", "requests_list"}:
-        return asyncio.run(_requests_list(
-            _get_dsn(args), getattr(args, "status", None), getattr(args, "json", False)))
+        return asyncio.run(
+            _requests_list(
+                _get_dsn(args),
+                getattr(args, "status", None),
+                getattr(args, "json", False),
+            )
+        )
     if func == "requests_grant":
-        return asyncio.run(_requests_decide(_get_dsn(args), args.id, "granted", args.note, None))
+        return asyncio.run(
+            _requests_decide(_get_dsn(args), args.id, "granted", args.note, None)
+        )
     if func == "requests_deny":
-        return asyncio.run(_requests_decide(_get_dsn(args), args.id, "denied", args.note, None))
+        return asyncio.run(
+            _requests_decide(_get_dsn(args), args.id, "denied", args.note, None)
+        )
     if func == "requests_modify":
-        return asyncio.run(_requests_decide(_get_dsn(args), args.id, "modified", args.note, args.value))
+        return asyncio.run(
+            _requests_decide(_get_dsn(args), args.id, "modified", args.note, args.value)
+        )
 
     # Character card management (don't need docker, except export)
     if func == "characters":
@@ -5242,51 +7329,63 @@ def _dispatch(argv: list[str] | None = None) -> int:
         return asyncio.run(_characters_export(dsn, args.name, args.output))
 
     if func in {"chat_sessions", "chat_sessions_list"}:
-        return asyncio.run(_chat_sessions_list(
-            _get_dsn(args),
-            getattr(args, "limit", 20),
-            getattr(args, "surface", None),
-            getattr(args, "status", "active"),
-            getattr(args, "json", False),
-        ))
+        return asyncio.run(
+            _chat_sessions_list(
+                _get_dsn(args),
+                getattr(args, "limit", 20),
+                getattr(args, "surface", None),
+                getattr(args, "status", "active"),
+                getattr(args, "json", False),
+            )
+        )
     if func == "chat_sessions_show":
-        return asyncio.run(_chat_sessions_show(
-            _get_dsn(args),
-            args.session_id,
-            args.visible_only,
-            args.json,
-        ))
+        return asyncio.run(
+            _chat_sessions_show(
+                _get_dsn(args),
+                args.session_id,
+                args.visible_only,
+                args.json,
+            )
+        )
     if func == "chat_sessions_export":
-        return asyncio.run(_chat_sessions_export(
-            _get_dsn(args),
-            args.session_id,
-            args.format,
-            args.output,
-            args.visible_only,
-        ))
+        return asyncio.run(
+            _chat_sessions_export(
+                _get_dsn(args),
+                args.session_id,
+                args.format,
+                args.output,
+                args.visible_only,
+            )
+        )
     if func == "chat_sessions_title":
-        return asyncio.run(_chat_sessions_title(
-            _get_dsn(args),
-            args.session_id,
-            args.title,
-            args.json,
-        ))
+        return asyncio.run(
+            _chat_sessions_title(
+                _get_dsn(args),
+                args.session_id,
+                args.title,
+                args.json,
+            )
+        )
     if func == "chat_sessions_fork":
-        return asyncio.run(_chat_sessions_fork(
-            _get_dsn(args),
-            args.session_id,
-            args.until_ordinal,
-            args.title,
-            args.json,
-        ))
+        return asyncio.run(
+            _chat_sessions_fork(
+                _get_dsn(args),
+                args.session_id,
+                args.until_ordinal,
+                args.title,
+                args.json,
+            )
+        )
     if func == "chat_sessions_clone":
-        return asyncio.run(_chat_sessions_fork(
-            _get_dsn(args),
-            args.session_id,
-            None,
-            args.title,
-            args.json,
-        ))
+        return asyncio.run(
+            _chat_sessions_fork(
+                _get_dsn(args),
+                args.session_id,
+                None,
+                args.title,
+                args.json,
+            )
+        )
 
     if func in {"hmx_export", "hmx_import", "hmx_review"}:
         from apps.cli_exchange import run_export, run_import, run_review
@@ -5309,7 +7408,34 @@ def _dispatch(argv: list[str] | None = None) -> int:
             yes=args.yes,
         )
 
-    docker_cmds = {"up", "dev", "down", "ps", "logs", "start", "stop", "reset", "upgrade"}
+    if isinstance(func, str) and func.startswith("service_"):
+        return _handle_host_service_command(
+            args,
+            compose_file=compose_file,
+            stack_root=stack_root,
+            env_file=env_file,
+        )
+
+    if isinstance(func, str) and func.startswith("tunnel_"):
+        return _handle_tunnel_command(args, env_file=env_file)
+
+    if isinstance(func, str) and func.startswith("voice_"):
+        return _handle_voice_command(args)
+
+    host_managed_workers = _host_managed_compose_workers()
+    docker_cmds = {
+        "up",
+        "dev",
+        "down",
+        "ps",
+        "logs",
+        "start",
+        "stop",
+        "reset",
+        "upgrade",
+    }
+    if {"heartbeat_worker", "maintenance_worker"} <= host_managed_workers:
+        docker_cmds -= {"start", "stop"}
     docker_bin: str | None = None
     compose_cmd: list[str] | None = None
     if func in docker_cmds:
@@ -5320,31 +7446,72 @@ def _dispatch(argv: list[str] | None = None) -> int:
         compose_cmd = ensure_compose(docker_bin)
 
     if func == "up":
+        if args.build and not is_source:
+            _print_err(
+                "`hexis up --build` needs a source checkout. This packaged install "
+                "uses published images; run `hexis upgrade` to refresh them."
+            )
+            return 1
+        compose_services: list[str] | None = None
+        if host_managed_workers:
+            compose_services = _configured_compose_services(
+                compose_cmd or [],
+                compose_file,
+                stack_root,
+                env_file,
+                args.profile,
+            )
+            if compose_services is None:
+                _print_err(
+                    "Could not derive the live Compose service list, so Hexis refused "
+                    "to risk starting duplicate Docker workers. Run `hexis service stop` "
+                    "to use the Docker-only path, or fix the Compose error and retry."
+                )
+                return 1
+            compose_services = [
+                name for name in compose_services if name not in host_managed_workers
+            ]
         if not is_source:
             from apps.cli_theme import console
+
             console.print("[accent]Pulling Docker images...[/accent]")
-            pull_rc = run_compose(compose_cmd or [], compose_file, stack_root, ["pull"], env_file)
+            pull_args = ["pull", *(compose_services or [])]
+            pull_rc = run_compose(
+                compose_cmd or [], compose_file, stack_root, pull_args, env_file
+            )
             if pull_rc != 0:
                 console.print(
                     "[warn]⚠ Image pull failed[/warn] — check your network, `docker login`, "
                     "or a registry rate limit. Continuing with cached images; if `up` reports a "
                     "missing image, that's the cause."
                 )
-        # Build compose args: --profile flags must come before the subcommand
-        compose_extra: list[str] = []
-        for profile in args.profile:
-            compose_extra += ["--profile", profile]
-        up_args = compose_extra + ["up", "-d"]
-        # Source checkouts build by default so the running containers always
-        # match the code on disk (cheap: the dependency layer is cached; code
-        # layers are straight COPYs). `--no-build` opts out.
-        if is_source and not args.no_build:
-            up_args.append("--build")
+        up_args = _up_compose_args(
+            args.profile,
+            is_source=is_source,
+            build=bool(args.build),
+            services=compose_services,
+        )
         rc = run_compose(compose_cmd or [], compose_file, stack_root, up_args, env_file)
         if rc == 0:
             from apps.cli_theme import console
+
             console.print("\n[ok]Stack is starting.[/ok]\n")
-            console.print("  [ok]Background workers[/ok] Heartbeat and memory maintenance run by default")
+            if host_managed_workers:
+                workers_ok, workers_error = _ensure_installed_host_services_running()
+                if not workers_ok:
+                    _print_err(
+                        "The Docker services started, but Hexis could not start the "
+                        f"installed host workers: {workers_error} Run `hexis service "
+                        "status` and `hexis service logs`, then retry `hexis up`."
+                    )
+                    return 1
+                console.print(
+                    "  [ok]Background workers[/ok] Running as user-owned host services"
+                )
+            else:
+                console.print(
+                    "  [ok]Background workers[/ok] Heartbeat and memory maintenance run by default"
+                )
 
             # Start the standalone embedding sidecar before probing DB health.
             embedding_probe_allowed = True
@@ -5368,20 +7535,53 @@ def _dispatch(argv: list[str] | None = None) -> int:
             # no-op if already current). The workers/API also run this on startup.
             try:
                 from core.agent_api import apply_migrations
+
                 applied = asyncio.run(apply_migrations(db_dsn_from_env()))
                 if applied:
-                    console.print(f"[ok]Applied {len(applied)} schema migration(s) — no data lost.[/ok]")
+                    console.print(
+                        f"[ok]Applied {len(applied)} schema migration(s) — no data lost.[/ok]"
+                    )
             except Exception:
                 pass  # never block startup
 
+            voice_started, voice_note = _start_configured_voice_sidecar()
+            if voice_started:
+                console.print("  [ok]Local speech[/ok] Piper sidecar is ready")
+            if voice_note:
+                console.print(f"  [warn]⚠ Local speech[/warn] {voice_note}")
+
             # A fresh agent must be configured before chat/ui are useful — lead with it.
-            console.print("  [accent]hexis init[/accent]   Configure the agent (start here)")
+            console.print(
+                "  [accent]hexis init[/accent]   Configure the agent (start here)"
+            )
             console.print("  [accent]hexis chat[/accent]   Chat in the terminal")
             console.print("  [accent]hexis ui[/accent]     Open the web dashboard")
             console.print()
+        elif is_source and not args.build:
+            _print_err(
+                "Hexis did not start; no source build was attempted. The Docker "
+                "Compose output above has the cause. If an image could not be pulled, "
+                "check the network or registry login and run `hexis up` again. To "
+                "deliberately build this checkout instead, run `hexis up --build`."
+            )
         return rc
     if func == "dev":
         from apps.cli_theme import console
+
+        host_status = _host_service_status_if_installed()
+        active_host_services = [
+            str(item.get("name"))
+            for item in (host_status or {}).get("services", [])
+            if isinstance(item, dict) and item.get("active")
+        ]
+        if active_host_services:
+            _print_err(
+                "Host workers are already running: "
+                f"{', '.join(active_host_services)}. Watch mode runs Docker workers, "
+                "so stop the host copies with `hexis service stop` before `hexis dev`."
+            )
+            return 1
+
         if not is_source:
             _print_err(
                 "`hexis dev` needs a source checkout — it watches the repo and rebuilds "
@@ -5394,8 +7594,11 @@ def _dispatch(argv: list[str] | None = None) -> int:
             compose_extra += ["--profile", profile]
         console.print("[accent]Building and starting the stack...[/accent]")
         rc = run_compose(
-            compose_cmd or [], compose_file, stack_root,
-            compose_extra + ["up", "-d", "--build"], env_file,
+            compose_cmd or [],
+            compose_file,
+            stack_root,
+            compose_extra + ["up", "-d", "--build"],
+            env_file,
         )
         if rc != 0:
             return rc
@@ -5408,38 +7611,76 @@ def _dispatch(argv: list[str] | None = None) -> int:
             pass
         try:
             from core.agent_api import apply_migrations
+
             applied = asyncio.run(apply_migrations(db_dsn_from_env()))
             if applied:
-                console.print(f"[ok]Applied {len(applied)} schema migration(s) — no data lost.[/ok]")
+                console.print(
+                    f"[ok]Applied {len(applied)} schema migration(s) — no data lost.[/ok]"
+                )
         except Exception:
             pass  # workers also migrate on startup; never block dev mode
+        voice_started, voice_note = _start_configured_voice_sidecar()
+        if voice_started:
+            console.print("[ok]Local speech sidecar is ready.[/ok]")
+        if voice_note:
+            console.print(f"[warn]⚠ Local speech:[/warn] {voice_note}")
         console.print("\n[ok]Stack is running in watch mode.[/ok]")
-        console.print("  Edits under core/ services/ apps/ channels/ plugins/ skills/ and db/")
-        console.print("  sync into the running containers and restart them; new db/migrations")
-        console.print("  apply on that restart. pyproject.toml changes trigger a rebuild.")
+        console.print(
+            "  Edits under core/ services/ apps/ channels/ plugins/ skills/ and db/"
+        )
+        console.print(
+            "  sync into the running containers and restart them; new db/migrations"
+        )
+        console.print(
+            "  apply on that restart. pyproject.toml changes trigger a rebuild."
+        )
         console.print("  [dim]Ctrl+C stops watching — the stack keeps running.[/dim]\n")
         try:
             rc = run_compose(
-                compose_cmd or [], compose_file, stack_root,
-                compose_extra + ["watch", "--no-up"], env_file,
+                compose_cmd or [],
+                compose_file,
+                stack_root,
+                compose_extra + ["watch", "--no-up"],
+                env_file,
             )
         except KeyboardInterrupt:
             rc = 130
         if rc == 130:  # normal Ctrl+C exit from the watch session
             rc = 0
-        console.print("\n[dim]Stopped watching. The stack is still running; plain `hexis up` also rebuilds on demand.[/dim]")
+        console.print(
+            "\n[dim]Stopped watching. The stack is still running; use "
+            "`hexis up --build` for a later one-time rebuild.[/dim]"
+        )
         return rc
     if func == "down":
-        rc = run_compose(compose_cmd or [], compose_file, stack_root, ["down"], env_file)
+        if host_managed_workers:
+            workers_ok, workers_error = _stop_installed_host_services()
+            if not workers_ok:
+                _print_err(
+                    "Hexis did not stop the host workers, so it left the Docker stack "
+                    f"running too: {workers_error} Run `hexis service status` and retry."
+                )
+                return 1
+        rc = run_compose(
+            compose_cmd or [], compose_file, stack_root, ["down"], env_file
+        )
         if rc == 0:
             stopped_sidecar, sidecar_note = _stop_owned_local_embedding_service()
             if stopped_sidecar:
                 print("Stopped the embedding service started by Hexis.")
             if sidecar_note:
                 print(f"Note: {sidecar_note}")
+            voice_ok, voice_stopped, voice_note = _stop_owned_voice_sidecar()
+            if voice_stopped:
+                print("Stopped the local voice process started by Hexis.")
+            if voice_note:
+                print(f"Note: {voice_note}")
+            if not voice_ok:
+                return 1
         return rc
     if func == "reset":
         from apps.cli_theme import console
+
         if not args.yes:
             console.print(
                 "[bold red]WARNING:[/bold red] This will destroy ALL data "
@@ -5453,27 +7694,97 @@ def _dispatch(argv: list[str] | None = None) -> int:
             if answer.strip().lower() != "reset":
                 console.print("[dim]Aborted.[/dim]")
                 return 1
+        compose_services: list[str] | None = None
+        if host_managed_workers:
+            compose_services = _configured_compose_services(
+                compose_cmd or [], compose_file, stack_root, env_file
+            )
+            if compose_services is None:
+                _print_err(
+                    "Could not derive the live Compose service list, so Hexis refused "
+                    "to risk recreating duplicate Docker workers during reset. Fix the "
+                    "Compose error and retry."
+                )
+                return 1
+            compose_services = [
+                name for name in compose_services if name not in host_managed_workers
+            ]
+            workers_ok, workers_error = _stop_installed_host_services()
+            if not workers_ok:
+                _print_err(
+                    "The database was not reset because installed host workers could not "
+                    f"be stopped: {workers_error} Run `hexis service status` and retry."
+                )
+                return 1
         console.print("[accent]Stopping containers and removing volumes...[/accent]")
-        rc = run_compose(compose_cmd or [], compose_file, stack_root, ["down", "-v"], env_file)
+        rc = run_compose(
+            compose_cmd or [], compose_file, stack_root, ["down", "-v"], env_file
+        )
         if rc != 0:
+            if host_managed_workers:
+                workers_ok, workers_error = _ensure_installed_host_services_running()
+                recovery = (
+                    "The previously running host workers were restored."
+                    if workers_ok
+                    else f"Host workers also need attention: {workers_error}"
+                )
+                _print_err(
+                    "The reset did not remove the database because Compose could not "
+                    f"stop the stack. {recovery} Resolve the error above and retry."
+                )
             return rc
         if is_source:
             console.print("[accent]Rebuilding database image...[/accent]")
-            rc = run_compose(compose_cmd or [], compose_file, stack_root, ["build", "db"], env_file)
+            rc = run_compose(
+                compose_cmd or [], compose_file, stack_root, ["build", "db"], env_file
+            )
             if rc != 0:
+                if host_managed_workers:
+                    _print_err(
+                        "The old database volume was removed, but its replacement image "
+                        "did not build. Host workers remain stopped. Fix the build error, "
+                        "then run `hexis up --build`."
+                    )
                 return rc
         else:
             console.print("[accent]Pulling images...[/accent]")
-            run_compose(compose_cmd or [], compose_file, stack_root, ["pull"], env_file)
+            pull_args = ["pull", *(compose_services or [])]
+            rc = run_compose(
+                compose_cmd or [], compose_file, stack_root, pull_args, env_file
+            )
+            if rc != 0:
+                _print_err(
+                    "The database was removed, but replacement images could not be pulled. "
+                    "Host workers remain stopped. Fix the image error, then run `hexis up`."
+                )
+                return rc
         console.print("[accent]Starting services...[/accent]")
-        rc = run_compose(compose_cmd or [], compose_file, stack_root, ["up", "-d"], env_file)
+        up_args = ["up", "-d", *(compose_services or [])]
+        rc = run_compose(compose_cmd or [], compose_file, stack_root, up_args, env_file)
         if rc == 0:
-            console.print("\n[ok]Database reset complete.[/ok] Run [accent]hexis init[/accent] to reconfigure the agent.\n")
+            if host_managed_workers:
+                workers_ok, workers_error = _ensure_installed_host_services_running()
+                if not workers_ok:
+                    _print_err(
+                        "The database reset completed, but host workers did not restart: "
+                        f"{workers_error} Run `hexis service logs`, fix the cause, then "
+                        "run `hexis service start`."
+                    )
+                    return 1
+            console.print(
+                "\n[ok]Database reset complete.[/ok] Run [accent]hexis init[/accent] to reconfigure the agent.\n"
+            )
+        elif host_managed_workers:
+            _print_err(
+                "The database reset stopped before the stack restarted. Host workers "
+                "remain stopped; fix the Compose error above, then run `hexis up`."
+            )
         return rc
     if func == "upgrade":
         # The non-destructive counterpart to `reset`: refresh images + code and
         # migrate the schema, WITHOUT removing the data volume.
         from apps.cli_theme import console
+
         if not is_source and not args.no_self_update:
             # Packaged install: images are pinned to the CLI's own version
             # (see _compose_env), so the package must move first — then the
@@ -5512,23 +7823,75 @@ def _dispatch(argv: list[str] | None = None) -> int:
                     f"continuing with hexis {_ver}.[/warn]"
                 )
         console.print("[accent]Updating the stack (your data is preserved)...[/accent]")
+        compose_services: list[str] | None = None
+        if host_managed_workers:
+            compose_services = _configured_compose_services(
+                compose_cmd or [], compose_file, stack_root, env_file
+            )
+            if compose_services is None:
+                _print_err(
+                    "Could not derive the live Compose service list, so Hexis refused "
+                    "to risk starting duplicate Docker workers during upgrade. Fix the "
+                    "Compose error and retry."
+                )
+                return 1
+            compose_services = [
+                name for name in compose_services if name not in host_managed_workers
+            ]
         if is_source:
-            run_compose(compose_cmd or [], compose_file, stack_root, ["build"], env_file)
+            refresh_rc = run_compose(
+                compose_cmd or [],
+                compose_file,
+                stack_root,
+                ["build", *(compose_services or [])],
+                env_file,
+            )
         else:
-            run_compose(compose_cmd or [], compose_file, stack_root, ["pull"], env_file)
-        rc = run_compose(compose_cmd or [], compose_file, stack_root, ["up", "-d"], env_file)
+            refresh_rc = run_compose(
+                compose_cmd or [],
+                compose_file,
+                stack_root,
+                ["pull", *(compose_services or [])],
+                env_file,
+            )
+        if refresh_rc != 0:
+            _print_err(
+                "Hexis did not change the running stack because its replacement "
+                "images could not be prepared. Resolve the error above and retry."
+            )
+            return refresh_rc
+        rc = run_compose(
+            compose_cmd or [],
+            compose_file,
+            stack_root,
+            ["up", "-d", *(compose_services or [])],
+            env_file,
+        )
         if rc != 0:
             return rc
         console.print("[accent]Applying schema migrations...[/accent]")
         mrc = asyncio.run(_migrate(_get_dsn(args), status_only=False))
         if mrc == 0:
+            if host_managed_workers:
+                workers_ok, workers_error = _restart_installed_host_services()
+                if not workers_ok:
+                    _print_err(
+                        "The stack and schema were upgraded, but installed host workers "
+                        f"did not restart onto the new code: {workers_error} Run `hexis "
+                        "service logs`, fix the cause, then run `hexis service restart`."
+                    )
+                    return 1
             console.print("\n[ok]Upgrade complete — data preserved.[/ok]\n")
         return mrc
     if func == "ps":
-        return run_compose(compose_cmd or [], compose_file, stack_root, ["ps"], env_file)
+        return run_compose(
+            compose_cmd or [], compose_file, stack_root, ["ps"], env_file
+        )
     if func == "logs":
         log_args = ["logs"] + (["-f"] if args.follow else []) + args.services
-        return run_compose(compose_cmd or [], compose_file, stack_root, log_args, env_file)
+        return run_compose(
+            compose_cmd or [], compose_file, stack_root, log_args, env_file
+        )
     if func == "chat":
         fwd_argv = list(args.args or [])
         return _run_module("apps.cli_chat", fwd_argv)
@@ -5559,13 +7922,18 @@ def _dispatch(argv: list[str] | None = None) -> int:
             return _handle_ui(stack_root, args.port, args.no_open, args.instance)
         # pip install path: run UI via container
         if compose_file is None:
-            _print_err("No compose file found. Reinstall hexis or run from a source checkout.")
+            _print_err(
+                "No compose file found. Reinstall hexis or run from a source checkout."
+            )
             return 1
         docker_bin = ensure_docker()
         compose_cmd_ui = ensure_compose(docker_bin)
-        return _handle_ui_container(compose_cmd_ui, compose_file, stack_root, env_file, args.port, args.no_open)
+        return _handle_ui_container(
+            compose_cmd_ui, compose_file, stack_root, env_file, args.port, args.no_open
+        )
     if func == "open":
         from core.browser import open_url
+
         if not _port_ready(args.port):
             _print_err(
                 f"Nothing is listening on http://localhost:{args.port}. "
@@ -5575,19 +7943,45 @@ def _dispatch(argv: list[str] | None = None) -> int:
         open_url(f"http://localhost:{args.port}")
         return 0
     if func == "start":
+        if host_managed_workers:
+            workers_ok, workers_error = _ensure_installed_host_services_running()
+            if not workers_ok:
+                _print_err(str(workers_error))
+                return 1
+        docker_targets = [
+            name
+            for name in ("heartbeat_worker", "maintenance_worker")
+            if name not in host_managed_workers
+        ]
+        if not docker_targets:
+            print("Started heartbeat and maintenance host services.")
+            return 0
         return run_compose(
             compose_cmd or [],
             compose_file,
             stack_root,
-            ["up", "-d", "heartbeat_worker", "maintenance_worker"],
+            ["up", "-d", *docker_targets],
             env_file,
         )
     if func == "stop":
+        if host_managed_workers:
+            workers_ok, workers_error = _stop_installed_host_services()
+            if not workers_ok:
+                _print_err(str(workers_error))
+                return 1
+        docker_targets = [
+            name
+            for name in ("heartbeat_worker", "maintenance_worker")
+            if name not in host_managed_workers
+        ]
+        if not docker_targets:
+            print("Stopped heartbeat and maintenance host services.")
+            return 0
         return run_compose(
             compose_cmd or [],
             compose_file,
             stack_root,
-            ["stop", "heartbeat_worker", "maintenance_worker"],
+            ["stop", *docker_targets],
             env_file,
         )
     if func == "doctor":
@@ -5606,9 +8000,16 @@ def _dispatch(argv: list[str] | None = None) -> int:
         from rich.spinner import Spinner
         from rich.live import Live
 
-        with Live(Spinner("dots", text="Running diagnostics..."), console=_con, transient=True):
-            checks = asyncio.run(cli_api.doctor_payload(
-                dsn, wait_seconds=args.wait_seconds, check_llm=bool(getattr(args, "llm", False))))
+        with Live(
+            Spinner("dots", text="Running diagnostics..."), console=_con, transient=True
+        ):
+            checks = asyncio.run(
+                cli_api.doctor_payload(
+                    dsn,
+                    wait_seconds=args.wait_seconds,
+                    check_llm=bool(getattr(args, "llm", False)),
+                )
+            )
 
         if args.json:
             sys.stdout.write(json.dumps(checks, indent=2) + "\n")
@@ -5631,7 +8032,9 @@ def _dispatch(argv: list[str] | None = None) -> int:
             ok = sum(1 for c in checks if c["status"] == "OK")
             warn_count = sum(1 for c in checks if c["status"] == "WARN")
             fail_count = sum(1 for c in checks if c["status"] == "FAIL")
-            _con.print(f"\n[ok]{ok} passed[/ok], [warn]{warn_count} warnings[/warn], [fail]{fail_count} failures[/fail]")
+            _con.print(
+                f"\n[ok]{ok} passed[/ok], [warn]{warn_count} warnings[/warn], [fail]{fail_count} failures[/fail]"
+            )
         return 0 if all(c["status"] != "FAIL" for c in checks) else 1
     if func == "demo":
         dsn = _get_dsn(args)
@@ -5654,14 +8057,18 @@ def _dispatch(argv: list[str] | None = None) -> int:
         dsn = _get_dsn(args)
         if args.raw:
             # Legacy raw status
-            payload = asyncio.run(cli_api.status_payload(dsn, wait_seconds=args.wait_seconds))
+            payload = asyncio.run(
+                cli_api.status_payload(dsn, wait_seconds=args.wait_seconds)
+            )
             if not args.no_docker:
                 try:
                     docker_bin = ensure_docker()
                     compose_cmd = ensure_compose(docker_bin)
                     if compose_file is None:
                         raise SystemExit
-                    rc, out = _run_compose_capture(compose_cmd, compose_file, stack_root, ["ps"], env_file)
+                    rc, out = _run_compose_capture(
+                        compose_cmd, compose_file, stack_root, ["ps"], env_file
+                    )
                     payload["docker_ps_rc"] = rc
                     payload["docker_ps"] = out
                 except SystemExit:
@@ -5685,7 +8092,9 @@ def _dispatch(argv: list[str] | None = None) -> int:
                 sys.stdout.write("\n".join(lines) + "\n")
             return 0
         # Rich status (default)
-        payload = asyncio.run(cli_api.status_payload_rich(dsn, wait_seconds=args.wait_seconds))
+        payload = asyncio.run(
+            cli_api.status_payload_rich(dsn, wait_seconds=args.wait_seconds)
+        )
         if args.json:
             sys.stdout.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
         else:
@@ -5709,7 +8118,9 @@ def _dispatch(argv: list[str] | None = None) -> int:
     if func == "skills_proposals":
         return asyncio.run(_skills_proposals(_get_dsn(args), args.status, args.json))
     if func == "skills_review":
-        return asyncio.run(_skills_review(_get_dsn(args), args.proposal_id, args.action, args.yes))
+        return asyncio.run(
+            _skills_review(_get_dsn(args), args.proposal_id, args.action, args.yes)
+        )
     if func == "migrate":
         return asyncio.run(_migrate(_get_dsn(args), args.status))
     if func == "backup":
@@ -5733,6 +8144,7 @@ def _dispatch(argv: list[str] | None = None) -> int:
             sys.stdout.write(json.dumps(cfg, indent=2, sort_keys=True) + "\n")
         else:
             from apps.cli_theme import console as _con, make_table as _mt
+
             # Group by key prefix
             groups: dict[str, list[tuple[str, str]]] = {}
             for key in sorted(cfg.keys()):
@@ -5751,13 +8163,17 @@ def _dispatch(argv: list[str] | None = None) -> int:
                     table.add_section()
                 first_group = False
                 for key, val in items:
-                    display_val = f"[dim]{val}[/dim]" if val == '***' or val == '"***"' else val
+                    display_val = (
+                        f"[dim]{val}[/dim]" if val == "***" or val == '"***"' else val
+                    )
                     table.add_row(key, display_val)
             _con.print(table)
         return 0
     if func == "config_validate":
         dsn = _get_dsn(args)
-        errors, warnings = asyncio.run(cli_api.config_validate(dsn, wait_seconds=args.wait_seconds))
+        errors, warnings = asyncio.run(
+            cli_api.config_validate(dsn, wait_seconds=args.wait_seconds)
+        )
         for w in warnings:
             _print_err(f"warning: {w}")
         if errors:
@@ -5773,6 +8189,20 @@ def _dispatch(argv: list[str] | None = None) -> int:
 
         dsn = _get_dsn(args)
         result = dispatch_auth_command(func, args, dsn)
+        if result is not None:
+            return result
+
+    if func.startswith("node_"):
+        from apps.cli_node import dispatch_node_command
+
+        result = dispatch_node_command(func, args, _get_dsn(args))
+        if result is not None:
+            return result
+
+    if func.startswith("execution_"):
+        from apps.cli_execution import dispatch_execution_command
+
+        result = dispatch_execution_command(func, args, _get_dsn(args))
         if result is not None:
             return result
 
@@ -5803,7 +8233,9 @@ def _dispatch(argv: list[str] | None = None) -> int:
         return asyncio.run(_tools_web_search_set_searxng_url(dsn, args.url))
     if func == "tools_add_mcp":
         dsn = _get_dsn(args)
-        return asyncio.run(_tools_add_mcp(dsn, args.name, args.command, args.args, args.env))
+        return asyncio.run(
+            _tools_add_mcp(dsn, args.name, args.command, args.args, args.env)
+        )
     if func == "tools_remove_mcp":
         dsn = _get_dsn(args)
         return asyncio.run(_tools_remove_mcp(dsn, args.name))
@@ -5818,6 +8250,7 @@ def _dispatch(argv: list[str] | None = None) -> int:
         return asyncio.run(_channels_status(dsn, False))
     if func == "channels_start":
         from services.channel_worker import run_channel_worker
+
         asyncio.run(run_channel_worker(channels=args.channel, instance=args.instance))
         return 0
     if func == "channels_status":
@@ -5830,7 +8263,9 @@ def _dispatch(argv: list[str] | None = None) -> int:
     # Recall command
     if func == "recall":
         dsn = _get_dsn(args)
-        return asyncio.run(_recall(dsn, args.query, args.limit, args.memory_type, args.json))
+        return asyncio.run(
+            _recall(dsn, args.query, args.limit, args.memory_type, args.json)
+        )
 
     # Goals commands
     if func == "goals":
@@ -5842,7 +8277,9 @@ def _dispatch(argv: list[str] | None = None) -> int:
         return asyncio.run(_goals_list(dsn, args.priority, args.json))
     if func == "goals_create":
         dsn = _get_dsn(args)
-        return asyncio.run(_goals_create(dsn, args.title, args.description, args.priority, args.source))
+        return asyncio.run(
+            _goals_create(dsn, args.title, args.description, args.priority, args.source)
+        )
     if func == "goals_update":
         dsn = _get_dsn(args)
         return asyncio.run(_goals_update(dsn, args.goal_id, args.priority, args.reason))
@@ -5860,10 +8297,18 @@ def _dispatch(argv: list[str] | None = None) -> int:
         return asyncio.run(_schedule_list(dsn, args.status, args.json))
     if func == "schedule_create":
         dsn = _get_dsn(args)
-        return asyncio.run(_schedule_create(
-            dsn, args.name, args.kind, args.action,
-            args.payload, args.schedule, args.timezone, args.description,
-        ))
+        return asyncio.run(
+            _schedule_create(
+                dsn,
+                args.name,
+                args.kind,
+                args.action,
+                args.payload,
+                args.schedule,
+                args.timezone,
+                args.description,
+            )
+        )
     if func == "schedule_delete":
         dsn = _get_dsn(args)
         return asyncio.run(_schedule_delete(dsn, args.task_id, args.force))

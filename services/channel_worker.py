@@ -21,11 +21,12 @@ import socket
 from typing import Any
 
 import asyncpg
-from dotenv import load_dotenv
+
+# Import order is intentional: this loads the explicitly selected environment
+# before channel modules derive process-level connection constants.
+from services import worker_environment as _worker_environment  # noqa: F401
 
 from core.agent_api import db_dsn_from_env
-
-load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -33,10 +34,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger("channel_worker")
 
-CHANNEL_CONFIG_POLL_INTERVAL_S = float(os.getenv("HEXIS_CHANNEL_CONFIG_POLL_INTERVAL_S", "15"))
+CHANNEL_CONFIG_POLL_INTERVAL_S = float(
+    os.getenv("HEXIS_CHANNEL_CONFIG_POLL_INTERVAL_S", "15")
+)
 WORKER_STORM_MAX_STARTS = int(os.getenv("WORKER_STORM_MAX_STARTS", 5))
 WORKER_STORM_WINDOW_SECONDS = int(os.getenv("WORKER_STORM_WINDOW_SECONDS", 120))
-WORKER_STORM_BACKOFF_CAP_SECONDS = int(os.getenv("WORKER_STORM_BACKOFF_CAP_SECONDS", 300))
+WORKER_STORM_BACKOFF_CAP_SECONDS = int(
+    os.getenv("WORKER_STORM_BACKOFF_CAP_SECONDS", 300)
+)
 SUPPORTED_CHANNEL_TYPES = [
     "discord",
     "telegram",
@@ -56,7 +61,9 @@ def _worker_metadata() -> dict[str, Any]:
     }
 
 
-async def _register_channel_worker(pool: asyncpg.Pool, instance: str | None) -> str | None:
+async def _register_channel_worker(
+    pool: asyncpg.Pool, instance: str | None
+) -> str | None:
     metadata = _worker_metadata()
     try:
         async with pool.acquire() as conn:
@@ -104,7 +111,9 @@ async def _mark_channel_worker_seen(pool: asyncpg.Pool, worker_id: str | None) -
         return
     try:
         async with pool.acquire() as conn:
-            await conn.fetchval("SELECT mark_worker_instance_seen($1::uuid, 'running')", worker_id)
+            await conn.fetchval(
+                "SELECT mark_worker_instance_seen($1::uuid, 'running')", worker_id
+            )
     except Exception:
         logger.debug("channel worker liveness update failed", exc_info=True)
 
@@ -212,7 +221,9 @@ def _is_configured_whatsapp(config: dict[str, Any]) -> bool:
     except Exception:
         access_token = os.getenv("WHATSAPP_ACCESS_TOKEN") or config.get("access_token")
 
-    phone_number_id = str(config.get("phone_number_id") or os.getenv("WHATSAPP_PHONE_NUMBER_ID") or "")
+    phone_number_id = str(
+        config.get("phone_number_id") or os.getenv("WHATSAPP_PHONE_NUMBER_ID") or ""
+    )
     return bool(access_token) and bool(phone_number_id)
 
 
@@ -278,10 +289,16 @@ async def _record_adapter_runtime(
             json.dumps(metadata or {}),
         )
     except Exception:
-        logger.debug("Failed to record channel adapter runtime for %s", channel_type, exc_info=True)
+        logger.debug(
+            "Failed to record channel adapter runtime for %s",
+            channel_type,
+            exc_info=True,
+        )
 
 
-async def _ensure_configured_adapters_running(manager, conn: asyncpg.Connection, channels: list[str] | None) -> int:
+async def _ensure_configured_adapters_running(
+    manager, conn: asyncpg.Connection, channels: list[str] | None
+) -> int:
     """
     Detect newly-configured channels and start their adapters.
 
@@ -305,6 +322,10 @@ async def _ensure_configured_adapters_running(manager, conn: asyncpg.Connection,
             continue
 
         config = await _load_channel_config(conn, channel_type)
+        # Adapters remain transport-only sensors so the disposition flag can
+        # change at runtime. While disabled, manager.py applies the attached
+        # legacy gate hint and outward behavior remains unchanged.
+        config["forward_all"] = True
         if not _is_channel_configured(channel_type, config):
             await _record_adapter_runtime(
                 conn,
@@ -340,7 +361,9 @@ async def _ensure_configured_adapters_running(manager, conn: asyncpg.Connection,
 
                     adapter = TelegramAdapter(config)
                 except ImportError:
-                    logger.warning("python-telegram-bot not installed, skipping Telegram channel")
+                    logger.warning(
+                        "python-telegram-bot not installed, skipping Telegram channel"
+                    )
                     await _record_adapter_runtime(
                         conn,
                         channel_type,
@@ -355,7 +378,7 @@ async def _ensure_configured_adapters_running(manager, conn: asyncpg.Connection,
                 try:
                     from channels.slack_adapter import SlackAdapter
 
-                    adapter = SlackAdapter(config)
+                    adapter = SlackAdapter(config, pool=manager.pool)
                 except ImportError:
                     logger.warning("slack-bolt not installed, skipping Slack channel")
                     await _record_adapter_runtime(
@@ -451,7 +474,9 @@ async def run_channel_worker(
     # Initial config scan (may find zero channels).
     async with pool.acquire() as conn:
         try:
-            is_ready = await conn.fetchval("SELECT is_agent_configured() AND is_init_complete()")
+            is_ready = await conn.fetchval(
+                "SELECT is_agent_configured() AND is_init_complete()"
+            )
             if not is_ready:
                 logger.warning("Agent not configured. Run 'hexis init' first.")
         except Exception:
@@ -478,6 +503,7 @@ async def run_channel_worker(
     outbox_task = None
     try:
         from channels.outbox import ChannelOutboxConsumer
+
         outbox_consumer = ChannelOutboxConsumer(manager, pool)
         outbox_task = asyncio.create_task(
             outbox_consumer.start(),
@@ -499,20 +525,48 @@ async def run_channel_worker(
             try:
                 await _mark_channel_worker_seen(pool, worker_id)
                 async with pool.acquire() as conn:
-                    started = await _ensure_configured_adapters_running(manager, conn, channels)
+                    started = await _ensure_configured_adapters_running(
+                        manager, conn, channels
+                    )
                     if started:
-                        logger.info("Detected new channel config; started %d adapter(s)", started)
+                        logger.info(
+                            "Detected new channel config; started %d adapter(s)",
+                            started,
+                        )
             except asyncio.CancelledError:
                 break
             except Exception:
                 logger.exception("Channel config refresh failed")
 
             try:
-                await asyncio.wait_for(stop_event.wait(), timeout=CHANNEL_CONFIG_POLL_INTERVAL_S)
+                await asyncio.wait_for(
+                    stop_event.wait(), timeout=CHANNEL_CONFIG_POLL_INTERVAL_S
+                )
             except asyncio.TimeoutError:
                 pass
 
-    config_task = asyncio.create_task(_config_watch_loop(), name="channel-config-watcher")
+    config_task = asyncio.create_task(
+        _config_watch_loop(), name="channel-config-watcher"
+    )
+
+    async def _approval_escalation_loop() -> None:
+        from services.operator_approval import run_operator_approval_escalations
+
+        while not stop_event.is_set():
+            try:
+                await run_operator_approval_escalations(pool, manager)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("Operator approval escalation sweep failed")
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=15.0)
+            except asyncio.TimeoutError:
+                pass
+
+    approval_task = asyncio.create_task(
+        _approval_escalation_loop(), name="operator-approval-escalation"
+    )
 
     # Wait for shutdown signal
     await stop_event.wait()
@@ -520,8 +574,13 @@ async def run_channel_worker(
     # Graceful shutdown
     logger.info("Stopping channel adapters...")
     config_task.cancel()
+    approval_task.cancel()
     try:
         await config_task
+    except asyncio.CancelledError:
+        pass
+    try:
+        await approval_task
     except asyncio.CancelledError:
         pass
     if outbox_consumer:
@@ -545,13 +604,23 @@ def main() -> int:
         description="Run Hexis channel adapters (Discord, Telegram, etc.)",
     )
     p.add_argument(
-        "--channel", "-c",
+        "--channel",
+        "-c",
         action="append",
-        choices=["discord", "telegram", "slack", "signal", "whatsapp", "imessage", "matrix"],
+        choices=[
+            "discord",
+            "telegram",
+            "slack",
+            "signal",
+            "whatsapp",
+            "imessage",
+            "matrix",
+        ],
         help="Start only specific channel(s). Can be repeated. Default: all configured.",
     )
     p.add_argument(
-        "--instance", "-i",
+        "--instance",
+        "-i",
         default=os.getenv("HEXIS_INSTANCE"),
         help="Target a specific instance.",
     )

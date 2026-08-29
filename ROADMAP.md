@@ -51,43 +51,45 @@ a selector that scores word overlap means twenty more skills that do not activat
 | ~~Dead heartbeat actions (§9.1)~~ | ~0.5d | **done** — three, not seven; retired as redundant |
 | ~~`is_group` on all seven adapters (§12.2)~~ | ~1d | **done** — four were missing; two already had the signal unnamed |
 | ~~Port `capability_probe` + `tool_surface_audit` (§11.4·8)~~ | ~3d | **done** — continuous worker/context/tool snapshots + immutable surface decisions |
+| ~~Enforce migration checksums (§12.3)~~ | ~0.5d | **done** — 0238 compares every applied file at startup and in read-only status, fails with exact recovery guidance, and explicitly audits bounded pre-publication reconciliations |
 
-## Phase 3 — Become useful · ~10d
+## Phase 3 — Become useful · ~10d · **shipped 2026-08-28**
 
 The first phase a user would notice. Ordered so each makes the next more valuable.
 
 | Item | Effort | Why in this order |
 |---|---|---|
 | ~~Wave A everyday skills (§4)~~ | ~2d | **done** — six consent-safe workflows over existing core and optional plugin tools |
-| Port `operator_approval` + Slack actions (§11.4·4) | ~2d | makes Phase 0's fail-closed *livable* — approve from a phone |
-| Automation suggestions (§1) | ~2d | the agent starts proposing instead of waiting |
-| `ask_user` (§2) | ~3d | it stops guessing when it does not know |
-| Port `voice_notes` (§11.4·7) | ~1d | voice in, no client needed |
+| ~~Port `operator_approval` + Slack actions (§11.4·4)~~ | ~2d | **done** — exact one-shot Slack approval with signed actions and iMessage fallback |
+| ~~Automation suggestions (§1)~~ | ~2d | **done** — consent-first catalog, connector, usage, and skill-blueprint proposals with web + channel decisions |
+| ~~`ask_user` (§2)~~ | ~3d | **done** — durable chat/CLI/channel questions pause in place; heartbeat answers resume exactly once |
+| ~~Port `voice_notes` (§11.4·7)~~ | ~1d | **done** — allowlisted voice memos transcribe through explicit local/cloud setup; local diarization is approval-gated and cache-safe |
 
-## Phase 4 — Reach · ~7.5d
+## Phase 4 — Reach · ~7.5d · **shipped 2026-08-28**
 
 | Item | Effort | Note |
 |---|---|---|
-| Build off the install path (§6.1) | ~0.5d | no more failed installs |
-| Tailscale/HTTPS documented (§8.1) | ~1d | **ships with the PWA or not at all** |
-| PWA layer on `hexis-ui` (§3a) | ~3d | installable client, push, mic |
-| Deterministic image build (§6.2) | ~2d | a slow index stops meaning a wrong one |
+| ~~Build off the install path (§6.1)~~ | ~0.5d | **done** — source starts pinned published images; builds require an explicit `--build` or watch session |
+| ~~Tailscale/HTTPS documented (§8.1)~~ | ~1d | **done** — private Tailscale Serve runbook plus read-only HTTPS reachability diagnosis; loopback remains the OSS boundary |
+| ~~PWA layer on `hexis-ui` (§3a)~~ | ~3d | **done** — installable client, explicit privacy-safe push, foreground voice, and coalesced presence |
+| ~~Deterministic image build (§6.2)~~ | ~2d | **done** — worker/channel images use digest-pinned uv + Python, a committed hash-checked lock, bounded retries, and content-derived build IDs |
 
-## Phase 5 — Depth · ~13d
+## Phase 5 — Depth · ~13d · **shipped 2026-08-28**
 
 The Part I thesis (§S4). Mostly ports (§11.4), because Alex already built them.
 
 | Item | Effort | Note |
 |---|---|---|
-| Drop `<> zero_vec`; enforce at write (§14.1) | ~1d | **first in this phase** — memory volume grows from here |
-| Port `retention` + `scene_consolidation` + `incubation` (§11.4·1) | ~4d | forgetting, consolidation, spontaneous recall |
-| Port `memory_supersessions` (§11.4·2) | ~2d | unblocks bitemporal recall |
-| Port `belief_propagation` (§11.4·3) | ~2d | contradiction-as-event, plumbing half |
-| Port `operator_policy_corrections` (§11.4·5) | ~2d | never say it twice |
-| Appraisal emits emotion families (§13.3·C) | ~0.5d | retires the SQL emotion regexes |
-| Connector cognition: LLM-first (§13.3·B) | ~1d | retires `_URGENT_TERMS` / `_IMPORTANT_TERMS` |
+| ~~Drop `<> zero_vec`; enforce at write (§14.1)~~ | ~1d | **done** — embedded status now enforces a non-null, non-zero vector at write time; recall/search predicates are HNSW-eligible and live `idx_scan` is nonzero |
+| ~~Port `retention` + `scene_consolidation` + `incubation` (§11.4·1)~~ | ~4d | **done natively** — DB-owned forgetting, consolidation, and spontaneous recall predate and are the source of Alex's thin wrappers; worker wiring and 14 focused tests verified |
+| ~~Port `memory_supersessions` (§11.4·2)~~ | ~2d | **done** — DB-owned reason/actor lineage atomically closes validity windows, legacy pointer writes synchronize, explicit revert restores history, retention dual-writes, and strict Python accessors expose the ledger |
+| ~~Port `belief_propagation` (§11.4·3)~~ | ~2d | **done** — meaningful belief/evidence/supersession changes enter a durable replay log, bounded NOTIFY wakes subscribed workers without dropping rate-limited events, delivery receipts prove consumption, and the next heartbeat sees the revision context |
+| ~~Port `operator_policy_corrections` (§11.4·5)~~ | ~2d | **done** — identity-verified private turns atomically append standing-instruction evidence, reuse and reinforce one procedural policy memory, create one review-gated alignment item, inject active policy into normal and RLM continuity, and provide operator-only list/revoke controls; allowlists and groups never grant policy authority |
+| ~~Appraisal emits emotion families (§13.3·C)~~ | **done** | 0217: config-owned families flow from the appraisal prompt through normalization and affect persistence; continuity, social reward, and relationship injury consume the structured field instead of matching free-form labels |
+| ~~Connector cognition: LLM-first (§13.3·B)~~ | **done** | 0218: valid model verdicts are authoritative (including empty/low results); content-hash cache hits are free, fallback provenance is explicit, and free-text importance keyword lists are retired |
+| ~~Public memory benchmark (§S4.7)~~ | ~1w | **done** — 25 versioned, judge-free cases cover provenance, contradictions, six-month recall, cross-session continuity, and stale beliefs; adapters run Hexis and honest reference baselines, and the official one-shot 96.33 result preserves both Hexis misses and model variance |
 
-## Phase 6 — Outbound · ~14d
+## Phase 6 — Outbound · ~14d · **shipped 2026-08-28**
 
 The riskiest thing in the plan, deliberately last of the feature work. It messages
 real people, and it is gated behind knowing who is in the room (Phase 2) and being
@@ -95,19 +97,40 @@ able to approve from a phone (Phase 3).
 
 | Item | Effort | Note |
 |---|---|---|
-| Goal origin flag (§10.4) | ~1d | prerequisite for the permission slip |
-| Port `inbound_disposition` (§11.4·6) | ~2d | the inbound half, policy already in SQL |
-| Contact points + purpose gate + STOP (§10) | ~10d | **ships whole or not at all** |
-| Action/tool gate reconciliation (§9.6) | ~2d | the two gates stop disagreeing |
+| ~~Goal origin flag (§10.4)~~ | **done** | 0219/0220: typed `memories.goal_origin` is derived from trusted chat/heartbeat/MCP context; model-authored source text cannot forge user assignment, legacy goals are backfilled, and direct user assignment upgrades duplicates |
+| ~~Port `inbound_disposition` (§11.4·6)~~ | **done** | 0221/0222: all OSS adapters are transport-only sensors; SQL owns operator identity, live channel allowlists, trigger/mention/continuation/drop rules, ambiguity audit, passive ingestion, and fresh correction wakes behind a dark-by-default runtime switch |
+| ~~Contact points + purpose gate + STOP (§10)~~ | **done** | 0223: every provider, outbox, and direct-reply road is purpose-bound; per-entity/channel budgets learn from history and reciprocity; disclosure, cross-channel STOP, one-time acknowledgement, kill switches, and an inspectable ledger ship together |
+| ~~Action/tool gate reconciliation (§9.6)~~ | **done** | agentic heartbeat actions are tool calls on one semantic, dynamically expandable, dispatcher-enforced skill surface; the isolated legacy enum has executable handler coverage |
 
-## Phase 7 — Long tail
+## Phase 7 — Long tail · **shipped 2026-08-28**
 
 Real work, no urgency. Ordered by ratio, not by ambition.
 
-`hexis-node` + pairing (§3b, ~1w) · heartbeat cadence and economy (§9.2–9.4, ~1w) ·
-port `deliberation` (§11.4·9, ~4d) · Wave B skills (§4, ~1d each) · workers as host
-services (§6.3, ~1w) · `hexis tunnel` + exposure posture (§8.2–3, ~1w) · voice out,
-talk, wake (§5.2–4, ~3w) · execution backends (§7, ~2w)
+~~`hexis-node` + pairing (§3b)~~ **done** ·
+~~heartbeat cadence and economy (§9.2–9.4, ~1w)~~ **done** — 0225 adds an
+elapsed-time decaying bank, evidence-backed outcome gradient, and persisted
+urgency-adaptive scheduling ·
+~~port `deliberation` (§11.4·9, ~4d)~~ **done** — 0226 adds durable advisory
+perspectives, adversarial challenges, synthesis, dissent, missing evidence, and
+review conditions with inspectable degraded/failed runs ·
+~~Wave B skills (§4, ~1d each)~~ **done** — 0227 adds Notion, Spotify, Home
+Assistant, Open-Meteo weather, and Trello with guided secret-reference setup and
+approval-gated provider writes · ~~Wave C node skills (§4)~~ **done** — 0237 adds
+fixed-script Apple Reminders, Notes, and Calendar, exact-name Shortcuts,
+screenshots, and secret-safe local 1Password copy behind derived node
+capabilities and per-call approval · ~~workers as host
+services (§6.3, ~1w)~~ **done** — launchd/systemd user units share the uv-owned
+runtime, reference (but never copy) the chosen environment, migrate from Docker
+without an ownership gap, and stay single-owner across every stack lifecycle ·
+~~`hexis tunnel` + exposure posture (§8.2–3, ~1w)~~ **done** — exact-owned,
+tailnet-only Tailscale Serve lifecycle, explicit device approval, and fail-closed
+public-bind/Funnel doctor posture · ~~voice out + foreground talk + paired-node
+wake (§5.2–4)~~ **done** — local-only Piper output, opaque expiring audio,
+explicit foreground listen/respond control, and signed local wake detection with
+fresh capability approval · ~~execution backends (§7, ~2w)~~ **done** — one
+unchanged tool surface selects local, exact SSH, or ephemeral remote Docker;
+placement fails closed, SSH timeouts terminate the target process group, and
+remote containers are no-pull, network-off, exactly owned, and idle-cost-free
 
 ## The shape of it
 

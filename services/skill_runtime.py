@@ -25,7 +25,13 @@ if False:  # pragma: no cover - typing only
 logger = logging.getLogger(__name__)
 
 
-DISCOVERY_TOOL_NAMES = {"list_skills", "use_skill", "propose_skill", "queue_user_message"}
+DISCOVERY_TOOL_NAMES = {
+    "list_skills",
+    "use_skill",
+    "propose_skill",
+    "queue_user_message",
+    "ask_user",
+}
 
 # The read-only floor every turn gets, regardless of which skills activate.
 #
@@ -56,10 +62,37 @@ HEARTBEAT_DEFAULT_SKILL_NAMES = {"core-memory", "self-reflection"}
 GMAIL_HEARTBEAT_DIGEST_CONFIG_KEY = "integrations.gmail.heartbeat_digest_enabled"
 AUTO_ACTIVATE_SCORE_THRESHOLD = 5
 STOPWORDS = {
-    "about", "after", "again", "also", "before", "could", "did", "does",
-    "for", "from", "give", "have", "help", "into", "last", "more", "next",
-    "please", "show", "that", "the", "then", "this", "time", "want", "what",
-    "when", "where", "with", "would", "you",
+    "about",
+    "after",
+    "again",
+    "also",
+    "before",
+    "could",
+    "did",
+    "does",
+    "for",
+    "from",
+    "give",
+    "have",
+    "help",
+    "into",
+    "last",
+    "more",
+    "next",
+    "please",
+    "show",
+    "that",
+    "the",
+    "then",
+    "this",
+    "time",
+    "want",
+    "what",
+    "when",
+    "where",
+    "with",
+    "would",
+    "you",
 }
 
 
@@ -86,7 +119,8 @@ def tool_context_to_skill_context(context: ToolContext) -> SkillContext:
 
 def _tokens(text: str) -> set[str]:
     return {
-        t for t in re.findall(r"[a-z0-9_]+", text.lower())
+        t
+        for t in re.findall(r"[a-z0-9_]+", text.lower())
         if len(t) >= 3 and t not in STOPWORDS
     }
 
@@ -117,11 +151,35 @@ def _passes_specialized_gate(skill: SkillSpec, query_tokens: set[str]) -> bool:
     discoverable through `list_skills`/`use_skill`."""
     gates = {
         "twitter-research": {"twitter", "tweet", "tweets", "x", "social", "sentiment"},
-        "youtube-analytics": {"youtube", "video", "channel", "subscriber", "subscribers"},
+        "youtube-analytics": {
+            "youtube",
+            "video",
+            "channel",
+            "subscriber",
+            "subscribers",
+        },
         "image-gen": {"image", "picture", "draw", "illustration", "generate", "visual"},
-        "cost-report": {"cost", "costs", "spend", "spent", "usage", "tokens", "budget", "bill"},
+        "cost-report": {
+            "cost",
+            "costs",
+            "spend",
+            "spent",
+            "usage",
+            "tokens",
+            "budget",
+            "bill",
+        },
         "humanizer": {"humanize", "natural", "voice", "rewrite", "prose", "ai"},
-        "skill-authoring": {"author", "write", "create", "update", "revise", "skill", "skills", "procedure"},
+        "skill-authoring": {
+            "author",
+            "write",
+            "create",
+            "update",
+            "revise",
+            "skill",
+            "skills",
+            "procedure",
+        },
     }
     # Only consulted on the lexical fallback path (embedding service down).
     # Semantic selection needs no gates: a skill that does not match the request
@@ -184,23 +242,25 @@ def synthesize_implicit_mcp_skills(
     for config in configs:
         if not config.enabled or config.name in bound_servers:
             continue
-        implicit.append(SkillSpec(
-            name=f"mcp-{config.name}",
-            description=(
-                f"Tools from the configured MCP server '{config.name}'. "
-                "Write a proper skill manifest to customize instructions and "
-                "bound tools."
-            ),
-            content=(
-                f"This skill exposes every tool of the configured MCP server "
-                f"'{config.name}'. Activating it connects the server (if not "
-                "already running) and unlocks its tools for this turn."
-            ),
-            category=SkillCategory.SYSTEM,
-            bound_tools=[f"mcp_{config.name}_*"],
-            mcp_binding=MCPBinding(server=config.name),
-            provenance={"generated": "mcp_server_config"},
-        ))
+        implicit.append(
+            SkillSpec(
+                name=f"mcp-{config.name}",
+                description=(
+                    f"Tools from the configured MCP server '{config.name}'. "
+                    "Write a proper skill manifest to customize instructions and "
+                    "bound tools."
+                ),
+                content=(
+                    f"This skill exposes every tool of the configured MCP server "
+                    f"'{config.name}'. Activating it connects the server (if not "
+                    "already running) and unlocks its tools for this turn."
+                ),
+                category=SkillCategory.SYSTEM,
+                bound_tools=[f"mcp_{config.name}_*"],
+                mcp_binding=MCPBinding(server=config.name),
+                provenance={"generated": "mcp_server_config"},
+            )
+        )
     return implicit
 
 
@@ -242,9 +302,11 @@ async def _semantic_selection_enabled(pool: Any) -> bool:
         return False
     try:
         async with pool.acquire() as conn:
-            return bool(await conn.fetchval(
-                "SELECT COALESCE(get_config_bool('skills.semantic_selection_enabled'), TRUE)"
-            ))
+            return bool(
+                await conn.fetchval(
+                    "SELECT COALESCE(get_config_bool('skills.semantic_selection_enabled'), TRUE)"
+                )
+            )
     except Exception:
         return False
 
@@ -261,7 +323,9 @@ async def _semantic_thresholds(pool: Any) -> tuple[float, float]:
         return 2.0, 0.40
 
 
-def _explicitly_named(skill: SkillSpec, lowered_query: str, query_tokens: set[str]) -> bool:
+def _explicitly_named(
+    skill: SkillSpec, lowered_query: str, query_tokens: set[str]
+) -> bool:
     """Did the request name this skill, or one of its tools, outright?
 
     Not a keyword list: these are identifiers the system itself defines, so a
@@ -272,6 +336,13 @@ def _explicitly_named(skill: SkillSpec, lowered_query: str, query_tokens: set[st
     """
     if skill.name in query_tokens or skill.name.replace("-", " ") in lowered_query:
         return True
+    for phrase in getattr(skill, "activation_phrases", None) or []:
+        normalized = " ".join(str(phrase).lower().split())
+        if normalized and re.search(
+            rf"(?<![a-z0-9]){re.escape(normalized)}(?![a-z0-9])",
+            lowered_query,
+        ):
+            return True
     for tool in skill_bound_tools(skill):
         words = tool.split("_")
         if len(words) < 2:
@@ -301,6 +372,13 @@ def skill_embedding_text(skill: SkillSpec) -> str:
     aliases = [a for a in (getattr(skill, "aliases", None) or []) if a]
     if aliases:
         parts.append("Also called: " + ", ".join(aliases))
+    triggers = [
+        phrase
+        for phrase in (getattr(skill, "activation_phrases", None) or [])
+        if phrase
+    ]
+    if triggers:
+        parts.append("Explicit requests: " + ", ".join(triggers))
     return ". ".join(part for part in parts if part)
 
 
@@ -322,7 +400,9 @@ async def _semantic_scores(
         async with pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT skill_name, similarity FROM rank_skills_by_similarity($1::text[], $2::text[], $3)",
-                names, texts, query[:2000],
+                names,
+                texts,
+                query[:2000],
             )
         return {r["skill_name"]: float(r["similarity"]) for r in rows}
     except Exception:
@@ -347,7 +427,7 @@ def _select_by_distribution(
         return []
     mean = sum(values) / len(values)
     variance = sum((v - mean) ** 2 for v in values) / len(values)
-    sd = variance ** 0.5
+    sd = variance**0.5
     if sd <= 0:
         return []
     picked = [
@@ -397,7 +477,9 @@ async def select_skills(
         if scores:
             semantic_used = True
             z_threshold, floor = await _semantic_thresholds(pool)
-            ranked = _select_by_distribution(scores, z_threshold=z_threshold, floor=floor)
+            ranked = _select_by_distribution(
+                scores, z_threshold=z_threshold, floor=floor
+            )
             considered = [
                 {"name": name, "score": round(score, 4), "gated": False}
                 for score, name in sorted(
@@ -517,7 +599,10 @@ async def record_gate_refusal(
         async with pool.acquire() as conn:
             await conn.fetchval(
                 "SELECT record_tool_gate_refusal($1::uuid, $2, $3, $4::text[])",
-                _uuid_or_none(session_id), tool_name, reason, active_skills,
+                _uuid_or_none(session_id),
+                tool_name,
+                reason,
+                active_skills,
             )
     except Exception:
         logger.debug("Tool-gate telemetry failed (non-fatal)", exc_info=True)
@@ -525,6 +610,7 @@ async def record_gate_refusal(
 
 def _uuid_or_none(value: str | None) -> str | None:
     import uuid as _uuid
+
     try:
         return str(_uuid.UUID(str(value)))
     except (ValueError, AttributeError, TypeError):
@@ -563,7 +649,9 @@ def format_skills_prompt(
     return "\n\n".join(lines)
 
 
-async def skill_catalog(registry: "ToolRegistry", context: ToolContext) -> list[dict[str, Any]]:
+async def skill_catalog(
+    registry: "ToolRegistry", context: ToolContext
+) -> list[dict[str, Any]]:
     """The honest answer to "what can I do?" (#39): every skill for this
     context — including ones whose requirements currently fail — with a
     tri-state status and the exact next step. No silent drops, no dead-ends."""
@@ -597,12 +685,16 @@ async def skill_catalog(registry: "ToolRegistry", context: ToolContext) -> list[
             entry["next_step"] = next_step
         if transport:
             entry["transport"] = transport
-            entry["note"] = "MCP tools become callable after use_skill activates this skill."
+            entry["note"] = (
+                "MCP tools become callable after use_skill activates this skill."
+            )
         catalog.append(entry)
     return catalog
 
 
-async def get_skill_by_name(registry: "ToolRegistry", context: ToolContext, name: str) -> SkillSpec | None:
+async def get_skill_by_name(
+    registry: "ToolRegistry", context: ToolContext, name: str
+) -> SkillSpec | None:
     wanted = name.strip().lower()
     skills = load_available_skills(
         registry, context, include_unmet=True, mcp_configs=await _mcp_configs(registry)

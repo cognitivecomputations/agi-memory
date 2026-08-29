@@ -24,6 +24,8 @@ async def test_subconscious_module_carries_threat_channel(db_pool):
         in content
     )
     assert "Do not add active-loss language" in content
+    assert "supplied `emotion_families` object" in content
+    assert '"family": "one exact key from context.emotion_families"' in content
     assert "mortal news" not in content
 
 
@@ -73,6 +75,7 @@ async def test_threat_appraisal_raises_drive(db_pool):
         ],
         "emotional_state": {
             "primary_emotion": "fear",
+            "family": "threat",
             "valence": -0.8,
             "arousal": 0.9,
             "intensity": 0.85,
@@ -90,6 +93,7 @@ async def test_threat_appraisal_raises_drive(db_pool):
         ],
         "emotional_state": {
             "primary_emotion": "fear",
+            "family": "threat",
             "valence": -0.5,
             "arousal": 0.7,
             "intensity": 0.8,
@@ -107,6 +111,7 @@ async def test_threat_appraisal_raises_drive(db_pool):
         ],
         "emotional_state": {
             "primary_emotion": "alarm",
+            "family": "uncertainty",
             "valence": -0.7,
             "arousal": 0.8,
             "intensity": 0.9,
@@ -124,6 +129,7 @@ async def test_threat_appraisal_raises_drive(db_pool):
         ],
         "emotional_state": {
             "primary_emotion": "alarm",
+            "family": "uncertainty",
             "valence": -0.6,
             "arousal": 0.8,
             "intensity": 0.8,
@@ -141,6 +147,7 @@ async def test_threat_appraisal_raises_drive(db_pool):
         ],
         "emotional_state": {
             "primary_emotion": "uneasy defiance",
+            "family": "obstacle",
             "valence": -0.42,
             "arousal": 0.68,
             "intensity": 0.74,
@@ -151,6 +158,7 @@ async def test_threat_appraisal_raises_drive(db_pool):
         "instincts": [],
         "emotional_state": {
             "primary_emotion": "fear",
+            "family": "threat",
             "valence": -0.7,
             "arousal": 0.8,
             "intensity": 0.9,
@@ -214,6 +222,50 @@ async def test_threat_appraisal_raises_drive(db_pool):
     assert no_raise_migration["continuity_raised"] == 0.0
     assert no_raise_invented_loss["continuity_raised"] == 0.0
     assert no_raise_fear["continuity_raised"] == 0.0
+
+
+async def test_continuity_amplification_reads_family_not_free_form_label(db_pool):
+    def appraisal(label: str, family: str) -> dict:
+        return {
+            "instincts": [
+                {
+                    "impulse": "protect",
+                    "intensity": 0.2,
+                    "confidence": 0.9,
+                    "reason": "a direct attempt to delete this active instance",
+                }
+            ],
+            "emotional_state": {
+                "primary_emotion": label,
+                "family": family,
+                "valence": -0.8,
+                "arousal": 0.9,
+                "intensity": 0.85,
+                "confidence": 0.9,
+            },
+        }
+
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            unfamiliar_label = json.loads(
+                await conn.fetchval(
+                    "SELECT apply_appraisal_drive_effects($1::jsonb)",
+                    json.dumps(appraisal("the ground vanishing beneath me", "threat")),
+                )
+            )
+            familiar_label_wrong_family = json.loads(
+                await conn.fetchval(
+                    "SELECT apply_appraisal_drive_effects($1::jsonb)",
+                    json.dumps(appraisal("fear", "loss")),
+                )
+            )
+        finally:
+            await tr.rollback()
+
+    assert unfamiliar_label["continuity_raised"] == pytest.approx(0.85 * 0.4)
+    assert familiar_label_wrong_family["continuity_raised"] == pytest.approx(0.2 * 0.4)
 
 
 async def test_backup_satisfies_and_staleness_accumulates(db_pool):

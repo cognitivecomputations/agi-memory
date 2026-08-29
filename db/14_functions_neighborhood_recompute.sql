@@ -10,15 +10,15 @@ CREATE OR REPLACE FUNCTION recompute_neighborhood(
 RETURNS VOID AS $$
 DECLARE
     memory_emb vector;
-    zero_vec vector;
     neighbors JSONB;
 BEGIN
     SELECT embedding INTO memory_emb
     FROM memories
-    WHERE id = p_memory_id AND status = 'active';
+    WHERE id = p_memory_id
+      AND status = 'active'
+      AND embedding_status = 'embedded';
 
-    zero_vec := array_fill(0.0::float, ARRAY[embedding_dimension()])::vector;
-    IF memory_emb IS NULL OR memory_emb = zero_vec THEN
+    IF memory_emb IS NULL THEN
         RETURN;
     END IF;
 
@@ -29,8 +29,8 @@ BEGIN
         FROM memories m
         WHERE m.id != p_memory_id
           AND m.status = 'active'
+          AND m.embedding_status = 'embedded'
           AND m.embedding IS NOT NULL
-          AND m.embedding <> zero_vec
         ORDER BY m.embedding <=> memory_emb
         LIMIT p_neighbor_count
     ) sub

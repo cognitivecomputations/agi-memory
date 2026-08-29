@@ -2,6 +2,12 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { normalizeJsonValue } from "@/lib/db";
 
+type DbRecord = Record<string, unknown>;
+
+function errorMessage(error: unknown, fallback: string): string {
+  return error instanceof Error && error.message ? error.message : fallback;
+}
+
 export async function GET() {
   try {
     const [activeRows, backlogRows] = await Promise.all([
@@ -9,7 +15,7 @@ export async function GET() {
       prisma.$queryRawUnsafe("SELECT * FROM goal_backlog"),
     ]);
 
-    const goals = (activeRows as any[]).map((g: any) => ({
+    const goals = (activeRows as DbRecord[]).map((g) => ({
       id: g.id,
       title: g.title,
       description: g.description,
@@ -22,11 +28,14 @@ export async function GET() {
     }));
 
     // Add queued and backburner goals from backlog
-    for (const row of backlogRows as any[]) {
-      const priority = row.priority;
+    for (const row of backlogRows as DbRecord[]) {
+      const priority = typeof row.priority === "string" ? row.priority : "queued";
       if (priority === "active") continue; // already included above
-      const items = normalizeJsonValue(row.goals) || [];
-      for (const item of items) {
+      const normalizedItems = normalizeJsonValue(row.goals);
+      const items = Array.isArray(normalizedItems) ? normalizedItems : [];
+      for (const rawItem of items) {
+        if (!rawItem || typeof rawItem !== "object" || Array.isArray(rawItem)) continue;
+        const item = rawItem as DbRecord;
         goals.push({
           id: item.id,
           title: item.title,
@@ -42,10 +51,10 @@ export async function GET() {
     }
 
     return NextResponse.json({ goals });
-  } catch (error: any) {
+  } catch (error: unknown) {
     console.error("Goals API error:", error);
     return NextResponse.json(
-      { error: error?.message || "Failed to fetch goals" },
+      { error: errorMessage(error, "Failed to fetch goals") },
       { status: 500 }
     );
   }
@@ -60,7 +69,7 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "Title is required" }, { status: 400 });
     }
 
-    const rows: any[] = await prisma.$queryRawUnsafe(
+    const rows = await prisma.$queryRawUnsafe<Array<{ id: string }>>(
       `SELECT create_goal($1, $2, $3::goal_source, $4::goal_priority) AS id`,
       title.trim(),
       description?.trim() || null,
@@ -69,10 +78,10 @@ export async function POST(req: NextRequest) {
     );
 
     return NextResponse.json({ id: rows[0]?.id }, { status: 201 });
-  } catch (error: any) {
+  } catch (error: unknown) {
     console.error("Create goal error:", error);
     return NextResponse.json(
-      { error: error?.message || "Failed to create goal" },
+      { error: errorMessage(error, "Failed to create goal") },
       { status: 500 }
     );
   }

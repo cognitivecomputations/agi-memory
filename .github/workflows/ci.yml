@@ -25,6 +25,11 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
+      - name: Committed dependency lock is current
+        run: >-
+          docker run --rm -v "$PWD:/app:ro" -w /app
+          ghcr.io/astral-sh/uv:0.12.7-python3.12-trixie-slim@sha256:9b269b249ad3de71611f3f4c8cabd38f7786205bbd79f727029a5cfdb072ffd4
+          uv lock --check
       - run: pip install -e . black isort mypy
       - name: black (advisory)
         continue-on-error: true

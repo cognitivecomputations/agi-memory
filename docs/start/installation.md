@@ -115,8 +115,8 @@ On macOS 13 or newer without Docker Desktop, install and start the optional VZ/V
 
 ```bash
 git clone https://github.com/QuixiAI/Hexis.git && cd Hexis
-uv venv && source .venv/bin/activate
-uv pip install -e .
+uv sync --locked --inexact
+source .venv/bin/activate
 cp .env.example .env   # edit with your settings; never commit .env
 ```
 
@@ -164,11 +164,20 @@ See [Environment Variables](../operations/environment-variables.md) for the comp
 ## Start the Stack
 
 ```bash
-hexis up         # starts PostgreSQL, RabbitMQ, heartbeat worker, and maintenance worker
+hexis up         # starts the brain, workers, API, dashboard, and delivery relay
 hexis doctor     # verify everything is healthy
 ```
 
 The CLI auto-detects whether you're running from source or a packaged install and uses the appropriate Docker Compose file.
+It starts cached or published images by default; a source checkout only builds
+images when you explicitly run `hexis up --build` or enter watch mode with
+`hexis dev`.
+
+The dashboard stays available on loopback at `http://127.0.0.1:3477`. To install
+it on a phone, keep that loopback bind and run `hexis tunnel start`; the private
+[Tailscale HTTPS runbook](../operations/secure-remote-access.md) covers device
+approval and verification. Plain LAN HTTP cannot provide the service worker, push,
+or microphone.
 
 ## Verify It Worked
 

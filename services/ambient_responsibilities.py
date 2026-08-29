@@ -12,8 +12,15 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
-from core.auth.google_gmail import GmailOAuthError, load_default_credentials, refresh_default_credentials_if_needed
-from services.connector_cognition import estimate_connector_item_importance, estimate_connector_item_importance_llm
+from core.auth.google_gmail import (
+    GmailOAuthError,
+    load_default_credentials,
+    refresh_default_credentials_if_needed,
+)
+from services.connector_cognition import (
+    estimate_connector_item_importance,
+    estimate_connector_item_importance_llm,
+)
 from services.gmail_backfill import (
     GmailBackfillError,
     _connected_account_email,
@@ -70,7 +77,9 @@ def _first_notify_action(responsibility: dict[str, Any]) -> dict[str, Any]:
     return {}
 
 
-def _notify_message(responsibility: dict[str, Any], *, observation: dict[str, Any] | None = None) -> str:
+def _notify_message(
+    responsibility: dict[str, Any], *, observation: dict[str, Any] | None = None
+) -> str:
     action = _first_notify_action(responsibility)
     message = str(action.get("message") or "").strip()
     if message:
@@ -113,7 +122,9 @@ async def _complete(
     return _as_dict(raw)
 
 
-async def _checkin_count(pool: Any, responsibility_id: str, *, lookback_minutes: int) -> int:
+async def _checkin_count(
+    pool: Any, responsibility_id: str, *, lookback_minutes: int
+) -> int:
     async with pool.acquire() as conn:
         raw = await conn.fetchval(
             """
@@ -128,11 +139,17 @@ async def _checkin_count(pool: Any, responsibility_id: str, *, lookback_minutes:
     return int(raw or 0)
 
 
-async def _evaluate_checkin(pool: Any, claim: dict[str, Any]) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
+async def _evaluate_checkin(
+    pool: Any, claim: dict[str, Any]
+) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
     responsibility = _response(claim)
     evaluator = _as_dict(responsibility.get("evaluator"))
-    lookback_minutes = int(evaluator.get("lookback_minutes") or evaluator.get("grace_minutes") or 720)
-    count = await _checkin_count(pool, str(responsibility["id"]), lookback_minutes=lookback_minutes)
+    lookback_minutes = int(
+        evaluator.get("lookback_minutes") or evaluator.get("grace_minutes") or 720
+    )
+    count = await _checkin_count(
+        pool, str(responsibility["id"]), lookback_minutes=lookback_minutes
+    )
     if count > 0:
         return (
             "silent",
@@ -159,11 +176,16 @@ def _gmail_source(responsibility: dict[str, Any]) -> dict[str, Any] | None:
     for source in _as_list(responsibility.get("sources")):
         if not isinstance(source, dict):
             continue
-        connector = str(source.get("connector_id") or source.get("connector") or "").lower()
+        connector = str(
+            source.get("connector_id") or source.get("connector") or ""
+        ).lower()
         if connector == "gmail":
             return source
     evaluator = _as_dict(responsibility.get("evaluator"))
-    if str(evaluator.get("connector_id") or evaluator.get("connector") or "").lower() == "gmail":
+    if (
+        str(evaluator.get("connector_id") or evaluator.get("connector") or "").lower()
+        == "gmail"
+    ):
         return {"connector_id": "gmail", **evaluator}
     return None
 
@@ -182,7 +204,13 @@ def _generic_connector_sources(responsibility: dict[str, Any]) -> list[dict[str,
         if not isinstance(source, dict):
             continue
         connector = _source_connector(source)
-        if connector and connector not in {"gmail", "health", "fitness", "wearable", "steps"}:
+        if connector and connector not in {
+            "gmail",
+            "health",
+            "fitness",
+            "wearable",
+            "steps",
+        }:
             result.append(source)
     return result
 
@@ -193,7 +221,10 @@ def _metric_source(responsibility: dict[str, Any]) -> dict[str, Any] | None:
         if isinstance(source, dict) and _source_connector(source) in metric_connectors:
             return source
     evaluator = _as_dict(responsibility.get("evaluator"))
-    if _connector_id(evaluator.get("connector_id") or evaluator.get("connector")) in metric_connectors:
+    if (
+        _connector_id(evaluator.get("connector_id") or evaluator.get("connector"))
+        in metric_connectors
+    ):
         return {"connector_id": "health", **evaluator}
     if evaluator.get("metric"):
         return {"connector_id": "health", **evaluator}
@@ -210,7 +241,9 @@ def _gmail_query(responsibility: dict[str, Any], source: dict[str, Any]) -> str:
     if not query:
         query = "in:inbox"
     if "after:" not in query.lower():
-        last_checked = responsibility.get("last_checked_at") or responsibility.get("created_at")
+        last_checked = responsibility.get("last_checked_at") or responsibility.get(
+            "created_at"
+        )
         if isinstance(last_checked, str) and last_checked.strip():
             try:
                 parsed = datetime.fromisoformat(last_checked.replace("Z", "+00:00"))
@@ -222,18 +255,30 @@ def _gmail_query(responsibility: dict[str, Any], source: dict[str, Any]) -> str:
 
 def _parse_timestamp(value: Any) -> datetime:
     if isinstance(value, datetime):
-        return value.astimezone(timezone.utc) if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        return (
+            value.astimezone(timezone.utc)
+            if value.tzinfo
+            else value.replace(tzinfo=timezone.utc)
+        )
     if isinstance(value, str) and value.strip():
         try:
             parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-            return parsed.astimezone(timezone.utc) if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+            return (
+                parsed.astimezone(timezone.utc)
+                if parsed.tzinfo
+                else parsed.replace(tzinfo=timezone.utc)
+            )
         except ValueError:
             pass
     return datetime.now(timezone.utc)
 
 
 def _message_summary(source: dict[str, Any]) -> dict[str, Any]:
-    participants = source.get("participants") if isinstance(source.get("participants"), list) else []
+    participants = (
+        source.get("participants")
+        if isinstance(source.get("participants"), list)
+        else []
+    )
     sender = ""
     for participant in participants:
         if isinstance(participant, dict) and participant.get("role") == "from":
@@ -244,24 +289,11 @@ def _message_summary(source: dict[str, Any]) -> dict[str, Any]:
         "provider_thread_id": source.get("provider_thread_id"),
         "title": source.get("title") or "(No subject)",
         "from": sender,
-        "snippet": str((_as_dict(source.get("metadata")).get("gmail_snippet") or ""))[:500],
+        "snippet": str((_as_dict(source.get("metadata")).get("gmail_snippet") or ""))[
+            :500
+        ],
         "observed_at": source.get("item_timestamp"),
     }
-
-
-def _keyword_importance_matches(text: str) -> bool:
-    lowered = text.lower()
-    keywords = (
-        "urgent",
-        "asap",
-        "emergency",
-        "immediately",
-        "action required",
-        "deadline",
-        "overdue",
-        "critical",
-    )
-    return any(keyword in lowered for keyword in keywords)
 
 
 async def _importance_estimate(pool: Any, item: dict[str, Any]) -> dict[str, Any]:
@@ -269,7 +301,9 @@ async def _importance_estimate(pool: Any, item: dict[str, Any]) -> dict[str, Any
     try:
         async with pool.acquire() as conn:
             llm_enabled = bool(
-                await conn.fetchval("SELECT COALESCE(get_config_bool('ambient.importance_llm_enabled'), TRUE)")
+                await conn.fetchval(
+                    "SELECT COALESCE(get_config_bool('ambient.importance_llm_enabled'), TRUE)"
+                )
             )
             if llm_enabled:
                 return await estimate_connector_item_importance_llm(conn, item)
@@ -278,7 +312,9 @@ async def _importance_estimate(pool: Any, item: dict[str, Any]) -> dict[str, Any
     return baseline
 
 
-async def _select_fire_items(pool: Any, responsibility: dict[str, Any], items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+async def _select_fire_items(
+    pool: Any, responsibility: dict[str, Any], items: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
     evaluator = _as_dict(responsibility.get("evaluator"))
     evaluator_type = str(evaluator.get("type") or "").lower()
     if evaluator_type in {"importance", "urgent", "llm_importance"}:
@@ -289,16 +325,21 @@ async def _select_fire_items(pool: Any, responsibility: dict[str, Any], items: l
             pass
         selected = []
         for item in items:
-            content = " ".join(str(item.get(key) or "") for key in ("title", "from", "snippet", "content"))
+            content = " ".join(
+                str(item.get(key) or "")
+                for key in ("title", "from", "snippet", "content")
+            )
             estimate = await _importance_estimate(pool, {**item, "content": content})
             item["importance"] = estimate
-            if float(estimate.get("score") or 0.0) >= threshold or _keyword_importance_matches(content):
+            if float(estimate.get("score") or 0.0) >= threshold:
                 selected.append(item)
         return selected
     return items
 
 
-def _source_query_terms(source: dict[str, Any], evaluator: dict[str, Any]) -> tuple[list[str], list[str]]:
+def _source_query_terms(
+    source: dict[str, Any], evaluator: dict[str, Any]
+) -> tuple[list[str], list[str]]:
     query = str(source.get("query") or evaluator.get("query") or "").strip()
     from_terms: list[str] = []
     text_terms: list[str] = []
@@ -319,7 +360,9 @@ def _source_query_terms(source: dict[str, Any], evaluator: dict[str, Any]) -> tu
     return from_terms, text_terms
 
 
-def _generic_item_matches(source: dict[str, Any], evaluator: dict[str, Any], item: dict[str, Any]) -> bool:
+def _generic_item_matches(
+    source: dict[str, Any], evaluator: dict[str, Any], item: dict[str, Any]
+) -> bool:
     from_terms, text_terms = _source_query_terms(source, evaluator)
     participants = json.dumps(item.get("participants") or [], default=str).lower()
     text = " ".join(
@@ -331,7 +374,9 @@ def _generic_item_matches(source: dict[str, Any], evaluator: dict[str, Any], ite
     if isinstance(requested_labels, str):
         requested_labels = [requested_labels]
     if isinstance(requested_labels, list):
-        wanted = {str(label).lower() for label in requested_labels if str(label).strip()}
+        wanted = {
+            str(label).lower() for label in requested_labels if str(label).strip()
+        }
         if wanted and labels.isdisjoint(wanted):
             return False
     if from_terms and not all(term in participants for term in from_terms):
@@ -351,12 +396,17 @@ async def _fetch_generic_source_items(
         return []
     account_key = str(source.get("account_key") or "").strip() or None
     item_kind = str(source.get("item_kind") or "").strip() or None
-    since = _parse_timestamp(responsibility.get("last_checked_at") or responsibility.get("created_at"))
+    since = _parse_timestamp(
+        responsibility.get("last_checked_at") or responsibility.get("created_at")
+    )
     page_size = int(source.get("page_size") or source.get("max_results") or 0)
     if page_size <= 0:
         async with pool.acquire() as conn:
             page_size = int(
-                await conn.fetchval("SELECT COALESCE(get_config_int('ambient.generic_source_page_size'), 25)") or 25
+                await conn.fetchval(
+                    "SELECT COALESCE(get_config_int('ambient.generic_source_page_size'), 25)"
+                )
+                or 25
             )
     page_size = min(max(page_size, 1), 100)
     async with pool.acquire() as conn:
@@ -406,7 +456,9 @@ async def _fetch_generic_source_items(
     return items
 
 
-async def _evaluate_gmail(pool: Any, claim: dict[str, Any]) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
+async def _evaluate_gmail(
+    pool: Any, claim: dict[str, Any]
+) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
     responsibility = _response(claim)
     source = _gmail_source(responsibility)
     if source is None:
@@ -417,7 +469,9 @@ async def _evaluate_gmail(pool: Any, claim: dict[str, Any]) -> tuple[str, dict[s
             "blocked",
             {
                 "reason": "gmail_not_connected",
-                "missing_connectors": [{"connector_id": "gmail", "status": "not_connected"}],
+                "missing_connectors": [
+                    {"connector_id": "gmail", "status": "not_connected"}
+                ],
             },
             [],
         )
@@ -486,7 +540,9 @@ async def _evaluate_gmail(pool: Any, claim: dict[str, Any]) -> tuple[str, dict[s
         observation = {**summary, **observation}
         observations.append(observation)
         if observation.get("created"):
-            new_items.append({**summary, "content": source_item.get("content", ""), **observation})
+            new_items.append(
+                {**summary, "content": source_item.get("content", ""), **observation}
+            )
 
     selected = await _select_fire_items(pool, responsibility, new_items)
     if not selected:
@@ -507,7 +563,9 @@ async def _evaluate_gmail(pool: Any, claim: dict[str, Any]) -> tuple[str, dict[s
         if notify == str(responsibility.get("title") or "").strip():
             notify = f"{responsibility['title']}: {first.get('from') or 'Gmail'} - {first.get('title') or '(No subject)'}"
     else:
-        notify = f"{responsibility['title']}: {len(selected)} new matching Gmail messages."
+        notify = (
+            f"{responsibility['title']}: {len(selected)} new matching Gmail messages."
+        )
 
     return (
         "fired",
@@ -518,7 +576,16 @@ async def _evaluate_gmail(pool: Any, claim: dict[str, Any]) -> tuple[str, dict[s
             "new_observations": len(new_items),
             "notify_message": notify,
             "messages": [
-                {k: item.get(k) for k in ("provider_item_id", "title", "from", "snippet", "observation_id")}
+                {
+                    k: item.get(k)
+                    for k in (
+                        "provider_item_id",
+                        "title",
+                        "from",
+                        "snippet",
+                        "observation_id",
+                    )
+                }
                 for item in selected[:10]
             ],
         },
@@ -549,7 +616,8 @@ async def _evaluate_generic_connector_sources(
                     "item_kind": item.get("item_kind") or "message",
                     "provider_item_id": item.get("provider_item_id"),
                     "provider_thread_id": item.get("provider_thread_id"),
-                    "observed_at": item.get("item_timestamp") or item.get("first_seen_at"),
+                    "observed_at": item.get("item_timestamp")
+                    or item.get("first_seen_at"),
                     "title": item.get("title"),
                     "content": item.get("content"),
                     "participants": item.get("participants"),
@@ -576,7 +644,9 @@ async def _evaluate_generic_connector_sources(
             observation = {**summary, **observation}
             observations.append(observation)
             if observation.get("created"):
-                new_items.append({**summary, "content": item.get("content") or "", **observation})
+                new_items.append(
+                    {**summary, "content": item.get("content") or "", **observation}
+                )
 
     selected = await _select_fire_items(pool, responsibility, new_items)
     if not selected:
@@ -651,7 +721,9 @@ async def _evaluate_metric_threshold(
         return "silent", {"reason": "no_metric_source"}, []
 
     raw_value = source.get("current_value", evaluator.get("current_value"))
-    raw_threshold = source.get("value", evaluator.get("value", evaluator.get("threshold")))
+    raw_threshold = source.get(
+        "value", evaluator.get("value", evaluator.get("threshold"))
+    )
     metric = str(source.get("metric") or evaluator.get("metric") or "metric")
     operator = str(source.get("operator") or evaluator.get("operator") or "<").lower()
     if raw_value is None:
@@ -660,7 +732,9 @@ async def _evaluate_metric_threshold(
             {
                 "reason": "metric_provider_not_configured",
                 "metric": metric,
-                "missing_connectors": [{"connector_id": "health", "status": "not_connected"}],
+                "missing_connectors": [
+                    {"connector_id": "health", "status": "not_connected"}
+                ],
                 "next_step": "Connect a health or wearable provider that can write metric observations.",
             },
             [],
@@ -735,14 +809,22 @@ async def evaluate_ambient_responsibility(
     return "silent", {"reason": "no_supported_evaluator"}, []
 
 
-async def run_ambient_responsibility_step(pool: Any, *, limit: int | None = None) -> dict[str, Any]:
+async def run_ambient_responsibility_step(
+    pool: Any, *, limit: int | None = None
+) -> dict[str, Any]:
     """Claim and evaluate due ambient responsibilities."""
     async with pool.acquire() as conn:
-        enabled = await conn.fetchval("SELECT COALESCE(get_config_bool('ambient.enabled'), TRUE)")
+        enabled = await conn.fetchval(
+            "SELECT COALESCE(get_config_bool('ambient.enabled'), TRUE)"
+        )
         if not bool(enabled):
             return {"skipped": True, "reason": "disabled"}
-        raw_limit = limit or await conn.fetchval("SELECT COALESCE(get_config_int('ambient.batch_size'), 20)")
-        raw = await conn.fetchval("SELECT claim_due_ambient_responsibilities($1::int)", int(raw_limit or 20))
+        raw_limit = limit or await conn.fetchval(
+            "SELECT COALESCE(get_config_int('ambient.batch_size'), 20)"
+        )
+        raw = await conn.fetchval(
+            "SELECT claim_due_ambient_responsibilities($1::int)", int(raw_limit or 20)
+        )
     claims = _as_list(raw)
     if not claims:
         return {"skipped": True, "reason": "no_due_ambient_responsibilities"}
@@ -764,12 +846,22 @@ async def run_ambient_responsibility_step(pool: Any, *, limit: int | None = None
         if not run_id:
             continue
         try:
-            status, decision, observations = await evaluate_ambient_responsibility(pool, claim)
+            status, decision, observations = await evaluate_ambient_responsibility(
+                pool, claim
+            )
         except (GmailBackfillError, GmailOAuthError) as exc:
-            status, decision, observations = "blocked", {"reason": "provider_unavailable", "error": str(exc)}, []
+            status, decision, observations = (
+                "blocked",
+                {"reason": "provider_unavailable", "error": str(exc)},
+                [],
+            )
         except Exception as exc:
             logger.exception("Ambient responsibility evaluation failed")
-            status, decision, observations = "failed", {"reason": "evaluation_error", "error": str(exc)}, []
+            status, decision, observations = (
+                "failed",
+                {"reason": "evaluation_error", "error": str(exc)},
+                [],
+            )
 
         completed = await _complete(pool, run_id, status, decision, observations)
         if completed.get("success"):
@@ -780,11 +872,14 @@ async def run_ambient_responsibility_step(pool: Any, *, limit: int | None = None
         outbox = completed.get("outbox_messages")
         if isinstance(outbox, list) and outbox:
             result["outbox_messages"].extend(outbox)
-        result["runs"].append({
-            "run_id": run_id,
-            "responsibility_id": completed.get("responsibility_id") or _response(claim).get("id"),
-            "status": normalized,
-            "decision": completed.get("decision") or decision,
-        })
+        result["runs"].append(
+            {
+                "run_id": run_id,
+                "responsibility_id": completed.get("responsibility_id")
+                or _response(claim).get("id"),
+                "status": normalized,
+                "decision": completed.get("decision") or decision,
+            }
+        )
 
     return result

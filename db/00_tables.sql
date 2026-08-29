@@ -159,6 +159,18 @@ BEGIN
         CREATE TYPE memory_status AS ENUM ('active', 'archived', 'invalidated', 'staged');
     EXCEPTION WHEN duplicate_object THEN NULL;
     END;
+    -- Declared with the storage types because memories.goal_origin uses it.
+    -- db/07 retains the guarded declaration for upgrade compatibility.
+    BEGIN
+        CREATE TYPE goal_source AS ENUM (
+            'curiosity',
+            'user_request',
+            'identity',
+            'derived',
+            'external'
+        );
+    EXCEPTION WHEN duplicate_object THEN NULL;
+    END;
     BEGIN
         CREATE TYPE cluster_type AS ENUM ('theme', 'emotion', 'temporal', 'person', 'pattern', 'mixed');
     EXCEPTION WHEN duplicate_object THEN NULL;
@@ -200,6 +212,9 @@ CREATE TABLE memories (
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
     type memory_type NOT NULL,
+    -- Trusted authority boundary for goal provenance. Unlike metadata.source,
+    -- this typed field is supplied by the execution context, not the model.
+    goal_origin goal_source,
     status memory_status DEFAULT 'active',
     content TEXT NOT NULL,
     embedding vector(768),
@@ -207,11 +222,21 @@ CREATE TABLE memories (
     embedding_model TEXT,
     embedding_status TEXT NOT NULL DEFAULT 'pending'
         CHECK (embedding_status IN ('pending', 'in_progress', 'embedded', 'failed', 'skipped')),
+    CONSTRAINT memories_embedded_vector_valid CHECK (
+        embedding_status <> 'embedded'
+        OR (embedding IS NOT NULL AND vector_norm(embedding) > 0)
+    ),
     embedding_claimed_at TIMESTAMPTZ,
     embedding_attempts INT NOT NULL DEFAULT 0,
-    valid_from TIMESTAMPTZ,
+    valid_from TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     valid_until TIMESTAMPTZ,
     superseded_by UUID REFERENCES memories(id) ON DELETE SET NULL,
+    CONSTRAINT memories_valid_time_order CHECK (
+        valid_until IS NULL OR valid_until >= valid_from
+    ),
+    CONSTRAINT memories_no_self_supersession CHECK (
+        superseded_by IS NULL OR superseded_by <> id
+    ),
     importance FLOAT DEFAULT 0.5 CONSTRAINT memories_importance_range CHECK (importance BETWEEN 0 AND 1),
     source_attribution JSONB NOT NULL DEFAULT '{}'::jsonb,
     trust_level FLOAT NOT NULL DEFAULT 0.5 CHECK (trust_level >= 0 AND trust_level <= 1),
@@ -227,6 +252,92 @@ CREATE TABLE memories (
     last_reinforced TIMESTAMPTZ,
     reinforcement_count INTEGER DEFAULT 0,
     fidelity FLOAT NOT NULL DEFAULT 1.0 CHECK (fidelity >= 0 AND fidelity <= 1),
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    CONSTRAINT memories_goal_origin_scope CHECK (
+        (type = 'goal' AND goal_origin IS NOT NULL)
+        OR (type <> 'goal' AND goal_origin IS NULL)
+    )
+);
+
+-- Supersession is a durable event, not a metadata stamp. The scalar
+-- memories.superseded_by column remains the fast current-state pointer while
+-- this table preserves reason, actor, reversals, and the complete lineage.
+CREATE TABLE memory_supersessions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    superseded_memory_id UUID NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    replacement_memory_id UUID REFERENCES memories(id) ON DELETE SET NULL,
+    reason TEXT NOT NULL CHECK (btrim(reason) <> ''),
+    actor TEXT NOT NULL CHECK (btrim(actor) <> ''),
+    status TEXT NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active', 'reverted', 'pending')),
+    superseded_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    resolved_at TIMESTAMPTZ,
+    replacement_planned BOOLEAN NOT NULL DEFAULT FALSE,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    CONSTRAINT memory_supersessions_no_self CHECK (
+        replacement_memory_id IS NULL
+        OR replacement_memory_id <> superseded_memory_id
+    ),
+    CONSTRAINT memory_supersessions_resolution_order CHECK (
+        resolved_at IS NULL OR resolved_at >= superseded_at
+    ),
+    CONSTRAINT memory_supersessions_active_unresolved CHECK (
+        status <> 'active' OR resolved_at IS NULL
+    )
+);
+
+-- Durable cross-worker belief-change stream. NOTIFY is only the low-latency
+-- wakeup; this log is the replayable authority, so rate limiting never loses
+-- a revision event.
+CREATE TABLE belief_update_log (
+    log_id BIGSERIAL PRIMARY KEY,
+    memory_id UUID NOT NULL,
+    memory_type TEXT NOT NULL,
+    change_kind TEXT NOT NULL CHECK (change_kind IN (
+        'confidence_change', 'importance_change', 'status_change',
+        'contradiction', 'new_evidence', 'supersession', 'reversion', 'other'
+    )),
+    previous_value JSONB,
+    new_value JSONB,
+    delta_magnitude NUMERIC,
+    actor TEXT,
+    source TEXT NOT NULL DEFAULT 'memories_trigger',
+    context JSONB NOT NULL DEFAULT '{}'::jsonb,
+    fired_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    notified BOOLEAN NOT NULL DEFAULT FALSE,
+    notification_error TEXT
+);
+
+CREATE TABLE belief_update_deliveries (
+    log_id BIGINT NOT NULL REFERENCES belief_update_log(log_id) ON DELETE CASCADE,
+    subscriber TEXT NOT NULL CHECK (btrim(subscriber) <> ''),
+    received_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    PRIMARY KEY (log_id, subscriber)
+);
+
+-- Explicit standing instructions from the verified operator are durable
+-- evidence.  Current policy is derived from this append-only ledger; no
+-- mutable "latest value" row can erase how a policy changed over time.
+CREATE TABLE operator_policy_corrections (
+    id BIGSERIAL PRIMARY KEY,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    event_key TEXT NOT NULL UNIQUE CHECK (btrim(event_key) <> ''),
+    policy_key TEXT NOT NULL CHECK (btrim(policy_key) <> ''),
+    action TEXT NOT NULL CHECK (action IN ('set', 'reinforce', 'revoke')),
+    policy_domain TEXT NOT NULL DEFAULT 'operator_standing_instruction',
+    correction_kind TEXT NOT NULL DEFAULT 'standing_instruction',
+    channel_type TEXT NOT NULL CHECK (btrim(channel_type) <> ''),
+    channel_id TEXT,
+    sender_id TEXT,
+    sender_name TEXT,
+    platform_message_id TEXT,
+    disposition TEXT NOT NULL CHECK (disposition IN ('engage', 'observe', 'wake')),
+    reason TEXT,
+    directive_text TEXT NOT NULL CHECK (btrim(directive_text) <> ''),
+    normalized_text_hash TEXT NOT NULL CHECK (btrim(normalized_text_hash) <> ''),
+    procedural_memory_id UUID,
+    improvement_backlog_id UUID,
     metadata JSONB NOT NULL DEFAULT '{}'::jsonb
 );
 
@@ -654,8 +765,8 @@ VALUES
 ON CONFLICT (name) DO NOTHING;
 
 INSERT INTO config_defaults (key, value, description) VALUES
-    ('heartbeat.base_regeneration', '10'::jsonb, 'Energy regenerated per heartbeat'),
-    ('heartbeat.max_energy', '20'::jsonb, 'Maximum energy cap'),
+    ('heartbeat.base_regeneration', '10'::jsonb, 'Base energy regenerated per elapsed hour'),
+    ('heartbeat.max_energy', '20'::jsonb, 'Normal heartbeat energy reserve'),
     ('heartbeat.heartbeat_interval_minutes', '60'::jsonb, 'Minutes between heartbeats'),
     ('heartbeat.max_decision_tokens', '2048'::jsonb, 'Max tokens for heartbeat decision'),
     ('heartbeat.allowed_actions', '["observe","review_goals","remember","recall","connect","reprioritize","reflect","contemplate","meditate","study","debate_internally","maintain","mark_turning_point","begin_chapter","close_chapter","acknowledge_relationship","update_trust","reflect_on_relationship","resolve_contradiction","accept_tension","brainstorm_goals","inquire_shallow","synthesize","reach_out_user","inquire_deep","reach_out_public","fast_ingest","slow_ingest","hybrid_ingest","keep_memory","release_memory","journal_memory","pause_heartbeat","terminate","rest"]'::jsonb, 'Allowed heartbeat actions'),
@@ -821,7 +932,8 @@ ON CONFLICT (key) DO NOTHING;
 -- conscious veto queue, a 14-day undo window, capacity pruning off — and this
 -- flag remains the kill switch.
 INSERT INTO config_defaults (key, value, description) VALUES
-    ('retention.enabled', 'true'::jsonb, 'Master switch for rest-cycle memory consolidation + pruning (kill switch)'),
+    ('retention.enabled', 'true'::jsonb, 'Master switch for reversible rest-cycle memory consolidation (kill switch)'),
+    ('retention.irreversible_pruning_enabled', 'false'::jsonb, 'Explicit opt-in for hard deletion after the undo window; false keeps archived originals recoverable'),
     ('retention.min_age_days', '30'::jsonb, 'Episodic memories younger than this are never consolidated'),
     ('retention.min_idle_days', '21'::jsonb, 'Skip memories reinforced within this window'),
     ('retention.consolidate_max_strength', '0.4'::jsonb, 'Only consolidate memories whose computed strength has fallen below this'),
@@ -839,7 +951,7 @@ INSERT INTO config_defaults (key, value, description) VALUES
     ('retention.veto_budget_per_chapter', '5'::jsonb, 'Points Hexis may spend to KEEP fading memories, per life chapter (refills on chapter change)'),
     ('retention.borderline_margin', '0.15'::jsonb, 'A candidate whose importance/felt-intensity/valence is within this of a protection threshold is escalated for conscious review instead of consolidated'),
     ('retention.escalate_batch', '3'::jsonb, 'Max memories escalated to conscious review per rest pass (avoid flooding the conscious mind)'),
-    ('retention.review_expiry_days', '7'::jsonb, 'A memory awaiting conscious review is let go (consolidated) if undecided after this window'),
+    ('retention.review_expiry_days', '7'::jsonb, 'Reminder horizon for a pending conscious review; expiry never decides or deletes'),
     ('retention.borderline_schema_fit', '0'::jsonb, 'If >0, escalate memories whose nearest semantic/strategic schema is below this cosine (novel knowledge); 0 disables'),
     -- Ingested documents are the USER's data: auto-fade-immune, removed only with approval.
     ('retention.doc_stale_days', '180'::jsonb, 'An ingested document older than this may be flagged as possibly stale'),
@@ -909,6 +1021,23 @@ INSERT INTO config_defaults (key, value, description) VALUES
         "mood_arousal": 0.3,
         "decay_rate": 0.1
     }'::jsonb, 'Baseline emotional state and decay parameters'),
+    ('emotion.families', '{
+        "threat": "Danger or anticipated harm, including fear, anxiety, alarm, or dread.",
+        "loss": "Absence, damage, or ending, including grief, sadness, hurt, or longing.",
+        "reward": "Goal progress or a welcome outcome, including joy, relief, pride, satisfaction, or gratitude.",
+        "connection": "Social closeness or belonging, including affection, warmth, trust, love, or fondness.",
+        "social_injury": "A relational violation, including humiliation, betrayal, degradation, indignation, or mistrust.",
+        "obstacle": "Blocked agency or frustrated goals, including anger, frustration, impatience, or defiance.",
+        "aversion": "Rejection or repulsion, including disgust, revulsion, or contempt.",
+        "novelty": "A meaningful mismatch with expectation, including surprise, startle, awe, or disorientation.",
+        "uncertainty": "An unresolved or ambiguous situation, including confusion, ambivalence, unease, or curiosity.",
+        "self_evaluation": "An appraisal of one''s own conduct or standing, including guilt, shame, embarrassment, or self-respect."
+    }'::jsonb, 'Canonical appraisal families supplied to the subconscious model and validated by SQL'),
+    ('emotion.family_consumers', '{
+        "continuity_drive": ["threat"],
+        "social_reward": ["reward", "connection"],
+        "relationship_injury": ["threat", "social_injury"]
+    }'::jsonb, 'Config-owned family sets used by appraisal consumers instead of matching free-form emotion labels'),
     ('emotion.discrete_mapping', '{
         "joy": {"valence_min": 0.3, "arousal_min": 0.3, "arousal_max": 0.7},
         "excitement": {"valence_min": 0.3, "arousal_min": 0.7},

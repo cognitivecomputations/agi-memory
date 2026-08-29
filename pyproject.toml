@@ -26,9 +26,11 @@ dependencies = [
   "fastapi>=0.104.0",
   "python-multipart>=0.0.9",
   "uvicorn>=0.24.0",
+  "websockets>=14.0",
   "pydantic>=2.4.2",
   "jsonschema>=4.18.0",
   "cryptography>=41.0.0",
+  "pywebpush>=2.0.0",
   "asyncpg>=0.29.0",
   "psycopg2-binary>=2.9.9",
   "requests>=2.31.0",
@@ -70,6 +72,8 @@ hexis-worker = "apps.worker:main"
 hexis-mcp = "apps.hexis_mcp_server:main"
 hexis-api = "apps.hexis_api:main"
 hexis-channels = "services.channel_worker:main"
+hexis-voice = "apps.voice_sidecar:main"
+hexis-memory-benchmark = "evals.memory_benchmark.run:main"
 
 [project.optional-dependencies]
 anthropic = [
@@ -109,13 +113,25 @@ media = [
   "moviepy",
   "youtube-transcript-api>=0.6.0",
 ]
+audio_analysis = [
+  "pyannote.audio>=4.0.0",
+  "librosa>=0.10.0",
+  "soundfile>=0.12.0",
+]
+voice = [
+  "piper-tts[http]>=1.4.2,<2",
+]
+wake = [
+  "openwakeword==0.6.0",
+  "sounddevice>=0.5,<0.6",
+]
 
 [tool.setuptools]
 include-package-data = true
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["apps*", "core*", "services*", "channels*", "plugins*", "skills*", "schemas*", "db*", "ops*", "characters*"]
+include = ["apps*", "core*", "services*", "channels*", "plugins*", "skills*", "schemas*", "db*", "ops*", "characters*", "evals", "evals.memory_benchmark*"]
 
 [tool.setuptools.package-data]
 core = ["auth/gmail-credentials.json"]
@@ -127,3 +143,4 @@ ops = ["docker-compose.runtime.yml"]
 "apps.tui" = ["*.tcss"]
 schemas = ["*.json"]
 skills = ["installed/*/SKILL.md"]
+"evals.memory_benchmark" = ["*.json", "*.jsonl", "README.md", "results/*.json"]

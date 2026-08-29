@@ -242,6 +242,50 @@ BEGIN
 END;
 $$;
 
+-- Append trusted multimodal context produced inside the tool runtime. This is
+-- separate from append_agent_message so arbitrary text callers cannot smuggle
+-- provider-specific content shapes into the authoritative turn log.
+CREATE OR REPLACE FUNCTION append_agent_visual_message(
+    p_turn_id UUID,
+    p_label TEXT,
+    p_data_url TEXT
+) RETURNS JSONB
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    turn agent_turns%ROWTYPE;
+BEGIN
+    IF COALESCE(p_data_url, '') !~ '^data:image/(png|jpeg|webp|gif);base64,' THEN
+        RAISE EXCEPTION 'visual message requires a supported image data URL';
+    END IF;
+    UPDATE agent_turns
+    SET messages = COALESCE(messages, '[]'::jsonb)
+            || jsonb_build_array(jsonb_build_object(
+                'role', 'user',
+                'content', jsonb_build_array(
+                    jsonb_build_object(
+                        'type', 'input_text',
+                        'text', format('[Fresh tool-provided visual context: %s]',
+                            COALESCE(NULLIF(p_label, ''), 'image'))
+                    ),
+                    jsonb_build_object(
+                        'type', 'input_image',
+                        'image_url', p_data_url,
+                        'detail', 'auto'
+                    )
+                )
+            )),
+        updated_at = CURRENT_TIMESTAMP
+    WHERE id = p_turn_id
+    RETURNING * INTO turn;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'agent turn not found: %', p_turn_id;
+    END IF;
+    RETURN jsonb_build_object('turn_id', p_turn_id::text, 'messages', turn.messages);
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION finish_agent_turn(
     p_turn_id UUID,
     p_result JSONB DEFAULT '{}'::jsonb
