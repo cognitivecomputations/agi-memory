@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 # the corresponding DB prompt module. Anything else is literal addendum text
 # (the attached-document path).
 _ADDENDA_MODULES = {"philosophy": "philosophy", "letter": "LetterFromClaude"}
+_LOCAL_OPERATOR_SURFACES = {"api", "chat", "cli", "openai_compat", "tui", "web"}
 _MAX_ACTION_RECEIPTS_PER_TURN = 12
 _MAX_ACTION_RECEIPT_TEXT = 320
 _MAX_RECEIPT_HISTORY_TURNS = 8
@@ -432,6 +433,10 @@ async def _apply_chat_energy_effects(
     tool_energy_spent: int = 0,
     emotional_state: dict[str, Any] | None = None,
     surface: str = "chat",
+    user_message: str = "",
+    is_operator: bool = False,
+    session_id: str | None = None,
+    agent_turn_id: str | None = None,
 ) -> dict[str, Any]:
     try:
         async with pool.acquire() as conn:
@@ -441,10 +446,92 @@ async def _apply_chat_energy_effects(
                 json.dumps(emotional_state or {}, default=str),
                 json.dumps({"surface": surface}, default=str),
             )
-        return json.loads(raw) if isinstance(raw, str) else (raw or {})
+            feedback_raw = await conn.fetchval(
+                "SELECT credit_heartbeat_user_feedback($1::text, $2::boolean, $3::jsonb)",
+                user_message,
+                bool(is_operator),
+                json.dumps(
+                    {
+                        "surface": surface,
+                        "session_id": session_id,
+                        "agent_turn_id": agent_turn_id,
+                    },
+                    default=str,
+                ),
+            )
+        payload = json.loads(raw) if isinstance(raw, str) else (raw or {})
+        if not isinstance(payload, dict):
+            payload = {}
+        feedback = (
+            json.loads(feedback_raw)
+            if isinstance(feedback_raw, str)
+            else (feedback_raw or {})
+        )
+        payload["heartbeat_feedback"] = feedback
+        return payload
     except Exception:
         logger.debug("Chat energy effects failed (non-fatal)", exc_info=True)
         return {}
+
+
+def _trusted_operator_turn(
+    *,
+    surface: str,
+    is_group: bool,
+    trusted_operator: bool | None,
+) -> bool:
+    """Resolve operator authority from the transport, never from message text."""
+    if is_group:
+        return False
+    if trusted_operator is not None:
+        return bool(trusted_operator)
+    return surface in _LOCAL_OPERATOR_SURFACES
+
+
+async def _capture_operator_policy_for_turn(
+    pool: Any,
+    *,
+    user_message: str,
+    session_id: str | None,
+    user_label: str | None,
+    surface: str,
+    is_operator: bool,
+    operator_context: dict[str, Any] | None,
+) -> dict[str, Any]:
+    from services.operator_policy_corrections import (
+        capture_operator_policy_correction,
+    )
+
+    context = dict(operator_context or {})
+    raw_text = str(context.pop("raw_text", user_message))
+    metadata = context.pop("metadata", {})
+    if not isinstance(metadata, dict):
+        metadata = {}
+    metadata = {**metadata, "session_id": session_id}
+    return await capture_operator_policy_correction(
+        pool,
+        channel_type=str(context.pop("channel_type", surface)),
+        channel_id=context.pop("channel_id", session_id),
+        sender_id=context.pop("sender_id", None),
+        sender_name=context.pop("sender_name", user_label),
+        text=raw_text,
+        is_operator=is_operator,
+        disposition=str(context.pop("disposition", "engage")),
+        reason=context.pop("reason", "ordinary_chat_turn"),
+        metadata={**metadata, **context},
+    )
+
+
+def _operator_policy_capture_notice(result: dict[str, Any]) -> str:
+    if result.get("reason") not in {"storage_error", "invalid_result"}:
+        return ""
+    return (
+        "[OPERATOR POLICY STORAGE NOTICE]\n"
+        "The standing-instruction persistence check failed for this turn. If the "
+        "user gave a durable instruction, say plainly that it was not saved, while "
+        "still answering the request. Give this recovery step: "
+        + str(result.get("next_step") or "check the database migration and retry")
+    )
 
 
 async def chat_turn(
@@ -459,8 +546,11 @@ async def chat_turn(
     pool: Any | None = None,
     user_label: str | None = None,
     is_group: bool = False,
+    trusted_operator: bool | None = None,
+    operator_context: dict[str, Any] | None = None,
     surface: str = "chat",
     visual_attachments: list[dict[str, Any]] | None = None,
+    on_event: Callable[[AgentEventData], Awaitable[None]] | None = None,
 ) -> dict[str, Any]:
     dsn = dsn or db_dsn_from_env()
     normalized = normalize_llm_config(llm_config)
@@ -475,6 +565,24 @@ async def chat_turn(
         pool = await asyncpg.create_pool(dsn, min_size=_min, max_size=_max)
 
     try:
+        is_operator = _trusted_operator_turn(
+            surface=surface,
+            is_group=is_group,
+            trusted_operator=trusted_operator,
+        )
+        capture_result = await _capture_operator_policy_for_turn(
+            pool,
+            user_message=user_message,
+            session_id=session_id,
+            user_label=user_label,
+            surface=surface,
+            is_operator=is_operator,
+            operator_context=operator_context,
+        )
+        capture_notice = _operator_policy_capture_notice(capture_result)
+        agent_user_message = "\n\n".join(
+            part for part in (capture_notice, user_message) if part
+        )
         history = await _hydrate_chat_history(pool, session_id, history)
 
         # Check if RLM is enabled for chat
@@ -490,9 +598,22 @@ async def chat_turn(
 
         if use_rlm and not visual_attachments:
             from services.hexis_rlm import run_chat_turn
+            from services.operator_policy_corrections import (
+                render_operator_policy_context,
+            )
+
+            policy_context = await render_operator_policy_context(pool)
+            rlm_user_message = "\n\n".join(
+                part
+                for part in (
+                    policy_context,
+                    f"[USER MESSAGE]\n{agent_user_message}",
+                )
+                if part
+            )
 
             result = await run_chat_turn(
-                user_message=user_message,
+                user_message=rlm_user_message,
                 history=history,
                 llm_config=normalized,
                 dsn=dsn,
@@ -514,7 +635,13 @@ async def chat_turn(
                 background_dsn=dsn,
                 surface=surface,
             )
-            await _apply_chat_energy_effects(pool, surface=surface)
+            await _apply_chat_energy_effects(
+                pool,
+                surface=surface,
+                user_message=user_message,
+                is_operator=is_operator,
+                session_id=session_id,
+            )
             new_history = await _hydrate_after_persist(
                 mem_client, session_id, fallback_history
             )
@@ -526,7 +653,7 @@ async def chat_turn(
         loop_result = await run_agent(
             pool,
             registry,
-            user_message=user_message,
+            user_message=agent_user_message,
             mode="chat",
             history=history,
             session_id=session_id,
@@ -534,9 +661,11 @@ async def chat_turn(
             surface=surface,
             agent_profile=agent_profile,
             is_group=is_group,
+            is_operator=is_operator,
             dsn=dsn,
             max_iterations=max_tool_iterations,
             visual_attachments=visual_attachments,
+            on_event=on_event,
         )
         assistant_text = loop_result.text
         agent_turn_id = getattr(loop_result, "turn_id", None)
@@ -578,6 +707,10 @@ async def chat_turn(
             pool,
             tool_energy_spent=getattr(loop_result, "energy_spent", 0),
             surface=surface,
+            user_message=user_message,
+            is_operator=is_operator,
+            session_id=session_id,
+            agent_turn_id=agent_turn_id,
         )
         new_history = await _hydrate_after_persist(
             mem_client, session_id, fallback_history
@@ -600,8 +733,11 @@ async def stream_chat_turn(
     pool: Any | None = None,
     user_label: str | None = None,
     is_group: bool = False,
+    trusted_operator: bool | None = None,
+    operator_context: dict[str, Any] | None = None,
     surface: str = "chat",
     visual_attachments: list[dict[str, Any]] | None = None,
+    on_question: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
 ) -> AsyncIterator[str]:
     """
     Streaming variant of chat_turn().
@@ -625,6 +761,8 @@ async def stream_chat_turn(
         pool=pool,
         user_label=user_label,
         is_group=is_group,
+        trusted_operator=trusted_operator,
+        operator_context=operator_context,
         surface=surface,
         visual_attachments=visual_attachments,
     ):
@@ -638,6 +776,8 @@ async def stream_chat_turn(
             timed_out = stopped == "timeout" or bool(event.data.get("timed_out"))
         elif event.event == AgentEvent.ERROR:
             error_message = str(event.data.get("error") or "Unknown agent error")
+        elif event.event == AgentEvent.QUESTION and on_question is not None:
+            await on_question(dict(event.data))
 
     full_text = "".join(collected)
     if timed_out:
@@ -665,6 +805,8 @@ async def stream_chat_events(
     pool: Any | None = None,
     user_label: str | None = None,
     is_group: bool = False,
+    trusted_operator: bool | None = None,
+    operator_context: dict[str, Any] | None = None,
     surface: str = "chat",
     prompt_addenda: list[str] | None = None,
     max_tokens: int | None = None,
@@ -692,6 +834,24 @@ async def stream_chat_events(
         pool = await asyncpg.create_pool(dsn, min_size=_min, max_size=_max)
 
     try:
+        is_operator = _trusted_operator_turn(
+            surface=surface,
+            is_group=is_group,
+            trusted_operator=trusted_operator,
+        )
+        capture_result = await _capture_operator_policy_for_turn(
+            pool,
+            user_message=user_message,
+            session_id=session_id,
+            user_label=user_label,
+            surface=surface,
+            is_operator=is_operator,
+            operator_context=operator_context,
+        )
+        capture_notice = _operator_policy_capture_notice(capture_result)
+        agent_user_message = "\n\n".join(
+            part for part in (capture_notice, user_message) if part
+        )
         if gateway_source_id:
             try:
                 from core.gateway import EventSource, Gateway
@@ -795,6 +955,19 @@ async def stream_chat_events(
 
         if use_rlm:
             normalized = normalize_llm_config(llm_config or {})
+            from services.operator_policy_corrections import (
+                render_operator_policy_context,
+            )
+
+            policy_context = await render_operator_policy_context(pool)
+            rlm_user_message = "\n\n".join(
+                part
+                for part in (
+                    policy_context,
+                    f"[USER MESSAGE]\n{agent_user_message}",
+                )
+                if part
+            )
             yield AgentEventData(
                 event=AgentEvent.LOOP_START,
                 data={"phase": "conscious_final", "runtime": "rlm"},
@@ -803,7 +976,7 @@ async def stream_chat_events(
                 from services.hexis_rlm import run_chat_turn
 
                 result = await run_chat_turn(
-                    user_message=user_message,
+                    user_message=rlm_user_message,
                     history=history,
                     llm_config=normalized,
                     dsn=dsn,
@@ -840,7 +1013,11 @@ async def stream_chat_events(
                         },
                     )
                     energy_result = await _apply_chat_energy_effects(
-                        pool, surface=surface
+                        pool,
+                        surface=surface,
+                        user_message=user_message,
+                        is_operator=is_operator,
+                        session_id=session_id,
                     )
                     if energy_result:
                         yield AgentEventData(
@@ -875,7 +1052,7 @@ async def stream_chat_events(
         async for event in stream_agent(
             pool,
             registry,
-            user_message=user_message,
+            user_message=agent_user_message,
             mode="chat",
             history=history,
             session_id=session_id,
@@ -883,6 +1060,7 @@ async def stream_chat_events(
             surface=surface,
             agent_profile=agent_profile,
             is_group=is_group,
+            is_operator=is_operator,
             dsn=dsn,
             prompt_addenda=prompt_addenda,
             max_tokens=max_tokens,
@@ -969,6 +1147,10 @@ async def stream_chat_events(
                 tool_energy_spent=tool_energy_spent,
                 emotional_state=appraisal_affect,
                 surface=surface,
+                user_message=user_message,
+                is_operator=is_operator,
+                session_id=session_id,
+                agent_turn_id=agent_turn_id,
             )
             if energy_result:
                 yield AgentEventData(

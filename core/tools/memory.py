@@ -13,6 +13,7 @@ from typing import Any
 from uuid import UUID
 
 from .base import (
+    OutboundSpec,
     ToolCategory,
     ToolContext,
     ToolErrorType,
@@ -25,7 +26,9 @@ from .base import (
 logger = logging.getLogger(__name__)
 
 
-async def _try_db_memory_tool(tool_name: str, arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult | None:
+async def _try_db_memory_tool(
+    tool_name: str, arguments: dict[str, Any], context: ToolExecutionContext
+) -> ToolResult | None:
     pool = context.registry.pool if context.registry else None
     if not pool:
         return None
@@ -39,19 +42,30 @@ async def _try_db_memory_tool(tool_name: str, arguments: dict[str, Any], context
     try:
         async with pool.acquire() as conn:
             raw = await conn.fetchval(
-                "SELECT execute_memory_tool($1::text, $2::jsonb)",
+                """
+                SELECT enrich_memory_tool_result(
+                    $1::text,
+                    execute_memory_tool($1::text, $2::jsonb)
+                )
+                """,
                 tool_name,
                 json.dumps(db_arguments),
             )
         payload = json.loads(raw) if isinstance(raw, str) else raw
         if isinstance(payload, dict) and "success" in payload:
             if payload.get("success"):
-                return ToolResult.success_result(payload.get("output"), payload.get("display_output"))
+                return ToolResult.success_result(
+                    payload.get("output"), payload.get("display_output")
+                )
             try:
-                error_type = ToolErrorType(payload.get("error_type") or ToolErrorType.EXECUTION_FAILED.value)
+                error_type = ToolErrorType(
+                    payload.get("error_type") or ToolErrorType.EXECUTION_FAILED.value
+                )
             except ValueError:
                 error_type = ToolErrorType.EXECUTION_FAILED
-            return ToolResult.error_result(payload.get("error") or "Memory tool failed", error_type)
+            return ToolResult.error_result(
+                payload.get("error") or "Memory tool failed", error_type
+            )
     except Exception:
         return None
     return None
@@ -100,7 +114,14 @@ class RecallHandler(ToolHandler):
                         "type": "array",
                         "items": {
                             "type": "string",
-                            "enum": ["episodic", "semantic", "procedural", "strategic", "worldview", "goal"],
+                            "enum": [
+                                "episodic",
+                                "semantic",
+                                "procedural",
+                                "strategic",
+                                "worldview",
+                                "goal",
+                            ],
                         },
                         "description": (
                             "Filter by memory types. Omit to search ALL types (recommended for most queries). "
@@ -260,7 +281,9 @@ class SearchHistoryHandler(ToolHandler):
             ToolErrorType.EXECUTION_FAILED,
         )
 
-    async def _touch_history_results(self, output: Any, context: ToolExecutionContext) -> None:
+    async def _touch_history_results(
+        self, output: Any, context: ToolExecutionContext
+    ) -> None:
         """Advisory access marking: browsing a desk item counts as using it."""
         if not isinstance(output, dict):
             return
@@ -286,12 +309,167 @@ class SearchHistoryHandler(ToolHandler):
         try:
             async with context.registry.pool.acquire() as conn:
                 if raw_unit_ids:
-                    await conn.execute("SELECT touch_subconscious_units($1::uuid[])", raw_unit_ids)
+                    await conn.execute(
+                        "SELECT touch_subconscious_units($1::uuid[])", raw_unit_ids
+                    )
                 if memory_ids:
                     await conn.execute("SELECT touch_memories($1::uuid[])", memory_ids)
         except Exception as exc:
             logger.warning("Failed to mark search_history results as accessed: %s", exc)
 
+
+class RecallAtTimeHandler(ToolHandler):
+    """Recall only memories whose validity window covered one past instant."""
+
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name="recall_at_time",
+            description=(
+                "Answer temporally framed memory questions such as 'as of last "
+                "Tuesday' or 'what did you know back then?'. Searches the durable "
+                "validity and supersession record at one exact past instant, "
+                "including memories that are no longer current. Returns historical "
+                "confidence/trust and citation envelopes. Resolve relative dates "
+                "against the current temporal context before calling."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Topic or claim to recall at the historical instant.",
+                    },
+                    "as_of": {
+                        "type": "string",
+                        "description": "Required ISO-8601 timestamp at or before now.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Config-bounded memory result budget.",
+                    },
+                    "min_score": {
+                        "type": "number",
+                        "minimum": 0.0,
+                        "maximum": 1.0,
+                    },
+                    "memory_types": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": [
+                                "episodic",
+                                "semantic",
+                                "procedural",
+                                "strategic",
+                                "worldview",
+                                "goal",
+                            ],
+                        },
+                        "uniqueItems": True,
+                    },
+                },
+                "required": ["query", "as_of"],
+                "additionalProperties": False,
+            },
+            category=ToolCategory.MEMORY,
+            energy_cost=1,
+            is_read_only=True,
+        )
+
+    async def execute(
+        self,
+        arguments: dict[str, Any],
+        context: ToolExecutionContext,
+    ) -> ToolResult:
+        args = dict(arguments)
+        if context.is_group:
+            args["exclude_sensitive"] = True
+        db_result = await _try_db_memory_tool("recall_at_time", args, context)
+        if db_result is not None:
+            return db_result
+        return ToolResult.error_result(
+            "execute_memory_tool dispatch failed (database unavailable or errored)",
+            ToolErrorType.EXECUTION_FAILED,
+        )
+
+
+class DiffMemoryHistoryHandler(ToolHandler):
+    """Compare two point-in-time snapshots and return the reasons for change."""
+
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name="diff_memory_history",
+            description=(
+                "Answer 'what changed about X between then and now, and why?'. "
+                "Compares two historical memory snapshots and returns additions, "
+                "expired beliefs, supersession reasons, audited belief revisions, "
+                "and explicit contradiction decisions. Use this for 'has that "
+                "changed?' rather than reconstructing history from current recall."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Topic to compare."},
+                    "from_time": {
+                        "type": "string",
+                        "description": "Required earlier ISO-8601 timestamp.",
+                    },
+                    "to_time": {
+                        "type": "string",
+                        "description": "Later ISO-8601 timestamp; omit to compare with now.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Config-bounded result budget per snapshot.",
+                    },
+                    "min_score": {
+                        "type": "number",
+                        "minimum": 0.0,
+                        "maximum": 1.0,
+                    },
+                    "memory_types": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": [
+                                "episodic",
+                                "semantic",
+                                "procedural",
+                                "strategic",
+                                "worldview",
+                                "goal",
+                            ],
+                        },
+                        "uniqueItems": True,
+                    },
+                },
+                "required": ["query", "from_time"],
+                "additionalProperties": False,
+            },
+            category=ToolCategory.MEMORY,
+            energy_cost=1,
+            is_read_only=True,
+        )
+
+    async def execute(
+        self,
+        arguments: dict[str, Any],
+        context: ToolExecutionContext,
+    ) -> ToolResult:
+        args = dict(arguments)
+        if context.is_group:
+            args["exclude_sensitive"] = True
+        db_result = await _try_db_memory_tool("diff_memory_history", args, context)
+        if db_result is not None:
+            return db_result
+        return ToolResult.error_result(
+            "execute_memory_tool dispatch failed (database unavailable or errored)",
+            ToolErrorType.EXECUTION_FAILED,
+        )
 
 class RememberHandler(ToolHandler):
     """Store or reuse a durable memory."""
@@ -652,12 +830,20 @@ class SearchDocumentsHandler(ToolHandler):
         context: ToolExecutionContext,
     ) -> ToolResult:
         if not context.registry or not context.registry.pool:
-            return ToolResult.error_result("Database unavailable", ToolErrorType.EXECUTION_FAILED)
+            return ToolResult.error_result(
+                "Database unavailable", ToolErrorType.EXECUTION_FAILED
+            )
 
         args = dict(arguments)
         has_selector = any(
             str(args.get(name) or "").strip()
-            for name in ("query", "source_path", "source_type", "created_after", "created_before")
+            for name in (
+                "query",
+                "source_path",
+                "source_type",
+                "created_after",
+                "created_before",
+            )
         )
         if not has_selector:
             return ToolResult.error_result(
@@ -670,21 +856,30 @@ class SearchDocumentsHandler(ToolHandler):
             offset = max(0, int(args.get("offset") or 0))
             snippet_chars = max(80, min(int(args.get("snippet_chars") or 500), 4000))
         except (TypeError, ValueError):
-            return ToolResult.error_result("limit, offset, and snippet_chars must be integers", ToolErrorType.INVALID_PARAMS)
+            return ToolResult.error_result(
+                "limit, offset, and snippet_chars must be integers",
+                ToolErrorType.INVALID_PARAMS,
+            )
 
         try:
             async with context.registry.pool.acquire() as conn:
                 rows = await conn.fetch(
                     """
-                    SELECT document_id, title, source_type, path, file_type,
-                           content_hash, word_count, size_bytes, created_at,
-                           updated_at, rank, snippet
-                    FROM search_source_documents(
-                        $1::text, $2::int, $3::text, $4::text,
-                        NULLIF($5::text, '')::timestamptz,
-                        NULLIF($6::text, '')::timestamptz,
-                        false, $7::int, $8::int, $9::boolean
+                    WITH hits AS (
+                        SELECT *
+                        FROM search_source_documents(
+                            $1::text, $2::int, $3::text, $4::text,
+                            NULLIF($5::text, '')::timestamptz,
+                            NULLIF($6::text, '')::timestamptz,
+                            false, $7::int, $8::int, $9::boolean
+                        )
                     )
+                    SELECT h.document_id, h.title, h.source_type, h.path, h.file_type,
+                           h.content_hash, h.word_count, h.size_bytes, h.created_at,
+                           h.updated_at, h.rank, h.snippet, d.source_attribution,
+                           source_citation_envelope(h.document_id) AS citation
+                    FROM hits h
+                    JOIN source_documents d ON d.id = h.document_id
                     """,
                     args.get("query"),
                     limit,
@@ -699,25 +894,49 @@ class SearchDocumentsHandler(ToolHandler):
         except Exception as e:
             return ToolResult.error_result(str(e), ToolErrorType.EXECUTION_FAILED)
 
-        documents = [
-            {
-                "document_id": str(row["document_id"]),
-                "title": row["title"],
-                "source_type": row["source_type"],
-                "path": row["path"],
-                "file_type": row["file_type"],
-                "content_hash": row["content_hash"],
-                "word_count": row["word_count"],
-                "size_bytes": row["size_bytes"],
-                "created_at": row["created_at"].isoformat() if row["created_at"] else None,
-                "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None,
-                "rank": row["rank"],
-                "snippet": row["snippet"],
-            }
-            for row in rows
-        ]
+        documents = []
+        for row in rows:
+            citation = row["citation"]
+            source_attribution = row["source_attribution"]
+            if isinstance(citation, str):
+                citation = json.loads(citation)
+            if isinstance(source_attribution, str):
+                source_attribution = json.loads(source_attribution)
+            documents.append(
+                {
+                    "document_id": str(row["document_id"]),
+                    "citation_id": citation.get("citation_id")
+                    if isinstance(citation, dict)
+                    else None,
+                    "citation": citation,
+                    "title": row["title"],
+                    "source_type": row["source_type"],
+                    "path": row["path"],
+                    "file_type": row["file_type"],
+                    "content_hash": row["content_hash"],
+                    "word_count": row["word_count"],
+                    "size_bytes": row["size_bytes"],
+                    "created_at": (
+                        row["created_at"].isoformat() if row["created_at"] else None
+                    ),
+                    "updated_at": (
+                        row["updated_at"].isoformat() if row["updated_at"] else None
+                    ),
+                    "rank": row["rank"],
+                    "snippet": row["snippet"],
+                    "source_attribution": source_attribution,
+                    "trust_level": citation.get("trust_level")
+                    if isinstance(citation, dict)
+                    else None,
+                }
+            )
         return ToolResult.success_result(
-            {"documents": documents, "count": len(documents), "offset": offset, "limit": limit},
+            {
+                "documents": documents,
+                "count": len(documents),
+                "offset": offset,
+                "limit": limit,
+            },
             display_output=f"Found {len(documents)} source document(s)",
         )
 
@@ -774,7 +993,9 @@ class OpenDocumentHandler(ToolHandler):
         context: ToolExecutionContext,
     ) -> ToolResult:
         if not context.registry or not context.registry.pool:
-            return ToolResult.error_result("Database unavailable", ToolErrorType.EXECUTION_FAILED)
+            return ToolResult.error_result(
+                "Database unavailable", ToolErrorType.EXECUTION_FAILED
+            )
 
         args = dict(arguments)
         document_id = args.get("document_id")
@@ -782,9 +1003,15 @@ class OpenDocumentHandler(ToolHandler):
             try:
                 document_id = UUID(str(document_id))
             except ValueError:
-                return ToolResult.error_result("document_id must be a uuid", ToolErrorType.INVALID_PARAMS)
+                return ToolResult.error_result(
+                    "document_id must be a uuid", ToolErrorType.INVALID_PARAMS
+                )
 
-        if not document_id and not str(args.get("content_hash") or "").strip() and not str(args.get("path") or "").strip():
+        if (
+            not document_id
+            and not str(args.get("content_hash") or "").strip()
+            and not str(args.get("path") or "").strip()
+        ):
             return ToolResult.error_result(
                 "Provide document_id, content_hash, or path.",
                 ToolErrorType.INVALID_PARAMS,
@@ -796,15 +1023,17 @@ class OpenDocumentHandler(ToolHandler):
             if max_chars is not None:
                 max_chars = max(1, int(max_chars))
         except (TypeError, ValueError):
-            return ToolResult.error_result("offset and max_chars must be integers", ToolErrorType.INVALID_PARAMS)
+            return ToolResult.error_result(
+                "offset and max_chars must be integers", ToolErrorType.INVALID_PARAMS
+            )
 
         try:
             async with context.registry.pool.acquire() as conn:
                 raw = await conn.fetchval(
                     """
-                    SELECT open_source_document(
+                    SELECT enrich_source_document_payload(open_source_document(
                         $1::uuid, $2::text, $3::text, $4::int, $5::int, $6::boolean
-                    )
+                    ))
                     """,
                     document_id,
                     args.get("content_hash"),
@@ -818,15 +1047,30 @@ class OpenDocumentHandler(ToolHandler):
 
         payload = json.loads(raw) if isinstance(raw, str) else raw
         if not isinstance(payload, dict):
-            return ToolResult.error_result("open_source_document returned an invalid payload", ToolErrorType.EXECUTION_FAILED)
+            return ToolResult.error_result(
+                "open_source_document returned an invalid payload",
+                ToolErrorType.EXECUTION_FAILED,
+            )
         if payload.get("error") == "missing_selector":
-            return ToolResult.error_result("Provide document_id, content_hash, or path.", ToolErrorType.INVALID_PARAMS)
+            return ToolResult.error_result(
+                "Provide document_id, content_hash, or path.",
+                ToolErrorType.INVALID_PARAMS,
+            )
         if payload.get("error") == "not_found":
-            return ToolResult.error_result("Source document not found.", ToolErrorType.INVALID_PARAMS)
+            return ToolResult.error_result(
+                "Source document not found.", ToolErrorType.INVALID_PARAMS
+            )
 
-        title = str(payload.get("title") or payload.get("path") or payload.get("document_id") or "document")
+        title = str(
+            payload.get("title")
+            or payload.get("path")
+            or payload.get("document_id")
+            or "document"
+        )
         suffix = " (truncated)" if payload.get("truncated") else ""
-        return ToolResult.success_result(payload, display_output=f"Opened source document: {title}{suffix}")
+        return ToolResult.success_result(
+            payload, display_output=f"Opened source document: {title}{suffix}"
+        )
 
 
 class OpenDocumentsHandler(ToolHandler):
@@ -890,7 +1134,9 @@ class OpenDocumentsHandler(ToolHandler):
         context: ToolExecutionContext,
     ) -> ToolResult:
         if not context.registry or not context.registry.pool:
-            return ToolResult.error_result("Database unavailable", ToolErrorType.EXECUTION_FAILED)
+            return ToolResult.error_result(
+                "Database unavailable", ToolErrorType.EXECUTION_FAILED
+            )
 
         args = dict(arguments)
 
@@ -920,7 +1166,9 @@ class OpenDocumentsHandler(ToolHandler):
             try:
                 document_ids.append(UUID(raw_id))
             except ValueError:
-                return ToolResult.error_result("document_ids must contain only uuids", ToolErrorType.INVALID_PARAMS)
+                return ToolResult.error_result(
+                    "document_ids must contain only uuids", ToolErrorType.INVALID_PARAMS
+                )
 
         try:
             offset = max(0, int(args.get("offset") or 0))
@@ -929,7 +1177,10 @@ class OpenDocumentsHandler(ToolHandler):
             if max_chars is not None:
                 max_chars = max(1, int(max_chars))
         except (TypeError, ValueError):
-            return ToolResult.error_result("offset, limit, and max_chars must be integers", ToolErrorType.INVALID_PARAMS)
+            return ToolResult.error_result(
+                "offset, limit, and max_chars must be integers",
+                ToolErrorType.INVALID_PARAMS,
+            )
 
         try:
             async with context.registry.pool.acquire() as conn:
@@ -952,14 +1203,28 @@ class OpenDocumentsHandler(ToolHandler):
 
         payload = json.loads(raw) if isinstance(raw, str) else raw
         if not isinstance(payload, dict):
-            return ToolResult.error_result("open_source_documents returned an invalid payload", ToolErrorType.EXECUTION_FAILED)
+            return ToolResult.error_result(
+                "open_source_documents returned an invalid payload",
+                ToolErrorType.EXECUTION_FAILED,
+            )
         if payload.get("error") == "missing_selector":
-            return ToolResult.error_result("Provide document_ids, content_hashes, or paths.", ToolErrorType.INVALID_PARAMS)
+            return ToolResult.error_result(
+                "Provide document_ids, content_hashes, or paths.",
+                ToolErrorType.INVALID_PARAMS,
+            )
 
-        docs = payload.get("documents") if isinstance(payload.get("documents"), list) else []
-        truncated_count = sum(1 for doc in docs if isinstance(doc, dict) and doc.get("truncated"))
+        docs = (
+            payload.get("documents")
+            if isinstance(payload.get("documents"), list)
+            else []
+        )
+        truncated_count = sum(
+            1 for doc in docs if isinstance(doc, dict) and doc.get("truncated")
+        )
         suffix = f", {truncated_count} truncated" if truncated_count else ""
-        return ToolResult.success_result(payload, display_output=f"Opened {len(docs)} source document(s){suffix}")
+        return ToolResult.success_result(
+            payload, display_output=f"Opened {len(docs)} source document(s){suffix}"
+        )
 
 
 class LoadDocumentsHandler(ToolHandler):
@@ -1033,7 +1298,9 @@ class LoadDocumentsHandler(ToolHandler):
         context: ToolExecutionContext,
     ) -> ToolResult:
         if not context.registry or not context.registry.pool:
-            return ToolResult.error_result("Database unavailable", ToolErrorType.EXECUTION_FAILED)
+            return ToolResult.error_result(
+                "Database unavailable", ToolErrorType.EXECUTION_FAILED
+            )
 
         args = dict(arguments)
 
@@ -1063,7 +1330,9 @@ class LoadDocumentsHandler(ToolHandler):
             try:
                 document_ids.append(UUID(raw_id))
             except ValueError:
-                return ToolResult.error_result("document_ids must contain only uuids", ToolErrorType.INVALID_PARAMS)
+                return ToolResult.error_result(
+                    "document_ids must contain only uuids", ToolErrorType.INVALID_PARAMS
+                )
 
         try:
             offset = max(0, int(args.get("offset") or 0))
@@ -1075,7 +1344,10 @@ class LoadDocumentsHandler(ToolHandler):
             if chunk_chars is not None:
                 chunk_chars = max(500, int(chunk_chars))
         except (TypeError, ValueError):
-            return ToolResult.error_result("offset, limit, max_chars, and chunk_chars must be integers", ToolErrorType.INVALID_PARAMS)
+            return ToolResult.error_result(
+                "offset, limit, max_chars, and chunk_chars must be integers",
+                ToolErrorType.INVALID_PARAMS,
+            )
 
         try:
             async with context.registry.pool.acquire() as conn:
@@ -1101,12 +1373,20 @@ class LoadDocumentsHandler(ToolHandler):
 
         payload = json.loads(raw) if isinstance(raw, str) else raw
         if not isinstance(payload, dict):
-            return ToolResult.error_result("load_source_documents_to_recmem returned an invalid payload", ToolErrorType.EXECUTION_FAILED)
+            return ToolResult.error_result(
+                "load_source_documents_to_recmem returned an invalid payload",
+                ToolErrorType.EXECUTION_FAILED,
+            )
         if payload.get("error") == "missing_selector":
-            return ToolResult.error_result("Provide document_ids, content_hashes, or paths.", ToolErrorType.INVALID_PARAMS)
+            return ToolResult.error_result(
+                "Provide document_ids, content_hashes, or paths.",
+                ToolErrorType.INVALID_PARAMS,
+            )
 
         count = int(payload.get("count") or 0)
-        return ToolResult.success_result(payload, display_output=f"Loaded {count} source document desk chunk(s)")
+        return ToolResult.success_result(
+            payload, display_output=f"Loaded {count} source document desk chunk(s)"
+        )
 
 
 class SearchDocumentChunksHandler(ToolHandler):
@@ -1145,7 +1425,14 @@ class SearchDocumentChunksHandler(ToolHandler):
                     },
                     "locator_kind": {
                         "type": "string",
-                        "enum": ["char", "page", "section", "sheet_row", "slide", "message"],
+                        "enum": [
+                            "char",
+                            "page",
+                            "section",
+                            "sheet_row",
+                            "slide",
+                            "message",
+                        ],
                         "description": "Optional locator-kind filter (e.g. sheet_row for spreadsheet rows).",
                     },
                     "sheet_name": {
@@ -1156,9 +1443,19 @@ class SearchDocumentChunksHandler(ToolHandler):
                     "page_end": {"type": "integer", "minimum": 1},
                     "created_after": {"type": "string"},
                     "created_before": {"type": "string"},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10},
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 50,
+                        "default": 10,
+                    },
                     "offset": {"type": "integer", "minimum": 0, "default": 0},
-                    "snippet_chars": {"type": "integer", "minimum": 80, "maximum": 2000, "default": 400},
+                    "snippet_chars": {
+                        "type": "integer",
+                        "minimum": 80,
+                        "maximum": 2000,
+                        "default": 400,
+                    },
                 },
                 "required": [],
             },
@@ -1173,14 +1470,26 @@ class SearchDocumentChunksHandler(ToolHandler):
         context: ToolExecutionContext,
     ) -> ToolResult:
         if not context.registry or not context.registry.pool:
-            return ToolResult.error_result("Database unavailable", ToolErrorType.EXECUTION_FAILED)
+            return ToolResult.error_result(
+                "Database unavailable", ToolErrorType.EXECUTION_FAILED
+            )
 
         args = dict(arguments)
-        has_selector = any(
-            str(args.get(name) or "").strip()
-            for name in ("query", "document_id", "source_path", "source_type",
-                         "locator_kind", "sheet_name")
-        ) or args.get("page_start") or args.get("page_end")
+        has_selector = (
+            any(
+                str(args.get(name) or "").strip()
+                for name in (
+                    "query",
+                    "document_id",
+                    "source_path",
+                    "source_type",
+                    "locator_kind",
+                    "sheet_name",
+                )
+            )
+            or args.get("page_start")
+            or args.get("page_end")
+        )
         if not has_selector:
             return ToolResult.error_result(
                 "Provide query or a scope filter (document_id, source_path, source_type, locator_kind, sheet_name, page range).",
@@ -1192,28 +1501,43 @@ class SearchDocumentChunksHandler(ToolHandler):
             try:
                 document_id = UUID(str(args["document_id"]).strip())
             except ValueError:
-                return ToolResult.error_result("document_id must be a uuid", ToolErrorType.INVALID_PARAMS)
+                return ToolResult.error_result(
+                    "document_id must be a uuid", ToolErrorType.INVALID_PARAMS
+                )
 
         try:
             limit = max(1, min(int(args.get("limit") or 10), 50))
             offset = max(0, int(args.get("offset") or 0))
             snippet_chars = max(80, min(int(args.get("snippet_chars") or 400), 2000))
-            page_start = int(args["page_start"]) if args.get("page_start") is not None else None
-            page_end = int(args["page_end"]) if args.get("page_end") is not None else None
+            page_start = (
+                int(args["page_start"]) if args.get("page_start") is not None else None
+            )
+            page_end = (
+                int(args["page_end"]) if args.get("page_end") is not None else None
+            )
         except (TypeError, ValueError):
-            return ToolResult.error_result("limit, offset, snippet_chars, and page bounds must be integers", ToolErrorType.INVALID_PARAMS)
+            return ToolResult.error_result(
+                "limit, offset, snippet_chars, and page bounds must be integers",
+                ToolErrorType.INVALID_PARAMS,
+            )
 
         try:
             async with context.registry.pool.acquire() as conn:
                 rows = await conn.fetch(
                     """
-                    SELECT * FROM search_source_chunks(
-                        $1::text, $2::int, $3::uuid, $4::text, $5::text,
-                        $6::text, $7::text, $8::int, $9::int,
-                        NULLIF($10::text, '')::timestamptz,
-                        NULLIF($11::text, '')::timestamptz,
-                        $12::boolean, $13::int, $14::int
+                    WITH hits AS (
+                        SELECT * FROM search_source_chunks(
+                            $1::text, $2::int, $3::uuid, $4::text, $5::text,
+                            $6::text, $7::text, $8::int, $9::int,
+                            NULLIF($10::text, '')::timestamptz,
+                            NULLIF($11::text, '')::timestamptz,
+                            $12::boolean, $13::int, $14::int
+                        )
                     )
+                    SELECT h.*, d.source_attribution,
+                           source_citation_envelope(h.document_id, h.chunk_id) AS citation
+                    FROM hits h
+                    JOIN source_documents d ON d.id = h.document_id
                     """,
                     args.get("query"),
                     limit,
@@ -1242,25 +1566,41 @@ class SearchDocumentChunksHandler(ToolHandler):
             locator = row["locator"]
             if isinstance(locator, str):
                 locator = json.loads(locator)
+            citation = row["citation"]
+            source_attribution = row["source_attribution"]
+            if isinstance(citation, str):
+                citation = json.loads(citation)
+            if isinstance(source_attribution, str):
+                source_attribution = json.loads(source_attribution)
             documents.add(str(row["document_id"]))
-            chunks.append({
-                "chunk_id": str(row["chunk_id"]),
-                "document_id": str(row["document_id"]),
-                "chunk_index": row["chunk_index"],
-                "title": row["title"],
-                "path": row["path"],
-                "source_type": row["source_type"],
-                "locator_kind": row["locator_kind"],
-                "locator": locator,
-                "heading_path": list(row["heading_path"] or []),
-                "page_start": row["page_start"],
-                "page_end": row["page_end"],
-                "sheet_name": row["sheet_name"],
-                "snippet": row["snippet"],
-                "content_hash": row["content_hash"],
-                "rank": row["rank"],
-                "rank_components": components,
-            })
+            chunks.append(
+                {
+                    "chunk_id": str(row["chunk_id"]),
+                    "document_id": str(row["document_id"]),
+                    "citation_id": citation.get("citation_id")
+                    if isinstance(citation, dict)
+                    else None,
+                    "citation": citation,
+                    "chunk_index": row["chunk_index"],
+                    "title": row["title"],
+                    "path": row["path"],
+                    "source_type": row["source_type"],
+                    "locator_kind": row["locator_kind"],
+                    "locator": locator,
+                    "heading_path": list(row["heading_path"] or []),
+                    "page_start": row["page_start"],
+                    "page_end": row["page_end"],
+                    "sheet_name": row["sheet_name"],
+                    "snippet": row["snippet"],
+                    "content_hash": row["content_hash"],
+                    "rank": row["rank"],
+                    "rank_components": components,
+                    "source_attribution": source_attribution,
+                    "trust_level": citation.get("trust_level")
+                    if isinstance(citation, dict)
+                    else None,
+                }
+            )
         return ToolResult.success_result(
             {"chunks": chunks, "count": len(chunks), "offset": offset, "limit": limit},
             display_output=f"Found {len(chunks)} chunk(s) across {len(documents)} document(s)",
@@ -1301,7 +1641,12 @@ class OpenDocumentChunkHandler(ToolHandler):
                     "chunk_end": {"type": "integer", "minimum": 0},
                     "page_start": {"type": "integer", "minimum": 1},
                     "page_end": {"type": "integer", "minimum": 1},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10},
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 50,
+                        "default": 10,
+                    },
                 },
                 "required": [],
             },
@@ -1316,10 +1661,16 @@ class OpenDocumentChunkHandler(ToolHandler):
         context: ToolExecutionContext,
     ) -> ToolResult:
         if not context.registry or not context.registry.pool:
-            return ToolResult.error_result("Database unavailable", ToolErrorType.EXECUTION_FAILED)
+            return ToolResult.error_result(
+                "Database unavailable", ToolErrorType.EXECUTION_FAILED
+            )
 
         args = dict(arguments)
-        raw_ids = [str(args.get("chunk_id") or "").strip()] if str(args.get("chunk_id") or "").strip() else []
+        raw_ids = (
+            [str(args.get("chunk_id") or "").strip()]
+            if str(args.get("chunk_id") or "").strip()
+            else []
+        )
         for item in args.get("chunk_ids") or []:
             if str(item).strip():
                 raw_ids.append(str(item).strip())
@@ -1328,14 +1679,18 @@ class OpenDocumentChunkHandler(ToolHandler):
             try:
                 chunk_ids.append(UUID(raw_id))
             except ValueError:
-                return ToolResult.error_result("chunk ids must be uuids", ToolErrorType.INVALID_PARAMS)
+                return ToolResult.error_result(
+                    "chunk ids must be uuids", ToolErrorType.INVALID_PARAMS
+                )
 
         document_id: UUID | None = None
         if str(args.get("document_id") or "").strip():
             try:
                 document_id = UUID(str(args["document_id"]).strip())
             except ValueError:
-                return ToolResult.error_result("document_id must be a uuid", ToolErrorType.INVALID_PARAMS)
+                return ToolResult.error_result(
+                    "document_id must be a uuid", ToolErrorType.INVALID_PARAMS
+                )
 
         if not chunk_ids and document_id is None:
             return ToolResult.error_result(
@@ -1349,16 +1704,18 @@ class OpenDocumentChunkHandler(ToolHandler):
             for name in ("chunk_start", "chunk_end", "page_start", "page_end"):
                 ints[name] = int(args[name]) if args.get(name) is not None else None
         except (TypeError, ValueError):
-            return ToolResult.error_result("range bounds and limit must be integers", ToolErrorType.INVALID_PARAMS)
+            return ToolResult.error_result(
+                "range bounds and limit must be integers", ToolErrorType.INVALID_PARAMS
+            )
 
         try:
             async with context.registry.pool.acquire() as conn:
                 raw = await conn.fetchval(
                     """
-                    SELECT open_source_chunks(
+                    SELECT enrich_source_chunk_payload(open_source_chunks(
                         $1::uuid[], $2::uuid, $3::int, $4::int, $5::int, $6::int,
                         $7::int, $8::boolean
-                    )
+                    ))
                     """,
                     chunk_ids or None,
                     document_id,
@@ -1374,9 +1731,15 @@ class OpenDocumentChunkHandler(ToolHandler):
 
         payload = json.loads(raw) if isinstance(raw, str) else raw
         if not isinstance(payload, dict):
-            return ToolResult.error_result("open_source_chunks returned an invalid payload", ToolErrorType.EXECUTION_FAILED)
+            return ToolResult.error_result(
+                "open_source_chunks returned an invalid payload",
+                ToolErrorType.EXECUTION_FAILED,
+            )
         if payload.get("error") == "missing_selector":
-            return ToolResult.error_result("Provide chunk_id(s) or document_id with a range.", ToolErrorType.INVALID_PARAMS)
+            return ToolResult.error_result(
+                "Provide chunk_id(s) or document_id with a range.",
+                ToolErrorType.INVALID_PARAMS,
+            )
         if payload.get("error") == "not_found":
             return ToolResult.error_result(
                 "No matching chunks — re-run search_document_chunks; the source may have been re-ingested with new chunk ids.",
@@ -1399,7 +1762,9 @@ class OpenDocumentChunkHandler(ToolHandler):
             chunk["citation"] = ", ".join(bit for bit in citation_bits if bit)
 
         count = int(payload.get("count") or 0)
-        return ToolResult.success_result(payload, display_output=f"Opened {count} chunk(s)")
+        return ToolResult.success_result(
+            payload, display_output=f"Opened {count} chunk(s)"
+        )
 
 
 class LoadDocumentChunksHandler(ToolHandler):
@@ -1415,7 +1780,7 @@ class LoadDocumentChunksHandler(ToolHandler):
                 "document + query (top matching passages), or by document + "
                 "page range. Give a reason; pin=true protects them from desk "
                 "cleanup while actively needed. Search them later with "
-                "search_history sources=[\"desk\"]."
+                'search_history sources=["desk"].'
             ),
             parameters={
                 "type": "object",
@@ -1435,7 +1800,12 @@ class LoadDocumentChunksHandler(ToolHandler):
                     },
                     "page_start": {"type": "integer", "minimum": 1},
                     "page_end": {"type": "integer", "minimum": 1},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 20, "default": 5},
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 20,
+                        "default": 5,
+                    },
                     "reason": {
                         "type": "string",
                         "description": "Brief reason these passages need to stay on the desk.",
@@ -1459,7 +1829,9 @@ class LoadDocumentChunksHandler(ToolHandler):
         context: ToolExecutionContext,
     ) -> ToolResult:
         if not context.registry or not context.registry.pool:
-            return ToolResult.error_result("Database unavailable", ToolErrorType.EXECUTION_FAILED)
+            return ToolResult.error_result(
+                "Database unavailable", ToolErrorType.EXECUTION_FAILED
+            )
 
         args = dict(arguments)
         chunk_ids: list[UUID] = []
@@ -1469,14 +1841,18 @@ class LoadDocumentChunksHandler(ToolHandler):
             try:
                 chunk_ids.append(UUID(str(item).strip()))
             except ValueError:
-                return ToolResult.error_result("chunk_ids must contain only uuids", ToolErrorType.INVALID_PARAMS)
+                return ToolResult.error_result(
+                    "chunk_ids must contain only uuids", ToolErrorType.INVALID_PARAMS
+                )
 
         document_id: UUID | None = None
         if str(args.get("document_id") or "").strip():
             try:
                 document_id = UUID(str(args["document_id"]).strip())
             except ValueError:
-                return ToolResult.error_result("document_id must be a uuid", ToolErrorType.INVALID_PARAMS)
+                return ToolResult.error_result(
+                    "document_id must be a uuid", ToolErrorType.INVALID_PARAMS
+                )
 
         if not chunk_ids and document_id is None:
             return ToolResult.error_result(
@@ -1486,10 +1862,16 @@ class LoadDocumentChunksHandler(ToolHandler):
 
         try:
             limit = max(1, min(int(args.get("limit") or 5), 20))
-            page_start = int(args["page_start"]) if args.get("page_start") is not None else None
-            page_end = int(args["page_end"]) if args.get("page_end") is not None else None
+            page_start = (
+                int(args["page_start"]) if args.get("page_start") is not None else None
+            )
+            page_end = (
+                int(args["page_end"]) if args.get("page_end") is not None else None
+            )
         except (TypeError, ValueError):
-            return ToolResult.error_result("limit and page bounds must be integers", ToolErrorType.INVALID_PARAMS)
+            return ToolResult.error_result(
+                "limit and page bounds must be integers", ToolErrorType.INVALID_PARAMS
+            )
 
         exclude_sensitive = bool(args.get("exclude_sensitive") or context.is_group)
         query = str(args.get("query") or "").strip()
@@ -1511,7 +1893,12 @@ class LoadDocumentChunksHandler(ToolHandler):
                             $4::int, $5::int, NULL, NULL, $6::boolean
                         )
                         """,
-                        query, limit, document_id, page_start, page_end, exclude_sensitive,
+                        query,
+                        limit,
+                        document_id,
+                        page_start,
+                        page_end,
+                        exclude_sensitive,
                     )
                     chunk_ids = [row["chunk_id"] for row in rows]
                     if not chunk_ids:
@@ -1544,9 +1931,14 @@ class LoadDocumentChunksHandler(ToolHandler):
 
         payload = json.loads(raw) if isinstance(raw, str) else raw
         if not isinstance(payload, dict):
-            return ToolResult.error_result("load_source_chunks_to_recmem returned an invalid payload", ToolErrorType.EXECUTION_FAILED)
+            return ToolResult.error_result(
+                "load_source_chunks_to_recmem returned an invalid payload",
+                ToolErrorType.EXECUTION_FAILED,
+            )
         if payload.get("error") == "missing_selector":
-            return ToolResult.error_result("Provide chunk_ids or document_id.", ToolErrorType.INVALID_PARAMS)
+            return ToolResult.error_result(
+                "Provide chunk_ids or document_id.", ToolErrorType.INVALID_PARAMS
+            )
 
         count = int(payload.get("count") or 0)
         return ToolResult.success_result(
@@ -1589,7 +1981,9 @@ class SenseMemoryAvailabilityHandler(ToolHandler):
         arguments: dict[str, Any],
         context: ToolExecutionContext,
     ) -> ToolResult:
-        db_result = await _try_db_memory_tool("sense_memory_availability", arguments, context)
+        db_result = await _try_db_memory_tool(
+            "sense_memory_availability", arguments, context
+        )
         if db_result is not None:
             return db_result
         # execute_memory_tool (db/38) owns this tool; the former Python
@@ -1848,7 +2242,13 @@ class CreateGoalHandler(ToolHandler):
                     },
                     "source": {
                         "type": "string",
-                        "enum": ["curiosity", "user_request", "identity", "derived", "external"],
+                        "enum": [
+                            "curiosity",
+                            "user_request",
+                            "identity",
+                            "derived",
+                            "external",
+                        ],
                         "default": "user_request",
                         "description": "Why this goal exists.",
                     },
@@ -1878,17 +2278,24 @@ class CreateGoalHandler(ToolHandler):
                         p_title := $1,
                         p_description := $2,
                         p_priority := $3,
-                        p_source := $4
+                        p_source := $4,
+                        p_origin := $5
                     )
                     """,
                     title,
                     description,
                     priority,
                     source,
+                    context.trusted_goal_origin,
                 )
 
             return ToolResult.success_result(
-                output={"goal_id": str(goal_id), "title": title, "priority": priority},
+                output={
+                    "goal_id": str(goal_id),
+                    "title": title,
+                    "priority": priority,
+                    "origin": context.trusted_goal_origin,
+                },
                 display_output=f"Created goal: {title}",
             )
 
@@ -1910,13 +2317,19 @@ class ScheduleTaskHandler(ToolHandler):
                 "type": "object",
                 "properties": {
                     "name": {"type": "string", "description": "Short task name."},
-                    "description": {"type": "string", "description": "Optional longer description."},
+                    "description": {
+                        "type": "string",
+                        "description": "Optional longer description.",
+                    },
                     "schedule_kind": {
                         "type": "string",
                         "enum": ["once", "interval", "daily", "weekly"],
                         "description": "Schedule type.",
                     },
-                    "schedule": {"type": "object", "description": "Schedule details for the selected type."},
+                    "schedule": {
+                        "type": "object",
+                        "description": "Schedule details for the selected type.",
+                    },
                     "timezone": {
                         "type": "string",
                         "description": "IANA timezone name (e.g., America/Los_Angeles).",
@@ -1926,13 +2339,22 @@ class ScheduleTaskHandler(ToolHandler):
                         "enum": ["queue_user_message", "create_goal"],
                         "description": "Action to perform when the schedule fires.",
                     },
-                    "action_payload": {"type": "object", "description": "Action payload."},
+                    "action_payload": {
+                        "type": "object",
+                        "description": "Action payload.",
+                    },
                     "max_runs": {
                         "type": "integer",
                         "description": "Optional max number of runs before auto-disable.",
                     },
                 },
-                "required": ["name", "schedule_kind", "schedule", "action_kind", "action_payload"],
+                "required": [
+                    "name",
+                    "schedule_kind",
+                    "schedule",
+                    "action_kind",
+                    "action_payload",
+                ],
             },
             category=ToolCategory.MEMORY,
             energy_cost=1,
@@ -2002,8 +2424,14 @@ class ListScheduledTasksHandler(ToolHandler):
             parameters={
                 "type": "object",
                 "properties": {
-                    "status": {"type": "string", "description": "Optional status filter"},
-                    "due_before": {"type": "string", "description": "Optional ISO8601 cutoff"},
+                    "status": {
+                        "type": "string",
+                        "description": "Optional status filter",
+                    },
+                    "due_before": {
+                        "type": "string",
+                        "description": "Optional ISO8601 cutoff",
+                    },
                     "limit": {"type": "integer", "default": 50},
                 },
                 "required": [],
@@ -2097,10 +2525,18 @@ class UpdateScheduledTaskHandler(ToolHandler):
                     arguments.get("name"),
                     arguments.get("description"),
                     arguments.get("schedule_kind"),
-                    json.dumps(arguments.get("schedule")) if arguments.get("schedule") is not None else None,
+                    (
+                        json.dumps(arguments.get("schedule"))
+                        if arguments.get("schedule") is not None
+                        else None
+                    ),
                     arguments.get("timezone"),
                     arguments.get("action_kind"),
-                    json.dumps(arguments.get("action_payload")) if arguments.get("action_payload") is not None else None,
+                    (
+                        json.dumps(arguments.get("action_payload"))
+                        if arguments.get("action_payload") is not None
+                        else None
+                    ),
                     arguments.get("status"),
                     arguments.get("max_runs"),
                 )
@@ -2153,7 +2589,11 @@ class DeleteScheduledTaskHandler(ToolHandler):
                 )
             return ToolResult.success_result(
                 output={"deleted": bool(ok), "task_id": task_id},
-                display_output=f"Deleted task {task_id}" if hard_delete else f"Disabled task {task_id}",
+                display_output=(
+                    f"Deleted task {task_id}"
+                    if hard_delete
+                    else f"Disabled task {task_id}"
+                ),
             )
         except Exception as e:
             return ToolResult.error_result(str(e), ToolErrorType.EXECUTION_FAILED)
@@ -2197,7 +2637,9 @@ class PonderHandler(ToolHandler):
     ) -> ToolResult:
         query = str(arguments.get("query") or "").strip()
         if not query:
-            return ToolResult.error_result("query is required", ToolErrorType.INVALID_PARAMS)
+            return ToolResult.error_result(
+                "query is required", ToolErrorType.INVALID_PARAMS
+            )
         try:
             async with context.registry.pool.acquire() as conn:
                 activation_id = await conn.fetchval(
@@ -2239,6 +2681,13 @@ class QueueUserMessageHandler(ToolHandler):
             category=ToolCategory.MEMORY,
             energy_cost=0,  # Free - just queuing
             is_read_only=False,
+            outbound=OutboundSpec(
+                recipient_arg=None,
+                body_arg="message",
+                channel="outbox",
+                fixed_recipient="primary_user",
+                primary_recipient=True,
+            ),
             allowed_contexts={ToolContext.HEARTBEAT, ToolContext.CHAT},
         )
 
@@ -2340,24 +2789,35 @@ class TraceWhyHandler(ToolHandler):
         try:
             memory_id = UUID(str(arguments["memory_id"]))
         except (ValueError, KeyError):
-            return ToolResult.error_result("memory_id must be a uuid", ToolErrorType.INVALID_PARAMS)
+            return ToolResult.error_result(
+                "memory_id must be a uuid", ToolErrorType.INVALID_PARAMS
+            )
         depth = max(1, min(int(arguments.get("depth") or 3), 6))
         try:
             async with context.registry.pool.acquire() as conn:
                 rows = await conn.fetch(
                     "SELECT cause_id, cause_content, relationship, distance "
-                    "FROM find_causal_chain($1::uuid, $2)", memory_id, depth,
+                    "FROM find_causal_chain($1::uuid, $2)",
+                    memory_id,
+                    depth,
                 )
             causes = [
-                {"memory_id": str(r["cause_id"]), "content": r["cause_content"],
-                 "relationship": r["relationship"], "distance": r["distance"]}
+                {
+                    "memory_id": str(r["cause_id"]),
+                    "content": r["cause_content"],
+                    "relationship": r["relationship"],
+                    "distance": r["distance"],
+                }
                 for r in rows
             ]
             display = (
                 f"{len(causes)} step(s) in the chain behind {str(memory_id)[:8]}"
-                if causes else "No recorded causes behind this memory — it may be a root experience."
+                if causes
+                else "No recorded causes behind this memory — it may be a root experience."
             )
-            return ToolResult.success_result({"causes": causes, "count": len(causes)}, display)
+            return ToolResult.success_result(
+                {"causes": causes, "count": len(causes)}, display
+            )
         except Exception as e:
             return ToolResult.error_result(str(e), ToolErrorType.EXECUTION_FAILED)
 
@@ -2371,6 +2831,8 @@ def create_memory_tools() -> list[ToolHandler]:
     """
     return [
         RecallHandler(),
+        RecallAtTimeHandler(),
+        DiffMemoryHistoryHandler(),
         SearchHistoryHandler(),
         RememberHandler(),
         AddEvidenceHandler(),

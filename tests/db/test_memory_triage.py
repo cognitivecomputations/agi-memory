@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 from uuid import uuid4
 
+import asyncpg
 import pytest
 
 pytestmark = [pytest.mark.asyncio(loop_scope="session")]
@@ -235,7 +236,7 @@ async def test_keep_memory_refused_when_no_budget(db_pool):
             await tr.rollback()
 
 
-async def test_release_memory_consolidates(db_pool):
+async def test_legacy_heartbeat_cannot_release_user_review(db_pool):
     async with db_pool.acquire() as conn:
         await conn.execute("LOAD 'age'")
         tr = conn.transaction()
@@ -246,17 +247,23 @@ async def test_release_memory_consolidates(db_pool):
                 f"INSERT INTO memories (type, content, embedding, importance, trust_level, status) "
                 f"VALUES ('episodic', $1, {_DUMMY}, 0.3, 0.9, 'active') RETURNING id", f"let go {k}") for k in range(3)]
             rid = await _pending_review(conn, ids)
-            res = _j(await conn.fetchval("SELECT execute_heartbeat_action($1, 'release_memory', $2::jsonb)",
-                                         uuid4(), json.dumps({"review_id": str(rid)})))
-            assert res["success"] is True
-            assert await conn.fetchval("SELECT status FROM memory_review_queue WHERE id=$1", rid) == "released"
+            savepoint = conn.transaction()
+            await savepoint.start()
+            with pytest.raises(asyncpg.InsufficientPrivilegeError, match="explicit user decision"):
+                await conn.fetchval(
+                    "SELECT execute_heartbeat_action($1, 'release_memory', $2::jsonb)",
+                    uuid4(),
+                    json.dumps({"review_id": str(rid)}),
+                )
+            await savepoint.rollback()
+            assert await conn.fetchval("SELECT status FROM memory_review_queue WHERE id=$1", rid) == "pending"
             assert await conn.fetchval(
-                "SELECT count(*) FROM memories WHERE id = ANY($1::uuid[]) AND status='archived'", ids) == 3
+                "SELECT count(*) FROM memories WHERE id = ANY($1::uuid[]) AND status='active'", ids) == 3
         finally:
             await tr.rollback()
 
 
-async def test_journal_memory_writes_and_fades(db_pool):
+async def test_legacy_heartbeat_cannot_journal_and_fade_user_review(db_pool):
     async with db_pool.acquire() as conn:
         await conn.execute("LOAD 'age'")
         tr = conn.transaction()
@@ -268,18 +275,25 @@ async def test_journal_memory_writes_and_fades(db_pool):
                 f"VALUES ('episodic', $1, {_DUMMY}, 0.3, 0.9, 'active') RETURNING id", f"journal {k}") for k in range(3)]
             rid = await _pending_review(conn, ids)
             before = await conn.fetchval("SELECT count(*) FROM journal_entries")
-            res = _j(await conn.fetchval("SELECT execute_heartbeat_action($1, 'journal_memory', $2::jsonb)",
-                                         uuid4(), json.dumps({"review_id": str(rid), "content": "I want to remember this."})))
-            assert res["success"] is True
-            assert await conn.fetchval("SELECT count(*) FROM journal_entries") == before + 1
+            savepoint = conn.transaction()
+            await savepoint.start()
+            with pytest.raises(asyncpg.InsufficientPrivilegeError, match="explicit user decision"):
+                await conn.fetchval(
+                    "SELECT execute_heartbeat_action($1, 'journal_memory', $2::jsonb)",
+                    uuid4(),
+                    json.dumps({"review_id": str(rid), "content": "I want to remember this."}),
+                )
+            await savepoint.rollback()
+            assert await conn.fetchval("SELECT count(*) FROM journal_entries") == before
+            assert await conn.fetchval("SELECT status FROM memory_review_queue WHERE id=$1", rid) == "pending"
             assert await conn.fetchval(
-                "SELECT count(*) FROM memories WHERE id = ANY($1::uuid[]) AND status='archived'", ids) == 3
+                "SELECT count(*) FROM memories WHERE id = ANY($1::uuid[]) AND status='active'", ids) == 3
         finally:
             await tr.rollback()
 
 
-# ---------------------------------------------------------------- default let-go
-async def test_expired_review_defaults_to_consolidate(db_pool):
+# ---------------------------------------------------------------- safe expiry
+async def test_expired_review_waits_for_an_explicit_decision(db_pool):
     async with db_pool.acquire() as conn:
         await conn.execute("LOAD 'age'")
         tr = conn.transaction()
@@ -292,10 +306,11 @@ async def test_expired_review_defaults_to_consolidate(db_pool):
             rid = await conn.fetchval(
                 "INSERT INTO memory_review_queue (memory_ids, reason, preview, expires_at) "
                 "VALUES ($1::uuid[], 'near', 'p', now() - interval '1 day') RETURNING id", ids)
-            _j(await conn.fetchval("SELECT run_retention_gc()"))
-            assert await conn.fetchval("SELECT status FROM memory_review_queue WHERE id=$1", rid) == "expired"
+            result = _j(await conn.fetchval("SELECT run_retention_gc()"))
+            assert result["reviews_awaiting_decision"] >= 1
+            assert await conn.fetchval("SELECT status FROM memory_review_queue WHERE id=$1", rid) == "pending"
             assert await conn.fetchval(
-                "SELECT count(*) FROM memories WHERE id = ANY($1::uuid[]) AND status='archived'", ids) == 3
+                "SELECT count(*) FROM memories WHERE id = ANY($1::uuid[]) AND status='active'", ids) == 3
         finally:
             await tr.rollback()
 

@@ -88,11 +88,13 @@ hexis maturity  # shows live capability levels and exact next steps
 hexis up
 ```
 
-`hexis up` starts the heartbeat and maintenance workers by default. Once init and consent are complete, the heartbeat runs hourly unless it is explicitly paused.
+`hexis up` starts the heartbeat and maintenance workers by default. Once init and
+consent are complete, the heartbeat uses a 60-minute base cadence, stretching to
+90 minutes while quiet and shortening toward 15 minutes as drive urgency rises.
 
 ## What Just Happened
 
-1. `hexis init` started the default stack (the database, queue, heartbeat worker, and maintenance worker), started the embedding sidecar, downloaded the embedding model if needed, configured your chosen character's identity/personality/values, and ran a consent flow where the agent agreed to begin.
+1. `hexis init` started the default stack (database, queue, heartbeat and maintenance workers, API, dashboard, and delivery relay), started the embedding sidecar, downloaded the embedding model if needed, configured your chosen character's identity/personality/values, and ran a consent flow where the agent agreed to begin.
 2. `hexis chat` opened an interactive conversation with memory enrichment -- your messages are augmented with relevant memories, and the agent forms new memories from the conversation.
 
 ## Next Steps

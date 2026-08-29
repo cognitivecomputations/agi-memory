@@ -40,6 +40,7 @@ from core.memory_exchange import (
     quote_staged_import,
     reject_staged_import,
     modify_staged_import,
+    verify_mind_continuity,
 )
 from core.protected_replacement import (
     operator_override_signing_material,
@@ -112,6 +113,30 @@ def _serialized_export(document: dict[str, Any], output_format: str) -> str:
 
 def _write_private_file(path_value: str, content: str, *, overwrite: bool) -> Path:
     return write_private_hmx_file(path_value, content, overwrite=overwrite)
+
+
+def _mind_default_output(document: dict[str, Any], output_format: str) -> Path:
+    """Choose a private, collision-resistant path from the exported truth."""
+
+    from core.config import hexis_home
+
+    output_dir = hexis_home() / "exports"
+    output_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    source = document.get("source") or {}
+    instance = "".join(
+        char if char.isalnum() or char in "-_" else "_"
+        for char in str(source.get("instance_id") or "hexis")
+    ).strip("_")[:40] or "hexis"
+    exported_at = str(document.get("exported_at") or "")
+    try:
+        stamp = datetime.fromisoformat(exported_at.replace("Z", "+00:00")).strftime(
+            "%Y%m%d_%H%M%S"
+        )
+    except ValueError:
+        stamp = "export"
+    export_suffix = str(document.get("export_id") or "mind").removeprefix("exp_")[-8:]
+    extension = "jsonl" if output_format == "jsonl" else "json"
+    return output_dir / f"{instance}-mind-{stamp}-{export_suffix}.hmx.{extension}"
 
 
 def _apply_skips(document: dict[str, Any], skipped: list[str]) -> dict[str, Any]:
@@ -212,9 +237,12 @@ def _print_import_result(
     *,
     as_json: bool,
     skipped: list[str],
+    continuity: dict[str, Any] | None = None,
 ) -> None:
     payload = asdict(result)
     payload["skipped_sections"] = skipped
+    if continuity is not None:
+        payload["continuity"] = continuity
     if as_json:
         sys.stdout.write(
             json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n"
@@ -352,9 +380,38 @@ def _print_import_result(
         console.print(
             f"[warn]warning:[/warn] {warning.get('code')} {warning.get('error', '')}"
         )
+    if continuity is not None:
+        if continuity.get("verified"):
+            console.print(
+                "[ok]Mind continuity verified:[/ok] lineage and all constitutional "
+                "section projections match the source file."
+            )
+        else:
+            console.print(
+                "[fail]Mind import completed, but continuity verification failed.[/fail] "
+                + str(continuity.get("next_step") or "Inspect the JSON report.")
+            )
 
 
 async def run_export(dsn: str, args: Any) -> int:
+    mind_export = bool(getattr(args, "mind", False))
+    intent = args.intent
+    if mind_export:
+        if intent not in (None, "port"):
+            raise HmxPolicyError("--mind uses intent=port and cannot be combined with another intent")
+        if args.types or args.since or args.until:
+            raise HmxPolicyError(
+                "a mind export must be complete; use --intent port for a filtered exchange"
+            )
+        if args.redaction != "none":
+            raise HmxPolicyError(
+                "a mind export cannot redact constitutional state; use --intent port for a redacted exchange"
+            )
+        intent = "port"
+    elif intent is None:
+        raise HmxPolicyError(
+            "export requires --intent port|duplicate|telepathy|analysis, or use --mind"
+        )
     if args.include_raw:
         from apps.cli_theme import err_console
 
@@ -371,7 +428,7 @@ async def run_export(dsn: str, args: Any) -> int:
     try:
         document = await export_hmx(
             conn,
-            intent=args.intent,
+            intent=intent,
             include_protected=_section_csv(args.include_protected),
             include_raw_units=args.include_raw,
             include_config=args.include_config,
@@ -393,16 +450,26 @@ async def run_export(dsn: str, args: Any) -> int:
             err_console.print(f"[warn]warning:[/warn] {warning}")
 
     content = _serialized_export(document, args.format)
-    if args.output in (None, "-"):
+    output = args.output
+    if mind_export and output is None:
+        output = str(_mind_default_output(document, args.format))
+    if output in (None, "-"):
         sys.stdout.write(content)
     else:
-        written = _write_private_file(args.output, content, overwrite=args.overwrite)
+        written = _write_private_file(output, content, overwrite=args.overwrite)
         from apps.cli_theme import console
 
         console.print(
             f"[ok]Exported HMX {document['hmx_version']} to {written}[/ok] "
             f"[muted]({document['statistics']['estimated_uncompressed_bytes']} bytes estimated)[/muted]"
         )
+        if mind_export:
+            console.print(
+                "[muted]Next:[/muted] securely copy this private file to the empty "
+                "destination, then run:\n"
+                f"  hexis import {written.name} --mind --dry-run --json\n"
+                f"  hexis import {written.name} --mind --confirm-intent port"
+            )
     return 0
 
 
@@ -480,6 +547,22 @@ async def _prepare_operator_override_report(
 async def run_import(dsn: str, args: Any) -> int:
     document = _load_document(args.path)
     intent = str(document.get("export_intent") or "")
+    mind_import = bool(getattr(args, "mind", False))
+    if mind_import:
+        if intent != "port":
+            raise HmxPolicyError("--mind accepts only a port-intent HMX file")
+        if args.strategy and args.strategy.replace("-", "_") != "additive":
+            raise HmxPolicyError(
+                "--mind uses the empty-target additive path; omit --strategy or choose additive"
+            )
+        if args.replace or args.force_replace:
+            raise HmxPolicyError(
+                "--mind never replaces an active target; use an ordinary authoritative import for explicit replacement review"
+            )
+        if args.skip_identity or args.skip_worldview or args.skip_narrative:
+            raise HmxPolicyError(
+                "--mind cannot skip constitutional sections; use an ordinary import for a partial transfer"
+            )
     if args.confirm_intent and args.confirm_intent != intent:
         raise HmxPolicyError(
             f"intent confirmation mismatch: file declares {intent!r}, "
@@ -500,7 +583,9 @@ async def run_import(dsn: str, args: Any) -> int:
         if enabled
     ]
     document = _apply_skips(document, skipped)
-    strategy = (args.strategy or default_import_strategy(intent)).replace("-", "_")
+    strategy = (
+        "additive" if mind_import else (args.strategy or default_import_strategy(intent))
+    ).replace("-", "_")
     replace_sections = normalize_replace_sections(args.replace)
     skipped_replacements = sorted(set(skipped) & set(replace_sections))
     if skipped_replacements:
@@ -526,6 +611,7 @@ async def run_import(dsn: str, args: Any) -> int:
             "--force-replace requires --strategy authoritative and at least one --replace section"
         )
 
+    continuity: dict[str, Any] | None = None
     conn = await _connect(dsn, args.wait_seconds)
     try:
         forecast = await dry_run_hmx(
@@ -584,11 +670,18 @@ async def run_import(dsn: str, args: Any) -> int:
             override_reason_code=args.override_reason_code,
             override_evidence_ref=args.override_evidence_ref,
         )
+        if mind_import:
+            continuity = await verify_mind_continuity(conn, document)
     finally:
         await conn.close()
 
-    _print_import_result(result, as_json=args.json, skipped=skipped)
-    return 0
+    _print_import_result(
+        result,
+        as_json=args.json,
+        skipped=skipped,
+        continuity=continuity,
+    )
+    return 0 if continuity is None or continuity.get("verified") else 2
 
 
 async def run_review(dsn: str, args: Any) -> int:

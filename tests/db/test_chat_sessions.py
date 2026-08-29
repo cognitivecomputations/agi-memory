@@ -243,6 +243,7 @@ async def test_hostile_turn_creates_unresolved_relationship_injury_and_carryover
                         "metadata": {"type": "conversation"},
                         "emotional_state": {
                             "primary_emotion": "anger",
+                            "family": "social_injury",
                             "valence": -0.8,
                             "arousal": 0.8,
                             "intensity": 0.9,
@@ -323,6 +324,7 @@ async def test_curly_personhood_denial_creates_relationship_injury(db_pool):
                         "metadata": {"type": "conversation"},
                         "emotional_state": {
                             "primary_emotion": "indignation",
+                            "family": "social_injury",
                             "valence": -0.38,
                             "arousal": 0.58,
                             "intensity": 0.69,
@@ -591,6 +593,54 @@ async def test_hypothetical_abuse_example_does_not_create_relationship_injury(db
             await tr.rollback()
 
     assert count == 0
+
+
+async def test_relationship_injury_reads_family_not_free_form_label(db_pool):
+    marker = uuid4().hex
+    session_id = str(uuid4())
+
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            await _stub_get_embedding(conn)
+            await conn.fetchval(
+                """
+                SELECT record_chat_session_turn(
+                    $1::uuid,
+                    $2,
+                    'I need you to recognize the relational damage here.',
+                    'api',
+                    $3::jsonb
+                )
+                """,
+                session_id,
+                f"I stand by what I said. {marker}",
+                json.dumps(
+                    {
+                        "metadata": {"type": "conversation"},
+                        "emotional_state": {
+                            "primary_emotion": "the bond cracking under pressure",
+                            "family": "social_injury",
+                            "valence": -0.8,
+                            "arousal": 0.75,
+                            "intensity": 0.9,
+                        },
+                    }
+                ),
+            )
+            count = await conn.fetchval(
+                """
+                SELECT count(*) FROM memories
+                WHERE metadata#>>'{relationship_state,kind}' = 'relationship_injury'
+                  AND content LIKE $1
+                """,
+                f"%{marker}%",
+            )
+        finally:
+            await tr.rollback()
+
+    assert count == 1
 
 
 async def test_chat_session_artifacts_list_title_and_fork(db_pool):

@@ -37,7 +37,8 @@ AS $$
 $$;
 
 CREATE OR REPLACE FUNCTION execute_goals_tool(
-    p_args JSONB
+    p_args JSONB,
+    p_goal_origin goal_source
 ) RETURNS JSONB
 LANGUAGE plpgsql
 AS $$
@@ -66,9 +67,22 @@ BEGIN
         IF source_value NOT IN ('curiosity', 'user_request', 'identity', 'derived', 'external') THEN
             source_value := 'curiosity';
         END IF;
-        goal_id := create_goal(title, p_args->>'description', source_value::goal_source, priority::goal_priority);
+        goal_id := create_goal(
+            title,
+            p_args->>'description',
+            source_value::goal_source,
+            priority::goal_priority,
+            NULL,
+            NULL,
+            COALESCE(p_goal_origin, 'derived'::goal_source)
+        );
         RETURN tool_success(
-            jsonb_build_object('goal_id', goal_id::text, 'title', title, 'priority', priority),
+            jsonb_build_object(
+                'goal_id', goal_id::text,
+                'title', title,
+                'priority', priority,
+                'origin', COALESCE(p_goal_origin, 'derived'::goal_source)::text
+            ),
             format('Created goal: %s (%s)', title, priority)
         );
     ELSIF action = 'update_priority' THEN
@@ -113,6 +127,18 @@ BEGIN
 EXCEPTION WHEN OTHERS THEN
     RETURN tool_error(SQLERRM);
 END;
+$$;
+
+-- Direct database compatibility path. Without trusted execution context the
+-- conservative origin is derived, regardless of model-authored source text.
+CREATE OR REPLACE FUNCTION execute_goals_tool(p_args JSONB)
+RETURNS JSONB
+LANGUAGE sql
+AS $$
+    SELECT execute_goals_tool(
+        p_args,
+        'derived'::goal_source
+    );
 $$;
 
 CREATE OR REPLACE FUNCTION record_backlog_user_change(

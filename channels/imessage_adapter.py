@@ -8,7 +8,6 @@ Inbound: Polling REST API.  Outbound: HTTP REST calls.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import time
@@ -17,11 +16,19 @@ from typing import Any, Callable, Awaitable
 from core.integration_reliability import (
     IntegrationHttpError,
     format_provider_error,
+    request_bytes_response,
     request_json,
     request_text_response,
 )
 
-from .base import ChannelAdapter, ChannelCapabilities, ChannelMessage, parse_allowlist, resolve_channel_token
+from .base import (
+    ChannelAdapter,
+    ChannelCapabilities,
+    ChannelMessage,
+    parse_allowlist,
+    resolve_channel_token,
+    resolve_forward_all,
+)
 from .media import Attachment
 
 logger = logging.getLogger(__name__)
@@ -42,20 +49,34 @@ class IMessageAdapter(ChannelAdapter):
     Config keys (from DB config table):
         channel.imessage.api_url: BlueBubbles server URL (default: http://localhost:1234)
         channel.imessage.password: BlueBubbles server password
+        channel.imessage.operator_recipient: phone/email allowed to decide approvals
         channel.imessage.allowed_handles: JSON array of phone/email handles, or "*"
 
     Requires a BlueBubbles server running on a Mac with iMessage configured.
     """
 
-    def __init__(self, config: dict[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        config: dict[str, Any] | None = None,
+        *,
+        forward_all: bool | None = None,
+    ) -> None:
         self._config = config or {}
+        self._forward_all = resolve_forward_all(self._config, forward_all)
         self._on_message: Callable[[ChannelMessage], Awaitable[None]] | None = None
         self._connected = False
         self._api_url = str(
-            self._config.get("api_url") or os.getenv("IMESSAGE_API_URL") or DEFAULT_API_URL
+            self._config.get("api_url")
+            or os.getenv("IMESSAGE_API_URL")
+            or DEFAULT_API_URL
         ).rstrip("/")
         self._password: str | None = None
-        self._allowed_handles = self._parse_allowlist(self._config.get("allowed_handles"))
+        self._allowed_handles = self._parse_allowlist(
+            self._config.get("allowed_handles")
+        )
+        self._operator_recipient = str(
+            self._config.get("operator_recipient") or ""
+        ).strip()
         self._session = None
         self._last_timestamp: int = 0  # Unix timestamp ms for polling cursor
 
@@ -176,15 +197,26 @@ class IMessageAdapter(ChannelAdapter):
 
         text = msg.get("text") or ""
         handle = msg.get("handle", {})
-        sender_address = handle.get("address", "") if isinstance(handle, dict) else str(handle)
+        sender_address = (
+            handle.get("address", "") if isinstance(handle, dict) else str(handle)
+        )
 
         if not sender_address:
             return
 
-        # Check allowlist
+        # In transport-only mode the manager's SQL resolver owns policy. Keep
+        # a hint so a runtime kill-switch change can still reproduce the
+        # legacy drop without restarting the adapter.
+        gate_hint: str | None = None
         if self._allowed_handles is not None:
-            if sender_address not in self._allowed_handles:
-                return
+            operator_reply = (
+                bool(self._operator_recipient)
+                and sender_address.lower() == self._operator_recipient.lower()
+            )
+            if sender_address not in self._allowed_handles and not operator_reply:
+                if not self._forward_all:
+                    return
+                gate_hint = "not_allowlisted"
 
         # Determine chat/channel ID from the first associated chat
         chats = msg.get("chats", [])
@@ -194,15 +226,25 @@ class IMessageAdapter(ChannelAdapter):
         attachments: list[Attachment] = []
         for att in msg.get("attachments", []):
             mime_type = att.get("mimeType") or att.get("uti")
-            attachments.append(Attachment(
-                url=f"{self._api_url}/api/v1/attachment/{att.get('guid', '')}/download?password={self._password}" if att.get("guid") else "",
-                filename=att.get("transferName") or att.get("filename"),
-                mime_type=mime_type,
-                size=att.get("totalBytes"),
-                platform_id=att.get("guid"),
-            ))
+            attachments.append(
+                Attachment(
+                    url=(
+                        f"{self._api_url}/api/v1/attachment/{att.get('guid', '')}/download?password={self._password}"
+                        if att.get("guid")
+                        else ""
+                    ),
+                    filename=att.get("transferName") or att.get("filename"),
+                    mime_type=mime_type,
+                    size=att.get("totalBytes"),
+                    platform_id=att.get("guid"),
+                )
+            )
 
-        sender_name = handle.get("displayName") or sender_address if isinstance(handle, dict) else sender_address
+        sender_name = (
+            handle.get("displayName") or sender_address
+            if isinstance(handle, dict)
+            else sender_address
+        )
 
         msg_guid = msg.get("guid", str(msg.get("dateCreated", "")))
 
@@ -217,6 +259,8 @@ class IMessageAdapter(ChannelAdapter):
             metadata={
                 "is_group": bool(chats and chats[0].get("isGroup")),
                 "service": msg.get("service", "iMessage"),
+                "is_mention": False,
+                **({"gate_hint": gate_hint} if gate_hint else {}),
             },
         )
 
@@ -228,6 +272,43 @@ class IMessageAdapter(ChannelAdapter):
         if self._session and not self._session.closed:
             await self._session.close()
         self._session = None
+
+    async def download_attachment(
+        self, attachment: Attachment, *, max_size: int
+    ) -> Attachment:
+        """Fetch media from the explicitly configured BlueBubbles server."""
+
+        if attachment.local_path or not attachment.url:
+            return attachment
+        if attachment.size is not None and attachment.size > max_size:
+            return attachment
+        from urllib.parse import urlparse
+
+        configured = urlparse(self._api_url)
+        requested = urlparse(attachment.url)
+        if (requested.scheme, requested.netloc) != (
+            configured.scheme,
+            configured.netloc,
+        ):
+            return await super().download_attachment(attachment, max_size=max_size)
+        response = await request_bytes_response(
+            "bluebubbles-media",
+            "GET",
+            attachment.url,
+            timeout=30.0,
+            attempts=3,
+            max_delay=5.0,
+            follow_redirects=False,
+            max_bytes=max_size,
+        )
+        from .media import materialize_attachment_bytes
+
+        return materialize_attachment_bytes(
+            attachment,
+            response.content,
+            content_type=response.headers.get("content-type"),
+            prefix="hexis-imessage-",
+        )
 
     async def send(
         self,
@@ -328,6 +409,7 @@ class IMessageAdapter(ChannelAdapter):
             elif attachment.url:
                 # Download first, then upload
                 from .media import download_attachment
+
                 downloaded = await download_attachment(attachment)
                 if downloaded.local_path:
                     file_handle = open(downloaded.local_path, "rb")
@@ -355,7 +437,11 @@ class IMessageAdapter(ChannelAdapter):
                     return msg_data.get("guid")
                 else:
                     body = await _read_aiohttp_text_limited(resp)
-                    logger.error("iMessage send_media failed: HTTP %d: %s", resp.status, body[:200])
+                    logger.error(
+                        "iMessage send_media failed: HTTP %d: %s",
+                        resp.status,
+                        body[:200],
+                    )
                     return None
         except Exception:
             logger.exception("Failed to send iMessage media to %s", channel_id)

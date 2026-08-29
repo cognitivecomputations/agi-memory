@@ -13,8 +13,8 @@ section: contributing
 
 ```bash
 git clone https://github.com/QuixiAI/Hexis.git && cd Hexis
-uv venv && source .venv/bin/activate
-uv pip install -e .
+uv sync --locked --inexact
+source .venv/bin/activate
 cp .env.example .env   # edit with your settings; never commit .env
 hexis up             # start services
 hexis doctor         # verify health
@@ -103,6 +103,9 @@ docker build -f ops/Dockerfile.ui -t ghcr.io/quixiai/hexis-ui:dev .
 ```
 
 The `hexis-brain` image takes the longest to build because it compiles pgvector, pgsql-http, and Apache AGE from source.
+The Python images install their runtime and channel dependencies from the
+committed `uv.lock`; after changing `pyproject.toml`, run `uv lock` and commit
+both files. `uv lock --check` is the local/CI drift check.
 
 ### Publishing manually
 

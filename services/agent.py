@@ -49,9 +49,13 @@ _SUBCONSCIOUS_TOTAL_CONTEXT_CHARS = 7000
 _MAX_VISUAL_ATTACHMENTS_PER_TURN = 8
 
 
-def _visual_attachment_parts(visual_attachments: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+def _visual_attachment_parts(
+    visual_attachments: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
     parts: list[dict[str, Any]] = []
-    for index, attachment in enumerate((visual_attachments or [])[:_MAX_VISUAL_ATTACHMENTS_PER_TURN], start=1):
+    for index, attachment in enumerate(
+        (visual_attachments or [])[:_MAX_VISUAL_ATTACHMENTS_PER_TURN], start=1
+    ):
         if not isinstance(attachment, dict):
             continue
         data_url = str(attachment.get("data_url") or "").strip()
@@ -60,8 +64,12 @@ def _visual_attachment_parts(visual_attachments: list[dict[str, Any]] | None) ->
             continue
         if mime_type and not mime_type.startswith("image/"):
             continue
-        name = str(attachment.get("name") or f"image-{index}").strip() or f"image-{index}"
-        parts.append({"type": "input_text", "text": f"\n[Attached image {index}: {name}]\n"})
+        name = (
+            str(attachment.get("name") or f"image-{index}").strip() or f"image-{index}"
+        )
+        parts.append(
+            {"type": "input_text", "text": f"\n[Attached image {index}: {name}]\n"}
+        )
         parts.append({"type": "input_image", "image_url": data_url, "detail": "auto"})
     return parts
 
@@ -104,7 +112,9 @@ class SubconsciousOutput:
     consolidation_observations: list[dict[str, Any]] = field(default_factory=list)
 
 
-async def render_subconscious_signals_db(conn: "asyncpg.Connection", output: SubconsciousOutput) -> str:
+async def render_subconscious_signals_db(
+    conn: "asyncpg.Connection", output: SubconsciousOutput
+) -> str:
     """Render the '## Subconscious Signals' block via the DB-owned renderer.
 
     render_subconscious_signals (db/39) is the single source of the prompt
@@ -184,7 +194,9 @@ def _subconscious_trace_events(output: SubconsciousOutput) -> list[AgentEventDat
     ]
 
 
-def _memory_event_preview(memory: "Memory", content_budget: int = 260) -> dict[str, Any]:
+def _memory_event_preview(
+    memory: "Memory", content_budget: int = 260
+) -> dict[str, Any]:
     memory_type = getattr(memory, "type", None)
     if hasattr(memory_type, "value"):
         memory_type = memory_type.value
@@ -194,7 +206,13 @@ def _memory_event_preview(memory: "Memory", content_budget: int = 260) -> dict[s
         "type": str(memory_type or ""),
         "content": content[:content_budget],
     }
-    for field_name in ("similarity", "relevance_score", "importance", "trust_level", "confidence"):
+    for field_name in (
+        "similarity",
+        "relevance_score",
+        "importance",
+        "trust_level",
+        "confidence",
+    ):
         value = getattr(memory, field_name, None)
         if isinstance(value, (int, float)):
             preview[field_name] = float(value)
@@ -204,7 +222,9 @@ def _memory_event_preview(memory: "Memory", content_budget: int = 260) -> dict[s
     return {key: value for key, value in preview.items() if value not in ("", None)}
 
 
-def _memory_event_previews(memories: list["Memory"], limit: int = 10) -> list[dict[str, Any]]:
+def _memory_event_previews(
+    memories: list["Memory"], limit: int = 10
+) -> list[dict[str, Any]]:
     return [_memory_event_preview(memory) for memory in memories[:limit]]
 
 
@@ -222,7 +242,9 @@ def _coerce_json_value(value: Any, default: Any) -> Any:
     return value if value is not None else default
 
 
-def _memory_to_subconscious_context(memory: "Memory", content_budget: int) -> dict[str, Any]:
+def _memory_to_subconscious_context(
+    memory: "Memory", content_budget: int
+) -> dict[str, Any]:
     content = memory.content
     if len(content) > content_budget:
         content = content[:content_budget].rstrip() + " [truncated]"
@@ -247,7 +269,9 @@ def _memory_to_subconscious_context(memory: "Memory", content_budget: int) -> di
     }
 
 
-def _bounded_subconscious_json(payload: dict[str, Any], total_chars: int = _SUBCONSCIOUS_TOTAL_CONTEXT_CHARS) -> str:
+def _bounded_subconscious_json(
+    payload: dict[str, Any], total_chars: int = _SUBCONSCIOUS_TOTAL_CONTEXT_CHARS
+) -> str:
     """Serialize valid JSON while keeping the inline appraisal lightweight."""
 
     def encode() -> str:
@@ -262,7 +286,9 @@ def _bounded_subconscious_json(payload: dict[str, Any], total_chars: int = _SUBC
         excess = len(encoded) - total_chars
         keep = max(0, len(additional) - excess - 100)
         payload["additional_context"] = additional[:keep].rstrip() + (
-            "\n[truncated for subconscious appraisal; full context is provided to the main turn]" if keep else ""
+            "\n[truncated for subconscious appraisal; full context is provided to the main turn]"
+            if keep
+            else ""
         )
         encoded = encode()
 
@@ -273,7 +299,9 @@ def _bounded_subconscious_json(payload: dict[str, Any], total_chars: int = _SUBC
             encoded = encode()
 
     memories = payload.get("relevant_memories")
-    while len(encoded) > total_chars and isinstance(memories, list) and len(memories) > 1:
+    while (
+        len(encoded) > total_chars and isinstance(memories, list) and len(memories) > 1
+    ):
         memories.pop()
         encoded = encode()
 
@@ -285,13 +313,18 @@ def _bounded_subconscious_json(payload: dict[str, Any], total_chars: int = _SUBC
         memory = memories[0]
         content = str(memory.get("content") or "")
         excess = len(encoded) - total_chars
-        memory["content"] = content[: max(0, len(content) - excess - 30)].rstrip() + " [truncated]"
+        memory["content"] = (
+            content[: max(0, len(content) - excess - 30)].rstrip() + " [truncated]"
+        )
         encoded = encode()
 
     if len(encoded) > total_chars:
         user_message = str(payload.get("user_message") or "")
         excess = len(encoded) - total_chars
-        payload["user_message"] = user_message[: max(0, len(user_message) - excess - 30)].rstrip() + " [truncated]"
+        payload["user_message"] = (
+            user_message[: max(0, len(user_message) - excess - 30)].rstrip()
+            + " [truncated]"
+        )
         encoded = encode()
 
     if len(encoded) > total_chars:
@@ -329,7 +362,14 @@ async def render_chat_continuity_context_db(
     except Exception:
         logger.debug("Chat continuity context unavailable", exc_info=True)
         return ""
-    return str(raw or "").strip()
+    continuity = str(raw or "").strip()
+    try:
+        policy_raw = await conn.fetchval("SELECT render_operator_policy_context()")
+        policy_context = str(policy_raw or "").strip()
+    except Exception:
+        logger.debug("Operator policy context unavailable", exc_info=True)
+        policy_context = ""
+    return "\n\n".join(part for part in (continuity, policy_context) if part)
 
 
 async def render_recent_conversation_carryover_db(
@@ -362,7 +402,9 @@ async def run_subconscious_appraisal(
     apply observations to the DB (that stays in the maintenance worker).
     """
     if llm_config is None:
-        llm_config = await load_llm_config(conn, "llm.subconscious", fallback_key="llm.heartbeat")
+        llm_config = await load_llm_config(
+            conn, "llm.subconscious", fallback_key="llm.heartbeat"
+        )
 
     payload: dict[str, Any] = {
         "task": "inline_appraisal",
@@ -390,9 +432,13 @@ async def run_subconscious_appraisal(
             db_ctx["appraisal_depth"] = depth_ctx
             db_ctx["limits"] = depth_ctx["limits"]
     except Exception:
-        logger.debug("Appraisal depth lookup failed; using default budgets", exc_info=True)
+        logger.debug(
+            "Appraisal depth lookup failed; using default budgets", exc_info=True
+        )
     limits = db_ctx.get("limits") or {}
-    context_chars = int(limits.get("context_chars") or _SUBCONSCIOUS_MEMORY_CONTEXT_CHARS)
+    context_chars = int(
+        limits.get("context_chars") or _SUBCONSCIOUS_MEMORY_CONTEXT_CHARS
+    )
     memory_chars = int(limits.get("memory_chars") or 1200)
     memory_limit = int(limits.get("memory_limit") or 10)
     max_tokens = int(limits.get("max_tokens") or 1800)
@@ -409,7 +455,9 @@ async def run_subconscious_appraisal(
             if remaining <= 0:
                 break
             content_budget = min(memory_chars, remaining)
-            payload["relevant_memories"].append(_memory_to_subconscious_context(memory, content_budget))
+            payload["relevant_memories"].append(
+                _memory_to_subconscious_context(memory, content_budget)
+            )
             remaining -= min(len(memory.content), content_budget)
         payload["identity"] = hydrated_context.identity[:5]
         payload["worldview"] = hydrated_context.worldview[:5]
@@ -430,6 +478,8 @@ async def run_subconscious_appraisal(
         payload["relationships"] = db_ctx["relationships"]
     if db_ctx.get("dopamine_state"):
         payload["dopamine_state"] = db_ctx["dopamine_state"]
+    if db_ctx.get("emotion_families"):
+        payload["emotion_families"] = db_ctx["emotion_families"]
 
     total_chars = int(limits.get("total_chars") or _SUBCONSCIOUS_TOTAL_CONTEXT_CHARS)
     user_prompt = "Context (JSON):\n" + _bounded_subconscious_json(payload, total_chars)
@@ -463,9 +513,13 @@ async def run_subconscious_appraisal(
             raw_response=raw,
         )
 
-    allowed_memory_ids = sorted({
-        str(memory.get("memory_id")) for memory in payload.get("relevant_memories", []) if isinstance(memory, dict) and memory.get("memory_id")
-    })
+    allowed_memory_ids = sorted(
+        {
+            str(memory.get("memory_id"))
+            for memory in payload.get("relevant_memories", [])
+            if isinstance(memory, dict) and memory.get("memory_id")
+        }
+    )
     # Normalization is DB-owned (db/67 normalize_inline_appraisal): confidence
     # thresholds, clamps, and allow-listing run in SQL with config knobs.
     normalized_raw = await conn.fetchval(
@@ -561,7 +615,11 @@ def render_interlocutor_block(
     lines = ["## Who you are speaking with"]
 
     if where in _PRIMARY_USER_SURFACES and not is_group:
-        who = interlocutor.strip() if interlocutor and interlocutor.strip() else "your primary user"
+        who = (
+            interlocutor.strip()
+            if interlocutor and interlocutor.strip()
+            else "your primary user"
+        )
         lines.append(
             f"You are speaking with {who}, directly and privately. This is the person "
             "whose agent you are: they hold authority over you, and everything you know "
@@ -649,10 +707,13 @@ async def build_system_prompt(
         stable.append(load_conversation_prompt().strip())
         if is_group:
             from services.prompt_resources import load_channel_context_prompt
+
             stable.append(load_channel_context_prompt().strip())
-        volatile.append(render_interlocutor_block(
-            interlocutor=interlocutor, surface=surface, is_group=is_group
-        ))
+        volatile.append(
+            render_interlocutor_block(
+                interlocutor=interlocutor, surface=surface, is_group=is_group
+            )
+        )
     else:
         stable.append(load_heartbeat_agentic_prompt().strip())
 
@@ -692,7 +753,12 @@ async def build_system_prompt(
     # character/persona, not compete with it as a higher-priority identity.
     if agent_profile:
         persona = agent_profile.get("persona")
-        if isinstance(persona, dict) and persona and registry is not None and getattr(registry, "pool", None) is not None:
+        if (
+            isinstance(persona, dict)
+            and persona
+            and registry is not None
+            and getattr(registry, "pool", None) is not None
+        ):
             async with registry.pool.acquire() as conn:
                 persona_block = await conn.fetchval(
                     "SELECT render_active_persona($1::jsonb)", json.dumps(persona)
@@ -723,7 +789,11 @@ async def build_system_prompt(
             volatile.append(costs_block)
 
     # Personhood modules
-    personhood_kind = "group" if (mode == "chat" and is_group) else ("conversation" if mode == "chat" else "heartbeat")
+    personhood_kind = (
+        "group"
+        if (mode == "chat" and is_group)
+        else ("conversation" if mode == "chat" else "heartbeat")
+    )
     try:
         personhood = compose_compact_personhood_prompt(personhood_kind)
         if personhood:
@@ -741,7 +811,10 @@ async def build_system_prompt(
             if key not in ("persona", "tools") and value not in (None, "", [], {})
         }
         if runtime_profile:
-            stable.append("## Agent Profile (Runtime)\n" + json.dumps(runtime_profile, separators=(", ", ": ")))
+            stable.append(
+                "## Agent Profile (Runtime)\n"
+                + json.dumps(runtime_profile, separators=(", ", ": "))
+            )
 
     # Session addenda: per-request prompt sections the caller resolved
     # (attached-document text, opted-in grounding modules). Turn-scoped —
@@ -774,10 +847,14 @@ async def run_agent(
     surface: str = "chat",
     heartbeat_context: dict[str, Any] | None = None,
     on_event: Callable[[AgentEventData], Awaitable[None]] | None = None,
+    on_approval: (
+        Callable[[str, dict[str, Any]], Awaitable[bool | dict[str, Any]]] | None
+    ) = None,
     streaming: bool = False,
     context_overrides: ContextOverrides | None = None,
     agent_profile: dict[str, Any] | None = None,
     is_group: bool = False,
+    is_operator: bool = False,
     dsn: str | None = None,
     has_backlog_tasks: bool = False,
     timeout_seconds: float | None = None,
@@ -829,7 +906,9 @@ async def run_agent(
                     # promise, made mechanical at the recall layer.
                     exclude_sensitive=False,
                 )
-                memory_context = await render_chat_memory_context_db(conn, context, max_memories=10)
+                memory_context = await render_chat_memory_context_db(
+                    conn, context, max_memories=10
+                )
 
                 # Emit memory recall event
                 if on_event and context.memories:
@@ -858,7 +937,11 @@ async def run_agent(
         try:
             inline_enabled = True
             if mode == "chat":
-                inline_enabled = bool(await conn.fetchval("SELECT COALESCE(get_config_bool('chat.inline_subconscious_enabled'), true)"))
+                inline_enabled = bool(
+                    await conn.fetchval(
+                        "SELECT COALESCE(get_config_bool('chat.inline_subconscious_enabled'), true)"
+                    )
+                )
             if inline_enabled:
                 if on_event:
                     await on_event(
@@ -871,13 +954,17 @@ async def run_agent(
                 # For chat, deterministic continuity is the appraisal context;
                 # semantically retrieved memories are supplied separately as
                 # hydrated_context. Heartbeat still renders its full snapshot.
-                sub_memory_ctx = continuity_context if mode == "chat" else memory_context
+                sub_memory_ctx = (
+                    continuity_context if mode == "chat" else memory_context
+                )
                 if mode == "heartbeat" and heartbeat_context:
                     from services.heartbeat_prompt import (
                         render_heartbeat_decision_prompt_db,
                     )
 
-                    sub_memory_ctx = await render_heartbeat_decision_prompt_db(conn, heartbeat_context)
+                    sub_memory_ctx = await render_heartbeat_decision_prompt_db(
+                        conn, heartbeat_context
+                    )
 
                 subconscious_output = await run_subconscious_appraisal(
                     conn,
@@ -885,7 +972,9 @@ async def run_agent(
                     sub_memory_ctx,
                     hydrated_context=context,
                 )
-                sub_signals = await render_subconscious_signals_db(conn, subconscious_output)
+                sub_signals = await render_subconscious_signals_db(
+                    conn, subconscious_output
+                )
 
                 if on_event:
                     for trace_event in _subconscious_trace_events(subconscious_output):
@@ -896,7 +985,9 @@ async def run_agent(
                             data={
                                 "phase": "subconscious",
                                 "status": "end",
-                                "output": _subconscious_event_payload(subconscious_output),
+                                "output": _subconscious_event_payload(
+                                    subconscious_output
+                                ),
                             },
                         )
                     )
@@ -928,10 +1019,13 @@ async def run_agent(
         max_skills=5 if mode == "heartbeat" else 4,
     )
     await record_selection(
-        pool, skill_selection,
+        pool,
+        skill_selection,
         registry=registry,
-        session_id=session_id, surface=surface,
-        tool_context=tool_context, query=skill_query,
+        session_id=session_id,
+        surface=surface,
+        tool_context=tool_context,
+        query=skill_query,
     )
 
     # 4. Build system prompt
@@ -969,15 +1063,39 @@ async def run_agent(
     else:
         enriched_parts.append(user_message)
 
-    enriched_user_message = "\n\n".join(enriched_parts) if enriched_parts else user_message
+    enriched_user_message = (
+        "\n\n".join(enriched_parts) if enriched_parts else user_message
+    )
     enriched_user_content = _user_content_with_visuals(
         enriched_user_message,
         visual_attachments if mode == "chat" else None,
     )
 
+    approval_wait_extension = 0
+    if on_approval is None:
+        from services.operator_approval import create_operator_approval_callback
+
+        on_approval, approval_wait_extension = await create_operator_approval_callback(
+            pool,
+            tool_context=tool_context,
+            session_id=session_id,
+            heartbeat_id=heartbeat_id,
+            surface=surface,
+        )
+
+    question_wait_extension = 0
+    if tool_context == ToolContext.CHAT:
+        from services.agent_questions import question_timeout_seconds
+
+        question_wait_extension = await question_timeout_seconds(pool)
+
     # 6. Configure AgentLoop with mode-specific defaults
     if mode == "chat":
-        effective_timeout = timeout_seconds or 120.0
+        effective_timeout = (
+            (timeout_seconds or 120.0)
+            + approval_wait_extension
+            + question_wait_extension
+        )
         effective_max_tokens = max_tokens or 4096
         loop_config = AgentLoopConfig(
             tool_context=tool_context,
@@ -992,6 +1110,8 @@ async def run_agent(
             max_tokens=effective_max_tokens,
             session_id=session_id,
             is_group=is_group,
+            is_operator=is_operator,
+            on_approval=on_approval,
             allowed_tool_names=set(skill_selection.allowed_tool_names),
             active_skill_names=[sk.name for sk in skill_selection.skills],
             surface=surface,
@@ -999,7 +1119,9 @@ async def run_agent(
             available_skill_count=len(skill_selection.available),
         )
     else:
-        effective_timeout = timeout_seconds or (300.0 if has_backlog_tasks else 120.0)
+        effective_timeout = (
+            timeout_seconds or (300.0 if has_backlog_tasks else 120.0)
+        ) + approval_wait_extension
         effective_max_tokens = max_tokens or (4096 if has_backlog_tasks else 2048)
         loop_config = AgentLoopConfig(
             tool_context=tool_context,
@@ -1013,6 +1135,8 @@ async def run_agent(
             temperature=0.7,
             max_tokens=effective_max_tokens,
             heartbeat_id=heartbeat_id,
+            is_operator=is_operator,
+            on_approval=on_approval,
             enable_planning=True,
             continuation_prompt=(
                 "You finished without taking further action. "
@@ -1039,7 +1163,9 @@ async def run_agent(
         # Fall back to non-streaming here.
         pass
 
-    result = await agent.run(enriched_user_message, history=history, user_content=enriched_user_content)
+    result = await agent.run(
+        enriched_user_message, history=history, user_content=enriched_user_content
+    )
     return result
 
 
@@ -1057,21 +1183,22 @@ async def stream_agent(
     surface: str = "chat",
     agent_profile: dict[str, Any] | None = None,
     is_group: bool = False,
+    is_operator: bool = False,
     dsn: str | None = None,
     has_backlog_tasks: bool = False,
     timeout_seconds: float | None = None,
     max_tokens: int | None = None,
     temperature: float | None = None,
-    on_approval: "Callable[[str, dict[str, Any]], Awaitable[bool]] | None" = None,
+    on_approval: "Callable[[str, dict[str, Any]], Awaitable[bool | dict[str, Any]]] | None" = None,
     prompt_addenda: list[str] | None = None,
     visual_attachments: list[dict[str, Any]] | None = None,
 ) -> AsyncIterator[AgentEventData]:
     """
     Streaming variant of run_agent(). Yields AgentEventData as they happen.
 
-    ``on_approval(tool_name, arguments) -> bool`` is called before any tool that
-    ``requires_approval`` runs; return False to deny. In interactive chat this is
-    the human's [y/N] gate for side-effecting tools (email, DMs, shell, …).
+    ``on_approval`` is called before protected tools. A local callback may
+    return a boolean; the default durable callback returns an exact one-shot
+    approval request id after an identity-checked phone decision.
 
     Used by the SSE chat endpoint to stream tokens to the frontend.
     """
@@ -1116,7 +1243,9 @@ async def stream_agent(
                     # promise, made mechanical at the recall layer.
                     exclude_sensitive=False,
                 )
-                memory_context = await render_chat_memory_context_db(conn, context, max_memories=10)
+                memory_context = await render_chat_memory_context_db(
+                    conn, context, max_memories=10
+                )
 
                 yield AgentEventData(
                     event=AgentEvent.PHASE_CHANGE,
@@ -1139,7 +1268,11 @@ async def stream_agent(
         subconscious_output = SubconsciousOutput()
         sub_signals = ""
         try:
-            inline_enabled = bool(await conn.fetchval("SELECT COALESCE(get_config_bool('chat.inline_subconscious_enabled'), true)"))
+            inline_enabled = bool(
+                await conn.fetchval(
+                    "SELECT COALESCE(get_config_bool('chat.inline_subconscious_enabled'), true)"
+                )
+            )
             if inline_enabled:
                 yield AgentEventData(
                     event=AgentEvent.PHASE_CHANGE,
@@ -1151,7 +1284,9 @@ async def stream_agent(
                     continuity_context,
                     hydrated_context=context,
                 )
-                sub_signals = await render_subconscious_signals_db(conn, subconscious_output)
+                sub_signals = await render_subconscious_signals_db(
+                    conn, subconscious_output
+                )
                 for trace_event in _subconscious_trace_events(subconscious_output):
                     yield trace_event
                 yield AgentEventData(
@@ -1172,10 +1307,13 @@ async def stream_agent(
         max_skills=4,
     )
     await record_selection(
-        pool, skill_selection,
+        pool,
+        skill_selection,
         registry=registry,
-        session_id=session_id, surface=surface,
-        tool_context=tool_context, query=user_message,
+        session_id=session_id,
+        surface=surface,
+        tool_context=tool_context,
+        query=user_message,
     )
 
     # Build system prompt
@@ -1219,6 +1357,21 @@ async def stream_agent(
             return fallback
 
     effective_timeout = timeout_seconds or _cfg_num("timeout_seconds", 120.0)
+    if on_approval is None:
+        from services.operator_approval import create_operator_approval_callback
+
+        on_approval, approval_wait_extension = await create_operator_approval_callback(
+            pool,
+            tool_context=tool_context,
+            session_id=session_id,
+            heartbeat_id=None,
+            surface=surface,
+        )
+        effective_timeout += approval_wait_extension
+    if tool_context == ToolContext.CHAT:
+        from services.agent_questions import question_timeout_seconds
+
+        effective_timeout += await question_timeout_seconds(pool)
     effective_max_tokens = int(max_tokens or _cfg_num("max_tokens", 4096))
     effective_temperature = (
         temperature if temperature is not None else _cfg_num("temperature", 0.7)
@@ -1236,6 +1389,7 @@ async def stream_agent(
         max_tokens=effective_max_tokens,
         session_id=session_id,
         is_group=is_group,
+        is_operator=is_operator,
         on_approval=on_approval,
         allowed_tool_names=set(skill_selection.allowed_tool_names),
         active_skill_names=[sk.name for sk in skill_selection.skills],
@@ -1245,5 +1399,7 @@ async def stream_agent(
     )
 
     agent = AgentLoop(loop_config)
-    async for event in agent.stream(enriched_user_message, history=history, user_content=enriched_user_content):
+    async for event in agent.stream(
+        enriched_user_message, history=history, user_content=enriched_user_content
+    ):
         yield event

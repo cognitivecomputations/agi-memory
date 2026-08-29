@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from core.llm_batch import DEFAULT_CHUNK_CHARS, batch_classify, chunk_by_size
+from core.llm_batch import batch_classify, chunk_by_size
 
 CFG = {"provider": "openai", "model": "gpt-4o"}
 
@@ -44,7 +44,9 @@ class TestChunking:
 
     def test_an_oversized_item_is_not_silently_dropped(self):
         """Better one oversized request the model can refuse than a lost item."""
-        chunks = chunk_by_size([1, 2], size_of=lambda i: 10_000 if i == 1 else 5, budget=100)
+        chunks = chunk_by_size(
+            [1, 2], size_of=lambda i: 10_000 if i == 1 else 5, budget=100
+        )
         assert [i for c in chunks for i in c] == [1, 2]
 
 
@@ -52,7 +54,9 @@ class TestBatching:
     @pytest.mark.asyncio
     async def test_eighty_items_take_one_call(self):
         reply = {"results": {f"i{k}": {"verdict": k} for k in range(80)}}
-        with patch("core.llm_batch.chat_json", AsyncMock(return_value=(reply, ""))) as m:
+        with patch(
+            "core.llm_batch.chat_json", AsyncMock(return_value=(reply, ""))
+        ) as m:
             out = await batch_classify(_items(80), **_args())
         assert m.await_count == 1, f"{m.await_count} calls for 80 items"
         assert len(out) == 80
@@ -61,7 +65,13 @@ class TestBatching:
     @pytest.mark.asyncio
     async def test_an_out_of_order_response_still_maps_correctly(self):
         """The property that makes id-keying non-negotiable."""
-        reply = {"results": {"i2": {"verdict": "C"}, "i0": {"verdict": "A"}, "i1": {"verdict": "B"}}}
+        reply = {
+            "results": {
+                "i2": {"verdict": "C"},
+                "i0": {"verdict": "A"},
+                "i1": {"verdict": "B"},
+            }
+        }
         with patch("core.llm_batch.chat_json", AsyncMock(return_value=(reply, ""))):
             out = await batch_classify(_items(3), **_args())
         assert out == {"i0": "A", "i1": "B", "i2": "C"}
@@ -69,13 +79,27 @@ class TestBatching:
     @pytest.mark.asyncio
     async def test_a_partial_response_falls_back_only_for_what_is_missing(self):
         reply = {"results": {"i0": {"verdict": "A"}}}
+        provenance = {}
         with patch("core.llm_batch.chat_json", AsyncMock(return_value=(reply, ""))):
-            out = await batch_classify(_items(3), **_args())
+            out = await batch_classify(_items(3), **_args(), provenance=provenance)
         assert out == {"i0": "A", "i1": "FALLBACK", "i2": "FALLBACK"}
+        assert provenance == {"i0": "llm", "i1": "fallback", "i2": "fallback"}
+
+    @pytest.mark.asyncio
+    async def test_an_explicit_empty_verdict_is_still_an_llm_answer(self):
+        reply = {"results": {"i0": {"claims": []}}}
+        provenance = {}
+        args = _args(parse=lambda doc: doc["claims"], fallback=lambda _item: ["rule"])
+        with patch("core.llm_batch.chat_json", AsyncMock(return_value=(reply, ""))):
+            out = await batch_classify(_items(1), **args, provenance=provenance)
+        assert out == {"i0": []}
+        assert provenance == {"i0": "llm"}
 
     @pytest.mark.asyncio
     async def test_a_list_shaped_response_is_accepted(self):
-        reply = {"results": [{"id": "i1", "verdict": "B"}, {"id": "i0", "verdict": "A"}]}
+        reply = {
+            "results": [{"id": "i1", "verdict": "B"}, {"id": "i0", "verdict": "A"}]
+        }
         with patch("core.llm_batch.chat_json", AsyncMock(return_value=(reply, ""))):
             out = await batch_classify(_items(2), **_args())
         assert out == {"i0": "A", "i1": "B"}
@@ -89,7 +113,9 @@ class TestBatching:
 
     @pytest.mark.asyncio
     async def test_every_item_is_present_even_when_the_call_dies(self):
-        with patch("core.llm_batch.chat_json", AsyncMock(side_effect=RuntimeError("boom"))):
+        with patch(
+            "core.llm_batch.chat_json", AsyncMock(side_effect=RuntimeError("boom"))
+        ):
             out = await batch_classify(_items(3), **_args())
         assert out == {"i0": "FALLBACK", "i1": "FALLBACK", "i2": "FALLBACK"}
 
@@ -164,29 +190,49 @@ class TestConnectorCognitionUsesOneCallPerRun:
 
         conn = AsyncMock()
         conn.fetch = AsyncMock(return_value=[])
-        with patch("core.llm_batch.chat_json", AsyncMock(return_value=(reply, ""))) as m, \
-             patch("services.connector_cognition.load_llm_config", AsyncMock(return_value=CFG)):
+        with (
+            patch("core.llm_batch.chat_json", AsyncMock(return_value=(reply, ""))) as m,
+            patch(
+                "services.connector_cognition.load_llm_config",
+                AsyncMock(return_value=CFG),
+            ),
+        ):
             out = await extract_user_model_claims_llm_batch(conn, items)
 
         assert m.await_count == 1, f"{m.await_count} model calls for 80 items"
         assert len(out) == 80
-        # The existing-claims context is fetched once per run, not once per item.
-        assert conn.fetch.await_count == 1
+        # One cache read plus one existing-claims read; neither scales with items.
+        assert conn.fetch.await_count == 2
 
     @pytest.mark.asyncio
-    async def test_importance_keeps_the_rules_floor_when_the_model_under_rates(self):
-        """The rules baseline is a floor: a model that under-scores something
-        safety- or finance-shaped must not be able to bury it."""
-        from services.connector_cognition import estimate_connector_item_importance_llm_batch
+    async def test_importance_model_is_authoritative_over_fallback_metadata(self):
+        """A successful model verdict is not merged with fallback scoring."""
+        from services.connector_cognition import (
+            estimate_connector_item_importance_llm_batch,
+        )
 
-        item = {"source_item_id": "s0", "content": "the hospital called about your father"}
-        reply = {"results": {"s0": {"score": 0.01, "label": "low", "reasons": []}}}
+        item = {
+            "source_item_id": "s0",
+            "content": "ordinary text",
+            "raw_metadata": {"priority": "urgent"},
+        }
+        reply = {
+            "results": {
+                "s0": {"score": 0.1, "label": "low", "reasons": ["model judgment"]}
+            }
+        }
 
         conn = AsyncMock()
-        with patch("core.llm_batch.chat_json", AsyncMock(return_value=(reply, ""))), \
-             patch("services.connector_cognition.load_llm_config", AsyncMock(return_value=CFG)):
+        conn.fetch = AsyncMock(return_value=[])
+        with (
+            patch("core.llm_batch.chat_json", AsyncMock(return_value=(reply, ""))),
+            patch(
+                "services.connector_cognition.load_llm_config",
+                AsyncMock(return_value=CFG),
+            ),
+        ):
             out = await estimate_connector_item_importance_llm_batch(conn, [item])
 
-        from services.connector_cognition import estimate_connector_item_importance
-        floor = estimate_connector_item_importance(item)["score"]
-        assert out["s0"]["score"] >= floor
+        assert out["s0"]["score"] == 0.1
+        assert out["s0"]["label"] == "low"
+        assert out["s0"]["reasons"] == ["model judgment"]

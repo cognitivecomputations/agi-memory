@@ -149,6 +149,13 @@ export default function DocumentsPage() {
     }
   }, []);
 
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const documentId = params.get("document");
+    if (!documentId) return;
+    void openDetail(documentId);
+  }, [openDetail]);
+
   const loadMore = useCallback(async () => {
     if (!detail?.document?.next_offset || !selected) return;
     const res = await fetch(

@@ -24,7 +24,7 @@ Connect your Hexis agent to Discord servers.
 
 ```bash
 hexis channels setup discord
-hexis up --profile active
+hexis up
 hexis channels status
 ```
 

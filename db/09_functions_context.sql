@@ -90,6 +90,7 @@ BEGIN
         'id', id,
         'title', metadata->>'title',
         'description', metadata->>'description',
+        'origin', goal_origin::text,
         'due_at', (metadata->>'due_at')::timestamptz,
         'last_touched', (metadata->>'last_touched')::timestamptz,
         'progress_count', jsonb_array_length(COALESCE(metadata->'progress', '[]'::jsonb)),
@@ -102,6 +103,7 @@ BEGIN
         'id', id,
         'title', metadata->>'title',
         'source', metadata->>'source',
+        'origin', goal_origin::text,
         'due_at', (metadata->>'due_at')::timestamptz
     )), '[]'::jsonb)
     INTO queued_goals
@@ -157,7 +159,8 @@ CREATE OR REPLACE FUNCTION get_goals_by_priority(
     progress JSONB,
     blocked_by JSONB,
     emotional_valence FLOAT,
-    created_at TIMESTAMPTZ
+    created_at TIMESTAMPTZ,
+    origin TEXT
 ) AS $$
 BEGIN
     IF p_priority IS NULL THEN
@@ -173,7 +176,8 @@ BEGIN
             m.metadata->'progress' as progress,
             m.metadata->'blocked_by' as blocked_by,
             (m.metadata->>'emotional_valence')::float as emotional_valence,
-            m.created_at
+            m.created_at,
+            m.goal_origin::text as origin
         FROM memories m
         WHERE m.type = 'goal'
           AND m.status = 'active'
@@ -193,7 +197,8 @@ BEGIN
             m.metadata->'progress' as progress,
             m.metadata->'blocked_by' as blocked_by,
             (m.metadata->>'emotional_valence')::float as emotional_valence,
-            m.created_at
+            m.created_at,
+            m.goal_origin::text as origin
         FROM memories m
         WHERE m.type = 'goal'
           AND m.status = 'active'

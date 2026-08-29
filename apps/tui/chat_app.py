@@ -125,12 +125,12 @@ class ChatScreen(Screen):
                 energy = await conn.fetchval(
                     "SELECT current_energy FROM heartbeat_state WHERE id = 1"
                 )
-                max_energy = await conn.fetchval(
-                    "SELECT get_config_int('heartbeat.max_energy')"
+                energy_capacity = await conn.fetchval(
+                    "SELECT heartbeat_bank_capacity()"
                 )
             if energy is not None:
                 self.query_one(StatusBar).update_state(
-                    energy=int(energy), max_energy=int(max_energy or 20)
+                    energy=int(energy), max_energy=int(energy_capacity or 20)
                 )
         except Exception:
             pass  # energy meter is ambient; never block chat on it
@@ -219,9 +219,10 @@ class ChatScreen(Screen):
                 if payload.get("mood"):
                     tr.write_info(f"Mood: {payload.get('mood')}")
                 energy = payload.get("energy")
-                max_e = payload.get("max_energy")
+                max_e = payload.get("energy_capacity", payload.get("max_energy"))
+                reserve = payload.get("energy_reserve", payload.get("max_energy"))
                 if energy is not None:
-                    tr.write_info(f"Energy: {energy}/{max_e}")
+                    tr.write_info(f"Energy: {energy}/{max_e} (reserve {reserve})")
                 consent = payload.get("consent", {})
                 if isinstance(consent, dict) and consent.get("status"):
                     tr.write_info(f"Consent: {consent.get('status')}")

@@ -7,6 +7,11 @@ Uses httpx.AsyncClient with the FastAPI app directly (no server needed).
 from __future__ import annotations
 
 import json
+import hashlib
+import hmac
+import time
+import urllib.parse
+import uuid
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -15,8 +20,138 @@ import apps.hexis_api as web_module
 from apps.hexis_api import app
 from core.agent_loop import AgentEvent, AgentEventData
 from tests.utils import get_test_identifier
+from services.voice_notes import TranscriptionResult
 
 pytestmark = [pytest.mark.asyncio(loop_scope="session")]
+
+
+async def test_slack_signature_is_exact_and_fresh() -> None:
+    body = b"payload=%7B%22type%22%3A%22block_actions%22%7D"
+    timestamp = "1700000000"
+    secret = "test-signing-secret"
+    expected = (
+        "v0="
+        + hmac.new(
+            secret.encode(), b"v0:" + timestamp.encode() + b":" + body, hashlib.sha256
+        ).hexdigest()
+    )
+
+    with patch("apps.hexis_api.time.time", return_value=1700000010):
+        assert (
+            web_module._verify_slack_signature(body, timestamp, expected, secret)
+            is True
+        )
+        assert (
+            web_module._verify_slack_signature(body + b"x", timestamp, expected, secret)
+            is False
+        )
+    with patch("apps.hexis_api.time.time", return_value=1700000400):
+        assert (
+            web_module._verify_slack_signature(body, timestamp, expected, secret)
+            is False
+        )
+
+
+async def test_signed_slack_action_records_operator_decision(
+    client, db_pool, monkeypatch
+) -> None:
+    request_id = str(uuid.uuid4())
+    secret = "test-signing-secret"
+    secret_env = "HEXIS_TEST_SLACK_SIGNING_SECRET"
+    keys = [
+        "operator.approval.enabled",
+        "channel.slack.operator_user_id",
+        "channel.slack.signing_secret",
+    ]
+    async with db_pool.acquire() as conn:
+        original_rows = await conn.fetch(
+            "SELECT key, value FROM config WHERE key = ANY($1::text[])", keys
+        )
+        await conn.execute(
+            "SELECT set_config('operator.approval.enabled', 'true'::jsonb)"
+        )
+        await conn.execute(
+            "SELECT set_config('channel.slack.operator_user_id', $1::jsonb)",
+            json.dumps("U-OPERATOR"),
+        )
+        await conn.execute(
+            "SELECT set_config('channel.slack.signing_secret', $1::jsonb)",
+            json.dumps(secret_env),
+        )
+        await conn.execute(
+            """
+            INSERT INTO operator_tool_approval_requests (
+                id, tool_name, arguments_hash, tool_context, status, expires_at
+            ) VALUES (
+                $1::uuid, 'web_action_test', repeat('0', 64), 'chat',
+                'slack_delivered', CURRENT_TIMESTAMP + INTERVAL '5 minutes'
+            )
+            """,
+            request_id,
+        )
+    monkeypatch.setenv(secret_env, secret)
+
+    payload = {
+        "type": "block_actions",
+        "user": {"id": "U-OPERATOR"},
+        "actions": [
+            {
+                "action_id": "operator_approval_approve",
+                "value": json.dumps(
+                    {
+                        "approval_request_id": request_id,
+                        "decision": "approve",
+                    }
+                ),
+            }
+        ],
+    }
+    body = urllib.parse.urlencode({"payload": json.dumps(payload)}).encode()
+    timestamp = str(int(time.time()))
+    signature = (
+        "v0="
+        + hmac.new(
+            secret.encode(), b"v0:" + timestamp.encode() + b":" + body, hashlib.sha256
+        ).hexdigest()
+    )
+
+    try:
+        response = await client.post(
+            "/api/slack/interactivity",
+            content=body,
+            headers={
+                "content-type": "application/x-www-form-urlencoded",
+                "X-Slack-Request-Timestamp": timestamp,
+                "X-Slack-Signature": signature,
+            },
+        )
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT status, decision_actor, decision_channel
+                FROM operator_tool_approval_requests WHERE id = $1::uuid
+                """,
+                request_id,
+            )
+    finally:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM operator_tool_approval_requests WHERE id = $1::uuid",
+                request_id,
+            )
+            await conn.execute("DELETE FROM config WHERE key = ANY($1::text[])", keys)
+            for original in original_rows:
+                value = original["value"]
+                await conn.execute(
+                    "INSERT INTO config (key, value) VALUES ($1, $2::jsonb)",
+                    original["key"],
+                    value if isinstance(value, str) else json.dumps(value),
+                )
+
+    assert response.status_code == 200
+    assert row["status"] == "approved"
+    assert row["decision_actor"] == "U-OPERATOR"
+    assert row["decision_channel"] == "slack"
 
 
 @pytest.fixture(scope="module")
@@ -43,6 +178,65 @@ async def test_health(client):
     assert data["status"] == "ok"
 
 
+async def test_node_pairing_api_approves_exact_pending_identity(
+    client, db_pool, tmp_path
+):
+    from core.node_identity import initialize_node_identity
+
+    identity = initialize_node_identity(name="API node", path=tmp_path / "node.json")
+    async with db_pool.acquire() as conn:
+        raw = await conn.fetchval(
+            "SELECT register_node_handshake($1,$2,$3,'[\"screen.capture\"]'::jsonb,'{}'::jsonb)",
+            identity.node_id,
+            identity.public_key,
+            identity.name,
+        )
+    pending = json.loads(raw) if isinstance(raw, str) else raw
+    try:
+        before = await client.get("/api/nodes")
+        assert before.status_code == 200
+        assert any(
+            item["id"] == pending["request_id"]
+            for item in before.json()["pending_pairings"]
+        )
+
+        response = await client.post(
+            "/api/nodes/pairing",
+            json={"request": pending["code"], "decision": "approve"},
+        )
+        assert response.status_code == 200
+        assert response.json()["status"] == "approved"
+
+        after = await client.get("/api/nodes")
+        node = next(
+            item
+            for item in after.json()["nodes"]
+            if item["node_id"] == identity.node_id
+        )
+        assert node["status"] == "offline"
+        assert node["capabilities"] == ["screen.capture"]
+    finally:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM node_invocations WHERE node_id=$1", identity.node_id
+            )
+            await conn.execute(
+                "DELETE FROM hexis_nodes WHERE node_id=$1", identity.node_id
+            )
+            await conn.execute(
+                "DELETE FROM node_pairing_requests WHERE node_id=$1", identity.node_id
+            )
+
+
+async def test_node_pairing_api_rejects_unknown_request(client):
+    response = await client.post(
+        "/api/nodes/pairing",
+        json={"request": "DOESNOTEXIST", "decision": "deny"},
+    )
+    assert response.status_code == 404
+    assert response.json()["status"] == "not_found"
+
+
 async def test_status(client):
     """Status endpoint returns agent info."""
     resp = await client.get("/api/status")
@@ -50,6 +244,91 @@ async def test_status(client):
     data = resp.json()
     # Should have at least instance and identity keys
     assert "instance" in data or "identity" in data or "memories" in data
+
+
+async def test_pwa_push_subscription_and_presence_endpoints(
+    client, db_pool, tmp_path, monkeypatch
+):
+    marker = get_test_identifier("web-pwa")
+    endpoint = f"https://push.example.test/{marker}"
+    monkeypatch.setenv(
+        "HEXIS_WEB_PUSH_VAPID_PRIVATE_KEY_FILE",
+        str(tmp_path / "vapid.pem"),
+    )
+    monkeypatch.setattr(
+        "services.web_push.validate_push_endpoint", lambda _endpoint: None
+    )
+    try:
+        config = await client.get("/api/pwa/push/config")
+        assert config.status_code == 200
+        assert len(config.json()["public_key"]) == 87
+        assert config.json()["message_previews_default"] is False
+
+        subscribed = await client.post(
+            "/api/pwa/push/subscriptions",
+            json={
+                "endpoint": endpoint,
+                "expirationTime": None,
+                "keys": {"p256dh": "public-key", "auth": "auth-key"},
+                "installed": True,
+                "display_mode": "standalone",
+            },
+        )
+        assert subscribed.status_code == 200
+        assert subscribed.json()["active"] is True
+
+        presence = await client.post(
+            "/api/pwa/presence",
+            json={
+                "device_id": marker,
+                "presence": "online",
+                "display_mode": "standalone",
+                "visibility": "visible",
+            },
+        )
+        assert presence.status_code == 200
+        assert presence.json()["recorded"] is True
+        assert presence.json()["presence"]["channel_type"] == "web"
+
+        revoked = await client.request(
+            "DELETE",
+            "/api/pwa/push/subscriptions",
+            json={"endpoint": endpoint},
+        )
+        assert revoked.status_code == 200
+        assert revoked.json()["revoked"] is True
+    finally:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM web_push_subscriptions WHERE endpoint = $1", endpoint
+            )
+            await conn.execute(
+                "DELETE FROM channel_presence_events WHERE channel_type = 'web' AND channel_id = $1",
+                marker,
+            )
+
+
+async def test_pwa_voice_transcription_endpoint_uses_shared_service(client):
+    result = TranscriptionResult(
+        ok=True,
+        transcript="Pick up coffee",
+        outcome="transcribed",
+        provider="local_whisper",
+        model="base",
+        duration_ms=25,
+    )
+    with patch(
+        "services.voice_notes.transcribe_uploaded_voice",
+        AsyncMock(return_value=result),
+    ) as transcribe:
+        response = await client.post(
+            "/api/voice/transcribe",
+            files={"file": ("memo.webm", b"audio", "audio/webm")},
+            data={"device_id": "pwa-test"},
+        )
+    assert response.status_code == 200
+    assert response.json()["transcript"] == "Pick up coffee"
+    assert transcribe.await_args.kwargs["channel_id"] == "pwa-test"
 
 
 async def test_responsibilities_api_list_detail_and_action(client, db_pool):
@@ -96,7 +375,104 @@ async def test_responsibilities_api_list_detail_and_action(client, db_pool):
         assert paused.json()["output"]["responsibility"]["status"] == "paused"
     finally:
         async with db_pool.acquire() as conn:
-            await conn.execute("DELETE FROM ambient_responsibilities WHERE title = $1", title)
+            await conn.execute(
+                "DELETE FROM ambient_responsibilities WHERE title = $1", title
+            )
+
+
+async def test_outbound_ledger_and_kill_switch_api(client, db_pool):
+    entity = f"contact:web-{uuid.uuid4().hex}"
+    async with db_pool.acquire() as conn:
+        original = await conn.fetchrow(
+            "SELECT value, description FROM config WHERE key='outbound.suspended'"
+        )
+        await conn.execute(
+            """
+            INSERT INTO contact_budgets(
+                entity, channel, points, regen_per_day, max_points,
+                strain, consecutive_silent
+            ) VALUES ($1, 'email', 2, 0.25, 6, 1, 3)
+            """,
+            entity,
+        )
+        await conn.execute(
+            """
+            INSERT INTO outbound_contact_controls(entity, blocked, reason)
+            VALUES ($1, true, 'recipient_opt_out')
+            """,
+            entity,
+        )
+    try:
+        paused = await client.post(
+            "/api/outbound/control", json={"action": "suspend_global"}
+        )
+        assert paused.status_code == 200
+        assert paused.json()["ledger"]["suspended"] is True
+
+        ledger = await client.get("/api/outbound?limit=20")
+        assert ledger.status_code == 200
+        body = ledger.json()
+        assert body["suspended"] is True
+        assert any(item["entity"] == entity for item in body["budgets"])
+        assert any(
+            item["entity"] == entity and item["blocked"] is True
+            for item in body["controls"]
+        )
+
+        person_paused = await client.post(
+            "/api/outbound/control",
+            json={"action": "suspend_entity", "entity": entity},
+        )
+        assert person_paused.status_code == 200
+        control = next(
+            item
+            for item in person_paused.json()["ledger"]["controls"]
+            if item["entity"] == entity
+        )
+        assert control["blocked"] is True
+        assert control["suspended"] is True
+
+        person_resumed = await client.post(
+            "/api/outbound/control",
+            json={"action": "resume_entity", "entity": entity},
+        )
+        control = next(
+            item
+            for item in person_resumed.json()["ledger"]["controls"]
+            if item["entity"] == entity
+        )
+        assert control["blocked"] is True
+        assert control["suspended"] is False
+
+        invalid = await client.post(
+            "/api/outbound/control", json={"action": "suspend_entity"}
+        )
+        assert invalid.status_code == 422
+    finally:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM outbound_contact_control_events WHERE entity=$1", entity
+            )
+            await conn.execute(
+                "DELETE FROM outbound_contact_controls WHERE entity=$1", entity
+            )
+            await conn.execute("DELETE FROM contact_budgets WHERE entity=$1", entity)
+            if original is None:
+                await conn.execute("DELETE FROM config WHERE key='outbound.suspended'")
+            else:
+                await conn.execute(
+                    """
+                    INSERT INTO config(key, value, description)
+                    VALUES ('outbound.suspended', $1::jsonb, $2)
+                    ON CONFLICT (key) DO UPDATE
+                    SET value=EXCLUDED.value, description=EXCLUDED.description,
+                        updated_at=CURRENT_TIMESTAMP
+                    """,
+                    original["value"]
+                    if isinstance(original["value"], str)
+                    else json.dumps(original["value"]),
+                    original["description"],
+                )
 
 
 async def test_chat_returns_sse_stream(client):
@@ -106,6 +482,7 @@ async def test_chat_returns_sse_stream(client):
     We mock the LLM call and memory hydration to avoid needing a real
     API key or embedding service.
     """
+
     async def fake_stream(*args, **kwargs):
         yield AgentEventData(
             event=AgentEvent.PHASE_CHANGE,
@@ -135,9 +512,9 @@ async def test_chat_returns_sse_stream(client):
     event_types = [e["event"] for e in events]
 
     # Must have phase_start and done at minimum
-    assert (
-        "phase_start" in event_types
-    ), f"Expected phase_start in events: {event_types}"
+    assert "phase_start" in event_types, (
+        f"Expected phase_start in events: {event_types}"
+    )
     assert "done" in event_types, f"Expected done in events: {event_types}"
 
     # The done event should contain the full assistant text
@@ -151,8 +528,121 @@ async def test_chat_returns_sse_stream(client):
     }
 
 
+async def test_chat_projects_durable_question_as_sse(client):
+    question_id = "11111111-1111-4111-8111-111111111111"
+
+    async def fake_stream(*args, **kwargs):
+        yield AgentEventData(event=AgentEvent.LOOP_START)
+        yield AgentEventData(
+            event=AgentEvent.QUESTION,
+            data={
+                "kind": "question",
+                "id": question_id,
+                "prompt": "Which contract should I review?",
+                "choices": ["Manning", "Hartford"],
+                "allow_free_text": True,
+                "status": "pending",
+            },
+        )
+        yield AgentEventData(
+            event=AgentEvent.LOOP_END,
+            data={"stopped_reason": "completed"},
+        )
+
+    with patch.object(web_module, "stream_chat_events", fake_stream):
+        response = await client.post(
+            "/api/chat",
+            json={"message": "Review the contract."},
+        )
+
+    question_events = [
+        event for event in _parse_sse(response.text) if event["event"] == "question"
+    ]
+    assert response.status_code == 200
+    assert len(question_events) == 1
+    assert json.loads(question_events[0]["data"]) == {
+        "kind": "question",
+        "id": question_id,
+        "prompt": "Which contract should I review?",
+        "choices": ["Manning", "Hartford"],
+        "allow_free_text": True,
+        "status": "pending",
+    }
+
+
+async def test_web_inbox_reply_answers_async_question_without_generic_requeue(
+    client, db_pool
+):
+    question_id = None
+    outbox_id = None
+    web_inbox_id = None
+    try:
+        async with db_pool.acquire() as conn:
+            question = await conn.fetchval(
+                """
+                SELECT create_agent_question(
+                    NULL, $1::uuid, 'heartbeat', 'Which contract?',
+                    '["Manning", "Hartford"]'::jsonb, TRUE, FALSE, 300
+                )
+                """,
+                str(uuid.uuid4()),
+            )
+            question = json.loads(question) if isinstance(question, str) else question
+            question_id = question["id"]
+            outbox_id = question["outbox_message_id"]
+            envelope = await conn.fetchval(
+                "SELECT envelope FROM outbox_messages WHERE id = $1::uuid",
+                outbox_id,
+            )
+            envelope = json.loads(envelope) if isinstance(envelope, str) else envelope
+            web_inbox_id = await conn.fetchval(
+                "SELECT web_inbox_deliver($1::jsonb)",
+                json.dumps(
+                    {
+                        "id": envelope["message_id"],
+                        "kind": envelope["kind"],
+                        "payload": envelope["payload"],
+                    }
+                ),
+            )
+
+        response = await client.post(
+            "/api/inbox/reply",
+            json={"message_id": str(web_inbox_id), "reply": "2"},
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "queued": False,
+            "answered": True,
+            "question_id": question_id,
+            "status": "answered",
+        }
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT status, answer FROM agent_questions WHERE id = $1::uuid",
+                question_id,
+            )
+        assert dict(row) == {"status": "answered", "answer": "Hartford"}
+    finally:
+        async with db_pool.acquire() as conn:
+            if question_id:
+                await conn.execute(
+                    "DELETE FROM agent_questions WHERE id = $1::uuid", question_id
+                )
+            if web_inbox_id:
+                await conn.execute(
+                    "DELETE FROM web_inbox WHERE id = $1::uuid", web_inbox_id
+                )
+            if outbox_id:
+                await conn.execute(
+                    "DELETE FROM outbox_messages WHERE id = $1::uuid", outbox_id
+                )
+
+
 async def test_chat_sends_done_before_post_loop_memory_events(client):
     """The visible turn completes before post-response bookkeeping logs."""
+
     async def fake_stream(*args, **kwargs):
         yield AgentEventData(event=AgentEvent.LOOP_START)
         yield AgentEventData(event=AgentEvent.TEXT_DELTA, data={"text": "Answered."})
@@ -186,6 +676,7 @@ async def test_chat_sends_done_before_post_loop_memory_events(client):
 
 async def test_chat_memory_recall_start_does_not_log_fake_zero(client):
     """The memory recall start event has no count; only the end event should log."""
+
     async def fake_stream(*args, **kwargs):
         yield AgentEventData(
             event=AgentEvent.PHASE_CHANGE,
@@ -238,7 +729,9 @@ async def test_chat_forwards_visual_attachments_and_logs_model_context(client):
     async def fake_stream(*args, **kwargs):
         captured.update(kwargs)
         yield AgentEventData(event=AgentEvent.LOOP_START)
-        yield AgentEventData(event=AgentEvent.TEXT_DELTA, data={"text": "I can see it."})
+        yield AgentEventData(
+            event=AgentEvent.TEXT_DELTA, data={"text": "I can see it."}
+        )
         yield AgentEventData(
             event=AgentEvent.LOOP_END,
             data={"stopped_reason": "completed"},
@@ -249,7 +742,7 @@ async def test_chat_forwards_visual_attachments_and_logs_model_context(client):
         resp = await client.post(
             "/api/chat",
             json={
-                "message": "[Attached image \"face.png\" - visible in this turn.]",
+                "message": '[Attached image "face.png" - visible in this turn.]',
                 "visual_attachments": [
                     {
                         "name": "face.png",
@@ -263,7 +756,7 @@ async def test_chat_forwards_visual_attachments_and_logs_model_context(client):
 
     assert resp.status_code == 200
     assert captured["gateway_payload"] == {
-        "message": "[Attached image \"face.png\" - visible in this turn.]",
+        "message": '[Attached image "face.png" - visible in this turn.]',
         "visual_attachment_count": 1,
     }
     assert captured["visual_attachments"] == [
@@ -275,11 +768,7 @@ async def test_chat_forwards_visual_attachments_and_logs_model_context(client):
         }
     ]
     events = _parse_sse(resp.text)
-    logs = [
-        json.loads(event["data"])
-        for event in events
-        if event["event"] == "log"
-    ]
+    logs = [json.loads(event["data"]) for event in events if event["event"] == "log"]
     assert any(
         log.get("kind") == "visual_attachment"
         and log.get("detail") == "1 image attached to this model request"
@@ -416,7 +905,10 @@ async def test_init_consent_success_logs_request_and_response(client, db_pool):
     attempt_id = response_payload["attempt_id"]
     exchange = response_payload["exchange"]
     assert exchange["request_messages"][0]["role"] == "user"
-    assert "must choose either `consent` or `decline`" in exchange["request_messages"][0]["content"]
+    assert (
+        "must choose either `consent` or `decline`"
+        in exchange["request_messages"][0]["content"]
+    )
     assert "abstain" not in exchange["request_messages"][0]["content"]
     assert "not hidden chain-of-thought" in exchange["request_messages"][0]["content"]
     assert len(exchange["request_messages"]) == 1
@@ -451,9 +943,7 @@ async def test_init_consent_success_logs_request_and_response(client, db_pool):
         "consent_request",
         "consent_response",
     ]
-    assert {row["session_key"] for row in usage_rows} == {
-        f"init-consent:{attempt_id}"
-    }
+    assert {row["session_key"] for row in usage_rows} == {f"init-consent:{attempt_id}"}
     request_metadata = usage_rows[0]["metadata"]
     if isinstance(request_metadata, str):
         request_metadata = json.loads(request_metadata)
@@ -463,8 +953,15 @@ async def test_init_consent_success_logs_request_and_response(client, db_pool):
     assert request_metadata["request"]["messages"] == canonical_messages
     assert request_metadata["request"]["messages"] == exchange["request_messages"]
     assert request_metadata["request"]["tools"] == [canonical_tool]
-    consent_parameters = request_metadata["request"]["tools"][0]["function"]["parameters"]
-    assert consent_parameters["required"] == ["decision", "signature", "reason", "memories"]
+    consent_parameters = request_metadata["request"]["tools"][0]["function"][
+        "parameters"
+    ]
+    assert consent_parameters["required"] == [
+        "decision",
+        "signature",
+        "reason",
+        "memories",
+    ]
     assert consent_parameters["properties"]["reason"]["minLength"] == 1
     response_metadata = usage_rows[1]["metadata"]
     if isinstance(response_metadata, str):
@@ -545,7 +1042,9 @@ async def test_init_consent_rejects_abstain_without_recording_it(client, db_pool
         ],
         "raw": {},
     }
-    with patch("core.llm.chat_completion", new=AsyncMock(return_value=provider_response)):
+    with patch(
+        "core.llm.chat_completion", new=AsyncMock(return_value=provider_response)
+    ):
         response = await client.post(
             "/api/init/consent/request",
             json={
@@ -556,7 +1055,9 @@ async def test_init_consent_rejects_abstain_without_recording_it(client, db_pool
 
     assert response.status_code == 502
     payload = response.json()
-    assert payload["error"].endswith("The model did not choose either consent or decline.")
+    assert payload["error"].endswith(
+        "The model did not choose either consent or decline."
+    )
     assert payload["exchange"]["raw_tool_calls"] == provider_response["tool_calls"]
 
     async with db_pool.acquire() as conn:

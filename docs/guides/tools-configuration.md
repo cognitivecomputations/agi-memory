@@ -42,7 +42,7 @@ Each tool has an energy cost deducted from the agent's budget:
 
 | Cost | Tools |
 |------|-------|
-| **0** | `sense_memory_availability`, `queue_user_message`, `get_contact`, `list_council_personas` |
+| **0** | `ask_user`, `sense_memory_availability`, `queue_user_message`, `get_contact`, `list_council_personas`, `list_deliberations`, `inspect_deliberation` |
 | **1** | `recall`, `remember`, `read_file`, `glob`, `grep`, `manage_goals`, `manage_backlog` |
 | **2** | `web_search`, `web_fetch`, `fast_ingest`, `write_file`, `edit_file`, `todoist_*`, `asana_*` |
 | **3** | `shell`, `code_execution`, `calendar_*`, `hybrid_ingest`, `generate_image` |
@@ -57,6 +57,38 @@ hexis tools set-cost web_search 1    # make web search cheaper
 ```
 
 The heartbeat context has a default max of 5 energy per tool call.
+
+## Clarification Questions
+
+`ask_user` is always reachable and costs no energy. In a live dashboard, CLI,
+or channel conversation, it pauses the current turn for up to
+`chat.question_timeout_s` seconds and continues with the exact answer. The
+dashboard shows a choice card, the CLI uses an arrow-key picker, and text
+channels accept the displayed number (or the question code when several are
+waiting).
+
+During an unattended heartbeat, the same tool files an inert question in the
+outbox and ends the beat cleanly. A dashboard or channel reply is attached to
+one later heartbeat exactly once; it never schedules or performs the proposed
+work merely because the question was delivered.
+
+## Audio Tools
+
+The optional `transcribe` tool reads one local recording using the provider
+chosen in **Settings → Voice notes**. Both local-file audio tools require
+operator approval. Local Whisper needs `pip install 'hexis[media]'`; cloud
+transcription also requires the disclosure choice and `OPENAI_API_KEY` in the
+channel-worker environment.
+
+`analyze_local_audio` adds device-local pyannote speaker diarization and can
+label timestamped Whisper JSON segments. Start it once, then poll with
+`action=status` and the same `audio_path`. Generated JSON, SRT, status, and log
+files live under `$XDG_CACHE_HOME/hexis/audio-analysis` (or
+`~/.cache/hexis/audio-analysis`), never in the source repository. Install its
+optional runtime with `pip install 'hexis[audio_analysis]'`, accept the selected
+pyannote model terms, and expose `HF_TOKEN`. Acoustic emotion heuristics remain
+off unless separately enabled and requested; their output is labeled as a
+coarse estimate, not a reliable reading of emotion.
 
 ## Context-Specific Permissions
 

@@ -58,6 +58,8 @@ def test_package_uninstaller_falls_back_to_current_interpreter_pip(monkeypatch):
 
 
 def _patch_successful_uninstall(monkeypatch, tmp_path):
+    from core import host_services
+
     compose_file = tmp_path / "docker-compose.yml"
     compose_file.write_text("services: {}\n", encoding="utf-8")
     data_dir = tmp_path / ".hexis"
@@ -73,7 +75,9 @@ def _patch_successful_uninstall(monkeypatch, tmp_path):
         lambda: (["uv", "tool", "uninstall", "hexis"], "uv"),
     )
     monkeypatch.setattr(hexis_cli, "ensure_docker", lambda: "docker")
-    monkeypatch.setattr(hexis_cli, "ensure_compose", lambda _docker: ["docker", "compose"])
+    monkeypatch.setattr(
+        hexis_cli, "ensure_compose", lambda _docker: ["docker", "compose"]
+    )
     monkeypatch.setattr(
         hexis_cli,
         "run_compose",
@@ -89,6 +93,7 @@ def _patch_successful_uninstall(monkeypatch, tmp_path):
         hexis_cli, "_purge_owned_local_embedding_assets", lambda: ([], [])
     )
     monkeypatch.setattr(hexis_cli, "_local_embedding_binary", lambda: None)
+    monkeypatch.setattr(host_services, "installed_host_services", lambda: [])
     monkeypatch.setattr(
         hexis_cli.subprocess,
         "run",
@@ -123,9 +128,7 @@ def test_uninstall_removes_runtime_but_preserves_data_by_default(
     assert "preserved" in output
 
 
-def test_uninstall_purge_requires_explicit_mode_and_deletes_data(
-    monkeypatch, tmp_path
-):
+def test_uninstall_purge_requires_explicit_mode_and_deletes_data(monkeypatch, tmp_path):
     compose_file, data_dir, compose_calls, package_calls = _patch_successful_uninstall(
         monkeypatch, tmp_path
     )
@@ -141,11 +144,49 @@ def test_uninstall_purge_requires_explicit_mode_and_deletes_data(
     )
 
     assert rc == 0
-    assert compose_calls == [
-        ["down", "--remove-orphans", "--rmi", "all", "--volumes"]
-    ]
+    assert compose_calls == [["down", "--remove-orphans", "--rmi", "all", "--volumes"]]
     assert package_calls == [["uv", "tool", "uninstall", "hexis"]]
     assert not data_dir.exists()
+
+
+def test_cli_only_uninstall_removes_host_units_before_package(
+    monkeypatch, tmp_path, capsys
+):
+    from core import host_services
+
+    compose_file, data_dir, compose_calls, package_calls = _patch_successful_uninstall(
+        monkeypatch, tmp_path
+    )
+    service_calls: list[list[str]] = []
+    monkeypatch.setattr(
+        host_services,
+        "installed_host_services",
+        lambda: ["heartbeat", "maintenance"],
+    )
+    monkeypatch.setattr(
+        host_services,
+        "uninstall_host_services",
+        lambda services: (
+            service_calls.append(list(services)) or {"uninstalled": list(services)}
+        ),
+    )
+
+    rc = hexis_cli._uninstall(
+        compose_file=compose_file,
+        stack_root=tmp_path,
+        env_file=None,
+        is_source=False,
+        purge=False,
+        cli_only=True,
+        yes=True,
+    )
+
+    assert rc == 0
+    assert compose_calls == []
+    assert service_calls == [["heartbeat", "maintenance"]]
+    assert package_calls == [["uv", "tool", "uninstall", "hexis"]]
+    assert data_dir.exists()
+    assert "Host-service logs were preserved" in capsys.readouterr().out
 
 
 def test_purge_confirmation_names_permanent_data_loss(monkeypatch, tmp_path, capsys):
@@ -237,9 +278,7 @@ def test_unowned_embedding_service_is_left_running(monkeypatch, tmp_path):
         "_port_listener_summary",
         lambda _port: "embeddinggemma (pid 1234)",
     )
-    monkeypatch.setattr(
-        hexis_cli, "_legacy_owned_local_embedding_pid", lambda: None
-    )
+    monkeypatch.setattr(hexis_cli, "_legacy_owned_local_embedding_pid", lambda: None)
 
     stopped, note = hexis_cli._stop_owned_local_embedding_service()
 
@@ -251,9 +290,7 @@ def test_legacy_embedding_service_is_verified_by_hexis_log(monkeypatch, tmp_path
     monkeypatch.setattr(
         hexis_cli, "_LOCAL_EMBEDDING_LOG", tmp_path / "embeddinggemma.log"
     )
-    monkeypatch.setattr(
-        hexis_cli, "_port_listener_pids", lambda _port: [1234, 5678]
-    )
+    monkeypatch.setattr(hexis_cli, "_port_listener_pids", lambda _port: [1234, 5678])
     monkeypatch.setattr(
         hexis_cli,
         "_process_command",
@@ -288,9 +325,7 @@ def test_legacy_verified_embedding_service_is_stopped(monkeypatch, tmp_path):
     commands = iter(["/tmp/embeddinggemma", None])
     signals: list[tuple[int, int]] = []
     monkeypatch.setattr(hexis_cli, "_LOCAL_EMBEDDING_LOG", log_path)
-    monkeypatch.setattr(
-        hexis_cli, "_legacy_owned_local_embedding_pid", lambda: 1234
-    )
+    monkeypatch.setattr(hexis_cli, "_legacy_owned_local_embedding_pid", lambda: 1234)
     monkeypatch.setattr(hexis_cli, "_process_command", lambda _pid: next(commands))
     monkeypatch.setattr(
         hexis_cli.os, "kill", lambda pid, sig: signals.append((pid, sig))
@@ -317,9 +352,7 @@ def test_owned_embedding_binary_and_cache_are_purged(monkeypatch, tmp_path):
 
     assert hexis_cli._record_owned_local_embedding_binary(binary) is True
     assert (
-        hexis_cli._mark_local_embedding_cache_if_created(
-            existed_before_start=False
-        )
+        hexis_cli._mark_local_embedding_cache_if_created(existed_before_start=False)
         is True
     )
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "different-cache"))
@@ -349,9 +382,7 @@ def test_changed_owned_embedding_binary_is_preserved(monkeypatch, tmp_path):
     assert any("changed" in note for note in notes)
 
 
-def test_embedding_cache_is_marked_only_when_created_after_start(
-    monkeypatch, tmp_path
-):
+def test_embedding_cache_is_marked_only_when_created_after_start(monkeypatch, tmp_path):
     log_path = tmp_path / ".hexis" / "embeddinggemma.log"
     cache_root = tmp_path / "cache"
     cache_dir = cache_root / "embeddinggemma.c"
@@ -359,18 +390,14 @@ def test_embedding_cache_is_marked_only_when_created_after_start(
     monkeypatch.setenv("XDG_CACHE_HOME", str(cache_root))
 
     assert (
-        hexis_cli._mark_local_embedding_cache_if_created(
-            existed_before_start=False
-        )
+        hexis_cli._mark_local_embedding_cache_if_created(existed_before_start=False)
         is None
     )
     assert not cache_dir.exists()
 
     cache_dir.mkdir(parents=True)
     assert (
-        hexis_cli._mark_local_embedding_cache_if_created(
-            existed_before_start=False
-        )
+        hexis_cli._mark_local_embedding_cache_if_created(existed_before_start=False)
         is True
     )
     assert (cache_dir / hexis_cli._LOCAL_EMBEDDING_CACHE_MARKER).is_file()
@@ -386,9 +413,7 @@ def test_embedding_cache_with_changed_ownership_marker_is_preserved(
     monkeypatch.setattr(hexis_cli, "_LOCAL_EMBEDDING_LOG", log_path)
     monkeypatch.setenv("XDG_CACHE_HOME", str(cache_root))
     assert (
-        hexis_cli._mark_local_embedding_cache_if_created(
-            existed_before_start=False
-        )
+        hexis_cli._mark_local_embedding_cache_if_created(existed_before_start=False)
         is True
     )
     (cache_dir / hexis_cli._LOCAL_EMBEDDING_CACHE_MARKER).write_text(

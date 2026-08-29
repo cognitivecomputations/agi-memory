@@ -872,7 +872,7 @@ DECLARE
     max_e FLOAT;
     new_e FLOAT;
 BEGIN
-    max_e := get_config_float('heartbeat.max_energy');
+    max_e := heartbeat_bank_capacity();
 
     UPDATE heartbeat_state
     SET current_energy = GREATEST(0, LEAST(current_energy + p_delta, max_e)),
@@ -944,6 +944,9 @@ BEGIN
     END IF;
     IF state_record.last_heartbeat_at IS NULL THEN
         RETURN TRUE;
+    END IF;
+    IF state_record.next_heartbeat_at IS NOT NULL THEN
+        RETURN CURRENT_TIMESTAMP >= state_record.next_heartbeat_at;
     END IF;
     interval_minutes := get_config_float('heartbeat.heartbeat_interval_minutes');
 

@@ -9,10 +9,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from typing import Any, Callable, Awaitable
 
-from .base import ChannelAdapter, ChannelCapabilities, ChannelMessage, parse_allowlist, resolve_channel_token
+from .base import (
+    ChannelAdapter,
+    ChannelCapabilities,
+    ChannelMessage,
+    parse_allowlist,
+    resolve_channel_token,
+    resolve_forward_all,
+)
 from .media import Attachment
 from .presentation import MarkdownDialect
 
@@ -38,13 +44,21 @@ class DiscordAdapter(ChannelAdapter):
         - Channel messages in allowed channels
     """
 
-    def __init__(self, config: dict[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        config: dict[str, Any] | None = None,
+        *,
+        forward_all: bool | None = None,
+    ) -> None:
         self._config = config or {}
+        self._forward_all = resolve_forward_all(self._config, forward_all)
         self._client = None
         self._on_message: Callable[[ChannelMessage], Awaitable[None]] | None = None
         self._connected = False
         self._allowed_guilds = self._parse_allowlist(self._config.get("allowed_guilds"))
-        self._allowed_channels = self._parse_allowlist(self._config.get("allowed_channels"))
+        self._allowed_channels = self._parse_allowlist(
+            self._config.get("allowed_channels")
+        )
 
     @staticmethod
     def _parse_allowlist(value: Any) -> set[str] | None:
@@ -139,19 +153,25 @@ class DiscordAdapter(ChannelAdapter):
             return
 
         is_dm = isinstance(message.channel, discord.DMChannel)
+        is_mention = bool(self._client.user.mentioned_in(message))
+        gate_hint: str | None = None
 
         if not is_dm:
             # Check guild allowlist
             if self._allowed_guilds is not None and message.guild:
                 if str(message.guild.id) not in self._allowed_guilds:
-                    return
+                    if not self._forward_all:
+                        return
+                    gate_hint = "not_allowed_guild"
 
             # Check channel allowlist
             if self._allowed_channels is not None:
                 if str(message.channel.id) not in self._allowed_channels:
                     # Still respond if mentioned
-                    if not self._client.user.mentioned_in(message):
-                        return
+                    if not is_mention and gate_hint is None:
+                        if not self._forward_all:
+                            return
+                        gate_hint = "not_allowed_channel"
 
         # Strip bot mention from content
         content = message.content
@@ -187,7 +207,9 @@ class DiscordAdapter(ChannelAdapter):
             sender_name=message.author.display_name,
             content=content,
             message_id=str(message.id),
-            reply_to_id=str(message.reference.message_id) if message.reference else None,
+            reply_to_id=str(message.reference.message_id)
+            if message.reference
+            else None,
             thread_id=thread_id,
             attachments=attachments,
             metadata={
@@ -196,6 +218,8 @@ class DiscordAdapter(ChannelAdapter):
                 "is_group": message.guild is not None,
                 "guild_id": str(message.guild.id) if message.guild else None,
                 "is_dm": is_dm,
+                "is_mention": is_mention,
+                **({"gate_hint": gate_hint} if gate_hint else {}),
             },
         )
 
@@ -229,6 +253,7 @@ class DiscordAdapter(ChannelAdapter):
             reference = None
             if reply_to:
                 import discord
+
                 reference = discord.MessageReference(
                     message_id=int(reply_to),
                     channel_id=int(channel_id),
@@ -253,7 +278,10 @@ class DiscordAdapter(ChannelAdapter):
             logger.debug("Silent exception in DiscordAdapter", exc_info=True)
 
     async def edit_message(
-        self, channel_id: str, message_id: str, text: str,
+        self,
+        channel_id: str,
+        message_id: str,
+        text: str,
     ) -> bool:
         if not self._client:
             return False
@@ -288,13 +316,16 @@ class DiscordAdapter(ChannelAdapter):
             reference = None
             if reply_to:
                 reference = discord.MessageReference(
-                    message_id=int(reply_to), channel_id=int(channel_id),
+                    message_id=int(reply_to),
+                    channel_id=int(channel_id),
                 )
 
             if attachment.local_path:
                 sent = await channel.send(
                     content=caption,
-                    file=discord.File(attachment.local_path, filename=attachment.filename),
+                    file=discord.File(
+                        attachment.local_path, filename=attachment.filename
+                    ),
                     reference=reference,
                 )
             else:
@@ -303,8 +334,12 @@ class DiscordAdapter(ChannelAdapter):
                 if attachment.mime_type and attachment.mime_type.startswith("image/"):
                     embed.set_image(url=attachment.url)
                 else:
-                    embed.description = f"[{attachment.filename or 'Attachment'}]({attachment.url})"
-                sent = await channel.send(content=caption, embed=embed, reference=reference)
+                    embed.description = (
+                        f"[{attachment.filename or 'Attachment'}]({attachment.url})"
+                    )
+                sent = await channel.send(
+                    content=caption, embed=embed, reference=reference
+                )
 
             return str(sent.id)
         except Exception:

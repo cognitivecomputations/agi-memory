@@ -8,42 +8,64 @@ and importance records.
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import re
 from typing import Any
 
 from core.llm_config import load_llm_config
 from core.llm_batch import batch_classify
-from core.llm_json import chat_json
 
 logger = logging.getLogger(__name__)
 
-DETECTOR_VERSION = "connector_cognition_hybrid_v2"
-RULES_DETECTOR_VERSION = "connector_cognition_rules_v2"
+LLM_DETECTOR_VERSION = "connector_cognition_llm_v3"
+CACHE_DETECTOR_VERSION = "connector_cognition_llm_cache_v3"
+FALLBACK_DETECTOR_VERSION = "connector_cognition_rules_fallback_v3"
+CLAIMS_CACHE_VERSION = "user_model_claims_v3"
+IMPORTANCE_CACHE_VERSION = "item_importance_v3"
 
 _PREFERENCE_PATTERNS = (
-    re.compile(r"\bI\s+(?:really\s+)?(?:prefer|like|love|enjoy)\s+([^.!?\n]{2,120})", re.I),
-    re.compile(r"\bI\s+(?:really\s+)?(?:hate|dislike|can't stand|cannot stand)\s+([^.!?\n]{2,120})", re.I),
+    re.compile(
+        r"\bI\s+(?:really\s+)?(?:prefer|like|love|enjoy)\s+([^.!?\n]{2,120})", re.I
+    ),
+    re.compile(
+        r"\bI\s+(?:really\s+)?(?:hate|dislike|can't stand|cannot stand)\s+([^.!?\n]{2,120})",
+        re.I,
+    ),
 )
 _ROUTINE_PATTERNS = (
     re.compile(r"\bI\s+(?:usually|always|often|normally)\s+([^.!?\n]{2,120})", re.I),
     re.compile(r"\bmy\s+(?:routine|schedule)\s+is\s+([^.!?\n]{2,120})", re.I),
 )
 _IDENTITY_PATTERNS = (
-    re.compile(r"\bI\s+(?:am|work as|work at|live in|live near)\s+([^.!?\n]{2,120})", re.I),
+    re.compile(
+        r"\bI\s+(?:am|work as|work at|live in|live near)\s+([^.!?\n]{2,120})", re.I
+    ),
     re.compile(r"\bmy\s+(?:name|job|role|company|city)\s+is\s+([^.!?\n]{2,120})", re.I),
 )
 _RELATIONSHIP_PATTERNS = (
-    re.compile(r"\b(?:my|our)\s+(?:friend|partner|spouse|wife|husband|boss|manager|coworker|colleague|client)\s+([^.!?\n]{2,120})", re.I),
-    re.compile(r"\b([A-Z][a-z][^.!?\n]{0,60})\s+is\s+(?:my|our)\s+(friend|partner|spouse|wife|husband|boss|manager|coworker|colleague|client)\b", re.I),
+    re.compile(
+        r"\b(?:my|our)\s+(?:friend|partner|spouse|wife|husband|boss|manager|coworker|colleague|client)\s+([^.!?\n]{2,120})",
+        re.I,
+    ),
+    re.compile(
+        r"\b([A-Z][a-z][^.!?\n]{0,60})\s+is\s+(?:my|our)\s+(friend|partner|spouse|wife|husband|boss|manager|coworker|colleague|client)\b",
+        re.I,
+    ),
 )
 _COMMITMENT_PATTERNS = (
-    re.compile(r"\bI\s+(?:promised|committed|agreed|need|have)\s+to\s+([^.!?\n]{2,140})", re.I),
-    re.compile(r"\b(?:please remind me|remind me|I should)\s+to\s+([^.!?\n]{2,140})", re.I),
+    re.compile(
+        r"\bI\s+(?:promised|committed|agreed|need|have)\s+to\s+([^.!?\n]{2,140})", re.I
+    ),
+    re.compile(
+        r"\b(?:please remind me|remind me|I should)\s+to\s+([^.!?\n]{2,140})", re.I
+    ),
 )
 _JUDGMENT_PATTERNS = (
     re.compile(r"\bI\s+(?:decide|judge|evaluate|prioritize)\s+([^.!?\n]{2,140})", re.I),
-    re.compile(r"\b(?:what matters to me is|the important thing is)\s+([^.!?\n]{2,140})", re.I),
+    re.compile(
+        r"\b(?:what matters to me is|the important thing is)\s+([^.!?\n]{2,140})", re.I
+    ),
 )
 _EPHEMERAL_USER_MODEL_PATTERNS = (
     re.compile(r"\bthis is (?:just )?(?:a )?test\b", re.I),
@@ -58,45 +80,6 @@ _THIRD_PARTY_QUOTE_LINE = re.compile(
     re.I,
 )
 
-_URGENT_TERMS = {
-    "crash",
-    "accident",
-    "emergency",
-    "hospital",
-    "911",
-    "evacuate",
-    "fire",
-    "fraud",
-    "breach",
-}
-_IMPORTANT_TERMS = {
-    "urgent",
-    "asap",
-    "deadline",
-    "due today",
-    "interview",
-    "offer",
-    "contract",
-    "invoice",
-    "payment failed",
-    "overdue",
-    "lawyer",
-    "legal",
-    "doctor",
-    "appointment",
-    "meeting",
-    "crash detected",
-    "car crash",
-    "emergency sos",
-    "password reset",
-    "security alert",
-    "bank",
-    "tax",
-    "court",
-    "visa",
-    "flight",
-}
-
 
 def _json(value: Any) -> Any:
     return json.loads(value) if isinstance(value, str) else value
@@ -104,6 +87,95 @@ def _json(value: Any) -> Any:
 
 def _json_dumps(value: Any) -> str:
     return json.dumps(value, default=str)
+
+
+def _content_hash(item: dict[str, Any]) -> str:
+    supplied = str(item.get("content_hash") or "").strip().lower()
+    if supplied:
+        return supplied
+    content = str(item.get("content") or "")
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def _detector_version(provenance: str) -> str:
+    if provenance == "cache":
+        return CACHE_DETECTOR_VERSION
+    if provenance == "llm":
+        return LLM_DETECTOR_VERSION
+    return FALLBACK_DETECTOR_VERSION
+
+
+async def _load_llm_cache(
+    conn: Any,
+    *,
+    task: str,
+    detector_version: str,
+    items: list[dict[str, Any]],
+) -> dict[str, Any]:
+    hashes = sorted({_content_hash(item) for item in items})
+    if not hashes:
+        return {}
+    try:
+        rows = await conn.fetch(
+            """
+            UPDATE connector_cognition_cache
+            SET hit_count = hit_count + 1,
+                last_used_at = CURRENT_TIMESTAMP
+            WHERE task = $1
+              AND detector_version = $2
+              AND content_hash = ANY($3::text[])
+            RETURNING content_hash, result
+            """,
+            task,
+            detector_version,
+            hashes,
+        )
+    except Exception:
+        logger.debug("Connector cognition cache lookup unavailable", exc_info=True)
+        return {}
+    return {str(row["content_hash"]): _json(row["result"]) for row in rows}
+
+
+async def _store_llm_cache(
+    conn: Any,
+    *,
+    task: str,
+    detector_version: str,
+    results_by_hash: dict[str, Any],
+    llm_config: dict[str, Any],
+) -> None:
+    if not results_by_hash:
+        return
+    payload = [
+        {"content_hash": content_hash, "result": result}
+        for content_hash, result in results_by_hash.items()
+    ]
+    try:
+        await conn.execute(
+            """
+            INSERT INTO connector_cognition_cache (
+                task, content_hash, detector_version, result,
+                provenance, provider, model, last_used_at
+            )
+            SELECT
+                $1, x.content_hash, $2, x.result,
+                'llm', $3, $4, CURRENT_TIMESTAMP
+            FROM jsonb_to_recordset($5::jsonb) AS x(content_hash text, result jsonb)
+            ON CONFLICT (task, content_hash, detector_version) DO UPDATE SET
+                result = EXCLUDED.result,
+                provenance = 'llm',
+                provider = EXCLUDED.provider,
+                model = EXCLUDED.model,
+                last_used_at = CURRENT_TIMESTAMP
+            """,
+            task,
+            detector_version,
+            str(llm_config.get("provider") or "") or None,
+            str(llm_config.get("model") or "") or None,
+            _json_dumps(payload),
+        )
+    except Exception:
+        logger.debug("Connector cognition cache write unavailable", exc_info=True)
 
 
 def _clean_fragment(value: str) -> str:
@@ -141,7 +213,9 @@ def _dedupe_claims(claims: list[dict[str, Any]]) -> list[dict[str, Any]]:
         normalized["confidence"] = _bounded_float(normalized.get("confidence"), 0.5)
         normalized["importance"] = _bounded_float(normalized.get("importance"), 0.5)
         if normalized.get("supersedes_claim_key"):
-            normalized["supersedes_claim_key"] = str(normalized["supersedes_claim_key"]).strip().lower()
+            normalized["supersedes_claim_key"] = (
+                str(normalized["supersedes_claim_key"]).strip().lower()
+            )
         contradictions = normalized.get("contradicts_claim_keys")
         if not isinstance(contradictions, list):
             contradictions = []
@@ -180,7 +254,7 @@ def _rule_extraction_text(content: str) -> str:
             continue
         if _THIRD_PARTY_QUOTE_LINE.search(stripped):
             continue
-        if stripped[:1] in {"\"", "'", "“", "‘"} and re.search(
+        if stripped[:1] in {'"', "'", "“", "‘"} and re.search(
             r"\bI\s+(?:prefer|like|love|hate|dislike|usually|always|often|normally|am|work|live)\b",
             stripped,
             re.I,
@@ -219,7 +293,9 @@ def extract_user_model_claims(item: dict[str, Any]) -> list[dict[str, Any]]:
             claim = f"User {'dislikes' if negative else 'prefers'} {fragment}."
             claims.append(
                 {
-                    "claim_key": _claim_key(category, f"{'dislikes' if negative else 'prefers'} {fragment}"),
+                    "claim_key": _claim_key(
+                        category, f"{'dislikes' if negative else 'prefers'} {fragment}"
+                    ),
                     "category": category,
                     "claim": claim,
                     "confidence": 0.62,
@@ -259,7 +335,9 @@ def extract_user_model_claims(item: dict[str, Any]) -> list[dict[str, Any]]:
 
     for pattern in _RELATIONSHIP_PATTERNS:
         for match in pattern.finditer(text):
-            fragment = _clean_fragment(" ".join(part for part in match.groups() if part))
+            fragment = _clean_fragment(
+                " ".join(part for part in match.groups() if part)
+            )
             if not fragment:
                 continue
             claims.append(
@@ -351,15 +429,13 @@ def _parse_claims(raw: Any) -> list[dict[str, Any]]:
 async def _active_user_model_claims(conn: Any) -> list[dict[str, Any]]:
     """The existing-claims context. Identical for every item in a run, so it is
     fetched once per run rather than once per item."""
-    rows = await conn.fetch(
-        """
+    rows = await conn.fetch("""
         SELECT claim_key, category, claim, confidence, importance
         FROM user_model_claims
         WHERE status = 'active'
         ORDER BY updated_at DESC
         LIMIT 80
-        """
-    )
+        """)
     return [
         {
             "claim_key": row["claim_key"],
@@ -373,7 +449,10 @@ async def _active_user_model_claims(conn: Any) -> list[dict[str, Any]]:
 
 
 async def extract_user_model_claims_llm_batch(
-    conn: Any, items: list[dict[str, Any]]
+    conn: Any,
+    items: list[dict[str, Any]],
+    *,
+    provenance: dict[str, str] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     """Claims for a whole batch in as few model calls as the budget allows.
 
@@ -385,22 +464,70 @@ async def extract_user_model_claims_llm_batch(
     llm_config = await load_llm_config(
         conn, "llm.connector_cognition", fallback_key="llm.subconscious"
     )
+    cached = await _load_llm_cache(
+        conn,
+        task="user_model_claims",
+        detector_version=CLAIMS_CACHE_VERSION,
+        items=items,
+    )
+    results: dict[str, list[dict[str, Any]]] = {}
+    representatives: dict[str, dict[str, Any]] = {}
+    keys_by_hash: dict[str, list[str]] = {}
+    for item in items:
+        item_key = str(item.get("source_item_id") or "")
+        content_hash = _content_hash(item)
+        keys_by_hash.setdefault(content_hash, []).append(item_key)
+        if content_hash in cached:
+            results[item_key] = _parse_claims(cached[content_hash])
+            if provenance is not None:
+                provenance[item_key] = "cache"
+        else:
+            representatives.setdefault(content_hash, item)
+
+    uncached = list(representatives.values())
+    if not uncached:
+        return results
+
     existing = await _active_user_model_claims(conn)
-    return await batch_classify(
-        items,
+    batch_provenance: dict[str, str] = {}
+    classified = await batch_classify(
+        uncached,
         llm_config=llm_config,
         system=_CLAIMS_SYSTEM,
         key=lambda it: str(it.get("source_item_id") or ""),
         item_payload=_claims_item_payload,
         parse=_parse_claims,
-        fallback=lambda _it: [],
+        fallback=extract_user_model_claims,
         shared={"existing_claims": existing},
         output_hint=_CLAIMS_OUTPUT_SCHEMA,
         max_tokens=8000,
+        provenance=batch_provenance,
     )
+    cache_writes: dict[str, Any] = {}
+    for content_hash, representative in representatives.items():
+        representative_key = str(representative.get("source_item_id") or "")
+        claims = classified.get(representative_key, [])
+        source = batch_provenance.get(representative_key, "fallback")
+        for item_key in keys_by_hash.get(content_hash, []):
+            results[item_key] = claims
+            if provenance is not None:
+                provenance[item_key] = source
+        if source == "llm":
+            cache_writes[content_hash] = {"claims": claims}
+
+    await _store_llm_cache(
+        conn,
+        task="user_model_claims",
+        detector_version=CLAIMS_CACHE_VERSION,
+        results_by_hash=cache_writes,
+        llm_config=llm_config,
+    )
+    return results
 
 
-async def extract_user_model_claims_llm(conn: Any, item: dict[str, Any]) -> list[dict[str, Any]]:
+async def extract_user_model_claims_llm(
+    conn: Any, item: dict[str, Any]
+) -> list[dict[str, Any]]:
     """Single-item claims extraction. Retained for callers with one item;
     the batch path is what the synthesis run uses."""
     key = str(item.get("source_item_id") or "")
@@ -409,50 +536,47 @@ async def extract_user_model_claims_llm(conn: Any, item: dict[str, Any]) -> list
 
 
 def estimate_connector_item_importance(item: dict[str, Any]) -> dict[str, Any]:
-    text = str(item.get("content") or "")
-    lowered = text.lower()
-    reasons: list[str] = []
+    """Non-semantic fallback used only when the model is unavailable.
+
+    Provider-supplied priority is structured evidence and can be honored. Raw
+    message prose is deliberately not searched for words that merely sound
+    important; without a provider signal the fallback reports uncertainty.
+    """
+    metadata = item.get("raw_metadata")
+    if not isinstance(metadata, dict):
+        metadata = item.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    priority = metadata.get("priority", metadata.get("importance"))
+    score = 0.5
+    reasons = ["LLM unavailable; no structured provider priority was supplied"]
     actions: list[dict[str, Any]] = []
-    score = 0.25
-
-    urgent_hits = sorted(term for term in _URGENT_TERMS if term in lowered)
-    important_hits = sorted(term for term in _IMPORTANT_TERMS if term in lowered)
-    if urgent_hits:
-        score = 0.96
-        reasons.append(f"urgent terms: {', '.join(urgent_hits[:5])}")
-        actions.append({"kind": "notify_user", "urgency": "urgent"})
-        actions.append({"kind": "prepare_summary", "urgency": "urgent"})
-    elif important_hits:
-        score = 0.86
-        reasons.append(f"important terms: {', '.join(important_hits[:5])}")
-        actions.append({"kind": "notify_user", "urgency": "important"})
-
-    if "?" in text and any(term in lowered for term in ("can you", "could you", "please", "need you")):
-        score = max(score, 0.72)
-        reasons.append("direct request/question")
-        actions.append({"kind": "draft_reply", "requires_authorization": True})
-
-    if any(term in lowered for term in ("unsubscribe", "spam", "phishing", "suspicious")):
-        score = max(score, 0.68)
-        reasons.append("possible spam/security triage")
-        actions.append({"kind": "classify_or_filter", "requires_authorization": True})
-
-    if any(term in lowered for term in ("schedule", "calendar", "appointment", "meeting")):
-        actions.append({"kind": "calendar_review", "requires_authorization": True})
-
-    label = "urgent" if score >= 0.95 else "important" if score >= 0.85 else "normal"
-    deduped_actions: list[dict[str, Any]] = []
-    seen_actions: set[str] = set()
-    for action in actions:
-        key = str(action.get("kind") or "")
-        if key and key not in seen_actions:
-            deduped_actions.append(action)
-            seen_actions.add(key)
+    if isinstance(priority, (int, float)) and not isinstance(priority, bool):
+        score = _bounded_float(priority, 0.5)
+        reasons = ["structured provider importance score"]
+    elif isinstance(priority, str):
+        normalized = priority.strip().lower()
+        provider_scores = {
+            "urgent": 0.96,
+            "critical": 0.96,
+            "high": 0.86,
+            "important": 0.86,
+            "normal": 0.5,
+            "low": 0.2,
+        }
+        if normalized in provider_scores:
+            score = provider_scores[normalized]
+            reasons = [f"structured provider priority: {normalized}"]
+    label = (
+        "urgent"
+        if score >= 0.95
+        else "important" if score >= 0.85 else "low" if score < 0.35 else "normal"
+    )
     return {
         "score": score,
         "label": label,
         "reasons": reasons,
-        "recommended_actions": deduped_actions,
+        "recommended_actions": actions,
     }
 
 
@@ -466,55 +590,94 @@ _IMPORTANCE_SYSTEM = (
 
 
 async def estimate_connector_item_importance_llm_batch(
-    conn: Any, items: list[dict[str, Any]]
+    conn: Any,
+    items: list[dict[str, Any]],
+    *,
+    provenance: dict[str, str] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Importance for a whole batch in as few model calls as the budget allows.
 
-    Keyed by ``source_item_id``. An item the model did not score keeps the rules
-    baseline, which is the same answer the per-item path gave on failure.
+    Keyed by ``source_item_id``. A valid model verdict is authoritative; only an
+    unavailable, missing, or invalid verdict receives the structural fallback.
     """
     if not items:
         return {}
     llm_config = await load_llm_config(
         conn, "llm.connector_importance", fallback_key="llm.subconscious"
     )
-    baselines = {
-        str(it.get("source_item_id") or ""): estimate_connector_item_importance(it)
-        for it in items
-    }
+    cached = await _load_llm_cache(
+        conn,
+        task="item_importance",
+        detector_version=IMPORTANCE_CACHE_VERSION,
+        items=items,
+    )
+    results: dict[str, dict[str, Any]] = {}
+    representatives: dict[str, dict[str, Any]] = {}
+    keys_by_hash: dict[str, list[str]] = {}
+    for item in items:
+        item_key = str(item.get("source_item_id") or "")
+        content_hash = _content_hash(item)
+        keys_by_hash.setdefault(content_hash, []).append(item_key)
+        if content_hash in cached:
+            results[item_key] = _normalize_importance(cached[content_hash])
+            if provenance is not None:
+                provenance[item_key] = "cache"
+        else:
+            representatives.setdefault(content_hash, item)
+
+    uncached = list(representatives.values())
+    if not uncached:
+        return results
 
     def _payload(it: dict[str, Any]) -> dict[str, Any]:
-        key = str(it.get("source_item_id") or "")
         return {
             "item": {
                 "title": it.get("title"),
                 "content": str(it.get("content") or "")[:6000],
                 "connector_id": it.get("connector_id"),
                 "timestamp": str(it.get("item_timestamp") or ""),
-            },
-            "rules_baseline": baselines.get(key, {}),
+            }
         }
 
-    def _merge(key: str, doc: Any) -> dict[str, Any]:
-        return _merge_importance(baselines.get(key, {}), doc)
-
-    raw = await batch_classify(
-        items,
+    batch_provenance: dict[str, str] = {}
+    classified = await batch_classify(
+        uncached,
         llm_config=llm_config,
         system=_IMPORTANCE_SYSTEM,
         key=lambda it: str(it.get("source_item_id") or ""),
         item_payload=_payload,
-        parse=lambda doc: doc,
-        fallback=lambda it: None,
+        parse=_normalize_importance,
+        fallback=estimate_connector_item_importance,
         max_tokens=8000,
+        provenance=batch_provenance,
     )
-    return {
-        key: (_merge(key, doc) if doc is not None else baselines.get(key, {}))
-        for key, doc in raw.items()
-    }
+    cache_writes: dict[str, Any] = {}
+    for content_hash, representative in representatives.items():
+        representative_key = str(representative.get("source_item_id") or "")
+        estimate = classified.get(
+            representative_key, estimate_connector_item_importance(representative)
+        )
+        source = batch_provenance.get(representative_key, "fallback")
+        for item_key in keys_by_hash.get(content_hash, []):
+            results[item_key] = estimate
+            if provenance is not None:
+                provenance[item_key] = source
+        if source == "llm":
+            cache_writes[content_hash] = estimate
+
+    await _store_llm_cache(
+        conn,
+        task="item_importance",
+        detector_version=IMPORTANCE_CACHE_VERSION,
+        results_by_hash=cache_writes,
+        llm_config=llm_config,
+    )
+    return results
 
 
-async def estimate_connector_item_importance_llm(conn: Any, item: dict[str, Any]) -> dict[str, Any]:
+async def estimate_connector_item_importance_llm(
+    conn: Any, item: dict[str, Any]
+) -> dict[str, Any]:
     """Single-item importance. Retained for callers with one item; the batch
     path is what the importance run uses."""
     key = str(item.get("source_item_id") or "")
@@ -522,41 +685,53 @@ async def estimate_connector_item_importance_llm(conn: Any, item: dict[str, Any]
     return out.get(key) or estimate_connector_item_importance(item)
 
 
-def _merge_importance(baseline: dict[str, Any], doc: Any) -> dict[str, Any]:
-    """Combine the model's verdict with the rules baseline.
-
-    The score only ever moves up: the rules are a floor, so a model that
-    under-rates something safety- or finance-shaped cannot silently bury it.
-    """
+def _normalize_importance(doc: Any) -> dict[str, Any]:
+    """Validate one authoritative model verdict without a keyword floor."""
     if not isinstance(doc, dict):
-        return baseline
+        raise ValueError("importance verdict must be an object")
     try:
-        score = max(float(baseline.get("score", 0.0)), max(0.0, min(1.0, float(doc.get("score") or 0.0))))
+        score = max(0.0, min(1.0, float(doc.get("score"))))
     except (TypeError, ValueError):
-        score = float(baseline.get("score") or 0.0)
-    label = str(doc.get("label") or baseline.get("label") or "normal").lower()
+        raise ValueError("importance verdict score must be numeric") from None
+    label = str(doc.get("label") or "").lower()
     if label not in {"low", "normal", "important", "urgent"}:
-        label = "urgent" if score >= 0.95 else "important" if score >= 0.85 else "normal"
+        label = (
+            "urgent"
+            if score >= 0.95
+            else "important" if score >= 0.85 else "low" if score < 0.35 else "normal"
+        )
     if score >= 0.95:
         label = "urgent"
     elif score >= 0.85 and label not in {"urgent", "important"}:
         label = "important"
-    reasons = baseline.get("reasons") if isinstance(baseline.get("reasons"), list) else []
-    if isinstance(doc.get("reasons"), list):
-        reasons = [*reasons, *[str(reason) for reason in doc["reasons"]]]
-    actions = baseline.get("recommended_actions") if isinstance(baseline.get("recommended_actions"), list) else []
-    if isinstance(doc.get("recommended_actions"), list):
-        actions = [*actions, *[action for action in doc["recommended_actions"] if isinstance(action, dict)]]
+    reasons = (
+        [str(reason) for reason in doc["reasons"]]
+        if isinstance(doc.get("reasons"), list)
+        else []
+    )
+    actions = (
+        [action for action in doc["recommended_actions"] if isinstance(action, dict)]
+        if isinstance(doc.get("recommended_actions"), list)
+        else []
+    )
     return {
         "score": score,
         "label": label,
-        "reasons": list(dict.fromkeys(str(reason) for reason in reasons if str(reason).strip()))[:8],
+        "reasons": list(
+            dict.fromkeys(str(reason) for reason in reasons if str(reason).strip())
+        )[:8],
         "recommended_actions": actions[:8],
     }
 
 
-async def run_user_model_synthesis_step(conn: Any, *, limit: int | None = None) -> dict[str, Any]:
-    if not bool(await conn.fetchval("SELECT COALESCE(get_config_bool('connector.user_model_synthesis_enabled'), TRUE)")):
+async def run_user_model_synthesis_step(
+    conn: Any, *, limit: int | None = None
+) -> dict[str, Any]:
+    if not bool(
+        await conn.fetchval(
+            "SELECT COALESCE(get_config_bool('connector.user_model_synthesis_enabled'), TRUE)"
+        )
+    ):
         return {"skipped": True, "reason": "disabled"}
     raw = await conn.fetchval("SELECT claim_user_model_source_items($1::int)", limit)
     items = _json(raw) or []
@@ -567,25 +742,37 @@ async def run_user_model_synthesis_step(conn: Any, *, limit: int | None = None) 
     failed = 0
     claims_created = 0
     llm_used = 0
+    cache_used = 0
+    fallback_used = 0
 
     # Config is read once per run, not once per item: these cannot change
     # mid-run, and eighty items previously cost a hundred and sixty round trips
     # to Postgres for two values.
-    mode = str(await conn.fetchval(
-        "SELECT COALESCE(get_config_text('connector.user_model_synthesis_mode'), 'hybrid')"
-    ) or "hybrid").lower()
-    llm_enabled = bool(await conn.fetchval(
-        "SELECT COALESCE(get_config_bool('connector.user_model_llm_enabled'), TRUE)"
-    ))
+    mode = str(
+        await conn.fetchval(
+            "SELECT COALESCE(get_config_text('connector.user_model_synthesis_mode'), 'llm')"
+        )
+        or "llm"
+    ).lower()
+    llm_enabled = bool(
+        await conn.fetchval(
+            "SELECT COALESCE(get_config_bool('connector.user_model_llm_enabled'), TRUE)"
+        )
+    )
 
     # One model call for the batch rather than one per item.
     llm_by_item: dict[str, list[dict[str, Any]]] = {}
-    if mode in {"llm", "hybrid"} and llm_enabled:
+    provenance_by_item: dict[str, str] = {}
+    if mode != "rules" and llm_enabled:
         candidates = [it for it in items if isinstance(it, dict)]
         try:
-            llm_by_item = await extract_user_model_claims_llm_batch(conn, candidates)
+            llm_by_item = await extract_user_model_claims_llm_batch(
+                conn, candidates, provenance=provenance_by_item
+            )
         except Exception as exc:
-            logger.warning("connector user-model LLM synthesis fell back to rules: %s", exc)
+            logger.warning(
+                "connector user-model LLM synthesis fell back to rules: %s", exc
+            )
             llm_by_item = {}
 
     for item in items:
@@ -593,23 +780,30 @@ async def run_user_model_synthesis_step(conn: Any, *, limit: int | None = None) 
             continue
         source_item_id = str(item.get("source_item_id") or "")
         try:
-            rules_claims = extract_user_model_claims(item)
-            llm_claims = llm_by_item.get(source_item_id) or []
-            if llm_claims:
-                llm_used += 1
-                claims = _dedupe_claims([*llm_claims, *([] if mode == "llm" else rules_claims)])
-            elif mode == "llm" and llm_enabled:
-                # Pure-LLM mode says the rules are not a substitute; an item the
-                # model did not answer for gets no claims rather than guessed ones.
-                claims = []
+            source = provenance_by_item.get(source_item_id, "fallback")
+            if source in {"llm", "cache"}:
+                claims = llm_by_item.get(source_item_id, [])
             else:
-                claims = rules_claims
-            result = _json(await conn.fetchval(
-                "SELECT record_user_model_synthesis($1::uuid, $2::jsonb, $3)",
-                source_item_id,
-                _json_dumps(claims),
-                DETECTOR_VERSION,
-            )) or {}
+                claims = llm_by_item.get(source_item_id)
+                if claims is None:
+                    claims = extract_user_model_claims(item)
+            if source == "llm":
+                llm_used += 1
+            elif source == "cache":
+                cache_used += 1
+            else:
+                fallback_used += 1
+            result = (
+                _json(
+                    await conn.fetchval(
+                        "SELECT record_user_model_synthesis($1::uuid, $2::jsonb, $3)",
+                        source_item_id,
+                        _json_dumps(claims),
+                        _detector_version(source),
+                    )
+                )
+                or {}
+            )
             claims_created += int(result.get("claim_count") or 0)
             completed += 1
         except Exception as exc:
@@ -626,11 +820,19 @@ async def run_user_model_synthesis_step(conn: Any, *, limit: int | None = None) 
         "failed": failed,
         "claims": claims_created,
         "llm_used": llm_used,
+        "cache_used": cache_used,
+        "fallback_used": fallback_used,
     }
 
 
-async def run_connector_importance_step(conn: Any, *, limit: int | None = None) -> dict[str, Any]:
-    if not bool(await conn.fetchval("SELECT COALESCE(get_config_bool('connector.importance_detection_enabled'), TRUE)")):
+async def run_connector_importance_step(
+    conn: Any, *, limit: int | None = None
+) -> dict[str, Any]:
+    if not bool(
+        await conn.fetchval(
+            "SELECT COALESCE(get_config_bool('connector.importance_detection_enabled'), TRUE)"
+        )
+    ):
         return {"skipped": True, "reason": "disabled"}
     raw = await conn.fetchval("SELECT claim_connector_importance_items($1::int)", limit)
     items = _json(raw) or []
@@ -640,22 +842,32 @@ async def run_connector_importance_step(conn: Any, *, limit: int | None = None) 
     completed = 0
     failed = 0
     notified = 0
+    llm_used = 0
+    cache_used = 0
+    fallback_used = 0
 
     # Read once per run: this cannot change mid-run, and it previously cost one
     # round trip per item.
-    llm_enabled = bool(await conn.fetchval(
-        "SELECT COALESCE(get_config_bool('connector.importance_llm_enabled'), TRUE)"
-    ))
+    llm_enabled = bool(
+        await conn.fetchval(
+            "SELECT COALESCE(get_config_bool('connector.importance_llm_enabled'), TRUE)"
+        )
+    )
 
     # One model call for the batch rather than one per item.
     estimates: dict[str, dict[str, Any]] = {}
+    provenance_by_item: dict[str, str] = {}
     if llm_enabled:
         try:
             estimates = await estimate_connector_item_importance_llm_batch(
-                conn, [it for it in items if isinstance(it, dict)]
+                conn,
+                [it for it in items if isinstance(it, dict)],
+                provenance=provenance_by_item,
             )
         except Exception as exc:
-            logger.warning("connector importance LLM detector fell back to rules: %s", exc)
+            logger.warning(
+                "connector importance LLM detector fell back to rules: %s", exc
+            )
             estimates = {}
 
     for item in items:
@@ -663,26 +875,40 @@ async def run_connector_importance_step(conn: Any, *, limit: int | None = None) 
             continue
         source_item_id = str(item.get("source_item_id") or "")
         try:
-            estimate = estimates.get(source_item_id) or estimate_connector_item_importance(item)
-            result = _json(await conn.fetchval(
-                """
-                SELECT record_connector_item_importance(
-                    $1::uuid,
-                    $2::float,
-                    $3,
-                    $4::jsonb,
-                    $5::jsonb,
-                    $6,
-                    TRUE
+            estimate = estimates.get(
+                source_item_id
+            ) or estimate_connector_item_importance(item)
+            source = provenance_by_item.get(source_item_id, "fallback")
+            if source == "llm":
+                llm_used += 1
+            elif source == "cache":
+                cache_used += 1
+            else:
+                fallback_used += 1
+            result = (
+                _json(
+                    await conn.fetchval(
+                        """
+                        SELECT record_connector_item_importance(
+                            $1::uuid,
+                            $2::float,
+                            $3,
+                            $4::jsonb,
+                            $5::jsonb,
+                            $6,
+                            TRUE
+                        )
+                        """,
+                        source_item_id,
+                        float(estimate["score"]),
+                        estimate["label"],
+                        _json_dumps(estimate["reasons"]),
+                        _json_dumps(estimate["recommended_actions"]),
+                        _detector_version(source),
+                    )
                 )
-                """,
-                source_item_id,
-                float(estimate["score"]),
-                estimate["label"],
-                _json_dumps(estimate["reasons"]),
-                _json_dumps(estimate["recommended_actions"]),
-                DETECTOR_VERSION,
-            )) or {}
+                or {}
+            )
             if result.get("notification_queued"):
                 notified += 1
             completed += 1
@@ -699,4 +925,7 @@ async def run_connector_importance_step(conn: Any, *, limit: int | None = None) 
         "completed": completed,
         "failed": failed,
         "notified": notified,
+        "llm_used": llm_used,
+        "cache_used": cache_used,
+        "fallback_used": fallback_used,
     }

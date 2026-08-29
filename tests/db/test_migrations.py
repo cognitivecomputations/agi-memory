@@ -59,6 +59,38 @@ async def test_migrations_recorded_and_idempotent(db_pool):
         )
 
 
+async def test_applied_migration_checksum_drift_fails_loudly(db_pool):
+    from core.migrations import (
+        MigrationChecksumError,
+        apply_pending_migrations,
+        migration_status,
+    )
+
+    async with db_pool.acquire() as conn:
+        transaction = conn.transaction()
+        await transaction.start()
+        try:
+            await conn.execute(
+                "UPDATE public.schema_migrations SET checksum = $1 WHERE version = $2",
+                "0" * 64,
+                "0001_hmx_enum_values",
+            )
+
+            status = await migration_status(conn)
+            assert len(status["drifted"]) == 1
+            drift = status["drifted"][0]
+            assert drift["version"] == "0001_hmx_enum_values"
+            assert drift["recorded_checksum"] == "0" * 64
+            assert drift["current_checksum"] != "0" * 64
+            with pytest.raises(
+                MigrationChecksumError,
+                match="Applied migrations are immutable",
+            ):
+                await apply_pending_migrations(conn)
+        finally:
+            await transaction.rollback()
+
+
 async def test_action_receipt_migration_upgrades_existing_memory_dispatch(db_pool):
     """0199 must preserve the old dispatcher while installing remember v2."""
     migration = (

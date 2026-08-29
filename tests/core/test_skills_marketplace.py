@@ -3,6 +3,7 @@
 import json
 import os
 import tempfile
+import uuid
 from pathlib import Path
 from unittest.mock import patch
 
@@ -86,7 +87,9 @@ class TestSkillSpecExtended:
         spec = SkillSpec(name="test", description="test", content="test")
         assert spec.enabled is True
 
-        spec2 = SkillSpec(name="test", description="test", content="test", enabled=False)
+        spec2 = SkillSpec(
+            name="test", description="test", content="test", enabled=False
+        )
         assert spec2.enabled is False
 
     def test_install_methods(self):
@@ -96,11 +99,13 @@ class TestSkillSpecExtended:
         assert method.bins == ["rg"]
 
     def test_install_method_from_dict(self):
-        m = InstallMethod.from_dict({
-            "kind": "pip",
-            "package": "requests",
-            "bins": [],
-        })
+        m = InstallMethod.from_dict(
+            {
+                "kind": "pip",
+                "package": "requests",
+                "bins": [],
+            }
+        )
         assert m.kind == "pip"
         assert m.package == "requests"
 
@@ -161,9 +166,21 @@ class TestSkillSpecExtended:
 
 
 class TestSkillRuntimeSelection:
-    async def test_default_chat_exposes_the_read_only_floor_but_nothing_that_acts(self, db_pool):
+    async def test_default_chat_exposes_the_read_only_floor_but_nothing_that_acts(
+        self, db_pool, monkeypatch
+    ):
         from core.tools import ToolContext, create_default_registry
         from services.skill_runtime import select_skills
+
+        async def flat_semantic_scores(_pool, skills, _query):
+            # CI's hash-derived fake vectors deliberately carry no semantics.
+            # A flat distribution is the production selector's representation
+            # of an ordinary continuity query with no specialized outlier.
+            return {skill.name: 0.5 for skill in skills}
+
+        monkeypatch.setattr(
+            "services.skill_runtime._semantic_scores", flat_semantic_scores
+        )
 
         registry = create_default_registry(db_pool)
         selection = await select_skills(
@@ -172,19 +189,32 @@ class TestSkillRuntimeSelection:
             query="what did we decide last time",
         )
 
-        assert [s.name for s in selection.skills] == ["core-memory"]
-        assert {"list_skills", "use_skill", "recall", "remember"} <= selection.allowed_tool_names
+        assert [s.name for s in selection.skills] == ["core-memory"], (
+            selection.considered[:10]
+        )
+        assert {
+            "list_skills",
+            "use_skill",
+            "recall",
+            "remember",
+        } <= selection.allowed_tool_names
         # A live turn always gets the read-only everyday floor: a selector that
         # guesses the topic wrongly must still leave the agent able to look
         # things up. Measured before this existed: seven of ten ordinary
         # requests reached core-memory alone and could not search the web.
-        assert {"web_search", "calendar_events", "search_contacts"} <= selection.allowed_tool_names
+        assert {
+            "web_search",
+            "calendar_events",
+            "search_contacts",
+        } <= selection.allowed_tool_names
         # Tools that *act* stay gated — the floor is for answering, not doing.
         assert "shell" not in selection.allowed_tool_names
         assert "email_send" not in selection.allowed_tool_names
         assert "write_file" not in selection.allowed_tool_names
 
-    async def test_research_query_activates_research_without_unrelated_integrations(self, db_pool):
+    async def test_research_query_activates_research_without_unrelated_integrations(
+        self, db_pool
+    ):
         from core.tools import ToolContext, create_default_registry
         from services.skill_runtime import select_skills
 
@@ -208,7 +238,9 @@ class TestSkillRuntimeSelection:
         assert "twitter-research" not in names
         assert "youtube-analytics" not in names
 
-    async def test_default_heartbeat_keeps_email_digest_gated_by_autonomy_config(self, db_pool):
+    async def test_default_heartbeat_keeps_email_digest_gated_by_autonomy_config(
+        self, db_pool
+    ):
         from core.tools import ToolContext, create_default_registry
         from services.skill_runtime import select_skills
 
@@ -226,11 +258,16 @@ class TestSkillRuntimeSelection:
         names = [s.name for s in selection.skills]
 
         assert "email-digest" not in names
-        assert not {"gmail_setup_status", "email_list", "email_read", "email_search"} & (
-            selection.allowed_tool_names
-        )
+        assert not {
+            "gmail_setup_status",
+            "email_list",
+            "email_read",
+            "email_search",
+        } & (selection.allowed_tool_names)
 
-    async def test_heartbeat_exposes_email_digest_after_explicit_autonomous_gmail_authorization(self, db_pool):
+    async def test_heartbeat_exposes_email_digest_after_explicit_autonomous_gmail_authorization(
+        self, db_pool
+    ):
         from core.tools import ToolContext, create_default_registry
         from services.skill_runtime import select_skills
 
@@ -255,7 +292,11 @@ class TestSkillRuntimeSelection:
                     """,
                     marker,
                 )
-                attempt = json.loads(raw_attempt) if isinstance(raw_attempt, str) else raw_attempt
+                attempt = (
+                    json.loads(raw_attempt)
+                    if isinstance(raw_attempt, str)
+                    else raw_attempt
+                )
                 await conn.fetchval(
                     """
                     SELECT complete_connection_attempt(
@@ -288,9 +329,12 @@ class TestSkillRuntimeSelection:
             names = [s.name for s in selection.skills]
 
             assert "email-digest" in names
-            assert {"gmail_setup_status", "email_list", "email_read", "email_search"} <= (
-                selection.allowed_tool_names
-            )
+            assert {
+                "gmail_setup_status",
+                "email_list",
+                "email_read",
+                "email_search",
+            } <= (selection.allowed_tool_names)
         finally:
             async with db_pool.acquire() as conn:
                 await conn.execute(
@@ -352,8 +396,14 @@ first, then respond using the recalled evidence.
 
 
 class TestPluginSkillDirs:
-    async def test_plugin_skill_dir_is_discoverable_and_activatable(self, db_pool, tmp_path):
-        from core.tools import ToolContext, ToolExecutionContext, create_default_registry
+    async def test_plugin_skill_dir_is_discoverable_and_activatable(
+        self, db_pool, tmp_path
+    ):
+        from core.tools import (
+            ToolContext,
+            ToolExecutionContext,
+            create_default_registry,
+        )
         from core.tools.skills import ListSkillsHandler, UseSkillHandler
         from services.skill_runtime import get_skill_by_name, select_skills
 
@@ -379,13 +429,18 @@ class TestPluginSkillDirs:
         assert "plugin-demo" in {s["name"] for s in listed.output["skills"]}
 
         # Activatable through use_skill, unlocking its bound tools
-        assert await get_skill_by_name(registry, ToolContext.CHAT, "plugin-demo") is not None
+        assert (
+            await get_skill_by_name(registry, ToolContext.CHAT, "plugin-demo")
+            is not None
+        )
         activated = await UseSkillHandler().execute({"name": "plugin-demo"}, ctx)
         assert activated.success is True
         assert "Plugin Demo" in activated.output["instructions"]
         assert "recall" in activated.output["bound_tools"]
 
-    async def test_create_full_registry_adopts_plugin_skill_dirs(self, db_pool, monkeypatch, tmp_path):
+    async def test_create_full_registry_adopts_plugin_skill_dirs(
+        self, db_pool, monkeypatch, tmp_path
+    ):
         from core.tools.registry import create_full_registry
 
         class _StubPluginRegistry:
@@ -407,8 +462,14 @@ class TestPluginSkillDirs:
 
 
 class TestSkillDiscoveryTools:
-    async def test_list_skills_and_use_skill_return_discoverable_capabilities(self, db_pool):
-        from core.tools import ToolContext, ToolExecutionContext, create_default_registry
+    async def test_list_skills_and_use_skill_return_discoverable_capabilities(
+        self, db_pool
+    ):
+        from core.tools import (
+            ToolContext,
+            ToolExecutionContext,
+            create_default_registry,
+        )
         from core.tools.skills import ListSkillsHandler, UseSkillHandler
 
         registry = create_default_registry(db_pool)
@@ -432,7 +493,11 @@ class TestSkillDiscoveryTools:
     async def test_author_skill_creates_parseable_agent_skill(
         self, db_pool, monkeypatch, tmp_path
     ):
-        from core.tools import ToolContext, ToolExecutionContext, create_default_registry
+        from core.tools import (
+            ToolContext,
+            ToolExecutionContext,
+            create_default_registry,
+        )
         from core.tools.skills import AuthorSkillHandler
         from skills.loader import load_skills_from_dir
 
@@ -445,21 +510,24 @@ class TestSkillDiscoveryTools:
             registry=registry,
         )
 
-        result = await AuthorSkillHandler().execute({
-            "name": "weekly-review",
-            "description": "Run a reusable weekly review workflow",
-            "category": "productivity",
-            "contexts": ["chat", "heartbeat"],
-            "bound_tools": ["recall", "remember"],
-            "content": (
-                "# Weekly Review\n\n"
-                "Use this when the user asks to review the week. First recall recent "
-                "commitments and goals, then summarize progress, blockers, and next "
-                "actions. Store durable decisions with remember and avoid inventing "
-                "events that were not recalled or provided in the current turn."
-            ),
-            "rationale": "The workflow is repeated and benefits from consistency.",
-        }, ctx)
+        result = await AuthorSkillHandler().execute(
+            {
+                "name": "weekly-review",
+                "description": "Run a reusable weekly review workflow",
+                "category": "productivity",
+                "contexts": ["chat", "heartbeat"],
+                "bound_tools": ["recall", "remember"],
+                "content": (
+                    "# Weekly Review\n\n"
+                    "Use this when the user asks to review the week. First recall recent "
+                    "commitments and goals, then summarize progress, blockers, and next "
+                    "actions. Store durable decisions with remember and avoid inventing "
+                    "events that were not recalled or provided in the current turn."
+                ),
+                "rationale": "The workflow is repeated and benefits from consistency.",
+            },
+            ctx,
+        )
 
         assert result.success is True
         path = agent_root / "weekly-review" / "SKILL.md"
@@ -474,7 +542,11 @@ class TestSkillDiscoveryTools:
     async def test_propose_skill_creates_pending_review_before_apply(
         self, db_pool, monkeypatch, tmp_path
     ):
-        from core.tools import ToolContext, ToolExecutionContext, create_default_registry
+        from core.tools import (
+            ToolContext,
+            ToolExecutionContext,
+            create_default_registry,
+        )
         from core.tools.skills import ProposeSkillHandler, ReviewSkillProposalHandler
         from skills.loader import load_skills_from_dir
 
@@ -487,9 +559,10 @@ class TestSkillDiscoveryTools:
             session_id="11111111-1111-4111-8111-111111111111",
             registry=registry,
         )
+        skill_name = f"inbox-triage-{uuid.uuid4().hex[:8]}"
         payload = {
             "need": "The agent noticed a reusable inbox triage workflow that is not covered by any current skill.",
-            "name": "inbox-triage",
+            "name": skill_name,
             "description": "Triage an inbox for important actionable items",
             "category": "productivity",
             "contexts": ["chat", "heartbeat"],
@@ -511,7 +584,7 @@ class TestSkillDiscoveryTools:
         assert result.success is True
         proposal_id = result.output["proposal_id"]
         assert result.output["writes_skill_file"] is False
-        assert not (agent_root / "inbox-triage" / "SKILL.md").exists()
+        assert not (agent_root / skill_name / "SKILL.md").exists()
         async with db_pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
@@ -523,10 +596,14 @@ class TestSkillDiscoveryTools:
             )
         assert row is not None
         assert row["status"] == "pending"
-        assert row["name"] == "inbox-triage"
+        assert row["name"] == skill_name
         assert row["confidence"] == pytest.approx(0.82)
         assert list(row["source_unit_ids"]) == []
-        evidence = row["evidence"] if isinstance(row["evidence"], dict) else json.loads(row["evidence"])
+        evidence = (
+            row["evidence"]
+            if isinstance(row["evidence"], dict)
+            else json.loads(row["evidence"])
+        )
         assert evidence["origin"] == "on_demand"
         assert evidence["call_id"] == "propose-skill-test"
         assert "inbox triage workflow" in evidence["need"]
@@ -537,15 +614,21 @@ class TestSkillDiscoveryTools:
         )
 
         assert applied.success is True
-        path = agent_root / "inbox-triage" / "SKILL.md"
+        path = agent_root / skill_name / "SKILL.md"
         assert path.exists()
         parsed = load_skills_from_dir(agent_root)
         assert len(parsed) == 1
-        assert parsed[0].name == "inbox-triage"
+        assert parsed[0].name == skill_name
         assert parsed[0].provenance["proposal_id"] == proposal_id
 
-    async def test_author_skill_refuses_accidental_overwrite(self, db_pool, monkeypatch, tmp_path):
-        from core.tools import ToolContext, ToolExecutionContext, create_default_registry
+    async def test_author_skill_refuses_accidental_overwrite(
+        self, db_pool, monkeypatch, tmp_path
+    ):
+        from core.tools import (
+            ToolContext,
+            ToolExecutionContext,
+            create_default_registry,
+        )
         from core.tools.skills import AuthorSkillHandler
 
         monkeypatch.setattr(
@@ -580,7 +663,11 @@ class TestSkillDiscoveryTools:
     async def test_author_skill_updates_only_structured_agent_owned_skill(
         self, db_pool, monkeypatch, tmp_path
     ):
-        from core.tools import ToolContext, ToolExecutionContext, create_default_registry
+        from core.tools import (
+            ToolContext,
+            ToolExecutionContext,
+            create_default_registry,
+        )
         from core.tools.skills import AuthorSkillHandler
         from skills.loader import load_skills_from_dir
 
@@ -671,7 +758,11 @@ class TestSkillDiscoveryTools:
     async def test_author_skill_upgrades_legacy_agent_provenance_on_update(
         self, db_pool, monkeypatch, tmp_path
     ):
-        from core.tools import ToolContext, ToolExecutionContext, create_default_registry
+        from core.tools import (
+            ToolContext,
+            ToolExecutionContext,
+            create_default_registry,
+        )
         from core.tools.skills import AuthorSkillHandler
         from skills.loader import load_skills_from_dir
 
@@ -763,7 +854,11 @@ class TestSkillDiscoveryTools:
         self_extension change and pins a first-person notice to the web inbox."""
         import json as jsonlib
 
-        from core.tools import ToolContext, ToolExecutionContext, create_default_registry
+        from core.tools import (
+            ToolContext,
+            ToolExecutionContext,
+            create_default_registry,
+        )
         from core.tools.skills import AuthorSkillHandler
 
         agent_root = tmp_path / "agent-authored"
@@ -775,16 +870,19 @@ class TestSkillDiscoveryTools:
             registry=registry,
         )
 
-        result = await AuthorSkillHandler().execute({
-            "name": "journaled-method",
-            "description": "A method whose authoring must be visible to the operator",
-            "bound_tools": ["recall"],
-            "content": (
-                "# Journaled Method\n\nUse this to prove visibility: the act of "
-                "authoring this skill must land in the change journal and post a "
-                "first-person notice to the operator's web inbox, without blocking."
-            ),
-        }, ctx)
+        result = await AuthorSkillHandler().execute(
+            {
+                "name": "journaled-method",
+                "description": "A method whose authoring must be visible to the operator",
+                "bound_tools": ["recall"],
+                "content": (
+                    "# Journaled Method\n\nUse this to prove visibility: the act of "
+                    "authoring this skill must land in the change journal and post a "
+                    "first-person notice to the operator's web inbox, without blocking."
+                ),
+            },
+            ctx,
+        )
         assert result.success is True
 
         async with db_pool.acquire() as conn:
@@ -835,8 +933,16 @@ class TestSkillDiscoveryTools:
 
 class TestSkillCategory:
     def test_all_categories(self):
-        expected = {"research", "productivity", "communication", "knowledge",
-                     "analytics", "creative", "system", "other"}
+        expected = {
+            "research",
+            "productivity",
+            "communication",
+            "knowledge",
+            "analytics",
+            "creative",
+            "system",
+            "other",
+        }
         actual = {c.value for c in SkillCategory}
         assert actual == expected
 
@@ -854,7 +960,9 @@ class TestRequirementChecking:
     def test_check_bins_available(self):
         """Python should always be available in test env."""
         spec = SkillSpec(
-            name="test", description="test", content="test",
+            name="test",
+            description="test",
+            content="test",
             requires_bins=["python3"],
         )
         missing = spec.check_bins_available()
@@ -863,7 +971,9 @@ class TestRequirementChecking:
 
     def test_check_bins_missing(self):
         spec = SkillSpec(
-            name="test", description="test", content="test",
+            name="test",
+            description="test",
+            content="test",
             requires_bins=["nonexistent_binary_xyz_12345"],
         )
         missing = spec.check_bins_available()
@@ -872,7 +982,9 @@ class TestRequirementChecking:
     def test_check_env_available(self):
         with patch.dict(os.environ, {"TEST_HEXIS_VAR": "value"}):
             spec = SkillSpec(
-                name="test", description="test", content="test",
+                name="test",
+                description="test",
+                content="test",
                 requires_env=["TEST_HEXIS_VAR"],
             )
             missing = spec.check_env_available()
@@ -880,7 +992,9 @@ class TestRequirementChecking:
 
     def test_check_env_missing(self):
         spec = SkillSpec(
-            name="test", description="test", content="test",
+            name="test",
+            description="test",
+            content="test",
             requires_env=["NONEXISTENT_ENV_VAR_XYZ"],
         )
         missing = spec.check_env_available()
@@ -888,24 +1002,32 @@ class TestRequirementChecking:
 
     def test_check_os_support(self):
         import sys
+
         spec = SkillSpec(
-            name="test", description="test", content="test",
+            name="test",
+            description="test",
+            content="test",
             os_support=[sys.platform],
         )
         assert spec.check_os_support() is True
 
     def test_check_os_unsupported(self):
         spec = SkillSpec(
-            name="test", description="test", content="test",
+            name="test",
+            description="test",
+            content="test",
             os_support=["win32_only_platform"],
         )
         assert spec.check_os_support() is False
 
     def test_full_requirements_met_all_ok(self):
         import sys
+
         with patch.dict(os.environ, {"TEST_VAR": "1"}):
             spec = SkillSpec(
-                name="test", description="test", content="test",
+                name="test",
+                description="test",
+                content="test",
                 requires_tools=["recall"],
                 requires_env=["TEST_VAR"],
                 requires_bins=["python3"],
@@ -919,7 +1041,9 @@ class TestRequirementChecking:
 
     def test_full_requirements_met_disabled(self):
         spec = SkillSpec(
-            name="test", description="test", content="test",
+            name="test",
+            description="test",
+            content="test",
             enabled=False,
         )
         met, reasons = spec.full_requirements_met(available_tools=set())
@@ -928,7 +1052,9 @@ class TestRequirementChecking:
 
     def test_full_requirements_met_missing_tool(self):
         spec = SkillSpec(
-            name="test", description="test", content="test",
+            name="test",
+            description="test",
+            content="test",
             requires_tools=["nonexistent_tool"],
         )
         met, reasons = spec.full_requirements_met(available_tools=set())
@@ -937,7 +1063,9 @@ class TestRequirementChecking:
 
     def test_full_requirements_met_missing_env(self):
         spec = SkillSpec(
-            name="test", description="test", content="test",
+            name="test",
+            description="test",
+            content="test",
             requires_env=["NONEXISTENT_VAR_ABC"],
         )
         met, reasons = spec.full_requirements_met(available_tools=set())
@@ -966,9 +1094,9 @@ class TestBuiltInSkillLibrary:
         for skill in skills:
             if skill.name not in ("research", "self-reflection"):
                 # New skills should have a non-OTHER category
-                assert skill.category != SkillCategory.OTHER or skill.name == "research", (
-                    f"Skill {skill.name} should have a specific category"
-                )
+                assert (
+                    skill.category != SkillCategory.OTHER or skill.name == "research"
+                ), f"Skill {skill.name} should have a specific category"
 
     def test_new_skills_have_bound_tools(self):
         skills_dir = Path(__file__).resolve().parents[2] / "skills" / "installed"
@@ -1008,7 +1136,9 @@ class TestSkillInstaller:
 
     def test_install_unsupported_os(self):
         spec = SkillSpec(
-            name="test", description="test", content="test",
+            name="test",
+            description="test",
+            content="test",
             os_support=["win32_only"],
         )
         results = install_skill_deps(spec)
@@ -1017,7 +1147,9 @@ class TestSkillInstaller:
 
     def test_install_reports_missing_env(self):
         spec = SkillSpec(
-            name="test", description="test", content="test",
+            name="test",
+            description="test",
+            content="test",
             requires_env=["NONEXISTENT_TEST_VAR_XYZ"],
         )
         results = install_skill_deps(spec)
@@ -1028,7 +1160,9 @@ class TestSkillInstaller:
     def test_install_reports_present_env(self):
         with patch.dict(os.environ, {"PRESENT_VAR": "value"}):
             spec = SkillSpec(
-                name="test", description="test", content="test",
+                name="test",
+                description="test",
+                content="test",
                 requires_env=["PRESENT_VAR"],
             )
             results = install_skill_deps(spec)
@@ -1037,7 +1171,9 @@ class TestSkillInstaller:
 
     def test_install_bins_already_present(self):
         spec = SkillSpec(
-            name="test", description="test", content="test",
+            name="test",
+            description="test",
+            content="test",
             requires_bins=["python3"],
         )
         results = install_skill_deps(spec)
@@ -1047,7 +1183,9 @@ class TestSkillInstaller:
 
     def test_install_missing_bins_no_method(self):
         spec = SkillSpec(
-            name="test", description="test", content="test",
+            name="test",
+            description="test",
+            content="test",
             requires_bins=["nonexistent_bin_xyz"],
         )
         results = install_skill_deps(spec)
@@ -1056,13 +1194,19 @@ class TestSkillInstaller:
     @patch("skills.loader.shutil.which")
     @patch("skills.loader._run_install_command")
     def test_install_with_brew(self, mock_run, mock_which):
-        mock_which.side_effect = lambda x: "/usr/local/bin/brew" if x == "brew" else None
+        mock_which.side_effect = lambda x: (
+            "/usr/local/bin/brew" if x == "brew" else None
+        )
         mock_run.return_value = (True, "installed")
 
         spec = SkillSpec(
-            name="test", description="test", content="test",
+            name="test",
+            description="test",
+            content="test",
             requires_bins=["rg"],
-            install_methods=[InstallMethod(kind="brew", package="ripgrep", bins=["rg"])],
+            install_methods=[
+                InstallMethod(kind="brew", package="ripgrep", bins=["rg"])
+            ],
         )
         results = install_skill_deps(spec)
         installed = [r for r in results if r["status"] == "installed"]
@@ -1074,9 +1218,15 @@ class TestSkillInstaller:
         mock_which.return_value = None  # No brew available
 
         spec = SkillSpec(
-            name="test", description="test", content="test",
+            name="test",
+            description="test",
+            content="test",
             requires_bins=["nonexistent_tool"],
-            install_methods=[InstallMethod(kind="brew", package="some-pkg", bins=["nonexistent_tool"])],
+            install_methods=[
+                InstallMethod(
+                    kind="brew", package="some-pkg", bins=["nonexistent_tool"]
+                )
+            ],
         )
         results = install_skill_deps(spec)
         skipped = [r for r in results if r["status"] == "skipped"]
@@ -1089,9 +1239,13 @@ class TestSkillInstaller:
         mock_run.return_value = (False, "pip install failed")
 
         spec = SkillSpec(
-            name="test", description="test", content="test",
+            name="test",
+            description="test",
+            content="test",
             requires_bins=["some_binary"],
-            install_methods=[InstallMethod(kind="pip", package="some-pkg", bins=["some_binary"])],
+            install_methods=[
+                InstallMethod(kind="pip", package="some-pkg", bins=["some_binary"])
+            ],
         )
         results = install_skill_deps(spec)
         failed = [r for r in results if r["status"] == "failed"]

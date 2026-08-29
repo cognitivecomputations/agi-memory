@@ -9,7 +9,7 @@ def _prepare_ui_tree(tmp_path: Path) -> Path:
     return stack_root
 
 
-def test_handle_ui_rejects_running_dashboard(monkeypatch, tmp_path):
+def test_handle_ui_opens_running_dashboard(monkeypatch, tmp_path):
     from apps import hexis_cli
 
     stack_root = _prepare_ui_tree(tmp_path)
@@ -31,8 +31,8 @@ def test_handle_ui_rejects_running_dashboard(monkeypatch, tmp_path):
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("dev server should not start")),
     )
 
-    assert hexis_cli._handle_ui(stack_root, 3477, no_open=False) == 1
-    assert opened == []
+    assert hexis_cli._handle_ui(stack_root, 3477, no_open=False) == 0
+    assert opened == ["http://localhost:3477/chat"]
 
 
 def test_handle_ui_reports_occupied_non_dashboard_port(monkeypatch, tmp_path):

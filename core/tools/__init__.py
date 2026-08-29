@@ -44,6 +44,7 @@ from .base import (
     ToolExecutionContext,
     ToolHandler,
     ToolInvocation,
+    OutboundSpec,
     ToolResult,
     ToolSpec,
     SyncToolHandler,
@@ -86,7 +87,12 @@ from .registry import (
 from .memory import create_memory_tools
 from .memory_exchange import create_memory_exchange_tools
 from .protected_replacement import create_protected_replacement_tools
-from .web import create_web_tools, WebSearchHandler, WebFetchHandler, WebSummarizeHandler
+from .web import (
+    create_web_tools,
+    WebSearchHandler,
+    WebFetchHandler,
+    WebSummarizeHandler,
+)
 from .filesystem import (
     create_filesystem_tools,
     ReadFileHandler,
@@ -208,6 +214,27 @@ from .integrations import (
     GrantConnectorActionPolicyHandler,
     RevokeConnectorActionPolicyHandler,
 )
+from .life_integrations import (
+    create_life_integration_tools,
+    ConnectLifeIntegrationHandler,
+    ConnectSpotifyHandler,
+    CompleteSpotifyConnectionHandler,
+    RevokeLifeIntegrationHandler,
+    NotionSearchHandler,
+    NotionGetPageHandler,
+    NotionQueryDataSourceHandler,
+    NotionCreatePageHandler,
+    SpotifySearchHandler,
+    SpotifyPlaybackStateHandler,
+    SpotifyControlPlaybackHandler,
+    HomeAssistantStatesHandler,
+    HomeAssistantCallServiceHandler,
+    WeatherForecastHandler,
+    TrelloListBoardsHandler,
+    TrelloListCardsHandler,
+    TrelloCreateCardHandler,
+    TrelloUpdateCardHandler,
+)
 from .gmail_actions import (
     create_gmail_action_tools,
     GmailSendHandler,
@@ -226,6 +253,18 @@ from .self_repair import (
     create_self_repair_tools,
     SelfRepairHandler,
 )
+from .questions import AskUserHandler, create_question_tools
+from .local_audio_analysis import (
+    AnalyzeLocalAudioHandler,
+    TranscribeAudioHandler,
+    create_local_audio_analysis_tools,
+)
+from .operator_policies import (
+    ManageOperatorPoliciesHandler,
+    create_operator_policy_tools,
+)
+from .nodes import NodeInvokeHandler, StructuredNodeHandler, create_node_tools
+from .speech import SpeakHandler, create_speech_tools
 
 __all__ = [
     # Base classes
@@ -235,9 +274,22 @@ __all__ = [
     "ToolExecutionContext",
     "ToolHandler",
     "ToolInvocation",
+    "OutboundSpec",
     "ToolResult",
     "ToolSpec",
     "SyncToolHandler",
+    "AskUserHandler",
+    "create_question_tools",
+    "AnalyzeLocalAudioHandler",
+    "TranscribeAudioHandler",
+    "create_local_audio_analysis_tools",
+    "ManageOperatorPoliciesHandler",
+    "create_operator_policy_tools",
+    "NodeInvokeHandler",
+    "StructuredNodeHandler",
+    "create_node_tools",
+    "SpeakHandler",
+    "create_speech_tools",
     # Config
     "ContextOverrides",
     "MCPServerConfig",
@@ -378,6 +430,25 @@ __all__ = [
     "ConnectorActionPolicyStatusHandler",
     "GrantConnectorActionPolicyHandler",
     "RevokeConnectorActionPolicyHandler",
+    "create_life_integration_tools",
+    "ConnectLifeIntegrationHandler",
+    "ConnectSpotifyHandler",
+    "CompleteSpotifyConnectionHandler",
+    "RevokeLifeIntegrationHandler",
+    "NotionSearchHandler",
+    "NotionGetPageHandler",
+    "NotionQueryDataSourceHandler",
+    "NotionCreatePageHandler",
+    "SpotifySearchHandler",
+    "SpotifyPlaybackStateHandler",
+    "SpotifyControlPlaybackHandler",
+    "HomeAssistantStatesHandler",
+    "HomeAssistantCallServiceHandler",
+    "WeatherForecastHandler",
+    "TrelloListBoardsHandler",
+    "TrelloListCardsHandler",
+    "TrelloCreateCardHandler",
+    "TrelloUpdateCardHandler",
     "create_gmail_action_tools",
     "create_twitter_x_action_tools",
     "TwitterXPostHandler",

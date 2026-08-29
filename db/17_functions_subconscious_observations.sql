@@ -560,7 +560,8 @@ BEGIN
             source,
             priority,
             parent_id,
-            due_at
+            due_at,
+            'derived'::goal_source
         );
         created_ids := array_append(created_ids, created_id);
     END LOOP;
@@ -891,6 +892,7 @@ DECLARE
     resolution_text TEXT;
     identity_updated BOOLEAN;
     pause_reason TEXT;
+    outbound_purpose JSONB;
 BEGIN
     BEGIN
         action_kind := p_action::heartbeat_action;
@@ -913,7 +915,51 @@ BEGIN
         END IF;
     END IF;
 
+    IF p_action IN ('reach_out_user', 'reach_out_public') THEN
+        IF p_action = 'reach_out_public'
+           AND (
+               NULLIF(btrim(COALESCE(p_params->>'platform', '')), '') IS NULL
+               OR NULLIF(btrim(COALESCE(p_params->>'target_id', '')), '') IS NULL
+           ) THEN
+            RETURN jsonb_build_object(
+                'success', false,
+                'error', 'reach_out_public requires an exact platform and public target_id; it cannot fall back to the user''s last-active private channel.',
+                'next_step', 'Choose a configured public channel and provide its exact room/channel target_id, or use the provider''s declared outbound tool.'
+            );
+        END IF;
+        EXECUTE 'SELECT verify_outbound_purpose($1, $2, $3, NULL, $4::jsonb)'
+        INTO outbound_purpose
+        USING
+            p_params->>'purpose_kind',
+            p_params->>'purpose_reference',
+            p_action = 'reach_out_user',
+            jsonb_build_object(
+                'tool_context', 'heartbeat',
+                'heartbeat_id', p_heartbeat_id
+            );
+        IF NOT COALESCE((outbound_purpose->>'verified')::boolean, FALSE) THEN
+            RETURN jsonb_build_object(
+                'success', false,
+                'error', 'Outbound communication requires a backed purpose_kind and purpose_reference.',
+                'purpose', outbound_purpose,
+                'next_step', CASE p_action
+                    WHEN 'reach_out_user' THEN 'Use connection with a recorded reference, or cite a goal, responsibility, reply, or user request.'
+                    ELSE 'Cite an existing goal, responsibility, reply thread, or explicit user request.'
+                END
+            );
+        END IF;
+    END IF;
+
     action_cost := get_action_cost(p_action);
+    IF COALESCE((outbound_purpose->>'assigned_goal')::boolean, FALSE) THEN
+        action_cost := action_cost * LEAST(
+            GREATEST(
+                COALESCE(get_config_float('outbound.assigned_goal_energy_multiplier'), 0.25),
+                0
+            ),
+            1
+        );
+    END IF;
     current_e := get_current_energy();
 
     IF current_e < action_cost THEN
@@ -1275,7 +1321,10 @@ BEGIN
                 jsonb_build_object(
                     'message', p_params->>'message',
                     'intent', p_params->>'intent',
-                    'heartbeat_id', p_heartbeat_id
+                    'heartbeat_id', p_heartbeat_id,
+                    'purpose_kind', p_params->>'purpose_kind',
+                    'purpose_reference', p_params->>'purpose_reference',
+                    'urgency', COALESCE(p_params->>'urgency', 'normal')
                 )
             );
             outbox_messages := outbox_messages || jsonb_build_array(queued_call);
@@ -1289,7 +1338,13 @@ BEGIN
                     'platform', p_params->>'platform',
                     'content', p_params->>'content',
                     'heartbeat_id', p_heartbeat_id,
-                    'boundaries', boundary_hits
+                    'boundaries', boundary_hits,
+                    'purpose_kind', p_params->>'purpose_kind',
+                    'purpose_reference', p_params->>'purpose_reference',
+                    'urgency', COALESCE(p_params->>'urgency', 'normal'),
+                    'target_id', p_params->>'target_id',
+                    'target_channel', p_params->>'platform',
+                    'delivery_mode', 'direct'
                 )
             );
             outbox_messages := outbox_messages || jsonb_build_array(queued_call);

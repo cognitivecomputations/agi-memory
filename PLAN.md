@@ -204,6 +204,15 @@ every row.
    and says so. An assistant that flags its own weak ground is more useful than one
    that sounds equally confident about everything.
 
+**Shipped 2026-08-28.** Memory and document tools now carry DB-generated citation
+envelopes through every channel presentation. The conversation contract requires
+exact citation IDs, the renderer produces linked expandable footnotes with locators
+and a live low-trust warning, and the memory/document pages open the cited record.
+Source normalization preserves complete locator-bearing provenance and derives
+kind-specific trust from `memory.source_trust_defaults`; the legacy default plateau
+was conservatively migrated into varied document and inference trust rather than
+presented as meaningful precision.
+
 **Effort:** ~1 week. **Demo value:** the highest in this document. Thirty seconds,
 unanswerable by any competitor.
 
@@ -244,6 +253,14 @@ costs. The detection is built. **What is missing is that nobody is ever told.**
 4. **Show the ledger.** A view in the dashboard: contradictions found, resolved, and
    accepted-as-tension. This is the proof that the thing is working.
 
+**Shipped 2026-08-28.** New semantic/worldview memories enter a durable daily queue
+and are compared only with DB-selected same-topic candidates. Confidence-gated cases
+flow into one inert ledger from both the batch detector and the subconscious path.
+The daily digest, Conversation inbox, verified private-channel code replies, and
+Contradictions page expose three operator choices. Winner decisions use
+`record_supersession()` to close the loser's validity window without deleting it;
+contextual tension retains both. Heartbeats can surface a case but cannot choose.
+
 **Effort:** ~1 week, most of it surfacing. **Strategic value:** the highest here.
 
 ### S4.3 "What did you know, and when?"
@@ -261,6 +278,16 @@ An agent that can answer this is doing something no file-backed competitor can a
 It is also the natural payoff of §S4.2: every resolved contradiction deepens the record
 instead of overwriting it.
 
+**Shipped 2026-08-28.** Temporal language in conversation now cues two DB-owned,
+agent-facing tools: `recall_at_time` reconstructs the validity, confidence, trust,
+and citable provenance that existed at one instant; `diff_memory_history` compares
+two instants and joins additions/expirations to supersession, evidence-revision,
+and contradiction-decision reasons. Reverted supersessions and inactive legacy or
+imported rows preserve only their real historical windows, group contexts retain
+the private-memory wall, and embedding failure degrades visibly to lexical recall.
+The Memory history dashboard exposes the same snapshot and comparison journey
+without requiring tool names, including direct links to the underlying memories.
+
 **Effort:** ~3 days, and it is nearly free once §S4.2 writes `valid_until` correctly.
 
 ### S4.4 Your mind is a file
@@ -275,6 +302,16 @@ headline.
 Make it a first-class flow: `hexis backup` already exists; add `hexis export --mind`,
 document the format, and demonstrate a mind moving from one machine to another and
 waking up continuous. Publish the schema. Invite other projects to import it.
+
+**Shipped 2026-08-28.** `hexis export --mind` now produces a complete private HMX
+port file under the user's Hexis home, with protected state, private memories,
+in-flight work, and audit history included and partial/redacted presets rejected.
+`hexis import FILE --mind` retains dry-run and exact-intent confirmation, accepts
+only the empty-target additive journey, and refuses silent replacement. After the
+transaction it proves source-lineage continuity plus semantic equality across all
+six constitutional sections while retaining exact transport digests for audit.
+The public HMX 1.7 schema, reference, CLI contract, and end-to-end transfer guide
+make the format inspectable and independently implementable.
 
 **Effort:** ~3 days of packaging on top of what ships. **Marketing value:**
 disproportionate.
@@ -296,6 +333,16 @@ This is the compounding loop Hermes advertises, with the trust property they can
 offer: you saw every change before it took. It also feeds §S4.2 — a correction here is
 a contradiction resolution.
 
+**Shipped 2026-08-28.** The existing opt-in, seven-day cross-session reviewer now
+lets the model decide whether enough meaningful change exists, but it may select
+only database-supplied memory IDs. One outbox digest and Learning review page show
+truth-derived semantic beliefs, procedures, strategies, and skill proposals with
+their evidence. Every item accepts approve, correct, or forget in place or through
+an exact verified-operator channel reply. Semantic corrections create a new
+bitemporal version and resolve through the contradiction ledger; protected
+forgetting requires a second confirmation. Approved skills enter the existing
+ownership-checked authoring path and retain visible retry state on failure.
+
 **Effort:** ~4 days on top of the existing background review.
 
 ### S4.6 Forgetting well
@@ -313,6 +360,18 @@ compressed. *"I remember what matters and I can tell you what I let go"* is a st
 claim than *"I remember everything,"* and it is the honest description of how memory
 actually has to work at scale.
 
+**Shipped 2026-08-28.** Memory pressure, candidate groups, low-fidelity
+reconstructions, pending load-bearing choices, and recoverable archives now share
+one database-owned Observe/UI packet and a first-class Forgetting page. A bounded
+outbox digest asks for keep, journal, or release; exact verified-operator channel
+replies and the dashboard complete the choice in place. Pending reviews never
+expire into a decision, and a database trigger prevents legacy heartbeat actions
+from releasing or journaling them. Completed gists emit receipts from the actual
+stored source IDs, source count, summary, and fidelity. Full source memories archive
+recoverably by default; irreversible grace-window/capacity pruning is a separate
+explicit opt-in and remains off. Migration 0236 upgrades live brains without data
+loss, while CLI status/dry-run and the public guide expose the whole journey.
+
 **Effort:** mostly already built; ~3 days to surface.
 
 ### S4.7 Define the measure
@@ -321,6 +380,17 @@ actually has to work at scale.
 detection, recall at six months, cross-session continuity, resistance to stale
 beliefs — run every agent on it, and publish the results *including where Hexis
 loses*.
+
+**Shipped 2026-08-28.** The public v1 corpus contains 25 timestamped synthetic cases,
+five for each named axis, with version-pinned SHA-256, JSON schemas, strict validation,
+judge-free scoring, rollback-isolated Hexis execution, and a gold-free command adapter
+for any other agent. Every registered local system was run: the official one-shot
+Hexis run scored 96.33, an append-only transcript baseline 82.33, and a recent 30-day
+window 32.00. The published case-level result retains Hexis's two misses—a dropped
+corroborating citation and a detector-to-answer handoff that omitted one side of an
+allergen conflict. No unrun
+third-party product is assigned a number. A higher 98.33 development pilot is
+disclosed as classifier variance, not selected as the headline score.
 
 Whoever defines the benchmark shapes what "best" means. This is the one axis where
 Hexis wins today, and the cheapest credibility available. Losing honestly on two axes
@@ -777,7 +847,16 @@ operator approves it — through the same decision surface as everything else. A
 that can run host commands is the most dangerous thing in the system; it gets the
 strictest consent.
 
-**Effort:** ~1 week for the daemon, pairing, and `system.*` + `notifications.*`.
+**Shipped 2026-08-28.** `hexis node` now owns the complete headless journey:
+mode-0600 Ed25519 device identity, exact-fingerprint pairing in the shared inbox or
+CLI, an outward-only WebSocket with single-session ownership and signed durable
+results, irreversible revocation, a locally pinned direct-argv command allowlist,
+and bounded `system.run` plus `screen.capture`. Every agent invocation still passes
+through the normal approval gate. Captures enter the DB-owned turn as model-visible
+image context without leaking their base64 bytes into ordinary tool text. The CLI,
+FastAPI surface, host-node skill, operational runbook, live migration, and a real
+challenge → approval → connected smoke journey ship together. `audio.*` remains
+deliberately deferred to the wake-word work in §5.4.
 
 ## 4. Everyday-life skills — point the skill surface outward
 
@@ -802,9 +881,25 @@ reason about its own belief revisions and cannot add milk to your reminders.
 - **Wave B — API-backed tools.** Notion, Spotify, Home Assistant, weather, Trello.
   Each is a `ToolHandler` in `core/tools/` plus a connector-setup flow of the kind
   `services/connector_setup.py` already runs for Gmail.
+  **Shipped 2026-08-28:** all five use DB-owned capability manifests and one
+  guided setup surface across chat, CLI, MCP, and the Connections page. Notion,
+  Home Assistant, and Trello persist only user-selected environment-variable
+  names; Spotify uses Authorization Code + PKCE with private mode-0600 token
+  storage; Open-Meteo weather needs no key. Catalog/state reads are bounded and
+  parallel-safe, while every provider-state change remains approval-gated and
+  mapped into connector action authorization. Migration 0227 preserves existing
+  data and seeds the same manifests into live and fresh databases.
 - **Wave C — needs the node (§3b).** Apple Reminders/Notes/Calendar via `osascript`,
   1Password CLI, Shortcuts, screenshots. Filesystem-backed ones (Obsidian, Bear) work
   today if the vault is mounted — do those in Wave A.
+  **Shipped 2026-08-28:** six approval-gated tools now cover fixed-script Apple
+  Reminders, Notes, and Calendar operations, exact-name Shortcuts, screenshots,
+  allowlisted commands, and secret-safe 1Password. Capabilities are derived from
+  executables on the node and any addition re-enters exact pairing approval.
+  1Password listing is metadata-only; field copy stays on the Mac clipboard and
+  sends only a receipt through the gateway. Migration 0237, the host-node skill,
+  operator runbook, injection/secret regression tests, and compiled JXA programs
+  ship with the runtime.
 
 **Effort:** Wave A ~2 days. Wave B ~1 day per integration. Wave C follows §3.
 
@@ -826,10 +921,26 @@ in the tree is `services/ingest/readers.py`, for ingesting audio *files*. Grep f
    reuses the same endpoint for in-app capture via `getUserMedia`.
 2. **`speak` tool** — TTS out, following the `embeddinggemma` sidecar precedent: a
    self-published binary, no third-party runtime. See `docs/operations/embeddings.md`
-   for the shape this should take.
+   for the shape this should take. **Shipped 2026-08-28:** the chat-only tool,
+   PWA/API audio path, and optional Piper HTTP sidecar share one bounded local-only
+   synthesis service. Setup derives its model from live DB configuration, records
+   exact mode-0600 process ownership, refuses remote/credential-bearing endpoints,
+   and never adopts or stops an ambient provider. Audits contain metadata only;
+   tool audio is opaque, uncached, and expiring.
 3. **Talk mode** — continuous listen/respond. Foreground-only in the PWA (§3a),
    which is enough for a conversation you started; always-on needs the node (§3b).
+   **Shipped 2026-08-28:** explicit per-session start/stop, real provider gating,
+   foreground visibility shutdown, calibrated voice activity/silence segmentation,
+   bounded utterances, mic release during thought/playback, manual send, written
+   transcript retention, and in-place pause/recovery.
 4. **Wake word** — needs the node, always-on, last, and only once 1–3 are solid.
+   **Shipped 2026-08-28:** explicitly configured openWakeWord/custom-model
+   detection stays on a paired outward-only node; the post-cue utterance is WAV/
+   size/hash/signature bounded and reuses the selected STT, canonical chat, and
+   local TTS paths. `audio.wake` capability additions require a fresh pairing
+   approval, the server gate defaults off, microphone capture closes during
+   thought/playback, pretrained model licensing is explicit, and the append-only
+   audit contains only counts/outcomes—not audio or conversation text.
 
 **Effort:** step 1 ~2 days. Steps 2–4 are each roughly a week and gated on §3.
 
@@ -867,6 +978,12 @@ mode.
    Python by design. Install them as launchd/systemd user services from the same uv
    tool that installs the CLI. This removes the worker image from the critical path
    entirely and matches how both competitors stay alive.
+   **Shipped 2026-08-28:** `hexis service` now installs, inspects, controls,
+   logs, and removes per-user launchd/systemd units using the current uv-owned
+   Python. Units retain only an explicit env-file reference and optional instance,
+   never copied secrets. Docker-to-host migration is explicit and fail-safe; stack,
+   init, reset, upgrade, UI, and uninstall paths derive one worker owner and avoid
+   duplicate containers. Linux lingering remains an explicit user choice.
 
 **Effort:** step 1 an afternoon, step 2 ~2 days, step 3 ~1 week.
 
@@ -881,6 +998,17 @@ container, on one machine.
 **Build.** An execution-backend abstraction behind the existing tools, so the tool
 contract does not change: `local` (today), then `ssh`, then `docker-remote`. Modal and
 Daytona only if someone asks.
+
+**Shipped 2026-08-28.** `shell`, `safe_shell`, `run_script`, and `execute_code`
+now resolve one live database-owned profile without changing their public input
+schemas. Local remains the default; SSH pins an exact identity and known-hosts
+file, enforces timeout on the target process group, and maps workspace-relative
+scripts without copying them. Remote Docker accepts only SSH transport, creates
+one labeled ephemeral container per call, never pulls implicitly, defaults to no
+network, removes only its exact owned container on timeout, and hibernates REPL
+state in a named volume. Read-only status, explicit test/select/remove journeys,
+bounded output/state retention, and fail-closed no-local-fallback behavior make
+placement visible and explicitly selectable. Modal and Daytona remain demand-gated as planned.
 
 **Priority: last.** It is the largest piece of work here and the one fewest users will
 notice. Listed for completeness, not urgency.
@@ -913,6 +1041,16 @@ with — *talk to it from Telegram while it works on a cloud VM*.
    a *Gateway exposure runbook*. Hexis wants the pairing half — device approval for
    nodes and PWA installs (§3a, §3b) — plus a `hexis doctor` check that fails loudly
    on a risky configuration.
+
+**Shipped 2026-08-28.** `hexis tunnel` now derives the dashboard port and live
+Tailscale identity, starts the local stack before making any network change, and
+owns only the exact tailnet-only root Serve handler it created. It refuses public
+binds, Funnel, unrelated handlers, stale ownership, and unreadable provider state;
+`stop` preserves ambient routes and local data. `hexis doctor` independently fails
+on public exposure even when PostgreSQL is unavailable. The PWA boundary is explicit
+tailnet device approval, while command-capable companion nodes retain their separate
+signed fingerprint approval and revocation flow. The HTTPS runbook covers the whole
+phone install, push, microphone, verification, and recovery journey.
 
 **There is no step 4, and this is a permanent constraint rather than a backlog item.**
 API-key authentication is a **Hexis Pro** feature; **OSS has no auth layer and is not
@@ -970,7 +1108,7 @@ tool. One way to do a thing, and it works.
 source scan is exactly what produced the wrong count. A handler that dislikes the
 probe's parameters still counts as a handler; only `Unknown action` fails.
 
-### 9.2 Energy saturates and the surplus is destroyed
+### 9.2 Energy saturates and the surplus is destroyed · *fixed 2026-08-28*
 
 `base_regeneration = 10`, `max_energy = 20`, interval 60 minutes. **Energy is full
 after two hours.** An agent idle overnight wakes at 20, exactly as if it had rested
@@ -981,39 +1119,69 @@ so **no ambition spanning more than one beat is representable.** The most expens
 thing the agent can conceive of is `inquire_deep` twice. An economy shaped like this
 can only express errands.
 
-**Fix:** let energy bank past the cap with decay, or introduce a project that draws
-down across several beats. *~2 days, and it is what makes long-horizon autonomy
-possible at all.*
+**Resolution:** energy now regenerates by actual elapsed time into an auditable bank,
+not by one fixed increment per worker tick. The default bank is three normal reserves
+(`heartbeat.energy_bank_multiplier = 3`); energy above the normal reserve decays with
+a configurable 12-hour half-life, so an idle night matters without creating an
+unbounded stockpile. Upgrade seeding derives `last_regenerated_at` from the live last
+heartbeat timestamp, preventing a migration-time windfall.
 
-### 9.3 Regeneration is time-based, so nothing rewards usefulness
+The agentic planner may spend at most one normal reserve on an ordinary beat and up
+to two when the live context contains actionable backlog, always bounded by the
+actual bank. Agentic tool receipts are charged exactly once at finalization; the
+legacy path keeps its existing per-action deductions. CLI, TUI, API, and dashboard
+surfaces derive both reserve and capacity from `heartbeat_economy_status()` rather
+than assuming that `max_energy` is still a hard cap. Implemented in migration 0225
+with baseline parity and rollback-safe coverage in
+`tests/db/test_heartbeat_economy.py`.
+
+### 9.3 Regeneration is time-based, so nothing rewards usefulness · *fixed 2026-08-28*
 
 +10/hr whether the last beat resolved a contradiction or picked `observe` and went back
 to sleep. The budget constrains *volume* and never steers toward *value* — and `rest`
 (cost 0) competes against thirty-four ways to look busy.
 
-**Fix:** couple some fraction of regen, or the cap, to outcomes — a beat that produced
-a durable memory, resolved a contradiction, or was thanked by the user regenerates
-better than one that did not. *~2 days, and it turns energy from a rate limit into a
-gradient.*
+**Resolution:** every beat now has a durable outcome ledger. Exact tool receipts and
+legacy action results record bounded, idempotent signals for durable memories,
+contradictions resolved, goals advanced, tool success/failure, and proactive contact.
+The value score is deliberately narrow: up to two durable memories add 0.35 each,
+two contradiction resolutions add 0.5 each, and two completed goals add 0.3 each.
+Merely sending a proactive message earns nothing.
 
-### 9.4 Fixed cadence ignores state it already computes
+The next regeneration multiplier is `0.75 + outcome_score * 0.5`, capped at 1.5 by
+default. Explicit appreciation can add 0.5 only when it comes from the verified
+operator within 24 hours of a completed proactive beat, and only once for that beat;
+ambient channel identity and generic positive language cannot mint reward. This
+makes usefulness a gradient while keeping all credit traceable to stored evidence.
+
+### 9.4 Fixed cadence ignores state it already computes · *fixed 2026-08-28*
 
 Every beat costs the same LLM call at 3am with nothing pending as at 9am after forty
 unread messages land. `urgency_ratio` and `urgent_drives` are **already assembled into
 the heartbeat context** and are not consulted when scheduling the next beat.
 
-**Fix:** modulate `next_heartbeat_at` by the urgency already computed. Cheaper and more
-relevant, with the inputs sitting in the same object. *~1 day.*
+**Resolution:** finalization now derives `next_heartbeat_at` from the existing maximum
+drive urgency ratio. With the default 60-minute base, quiet state stretches toward a
+90-minute idle cadence, urgency shortens it, and configurable 15/120-minute bounds
+prevent thrashing or starvation. `should_run_heartbeat()` honors that persisted due
+time, while interval `0` retains the explicit always-due development behavior.
+
+Migration 0225 was exercised on the live database with a rollback-only journey: two
+elapsed hours banked energy from 20 to 40 under a capacity of 60, a durable outcome
+scored 0.35 as `useful`, exact spend was deducted, live drive urgency selected a
+25.7-minute next cadence, and rollback left no smoke outcome behind.
 
 ### 9.5 Near-synonymous actions
 
 `contemplate`, `meditate`, `study`, `debate_internally`, `reflect` — five ways to think,
 chosen from one flat list. It is doubtful the model distinguishes them reliably.
 
-Three of the five are dead per §9.1, so this partly resolves itself: implement what is
-genuinely distinguishable and delete the rest. **Now that beats are running, this is
-measurable** — log the action distribution, and any action never chosen in a hundred
-beats is answering the question for us. *~1 day, after §9.1.*
+**Corrected 2026-08-28.** None of these five is dead; §9.1's executable audit proved
+the four multi-literal actions were hidden by the original source grep, and `reflect`
+was already a tool. The agentic heartbeat has since removed the flat action-choice
+layer entirely (§9.6): it selects skills and calls tools. `run_council` now provides
+the genuinely distinct, durable deliberative act, while the legacy enum remains only
+for compatibility and is covered by the execute-every-action assertion.
 
 ### 9.6 Two gates that do not know about each other
 
@@ -1027,6 +1195,15 @@ coincidental.
 **Fix:** derive the heartbeat's allowed tool set from the *chosen action*, not from
 lexical overlap on a serialized context. An action is a far better predictor of the
 tools a beat needs than a JSON dump is. *~2 days, and it depends on Tier 0.*
+
+**Shipped 2026-08-28 — reconciled by removing the second action gate.** The agentic
+heartbeat no longer chooses a typed JSON action and then discovers a separately
+selected tool surface. Its actions are tool calls. The initial surface comes from the
+same embedding-based skill selector used by chat, `use_skill` expands that exact
+surface during the turn, and `AgentLoop` enforces the expanded set before dispatch.
+The heartbeat prompt explicitly forbids JSON action plans. The legacy typed-action
+path remains isolated from registry tools and is covered by the executable
+all-actions test, so neither runtime has two authorities that can disagree.
 
 ## 10. Communication cadence — contact points and the permission slip
 
@@ -1075,6 +1252,16 @@ see §10.4.
 (§11.4·6) already implements operator detection, trigger words, allowlists, drop rules
 and ambiguity flagging, with all of the policy in PL/pgSQL — which is where this plan
 wants it anyway.
+
+**Shipped (0221/0222).** The port covers all seven OSS adapters. Adapters retain only
+transport and self-echo checks; Postgres derives identity and the live per-channel
+allowlists, then records one engage/observe/wake/drop decision. Observe/wake messages
+enter the canonical `channel_messages` source-artifact path without an unsolicited
+reply. Ambiguous operator turns use the configured Hexis LLM only as a thin, fail-open
+bridge, and cannot exceed the SQL allowlist/operator ceiling. Correction wakes respect
+pause and active-heartbeat state and expire after a bounded interval so stale sync does
+not wake the agent. The runtime switch defaults off and can change without restarting
+the channel worker.
 
 Implementation: the purpose is a required, recorded field on the outbound action —
 not a prompt convention. `reach_out_user` and `reach_out_public` take
@@ -1187,6 +1374,13 @@ not use it.
 arrives from a user turn. Until that flag is trustworthy, the permission slip cannot be
 implemented, because the system cannot tell whose idea something was. *~1 day, and it is
 a prerequisite for everything in §10.4.*
+
+**Shipped (0219/0220).** Goals now carry typed `memories.goal_origin`. Tool execution
+maps authenticated chat, heartbeat, and MCP surfaces to `user_request`, `derived`, and
+`external`; model-authored `metadata.source` is descriptive only and cannot grant the
+permission slip. Existing initialization goals were backfilled as user assignments,
+raw inserts default conservatively to `derived`, and a later direct user assignment
+upgrades an otherwise-identical autonomous goal without allowing downgrades.
 
 **The resulting shape** is a clean sentence the agent can be told and a user can
 understand:
@@ -1449,12 +1643,16 @@ plan found by hand.
    rather than hidden magic. **Port the idea, not the line count** — 791 lines is sized
    for his fleet; this tree needs a fraction of it.
 
-9. **`deliberation.py`** *(strip deps first)*
-   *Person Test.* `debate_internally` is a heartbeat action that is priced, offered,
-   and **unimplemented** (§9.1). Internal dialectic is a real mental act, and this
-   would give a dead action a body. Also the nearest thing to a reason for `run_council`
-   to exist. Requires clean-rooming away from `independence_engine`, `prediction_journal`
-   and `fragility`.
+9. **~~`deliberation.py`~~ — shipped clean-room 2026-08-28.**
+   *Person Test.* Internal dialectic is a real mental act and gives `run_council` a
+   durable body. Migration 0226 adds DB-owned sessions, ordered moves, verdicts,
+   evidence IDs, missing evidence, dissent, and observable review conditions. The
+   service runs bounded parallel perspectives, one adversarial challenge pass, and
+   one structured synthesis; degraded and failed runs remain inspectable, and only a
+   fully successful grounded run may create a concise episodic summary. The subsystem
+   is advisory: it never authorizes, blocks, or executes an action. The implementation
+   was written from the behavioral requirement and has no dependency on excluded
+   fork architecture.
 
 ### 11.5 The gap this exists to close
 
@@ -1551,19 +1749,19 @@ than a desktop app with no auth layer. **Twelve are still live**, and five of th
 belong in this plan rather than in a separate list, because they intersect work
 already scheduled here.
 
-### 12.1 `execute_code` is unsandboxed with no gate — the one live P0
+### 12.1 `execute_code` is gated; containment remains explicitly deferred
 
-`core/tools/code_execution.py:86` declares `requires_approval=False`, and the DB
-catalog agrees. Combined with §11.5 — the approval gate is skipped entirely when no
-callback is supplied — this is arbitrary code execution inside the autonomous loop
-with **neither a sandbox nor a gate**.
+`execute_code` originally declared `requires_approval=False`, while the approval
+gate was skipped entirely when no callback was supplied. That combination allowed
+arbitrary code execution inside the autonomous loop with neither containment nor a
+working consent boundary.
 
-The §11.5 fail-closed change does not fix this on its own, because the flag is
-`False`: there is nothing for a working gate to catch. Both halves are needed —
-`requires_approval=True`, *and* an execution sandbox.
+**Gate shipped.** The tool and DB catalog now require approval, and §11.5 fails
+closed when no person is available to answer. The remaining execution sandbox is
+still owed in the product roadmap, but was explicitly excluded from this execution
+sequence; approval is a consent boundary, not containment.
 
-**This is the highest-severity live item in either document** and it belongs above
-everything in the sequencing except the fail-closed one-liner it depends on.
+The sandbox remains the highest-severity deferred item in either document.
 
 ### 12.2 The agent must know who it is speaking with
 
@@ -1643,8 +1841,12 @@ the sentence being sent — not as a memory column.
 
 ### 12.3 Three findings that are the same pattern this plan keeps naming
 
-- **P0-7** — `core/migrations.py:243` computes a migration checksum and `:251` stores
-  it. **Nothing ever compares it.** Nine had already drifted at audit time.
+- **P0-7 — fixed 2026-08-28.** The migration runner now compares every applied
+  file with its recorded SHA-256 after the locked migration pass. Startup fails
+  loudly with the exact versions and hashes, while `hexis migrate --status` exposes
+  drift without mutating anything. Migration 0238 records the three bounded
+  pre-publication reconciliations that existed in the development database before
+  enforcement, so no historical edit is hidden.
 - **P1-1 — fixed 2026-08-23.** Chat, TUI, CLI chat, manual heartbeats, and worker
   heartbeats now build `create_full_registry`, so plugin and persisted dynamic tools
   reach the agent itself. The continuous capability probe measures the resulting
@@ -1826,6 +2028,15 @@ would have caught.*
 
 **B. Connector cognition → the LLM path becomes the path.** *Mostly a config flip.*
 
+> **Shipped 2026-08-27.** Successful model verdicts are now authoritative,
+> including an explicit empty claim set or a score below what the old rules would
+> have chosen. Rules run only when cognition is disabled, unavailable, missing, or
+> invalid, and stored detector versions distinguish `llm`, `llm_cache`, and
+> `rules_fallback`. Both verdict types use a DB-owned `content_hash` cache; only LLM
+> results are cached, so an outage fallback cannot become sticky. Free-text
+> importance keyword lists—including the ambient-monitor bypass—are gone; fallback
+> reads only structured provider priority (0218).
+
 `extract_user_model_claims_llm` and `estimate_connector_item_importance_llm` already
 exist, dispatched by `connector.user_model_mode` (`rules` | `llm` | `hybrid`) and
 `connector.user_model_llm_enabled`. The architecture is built; the rules are running
@@ -1914,6 +2125,13 @@ never by array position. Then:
 
 **C. Appraisal emits families.** So consumers read a field rather than pattern-match
 a label. *~half a day.*
+
+> **Shipped 2026-08-27.** The live `emotion.families` config is supplied to the
+> subconscious appraisal, which emits a canonical `family` alongside its expressive
+> `primary_emotion`. SQL validates the family without guessing from the label and
+> preserves it through affect and turn-memory context. Continuity pressure, social
+> reward, and relationship injury now consume config-owned family sets; the old
+> fear/positive/hostile label matching is no longer on the live path (0217).
 
 **D. Port `heartbeat_intent_classifier`** from Alex's fork (§11) — its own docstring
 says it *"replaces the keyword-based trading-intent pre-allocator."* Same disease,

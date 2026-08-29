@@ -40,6 +40,43 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# These handlers perform a person-facing network effect in the OSS runtime.
+# Registration fails if one loses its descriptor: a new/renamed provider send
+# must update this inventory and declare its shape before it can start.
+_NETWORK_MESSAGING_TOOL_NAMES = frozenset(
+    {
+        "discord_send",
+        "slack_send",
+        "telegram_send",
+        "signal_send",
+        "email_send",
+        "email_send_sendgrid",
+        "gmail_send",
+        "gmail_reply",
+        "twitter_x_post",
+        "twitter_x_reply",
+        "twitter_x_dm_send",
+        "queue_user_message",
+    }
+)
+
+
+def _requires_outbound_descriptor(spec: ToolSpec) -> bool:
+    """Recognize provider sends, including future category additions.
+
+    The explicit inventory catches special names such as queue_user_message.
+    The shape check makes adding another send/reply/post handler in either
+    person-facing category fail at startup until its transport is declared.
+    """
+    if spec.name in _NETWORK_MESSAGING_TOOL_NAMES:
+        return True
+    return (
+        not spec.is_read_only
+        and spec.category in {ToolCategory.EMAIL, ToolCategory.MESSAGING}
+        and spec.name.endswith(("_send", "_reply", "_post"))
+    )
+
+
 @dataclass
 class ExecutionStats:
     """Statistics for tool execution."""
@@ -107,7 +144,12 @@ class ToolRegistry:
 
     def register(self, handler: ToolHandler) -> None:
         """Register a tool handler."""
-        name = handler.spec.name
+        spec = handler.spec
+        name = spec.name
+        if _requires_outbound_descriptor(spec) and spec.outbound is None:
+            raise ValueError(
+                f"Network messaging tool {name!r} must declare ToolSpec.outbound"
+            )
         if name in self._handlers:
             logger.warning(f"Overwriting existing handler for tool: {name}")
         self._handlers[name] = handler
@@ -133,7 +175,12 @@ class ToolRegistry:
 
     def register_mcp(self, handler: ToolHandler) -> None:
         """Register an MCP tool handler."""
-        name = handler.spec.name
+        spec = handler.spec
+        name = spec.name
+        if _requires_outbound_descriptor(spec) and spec.outbound is None:
+            raise ValueError(
+                f"Network messaging tool {name!r} must declare ToolSpec.outbound"
+            )
         if name in self._mcp_handlers:
             logger.warning(f"Overwriting existing MCP handler: {name}")
         self._mcp_handlers[name] = handler
@@ -182,10 +229,15 @@ class ToolRegistry:
                 "optional": spec.optional,
                 "allowed_contexts": [ctx.value for ctx in spec.allowed_contexts],
                 "execution_kind": "python_driver",
+                "metadata": (
+                    {"outbound": spec.outbound.to_dict()}
+                    if spec.outbound is not None
+                    else {}
+                ),
             }
             if spec.name in mcp_names:
                 # Transport truth in the DB catalog (#41).
-                entry["metadata"] = {
+                entry["metadata"] = entry["metadata"] | {
                     "transport": "mcp",
                     "server": getattr(handler, "_server_name", None),
                 }
@@ -211,7 +263,10 @@ class ToolRegistry:
                 )
             self._catalog_dirty = False
         except Exception:
-            logger.debug("Failed to sync DB tool catalog; using in-process registry", exc_info=True)
+            logger.debug(
+                "Failed to sync DB tool catalog; using in-process registry",
+                exc_info=True,
+            )
 
     async def get_config(self, force_refresh: bool = False) -> ToolsConfig:
         """Get cached or fresh configuration."""
@@ -239,7 +294,9 @@ class ToolRegistry:
         for handler in self.list_all():
             spec = handler.spec
             # Skip optional tools unless explicitly allowlisted
-            if spec.optional and not config.is_optional_allowed(spec.name, spec.category):
+            if spec.optional and not config.is_optional_allowed(
+                spec.name, spec.category
+            ):
                 continue
             if config.is_tool_enabled_for_context(spec.name, spec.category, context):
                 if context in spec.allowed_contexts:
@@ -256,12 +313,17 @@ class ToolRegistry:
         await self.sync_tool_catalog()
         try:
             async with self.pool.acquire() as conn:
-                raw = await conn.fetchval("SELECT get_tool_specs_for_context($1::text)", context.value)
+                raw = await conn.fetchval(
+                    "SELECT get_tool_specs_for_context($1::text)", context.value
+                )
             specs = json.loads(raw) if isinstance(raw, str) else raw
             if isinstance(specs, list):
                 return specs
         except Exception:
-            logger.debug("DB tool spec lookup failed; falling back to in-process specs", exc_info=True)
+            logger.debug(
+                "DB tool spec lookup failed; falling back to in-process specs",
+                exc_info=True,
+            )
         handlers = await self.get_enabled_tools(context, config)
         return [h.spec.to_openai_function() for h in handlers]
 
@@ -274,7 +336,9 @@ class ToolRegistry:
         await self.sync_tool_catalog()
         try:
             async with self.pool.acquire() as conn:
-                raw = await conn.fetchval("SELECT get_tool_specs_for_context($1::text)", context.value)
+                raw = await conn.fetchval(
+                    "SELECT get_tool_specs_for_context($1::text)", context.value
+                )
             specs = json.loads(raw) if isinstance(raw, str) else raw
             if isinstance(specs, list):
                 return [
@@ -287,7 +351,10 @@ class ToolRegistry:
                     if isinstance(item, dict) and item.get("function", {}).get("name")
                 ]
         except Exception:
-            logger.debug("DB MCP spec lookup failed; falling back to in-process specs", exc_info=True)
+            logger.debug(
+                "DB MCP spec lookup failed; falling back to in-process specs",
+                exc_info=True,
+            )
         handlers = await self.get_enabled_tools(context, config)
         return [h.spec.to_mcp_tool() for h in handlers]
 
@@ -305,6 +372,9 @@ class ToolRegistry:
             "heartbeat_id": context.heartbeat_id,
             "session_id": context.session_id,
             "energy_available": context.energy_available,
+            "action_approved": context.action_approved,
+            "approval_request_id": context.approval_request_id,
+            "approval_channel": context.approval_channel,
         }
         try:
             async with self.pool.acquire() as conn:
@@ -317,11 +387,26 @@ class ToolRegistry:
             decision = json.loads(raw) if isinstance(raw, str) else raw
             if isinstance(decision, dict):
                 if decision.get("allowed") is True:
-                    return True, None, int(decision.get("energy_cost", spec.energy_cost) or 0)
-                error_type = ToolErrorType(decision.get("error_type", ToolErrorType.EXECUTION_FAILED.value))
-                return False, ToolResult.error_result(decision.get("reason") or "Policy denied", error_type), 0
+                    return (
+                        True,
+                        None,
+                        int(decision.get("energy_cost", spec.energy_cost) or 0),
+                    )
+                error_type = ToolErrorType(
+                    decision.get("error_type", ToolErrorType.EXECUTION_FAILED.value)
+                )
+                return (
+                    False,
+                    ToolResult.error_result(
+                        decision.get("reason") or "Policy denied", error_type
+                    ),
+                    0,
+                )
         except Exception:
-            logger.debug("DB tool policy check failed; falling back to in-process policy", exc_info=True)
+            logger.debug(
+                "DB tool policy check failed; falling back to in-process policy",
+                exc_info=True,
+            )
 
         policy_result = await self._policy.check_all(
             spec=spec,
@@ -332,6 +417,28 @@ class ToolRegistry:
         if not policy_result.allowed:
             return False, policy_result.to_result(), 0
         return True, None, config.get_energy_cost(spec.name, spec.energy_cost)
+
+    async def preflight_outbound_controls(
+        self,
+        spec: ToolSpec,
+        arguments: dict[str, Any],
+    ) -> ToolResult | None:
+        """Return a refusal when STOP or a kill switch blocks a provider call.
+
+        AgentLoop invokes this before its approval gate. The complete outbound
+        authorization still runs again in ``execute`` immediately before the
+        handler, so control changes cannot race the preflight.
+        """
+        if spec.outbound is None:
+            return None
+        from services.outbound_safety import preflight_tool_outbound_controls
+
+        preparation = await preflight_tool_outbound_controls(
+            self.pool,
+            spec=spec.outbound,
+            arguments=arguments,
+        )
+        return None if preparation.allowed else preparation.error_result()
 
     # =========================================================================
     # Execution
@@ -422,35 +529,69 @@ class ToolRegistry:
         if hook_outcome.mutated_arguments is not None:
             arguments = hook_outcome.mutated_arguments
 
+        outbound_preparation = None
+        if spec.outbound is not None:
+            from services.outbound_safety import prepare_tool_outbound
+
+            outbound_preparation = await prepare_tool_outbound(
+                self.pool,
+                tool_name=tool_name,
+                spec=spec.outbound,
+                arguments=arguments,
+                context=context,
+            )
+            if not outbound_preparation.allowed:
+                result = outbound_preparation.error_result()
+                invocation.complete(result)
+                self._stats.record(tool_name, result)
+                logger.info("Outbound tool %s denied: %s", tool_name, result.error)
+                return result
+            arguments = outbound_preparation.arguments
+
         # Execute with timeout
         try:
             # Set registry reference in context for nested calls
             context.registry = self
 
-            result = await asyncio.wait_for(
-                handler.execute(arguments, context),
-                timeout=120.0,  # 2 minute default timeout
-            )
+            if spec.execution_timeout_seconds is None:
+                result = await handler.execute(arguments, context)
+            else:
+                result = await asyncio.wait_for(
+                    handler.execute(arguments, context),
+                    timeout=spec.execution_timeout_seconds,
+                )
 
             # Set energy spent from config (may override default)
             result.energy_spent = energy_cost
 
         except asyncio.TimeoutError:
             result = ToolResult.error_result(
-                "Tool execution timed out after 120 seconds",
+                f"Tool execution timed out after {spec.execution_timeout_seconds:g} seconds",
                 ToolErrorType.TIMEOUT,
             )
         except asyncio.CancelledError:
-            result = ToolResult.error_result(
-                "Tool execution was cancelled",
-                ToolErrorType.CANCELLED,
-            )
+            # Cancellation belongs to the containing turn (including Ctrl+C
+            # in the CLI). Swallowing it here makes the agent keep running
+            # after its caller has explicitly stopped waiting.
+            raise
         except Exception as e:
             logger.exception(f"Error executing tool {tool_name}")
             result = ToolResult.error_result(
                 str(e),
                 ToolErrorType.EXECUTION_FAILED,
             )
+
+        if outbound_preparation is not None:
+            try:
+                from services.outbound_safety import finalize_tool_outbound
+
+                await finalize_tool_outbound(self.pool, outbound_preparation, result)
+            except Exception as exc:
+                # The provider effect may already have happened.  Never turn a
+                # successful send into an automatic retry; surface the audit
+                # failure on the result and in logs instead.
+                logger.exception("Failed to finalize outbound ledger for %s", tool_name)
+                result.metadata["outbound_ledger_error"] = str(exc)
 
         invocation.complete(result)
         self._stats.record(tool_name, result)
@@ -505,6 +646,10 @@ class ToolRegistry:
                     call_id=str(uuid.uuid4()),
                     heartbeat_id=context.heartbeat_id,
                     session_id=context.session_id,
+                    is_group=context.is_group,
+                    is_operator=context.is_operator,
+                    surface=context.surface,
+                    event_callback=context.event_callback,
                     energy_available=context.energy_available,
                     workspace_path=context.workspace_path,
                     allow_network=context.allow_network,
@@ -531,14 +676,21 @@ class ToolRegistry:
 
         if budgeting:
             remaining = int(context.energy_available or 0)
-            max_per_tool = config.get_context_overrides(ToolContext.HEARTBEAT).max_energy_per_tool
+            max_per_tool = config.get_context_overrides(
+                ToolContext.HEARTBEAT
+            ).max_energy_per_tool
 
             for idx, (tool_name, _) in enumerate(calls):
                 handler = self.get(tool_name)
                 cost = 0
                 if handler:
                     spec = handler.spec
-                    if config.is_tool_enabled_for_context(spec.name, spec.category, context.tool_context) and context.tool_context in spec.allowed_contexts:
+                    if (
+                        config.is_tool_enabled_for_context(
+                            spec.name, spec.category, context.tool_context
+                        )
+                        and context.tool_context in spec.allowed_contexts
+                    ):
                         cost = config.get_energy_cost(tool_name, spec.energy_cost)
 
                 energy_budget[idx] = cost
@@ -548,7 +700,9 @@ class ToolRegistry:
                     )
                     continue
                 if cost > remaining:
-                    denied_reasons[idx] = f"Insufficient energy: need {cost}, have {remaining}"
+                    denied_reasons[idx] = (
+                        f"Insufficient energy: need {cost}, have {remaining}"
+                    )
                     continue
                 remaining -= cost
 
@@ -579,7 +733,10 @@ class ToolRegistry:
 
         # Run parallel calls concurrently
         if parallel_calls:
-            async def run_one(idx: int, name: str, args: dict) -> tuple[int, ToolResult]:
+
+            async def run_one(
+                idx: int, name: str, args: dict
+            ) -> tuple[int, ToolResult]:
                 energy_available = context.energy_available
                 if budgeting:
                     energy_available = energy_budget.get(idx, 0)
@@ -588,6 +745,10 @@ class ToolRegistry:
                     call_id=str(uuid.uuid4()),
                     heartbeat_id=context.heartbeat_id,
                     session_id=context.session_id,
+                    is_group=context.is_group,
+                    is_operator=context.is_operator,
+                    surface=context.surface,
+                    event_callback=context.event_callback,
                     energy_available=energy_available,
                     workspace_path=context.workspace_path,
                     allow_network=context.allow_network,
@@ -613,6 +774,10 @@ class ToolRegistry:
                 call_id=str(uuid.uuid4()),
                 heartbeat_id=context.heartbeat_id,
                 session_id=context.session_id,
+                is_group=context.is_group,
+                is_operator=context.is_operator,
+                surface=context.surface,
+                event_callback=context.event_callback,
                 energy_available=energy_available,
                 workspace_path=context.workspace_path,
                 allow_network=context.allow_network,
@@ -718,6 +883,7 @@ def create_default_registry(pool: "asyncpg.Pool") -> ToolRegistry:
     from .image_gen import create_image_gen_tools
     from .usage_query import create_usage_tools
     from .integrations import create_integration_tools
+    from .life_integrations import create_life_integration_tools
     from .brave_search import create_brave_search_tools
     from .firecrawl import create_firecrawl_tools
     from .council import create_council_tools
@@ -726,6 +892,10 @@ def create_default_registry(pool: "asyncpg.Pool") -> ToolRegistry:
     from .self_inspection import create_self_inspection_tools
     from .self_repair import create_self_repair_tools
     from .resources import create_resource_tools
+    from .questions import create_question_tools
+    from .local_audio_analysis import create_local_audio_analysis_tools
+    from .nodes import create_node_tools
+    from .speech import create_speech_tools
     from .skills import create_skill_tools
     from .hooks import AuditTrailHook
 
@@ -736,6 +906,7 @@ def create_default_registry(pool: "asyncpg.Pool") -> ToolRegistry:
                 if value:
                     return value
             return None
+
         return _resolve
 
     def _json_env_resolver(*names: str):
@@ -748,10 +919,13 @@ def create_default_registry(pool: "asyncpg.Pool") -> ToolRegistry:
                 return parsed if isinstance(parsed, dict) else None
             except Exception:
                 return None
+
         return _resolve
 
     def _gmail_credentials_resolver() -> dict[str, Any] | None:
-        env_credentials = _json_env_resolver("GOOGLE_GMAIL_CREDENTIALS", "GOOGLE_CALENDAR_CREDENTIALS")()
+        env_credentials = _json_env_resolver(
+            "GOOGLE_GMAIL_CREDENTIALS", "GOOGLE_CALENDAR_CREDENTIALS"
+        )()
         if env_credentials:
             return env_credentials
         try:
@@ -773,18 +947,25 @@ def create_default_registry(pool: "asyncpg.Pool") -> ToolRegistry:
     builder.add_all(create_shell_tools())
     builder.add_all(create_code_execution_tools())
     builder.add_all(create_browser_tools())
-    builder.add_all(create_calendar_tools(
-        credentials_resolver=_json_env_resolver("GOOGLE_CALENDAR_CREDENTIALS", "GOOGLE_GMAIL_CREDENTIALS"),
-    ))
-    builder.add_all(create_email_tools(
-        smtp_config_resolver=_json_env_resolver("EMAIL_CONFIG"),
-        sendgrid_api_key_resolver=_env_resolver("SENDGRID_API_KEY"),
-        sendgrid_from_email=os.getenv("SENDGRID_FROM_EMAIL"),
-        gmail_credentials_resolver=_gmail_credentials_resolver,
-    ))
+    builder.add_all(
+        create_calendar_tools(
+            credentials_resolver=_json_env_resolver(
+                "GOOGLE_CALENDAR_CREDENTIALS", "GOOGLE_GMAIL_CREDENTIALS"
+            ),
+        )
+    )
+    builder.add_all(
+        create_email_tools(
+            smtp_config_resolver=_json_env_resolver("EMAIL_CONFIG"),
+            sendgrid_api_key_resolver=_env_resolver("SENDGRID_API_KEY"),
+            sendgrid_from_email=os.getenv("SENDGRID_FROM_EMAIL"),
+            gmail_credentials_resolver=_gmail_credentials_resolver,
+        )
+    )
     builder.add_all(create_gmail_action_tools())
     builder.add_all(create_twitter_x_action_tools())
     builder.add_all(create_integration_tools())
+    builder.add_all(create_life_integration_tools())
     builder.add_all(create_messaging_tools())
     builder.add_all(create_ingest_tools())
     builder.add_all(create_workflow_tools())
@@ -797,18 +978,29 @@ def create_default_registry(pool: "asyncpg.Pool") -> ToolRegistry:
     builder.add_all(create_contact_tools())
     builder.add_all(create_image_gen_tools())
     builder.add_all(create_usage_tools())
-    builder.add_all(create_brave_search_tools(
-        api_key_resolver=_env_resolver("BRAVE_SEARCH_API_KEY"),
-    ))
-    builder.add_all(create_firecrawl_tools(
-        api_key_resolver=_env_resolver("FIRECRAWL_API_KEY"),
-    ))
+    builder.add_all(
+        create_brave_search_tools(
+            api_key_resolver=_env_resolver("BRAVE_SEARCH_API_KEY"),
+        )
+    )
+    builder.add_all(
+        create_firecrawl_tools(
+            api_key_resolver=_env_resolver("FIRECRAWL_API_KEY"),
+        )
+    )
     builder.add_all(create_council_tools())
     builder.add_all(create_backup_tools())
     builder.add_all(create_humanizer_tools())
     builder.add_all(create_self_inspection_tools())
     builder.add_all(create_self_repair_tools())
     builder.add_all(create_resource_tools())
+    builder.add_all(create_question_tools())
+    builder.add_all(create_local_audio_analysis_tools())
+    builder.add_all(create_speech_tools())
+    builder.add_all(create_node_tools())
+    from .operator_policies import create_operator_policy_tools
+
+    builder.add_all(create_operator_policy_tools())
 
     registry = builder.build()
 
@@ -835,7 +1027,9 @@ async def create_full_registry(pool: "asyncpg.Pool") -> ToolRegistry:
         for handler in dynamic_handlers:
             name = handler.spec.name
             if name in existing_names:
-                logger.warning("Dynamic tool '%s' conflicts with existing tool, skipping", name)
+                logger.warning(
+                    "Dynamic tool '%s' conflicts with existing tool, skipping", name
+                )
                 continue
             registry.register(handler)
             existing_names.add(name)
@@ -853,7 +1047,9 @@ async def create_full_registry(pool: "asyncpg.Pool") -> ToolRegistry:
         for handler in plugin_registry.get_tool_handlers():
             name = handler.spec.name
             if name in existing_names:
-                logger.warning("Plugin tool '%s' conflicts with core tool, skipping", name)
+                logger.warning(
+                    "Plugin tool '%s' conflicts with core tool, skipping", name
+                )
                 continue
             registry.register(handler)
             existing_names.add(name)

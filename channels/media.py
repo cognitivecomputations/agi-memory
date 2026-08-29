@@ -12,7 +12,8 @@ import ipaddress
 import logging
 import os
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
@@ -134,6 +135,7 @@ async def download_attachment(
     *,
     max_size: int = DEFAULT_MAX_SIZE,
     cache_dir: str | None = None,
+    headers: dict[str, str] | None = None,
 ) -> Attachment:
     """
     Download an attachment to a local file with SSRF protection and size limits.
@@ -152,11 +154,12 @@ async def download_attachment(
     os.makedirs(target_dir, exist_ok=True)
 
     try:
+        request_headers = {"User-Agent": "Hexis/1.0", **(headers or {})}
         response = await request_bytes_response(
             "attachment",
             "GET",
             attachment.url,
-            headers={"User-Agent": "Hexis/1.0"},
+            headers=request_headers,
             timeout=30.0,
             attempts=3,
             max_delay=10.0,
@@ -165,19 +168,13 @@ async def download_attachment(
         )
 
         raw = response.content
-        filename = attachment.filename or _filename_from_response(response, attachment.url)
-        filepath = os.path.join(target_dir, filename)
-
-        with open(filepath, "wb") as f:
-            f.write(raw)
-
-        return Attachment(
-            url=attachment.url,
-            filename=filename,
-            mime_type=attachment.mime_type or response.headers.get("content-type"),
-            size=len(raw),
-            platform_id=attachment.platform_id,
-            local_path=filepath,
+        return materialize_attachment_bytes(
+            attachment,
+            raw,
+            content_type=response.headers.get("content-type"),
+            filename=attachment.filename
+            or _filename_from_response(response, attachment.url),
+            cache_dir=target_dir,
         )
 
     except IntegrationHttpError as exc:
@@ -188,10 +185,53 @@ async def download_attachment(
         return attachment
 
 
+def materialize_attachment_bytes(
+    attachment: Attachment,
+    raw: bytes,
+    *,
+    content_type: str | None = None,
+    filename: str | None = None,
+    cache_dir: str | None = None,
+    prefix: str = "hexis-attachment-",
+) -> Attachment:
+    """Persist already-authenticated media with a safe, collision-free name."""
+
+    target_dir = cache_dir or tempfile.gettempdir()
+    os.makedirs(target_dir, exist_ok=True)
+    safe_name = (
+        Path(filename or attachment.filename or "attachment").name or "attachment"
+    )
+    suffix = Path(safe_name).suffix[:16]
+    fd, filepath = tempfile.mkstemp(prefix=prefix, suffix=suffix, dir=target_dir)
+    try:
+        with os.fdopen(fd, "wb") as attachment_file:
+            attachment_file.write(raw)
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.unlink(filepath)
+        except OSError:
+            pass
+        raise
+    return Attachment(
+        url=attachment.url,
+        filename=safe_name,
+        mime_type=attachment.mime_type or content_type,
+        size=len(raw),
+        platform_id=attachment.platform_id,
+        local_path=filepath,
+    )
+
+
 def _filename_from_response(resp, url: str) -> str:
     """Derive a filename from Content-Disposition header or URL path."""
     # Try Content-Disposition
-    cd = resp.headers.get("content-disposition") or resp.headers.get("Content-Disposition", "")
+    cd = resp.headers.get("content-disposition") or resp.headers.get(
+        "Content-Disposition", ""
+    )
     if "filename=" in cd:
         parts = cd.split("filename=")
         if len(parts) > 1:

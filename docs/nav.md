@@ -22,6 +22,10 @@ section: root
 - [Character Cards](guides/character-cards.md)
 - [Ingestion](guides/ingestion.md)
 - [Memory Operations](guides/memory-operations.md)
+- [Move a Mind Between Machines](guides/mind-portability.md)
+- [Review What Hexis Learned](guides/learning-review.md)
+- [Forget Well](guides/forgetting-well.md)
+- [Public Memory Benchmark](guides/memory-benchmark.md)
 - [Heartbeat](guides/heartbeat.md)
 - [Tools Configuration](guides/tools-configuration.md)
 - [Channels Setup](guides/channels-setup.md)
@@ -40,6 +44,10 @@ section: root
 - [Database](operations/database.md)
 - [Embeddings](operations/embeddings.md)
 - [Environment Variables](operations/environment-variables.md)
+- [Secure Phone and PWA Access](operations/secure-remote-access.md)
+- [Companion Nodes](operations/companion-nodes.md)
+- [Voice and Talk Mode](operations/voice.md)
+- [Execution Backends](operations/execution-backends.md)
 - [Production](operations/production.md)
 - [Troubleshooting](operations/troubleshooting.md)
 
@@ -57,6 +65,7 @@ section: root
   - [Matrix](integrations/channels/matrix.md)
 - External
   - [Overview](integrations/external/index.md)
+  - [Everyday Life](integrations/external/everyday-life.md)
   - [Calendar and Email](integrations/external/calendar-and-email.md)
   - [CRM](integrations/external/crm.md)
   - [Productivity](integrations/external/productivity.md)
@@ -74,6 +83,7 @@ section: root
 - [Config Keys](reference/config-keys.md)
 - [API](reference/api.md)
 - [Plugin System](reference/plugin-system.md)
+- [HMX Mind Exchange Format](reference/hmx.md)
 
 ## Concepts
 - [Overview](concepts/index.md)

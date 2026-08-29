@@ -25,7 +25,7 @@ Complete reference for the `hexis` CLI. Install via `uv tool install hexis` (or 
 
 | Command | Description |
 |---------|-------------|
-| `hexis up [--build] [--profile PROFILE]` | Start the default stack: DB, queue, heartbeat worker, and maintenance worker |
+| `hexis up [--build] [--profile PROFILE]` | Start the default stack from cached/published images; `--build` explicitly builds a source checkout |
 | `hexis down` | Stop services |
 | `hexis uninstall [--purge\|--cli-only] [--yes]` | Remove Hexis; `--purge` also deletes brain/config data and provably Hexis-owned embedding assets |
 | `hexis ps` | Show running containers |
@@ -33,6 +33,52 @@ Complete reference for the `hexis` CLI. Install via `uv tool install hexis` (or 
 | `hexis start` | Start heartbeat and maintenance workers manually if stopped |
 | `hexis stop` | Stop workers |
 | `hexis reset [--yes]` | Wipe DB volume and re-initialize |
+
+When host worker services are installed, stack lifecycle commands exclude the
+matching Docker workers and control the host owner instead.
+
+### Host Worker Services
+
+| Command | Description |
+|---------|-------------|
+| `hexis service install [--channels] [--env-file PATH] [--no-start] [--enable-linger] [--replace-docker-workers]` | Install heartbeat and maintenance as launchd/systemd user services; optionally migrate channels and explicitly replace running Docker workers |
+| `hexis service status [--json]` | Show installed, enabled, and active state from the host service manager |
+| `hexis service start\|stop\|restart [heartbeat maintenance channels all]` | Control installed services; defaults to all installed units |
+| `hexis service logs [-f] [--lines N] [heartbeat maintenance channels all]` | Read the launchd files or systemd user journal; Ctrl+C exits follow mode |
+| `hexis service uninstall [services...] [--yes]` | Stop and remove only Hexis-managed unit files; preserve logs |
+
+Installation records the selected environment-file path, working directory,
+Python executable, and optional instance under `~/.hexis/host-services.json`
+with mode `0600`. Environment values and provider secrets are not copied into
+the unit or state file. The migration flag is required if matching Docker
+workers are already running, preventing accidental duplicate owners.
+
+### Private Remote Access
+
+| Command | Description |
+|---------|-------------|
+| `hexis tunnel start [--port PORT] [--no-start-stack] [--json]` | Start the local stack if needed, then create a tailnet-only Tailscale Serve route to the loopback dashboard |
+| `hexis tunnel status [--port PORT] [--json]` | Inspect local bind posture, Tailscale connection, exact Serve target, Funnel state, and route ownership without changing anything |
+| `hexis tunnel stop [--json]` | Remove only the root Serve/Funnel handler recorded as Hexis-owned; preserve the local stack, brain data, and unrelated Serve paths |
+
+OSS has no application authentication layer. The command never enables Funnel,
+never widens `HEXIS_BIND_ADDRESS`, and never replaces or adopts ambient Tailscale
+configuration. The phone or computer must first be approved in the same tailnet.
+See [Secure Phone and PWA Access](../operations/secure-remote-access.md).
+
+### Local Speech
+
+| Command | Description |
+|---------|-------------|
+| `hexis voice` | Inspect local speech status without changing state |
+| `hexis voice setup [-y] [--wait-seconds S] [--json]` | Confirm/install optional Piper support, derive the live configured model, and start it |
+| `hexis voice start [--wait-seconds S] [--json]` | Start the configured model without changing packages |
+| `hexis voice status [--json]` | Show readiness, endpoint, model, ownership, state, and log path |
+| `hexis voice stop [--json]` | Stop only the exact process recorded as Hexis-owned |
+
+Speech is disabled by default. The sidecar binds only to loopback; Hexis refuses
+remote or credential-bearing provider endpoints and never adopts an ambient
+process. See [Voice and Talk Mode](../operations/voice.md).
 
 ### Web UI
 
@@ -50,14 +96,15 @@ Complete reference for the `hexis` CLI. Install via `uv tool install hexis` (or 
 | `hexis doctor [--json] [--demo] [--llm]` | Health checks; LLM verification is explicit |
 | `hexis config show [--json] [--no-redact]` | Show current configuration |
 | `hexis config validate` | Validate config keys and env references |
-| `hexis skills [--json]` | Show background skill-review status |
-| `hexis skills enable\|disable` | Opt in or out of background proposal review |
+| `hexis skills [--json]` | Show weekly learning/skill-review status |
+| `hexis skills enable\|disable` | Opt in or out of the bounded weekly learning and proposal pass |
 | `hexis skills proposals [--status STATUS]` | List durable skill proposals |
 | `hexis skills review ID --action apply\|reject\|reopen` | Review one proposal with confirmation |
 | `hexis demo [--json]` | Run rollback-only recall/refusal/energy/heartbeat proofs |
 | `hexis maturity [--json]` | Score live capability maturity with evidence and next steps |
 
-`hexis doctor` also reports continuous tool reachability and the immutable
+`hexis doctor` also reports whether the dashboard has a trusted HTTPS route for
+the installable app, continuous tool reachability, and the immutable
 tool-surface audit. Workers derive reachability from the registry, live tool
 configuration, and loadable skills every 15 minutes by default. A warning includes
 the broken worker/context/tool path or the exact command needed to start measurement;
@@ -69,7 +116,14 @@ these advisory checks never stop the heartbeat.
 |---------|-------------|
 | `hexis chat [--dsn DSN]` | Interactive chat |
 | `hexis recall <query> [--limit N] [--type TYPE] [--json]` | Search memories |
+| `hexis retention [--json]` | Show memory pressure, recoverable archives, review backlog, and hard-pruning posture |
+| `hexis retention dry-run [--json]` | Run one rollback-only real rest cycle and show its exact diff |
+| `hexis retention enable` | Preview and confirm reversible rest-cycle consolidation |
+| `hexis retention disable` | Pause automatic rest-cycle consolidation without deleting anything |
 | `hexis export --intent INTENT [--output FILE] [--format json\|jsonl]` | Export an HMX memory exchange |
+| `hexis export --mind [--output FILE] [--format json\|jsonl]` | Export a complete private port file; defaults to `$HEXIS_HOME/exports` |
+| `hexis import FILE --mind --dry-run --json` | Validate an empty-target mind move without mutation |
+| `hexis import FILE --mind --confirm-intent port` | Import a mind into an empty target and verify lineage/protected-state continuity |
 | `hexis import FILE --dry-run [--strategy STRATEGY] [--json]` | Validate and forecast an HMX import without mutation |
 | `hexis import FILE --strategy additive --confirm-intent INTENT` | Run a confirmed additive HMX import |
 | `hexis import FILE --strategy authoritative --replace SECTION --replacement-rationale TEXT --confirm-intent INTENT` | Submit a protected whole-section replacement for agent acknowledgement |
@@ -85,6 +139,15 @@ HMX intents are `port`, `duplicate`, `telepathy`, and `analysis`. Exchange files
 contain sensitive data. File exports use mode `0600` and refuse to overwrite an
 existing path unless `--overwrite` is explicit. Import reads JSON or JSONL and
 requires `--confirm-intent` to exactly match the file before any mutation.
+
+`--mind` is the safe first-class port preset. Export includes all portable and
+protected sections, private-marked memories, in-flight work, and audit history;
+it rejects filters or redaction that would make the file only a partial mind.
+Import selects the empty-target additive path, retains the normal dry-run and
+exact-intent confirmation gates, refuses active-target replacement, then verifies
+the source lineage and all constitutional section projections while preserving
+the exact transport digests for audit. See
+[Move a Mind Between Machines](../guides/mind-portability.md).
 
 The default strategy is derived from the file intent. Telepathy imports enter
 deliberative staging; analysis imports enter physically isolated analysis-only
@@ -212,6 +275,44 @@ Actions: `queue_user_message`, `create_goal`
 | `hexis channels status [--json]` | Show session counts |
 
 Channels: `discord`, `telegram`, `slack`, `signal`, `whatsapp`, `imessage`, `matrix`
+
+### Companion Nodes
+
+| Command | Description |
+|---------|-------------|
+| `hexis node init --name NAME` | Create this device's signed identity; refuses to overwrite one |
+| `hexis node status [--local-only] [--json]` | Show truth-derived local capabilities and policy, paired nodes, and pending requests without exposing the private key |
+| `hexis node allow ALIAS [--allow-args] [--replace] -- EXECUTABLE [FIXED_ARGS...]` | Pin one direct executable/argv policy under a local alias |
+| `hexis node disallow ALIAS` | Remove one local command alias |
+| `hexis node run [--gateway URL] [--once]` | Connect outward, pair in place, and serve approved invocations |
+| `hexis node wake setup [--model NAME_OR_PATH] [--threshold F] [--device NAME] [-y] [--accept-model-license]` | Install optional local detection, explicitly select/license a model, and enable it in node policy without opening the microphone |
+| `hexis node wake status [--json]` | Read local wake configuration without opening the microphone |
+| `hexis node wake disable` | Disable wake capture for future node runs without deleting identity or models; Ctrl+C stops a current run |
+| `hexis node pairing [list] [--json]` | List pending signed identities |
+| `hexis node pairing approve\|deny REQUEST [--note TEXT]` | Decide a request by UUID or exact short code |
+| `hexis node invoke NODE_ID system.run --command ALIAS [--arg VALUE...] [--timeout S] [--yes]` | Explicitly run one locally allowed alias |
+| `hexis node invoke NODE_ID screen.capture [--output FILE] [--overwrite] [--timeout S] [--yes]` | Explicitly request a screen capture; refuses to replace a file without `--overwrite` |
+| `hexis node revoke NODE_ID [--reason TEXT] [--yes]` | Permanently revoke that signed identity and cancel queued work |
+
+The daemon never opens an inbound port. Pairing approval, capability-escalation
+approval, the agent tool-approval gate, node-local command policy, and the
+server's wake gate are separate boundaries. See
+[Companion Nodes](../operations/companion-nodes.md) for setup, remote-access
+constraints, permissions, and recovery.
+
+### Execution Backends
+
+| Command | Description |
+|---------|-------------|
+| `hexis execution status [--json]` | Show the selected profile and local prerequisites without connecting remotely |
+| `hexis execution add-ssh NAME --host HOST --user USER --workspace PATH --identity-file PATH --known-hosts-file PATH [--port N] [--replace]` | Save an exact SSH profile without activating or connecting to it |
+| `hexis execution add-docker NAME --docker-host ssh://USER@HOST[:PORT] --image IMAGE --workspace PATH --identity-file PATH --known-hosts-file PATH [--network none\|bridge] [--replace]` | Save an ephemeral remote-Docker profile with no implicit pull |
+| `hexis execution test [NAME] [--json] [--timeout S]` | Explicitly connect and verify workspace, shell, and Python availability |
+| `hexis execution use NAME` | Select a profile for new `shell`, `safe_shell`, `run_script`, and `execute_code` calls |
+| `hexis execution remove NAME` | Remove an inactive profile while preserving remote files and state volumes |
+
+Selection is database-owned and live. A remote failure never falls back to the
+local worker. See [Execution Backends](../operations/execution-backends.md).
 
 ### Skills
 

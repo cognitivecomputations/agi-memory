@@ -608,6 +608,9 @@ class IntegrationSetupStatusHandler(ToolHandler):
             )
         payload = _json(raw) or {}
         enrich_gmail_setup_runtime(payload)
+        from services.life_integrations import enrich_life_setup_status
+
+        enrich_life_setup_status(payload, connector_id)
         payload["channel_runtime"] = _json(runtime_raw) or []
         connectors = payload.get("connectors", [])
         connected = payload.get("connections", [])

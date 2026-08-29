@@ -24,7 +24,7 @@ Connect your Hexis agent to Matrix rooms.
 
 ```bash
 hexis channels setup matrix
-hexis up --profile active
+hexis up
 hexis channels status
 ```
 

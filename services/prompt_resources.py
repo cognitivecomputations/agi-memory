@@ -26,6 +26,9 @@ RECMEM_EPISODE_CREATE_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" 
 RECMEM_SEMANTIC_REFINE_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "recmem_semantic_refine.md"
 MEMORY_SUMMARIZATION_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "memory_summarization.md"
 SKILL_IMPROVEMENT_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "skill_improvement.md"
+CONTRADICTION_DETECTION_PROMPT_PATH = (
+    Path(__file__).resolve().parent / "prompts" / "contradiction_detection.md"
+)
 
 
 @dataclass(frozen=True)
@@ -158,6 +161,15 @@ def load_skill_improvement_prompt() -> str:
     return (
         "Review repeated cross-session experience for one reusable workflow. "
         "Return JSON with proposal set to null or a grounded skill proposal."
+    )
+
+
+def load_contradiction_detection_prompt() -> str:
+    if CONTRADICTION_DETECTION_PROMPT_PATH.exists():
+        return CONTRADICTION_DETECTION_PROMPT_PATH.read_text(encoding="utf-8")
+    return (
+        "Compare only the supplied memory pairs for genuine logical contradictions. "
+        "Return strict JSON with a contradictions array; never decide which is right."
     )
 
 

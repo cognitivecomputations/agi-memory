@@ -127,9 +127,14 @@ hexis migrate            # or `hexis upgrade` to also refresh images/code
 
 # Dev loop: watch mode — code + migration edits apply to the running stack
 # automatically (sync + restart; Ctrl+C stops watching, stack keeps running).
-# `hexis up` in a source checkout also rebuilds by default, so containers
-# always match the code on disk after any `up`.
+# `hexis up` uses cached/published images by default, including in a source
+# checkout. Use `hexis up --build` for a deliberate build or `hexis dev` while editing.
 hexis dev
+
+# Python runtime image dependencies are resolved only from the committed uv.lock.
+# After changing pyproject.toml, refresh and verify it before building.
+uv lock
+uv lock --check
 
 # Wipe the DB volume — deliberate clean slate only (loses all data)
 docker compose down -v && docker compose up -d

@@ -25,13 +25,13 @@ hexis status
 
 The heartbeat follows an OODA loop:
 
-1. **Initialize** -- Regenerate energy (+10/hour, max 20)
+1. **Initialize** -- Regenerate from elapsed time, decay banked surplus, and apply the prior outcome multiplier
 2. **Observe** -- Check environment, pending events, user presence
 3. **Orient** -- Review goals, gather context (memories, clusters, identity, worldview)
 4. **Decide** -- LLM call with action budget and context
 5. **Act** -- Execute chosen actions within energy budget
 6. **Record** -- Store heartbeat as episodic memory; the turn also mirrors into `subconscious_units` for the conscious-episode extraction sweep, and its final text passes the action-claim guardrail (unsupported "I did X" claims get a visible `[Correction]`)
-7. **Wait** -- Sleep until next heartbeat
+7. **Wait** -- Schedule the next heartbeat from current drive urgency
 
 ### Energy Budget
 
@@ -46,6 +46,12 @@ Each action has an energy cost. The agent must decide what's worth doing within 
 | **5** | Send messages, slow ingest |
 
 See [Energy Model](../reference/energy-model.md) for the complete cost table and philosophy.
+
+The default normal reserve is 20 and the default bank capacity is 60. Energy
+above the reserve decays with a 12-hour half-life. Ordinary beats spend from one
+reserve; beats with actionable backlog can draw up to two reserves when that
+energy has actually been banked. Useful durable outcomes improve the next
+regeneration multiplier.
 
 ### Context Restrictions
 
@@ -106,6 +112,10 @@ The heartbeat won't run until:
 1. `agent.is_configured` is `true` (set by `hexis init`)
 2. `is_init_complete` is `true`
 3. The heartbeat is not paused
+
+Once running, the database chooses the next time from live drive urgency. The
+configured 60-minute interval is the baseline: quiet state waits longer (90
+minutes by default), while high urgency can shorten the cadence to 15 minutes.
 
 ## Monitoring
 

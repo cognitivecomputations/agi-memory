@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import time
 import uuid
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -26,11 +25,11 @@ from core.agent_loop import (
     _to_openai_tool_call,
 )
 from core.tools.base import (
+    OutboundSpec,
     ToolCategory,
     ToolContext,
     ToolErrorType,
     ToolExecutionContext,
-    ToolHandler,
     ToolResult,
     ToolSpec,
 )
@@ -130,6 +129,7 @@ def _mock_registry(
         return ToolResult.success_result({"echo": name, "args": arguments})
 
     registry.execute = AsyncMock(side_effect=_execute)
+    registry.preflight_outbound_controls = AsyncMock(return_value=None)
 
     # get_config returns ToolsConfig
     config = config or ToolsConfig()
@@ -572,6 +572,62 @@ class TestLimits:
 
 class TestApproval:
     @patch("core.agent_loop.chat_completion")
+    async def test_stop_preflight_precedes_approval_request(self, mock_llm):
+        """A recipient STOP cannot trigger one more operator notification."""
+        approve = AsyncMock(return_value=True)
+        spec = ToolSpec(
+            name="provider_send",
+            description="Person-facing provider send.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "recipient": {"type": "string"},
+                    "message": {"type": "string"},
+                },
+            },
+            category=ToolCategory.MESSAGING,
+            requires_approval=True,
+            is_read_only=False,
+            outbound=OutboundSpec(
+                recipient_arg="recipient",
+                body_arg="message",
+                channel="test",
+            ),
+        )
+        registry = _mock_registry(spec_map={"provider_send": spec})
+        registry.preflight_outbound_controls.return_value = ToolResult.error_result(
+            "Recipient has opted out of all Hexis contact.",
+            ToolErrorType.OUTBOUND_BLOCKED,
+        )
+        mock_llm.side_effect = [
+            _tool_response(
+                "Sending.",
+                [
+                    _tool_call(
+                        "provider_send",
+                        {
+                            "recipient": "blocked@example.com",
+                            "message": "This must stay silent.",
+                            "purpose_kind": "user_request",
+                            "purpose_reference": "current_turn",
+                        },
+                    )
+                ],
+            ),
+            _text_response("The recipient has opted out, so I did not ask or send."),
+        ]
+
+        agent = AgentLoop(
+            _make_config(registry=registry, on_approval=approve)
+        )
+        result = await agent.run("Send the update")
+
+        registry.preflight_outbound_controls.assert_awaited_once()
+        approve.assert_not_awaited()
+        registry.execute.assert_not_awaited()
+        assert result.tool_calls_made[0]["error"] == "outbound_control_blocked"
+
+    @patch("core.agent_loop.chat_completion")
     async def test_approval_callback_called(self, mock_llm):
         """Approval callback is invoked for tools that require approval."""
         approval_calls = []
@@ -606,6 +662,48 @@ class TestApproval:
         assert len(approval_calls) == 1
         assert approval_calls[0][0] == "dangerous_tool"
         assert result.stopped_reason == "completed"
+
+    @patch("core.agent_loop.chat_completion")
+    async def test_exact_phone_approval_proof_reaches_tool_policy(self, mock_llm):
+        """A durable decision carries its one-shot request id into execution."""
+        request_id = str(uuid.uuid4())
+
+        async def _approve(name: str, args: dict) -> dict[str, Any]:
+            return {
+                "approved": True,
+                "request_id": request_id,
+                "approval_channel": "slack",
+                "status": "approved",
+            }
+
+        spec = ToolSpec(
+            name="dangerous_tool",
+            description="Needs approval",
+            parameters={"type": "object"},
+            category=ToolCategory.SHELL,
+            requires_approval=True,
+        )
+        captured_ctx = None
+        registry = _mock_registry(spec_map={"dangerous_tool": spec})
+
+        async def _capture_execute(name, args, ctx):
+            nonlocal captured_ctx
+            captured_ctx = ctx
+            return ToolResult.success_result("executed")
+
+        registry.execute = AsyncMock(side_effect=_capture_execute)
+        mock_llm.side_effect = [
+            _tool_response("Running.", [_tool_call("dangerous_tool", {"cmd": "ls"})]),
+            _text_response("Done."),
+        ]
+
+        agent = AgentLoop(_make_config(registry=registry, on_approval=_approve))
+        await agent.run("Run a command")
+
+        assert captured_ctx is not None
+        assert captured_ctx.action_approved is True
+        assert captured_ctx.approval_request_id == request_id
+        assert captured_ctx.approval_channel == "slack"
 
     @patch("core.agent_loop.chat_completion")
     async def test_approval_denied(self, mock_llm):
@@ -1291,7 +1389,7 @@ class TestIntegrationWithRegistry:
             timeout_seconds=10.0,
         )
         agent = AgentLoop(config)
-        result = await agent.run("Hi")
+        await agent.run("Hi")
 
         # Verify tools were passed to LLM
         call_args = mock_llm.call_args

@@ -172,7 +172,7 @@ INSERT INTO integration_connectors (
     'available',
     '{
       "live_chat": {"label": "Receive live Slack messages", "status": "available", "scopes": ["app_mentions:read", "channels:history"]},
-      "send": {"label": "Send Slack messages", "status": "available", "scopes": ["chat:write"]},
+      "send": {"label": "Send Slack messages and private approval DMs", "status": "available", "scopes": ["chat:write", "im:write"]},
       "ingest_live": {"label": "Preserve and ingest live Slack messages", "status": "available", "scopes": ["app_mentions:read", "channels:history"]},
       "media": {"label": "Read Slack file metadata from live events", "status": "available", "scopes": ["files:read"]},
       "backfill": {"label": "Import historical Slack messages", "status": "available", "scopes": ["channels:history", "groups:history", "im:history", "mpim:history"]},
@@ -185,9 +185,9 @@ INSERT INTO integration_connectors (
       "default_capabilities": ["live_chat", "send", "ingest_live"],
       "capability_order": ["live_chat", "send", "ingest_live", "media", "backfill", "admin"],
       "required_scopes": [],
-      "scope_order": ["app_mentions:read", "channels:history", "chat:write", "files:read", "groups:history", "im:history", "mpim:history"],
-      "config_keys": ["channel.slack.bot_token", "channel.slack.app_token", "channel.slack.allowed_channels"],
-      "env_vars": ["SLACK_BOT_TOKEN", "SLACK_APP_TOKEN"],
+      "scope_order": ["app_mentions:read", "channels:history", "chat:write", "im:write", "files:read", "groups:history", "im:history", "mpim:history"],
+      "config_keys": ["channel.slack.bot_token", "channel.slack.app_token", "channel.slack.signing_secret", "channel.slack.operator_user_id", "channel.slack.allowed_channels"],
+      "env_vars": ["SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "SLACK_SIGNING_SECRET"],
       "capability_aliases": {
         "read": "live_chat",
         "receive": "live_chat",
@@ -201,7 +201,8 @@ INSERT INTO integration_connectors (
       "user_next_step": "Create or choose a Slack app, enable Socket Mode, set SLACK_BOT_TOKEN to a bot token env var and SLACK_APP_TOKEN to an app-level token env var, then verify this connector. The channel worker starts Slack when those values resolve.",
       "notes": [
         "Store token values in environment variables, not in chat or Postgres.",
-        "Use channel.slack.allowed_channels to restrict where Hexis listens."
+        "Use channel.slack.allowed_channels to restrict where Hexis listens.",
+        "Set channel.slack.operator_user_id to your U... user ID for private protected-tool approvals and standing instructions."
       ]
     }'::jsonb,
     'https://api.slack.com/start/quickstart',
@@ -228,7 +229,7 @@ INSERT INTO integration_connectors (
       "capability_order": ["live_chat", "send", "ingest_live", "media", "backfill"],
       "required_scopes": [],
       "scope_order": [],
-      "config_keys": ["channel.telegram.bot_token", "channel.telegram.allowed_chat_ids"],
+      "config_keys": ["channel.telegram.bot_token", "channel.telegram.operator_user_id", "channel.telegram.allowed_chat_ids"],
       "env_vars": ["TELEGRAM_BOT_TOKEN"],
       "capability_aliases": {
         "read": "live_chat",
@@ -243,7 +244,8 @@ INSERT INTO integration_connectors (
       "user_next_step": "Create a Telegram bot with BotFather, store the bot token in TELEGRAM_BOT_TOKEN or another env var, set channel.telegram.bot_token to that env var name if needed, then verify this connector. The channel worker starts Telegram when the token resolves.",
       "notes": [
         "Store bot token values in environment variables, not in chat or Postgres.",
-        "Use channel.telegram.allowed_chat_ids to restrict where Hexis listens."
+        "Use channel.telegram.allowed_chat_ids to restrict where Hexis listens.",
+        "Set channel.telegram.operator_user_id to your numeric user ID if private messages may create standing instructions."
       ]
     }'::jsonb,
     'https://core.telegram.org/bots/tutorial',
@@ -270,7 +272,7 @@ INSERT INTO integration_connectors (
       "capability_order": ["live_chat", "send", "ingest_live", "media", "backfill"],
       "required_scopes": [],
       "scope_order": [],
-      "config_keys": ["channel.signal.phone_number", "channel.signal.api_url", "channel.signal.allowed_numbers"],
+      "config_keys": ["channel.signal.phone_number", "channel.signal.api_url", "channel.signal.operator_user_id", "channel.signal.allowed_numbers"],
       "env_vars": ["SIGNAL_PHONE_NUMBER", "SIGNAL_API_URL"],
       "capability_aliases": {
         "read": "live_chat",
@@ -285,7 +287,8 @@ INSERT INTO integration_connectors (
       "user_next_step": "Run or connect a signal-cli-rest-api sidecar, register/link the Signal phone number, set SIGNAL_PHONE_NUMBER and optionally SIGNAL_API_URL, then verify this connector. The channel worker starts Signal when the phone number resolves.",
       "notes": [
         "Signal protocol state lives in the sidecar, not in Postgres.",
-        "Use channel.signal.allowed_numbers to restrict who Hexis listens to."
+        "Use channel.signal.allowed_numbers to restrict who Hexis listens to.",
+        "Set channel.signal.operator_user_id to your number if private messages may create standing instructions."
       ]
     }'::jsonb,
     'https://github.com/bbernhard/signal-cli-rest-api',

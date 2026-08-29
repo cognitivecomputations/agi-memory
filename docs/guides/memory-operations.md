@@ -84,8 +84,10 @@ async with CognitiveMemory.connect(DSN) as mem:
 SELECT * FROM fast_recall('UI preferences', 5);
 ```
 
-Recall results include each memory's `trust` and `confidence`, so the agent
-can weigh what it believes. The agent-facing tool also accepts `min_score` (a
+Recall results include each memory's complete `source_attribution`, `trust`,
+and stable citation envelope. Claims drawn from those results carry linked
+footnotes in chat by default; low-trust sources are visibly marked rather than
+presented with the same certainty as strong evidence. The agent-facing tool also accepts `min_score` (a
 relevance floor — drop weak matches instead of padding to the count), and its
 default/maximum counts are config-driven budgets (`memory.recall_default_limit`,
 `memory.recall_max_limit`).
@@ -116,6 +118,40 @@ session by default because the live conversation is already in context. Set
 Inactive memories, expired memories, and redacted or archived raw turns are
 never returned.
 
+### Recall at a Point in Time
+
+Temporal questions use the validity record rather than trying to infer the past
+from today's memories. Ask naturally in chat—“As of last Tuesday, what did you
+know about the Manning deal?” or “Has that changed since June?”—and the
+conversation agent selects `recall_at_time` or `diff_memory_history` from the
+temporal cue. The **Memory history** dashboard provides the same journey as an
+explicit snapshot or side-by-side comparison.
+
+Point-in-time results include memories that have since been superseded, but only
+when their `valid_from` / `valid_until` and supersession events prove they were
+valid at the requested instant. Historical confidence and trust are rebuilt
+from `belief_revision_audit`; they are not copied from the current row. A diff
+returns what became valid, what expired, and the recorded supersession,
+contradiction decision, or evidence-revision reason:
+
+```sql
+SELECT temporal_memory_snapshot(
+    'Manning retainer',
+    '2026-06-01T12:00:00Z'::timestamptz
+);
+
+SELECT diff_memory_history(
+    'Manning retainer',
+    '2026-06-01T12:00:00Z'::timestamptz,
+    CURRENT_TIMESTAMP
+);
+```
+
+If embedding retrieval is unavailable, the snapshot still runs exact lexical
+history and reports that degraded mode. An empty result means the record has no
+matching memory at that instant; it does not mean the record asserted the
+opposite.
+
 ### Exact Sources: the Filing Cabinet and the Desk
 
 Distilled memories never carry whole files. When exact wording matters, the
@@ -134,13 +170,29 @@ agent climbs the retrieval ladder over two additional layers:
   `search_history` with `sources=["desk"]` searches them while reasoning.
   `list_desk` shows what is loaded, `open_desk_item` scrolls long items
   window by window, `pin_desk_item` protects what stays actively needed, and
-  `clear_desk` archives the rest — the cabinet copy always survives.
+`clear_desk` archives the rest — the cabinet copy always survives.
 
 From the terminal the same surfaces are `hexis docs ...` and `hexis desk ...`
 (see the [CLI Reference](../reference/cli.md)); in the web UI they are the
 **Documents** and **Desk** pages. `open_memory` on a distilled memory returns
 `source_documents` and `source_chunks` handles, so provenance is always one
 hop away.
+
+### Review Contradictions
+
+Hexis checks new semantic and worldview memories against a bounded set of
+same-topic memories once per day. A finding never changes either memory by
+itself. Pending cases appear in the Conversation inbox and on the
+**Contradictions** page with source, trust, and three explicit choices:
+
+- **Newer is right** — close the older memory's validity window.
+- **Older is right** — close the newer memory's validity window.
+- **Both, by context** — retain both as an explicit tension.
+
+The losing row remains queryable in history. From a verified private channel,
+reply with the numbered choice and the eight-character case code shown in the
+daily digest, such as `3 ABC12345`. Bare numbers and replies from non-operator
+contacts stay ordinary conversation.
 
 ### Hydrate (Context Building)
 
@@ -197,6 +249,12 @@ SELECT * FROM fast_recall('what the user likes', 10);
 
 -- Free lexical search across prior turns and consolidated memories
 SELECT * FROM search_cross_session_history('"release checklist"', 20);
+
+-- Reconstruct what was valid at one historical instant
+SELECT temporal_memory_snapshot('release plan', '2026-06-01T12:00:00Z');
+
+-- Explain what changed between two instants
+SELECT diff_memory_history('release plan', '2026-06-01T12:00:00Z', CURRENT_TIMESTAMP);
 
 -- Count memories by type
 SELECT type, count(*) FROM memories WHERE status = 'active' GROUP BY type;
