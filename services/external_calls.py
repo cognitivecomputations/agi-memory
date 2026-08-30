@@ -214,6 +214,21 @@ class ExternalCallProcessor:
             )
         except Exception as e:
             logger.exception("RLM heartbeat decision failed, falling back to legacy")
+            # #111: a total LLM failure used to be swallowed into a
+            # fabricated decision three layers down, so self-repair never
+            # saw it (record_defect_event's only caller is gated on a
+            # non-empty actions array). Record the real error here -- the
+            # one place that still holds it -- before falling back.
+            try:
+                await conn.fetchval(
+                    "SELECT record_defect_event($1, $2, $3, $4::jsonb)",
+                    "heartbeat",
+                    "llm.heartbeat",
+                    str(e),
+                    json.dumps({"heartbeat_id": heartbeat_id, "fallback": "legacy"}),
+                )
+            except Exception:
+                logger.exception("Failed to record defect event for RLM heartbeat failure")
             return await self._process_heartbeat_decision_call(conn, call_input)
 
         return result
