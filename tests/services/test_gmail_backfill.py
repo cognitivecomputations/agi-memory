@@ -176,11 +176,18 @@ async def test_run_gmail_backfill_step_stores_source_documents_and_ingestion_job
         ))
 
     assert handled == 1
-    assert status["jobs"][0]["job_id"] == job["job_id"]
-    assert status["jobs"][0]["status"] == "completed"
-    assert status["jobs"][0]["result"]["items_stored"] == 2
-    assert status["jobs"][0]["result"]["truncated"] is True
+    jobs_by_id = {j["job_id"]: j for j in status["jobs"]}
+    original = jobs_by_id[job["job_id"]]
+    assert original["status"] == "completed"
+    assert original["result"]["items_stored"] == 2
+    assert original["result"]["truncated"] is True
     assert status["cursors"][0]["cursor_value"]["page_token"] == "next-page"
+    # #110: a truncated completion now self-continues -- a pending successor
+    # job is queued so the next maintenance tick picks up at "next-page"
+    # instead of a capped backfill silently completing forever.
+    successors = [j for jid, j in jobs_by_id.items() if jid != job["job_id"]]
+    assert len(successors) == 1
+    assert successors[0]["status"] == "pending"
     assert [row["provider_item_id"] for row in items] == ["msg-1", "msg-2"]
     assert items[0]["ingestion_job_id"] is not None
     assert _j(items[0]["raw_metadata"])["gmail_history_id"] == "history-msg-1"
