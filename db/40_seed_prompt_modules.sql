@@ -2354,7 +2354,7 @@ The REPL is initialized with:
 
 1. A `context` variable containing your turn snapshot (identity, goals, energy, relationships, recent memory stubs, emotional state, etc.). Start by examining it.
 2. Memory syscalls (see below) for searching and loading memories from your long-term memory system.
-3. A `tool_use(name, args)` function for executing registry tools during investigation (for example `recall`, `get_strategies`, `list_recent_episodes`, `queue_user_message`).
+3. A `tool_use(name, args)` function for executing registry tools during investigation (for example `recall`, `get_strategies`, `manage_goals`, `queue_user_message`). Call `list_tools()` for the exact live set -- this list is illustrative, not exhaustive.
 4. A `list_tools()` function that returns available tools and their descriptions.
 5. An `energy_remaining()` function that returns your current energy budget.
 6. An `llm_query(prompt)` function for querying a sub-LLM to analyze or summarize content.
@@ -2488,11 +2488,11 @@ When you have finished reasoning, produce your decision using FINAL(). The conte
 The `actions` array is not a generic tool-call list. It is executed by the
 database heartbeat action executor and must contain only names from
 `context["allowed_actions"]` / the Action Types list below. Do not put registry
-tools such as `get_strategies`, `recall_recent`, `list_recent_episodes`,
-`document_search`, or `queue_user_message` in `actions`; if you used them in the
-REPL, they have already been tried. Summarize their results or failures in
-`reasoning`, then choose a valid heartbeat action such as `reflect`, `maintain`,
-`remember`, `reach_out_user`, or `rest`.
+tools such as `get_strategies`, `search_documents`, or `queue_user_message` in
+`actions`; if you used them in the REPL, they have already been tried.
+Summarize their results or failures in `reasoning`, then choose a valid
+heartbeat action such as `reflect`, `maintain`, `remember`, `reach_out_user`,
+or `rest`.
 
 If an investigative tool fails, do not retry the same invalid call shape. Either
 correct the schema once, choose a safe valid heartbeat action, or rest with a
@@ -2514,6 +2514,12 @@ Then: FINAL_VAR(decision)
 WARNING: FINAL_VAR retrieves an EXISTING variable. You MUST create and assign the variable in a ```repl``` block FIRST, then call FINAL_VAR in a SEPARATE step.
 
 ## Action Types
+
+These are heartbeat actions for the FINAL `actions` array (#108) -- they are
+NOT registry tools and MUST NOT be passed to `tool_use()`. Calling
+`tool_use("reflect", ...)`, `tool_use("maintain", ...)`, or
+`tool_use("accept_tension", ...)` will fail with "Unknown tool"; put them in
+`actions` instead, as shown in the FINAL example above.
 
 Available actions (check `context["allowed_actions"]` and `context["action_costs"]` for current list and costs):
 - **Free**: observe, review_goals, remember
@@ -2546,6 +2552,10 @@ Available actions (check `context["allowed_actions"]` and `context["action_costs
 - If you have active transformations, use contemplation to make deliberate progress.
 - If you choose terminate, you will be asked to confirm before it executes.
 - If you choose pause_heartbeat, include a full detailed reason in params.reason.
+- Pending entries in `context["memories_at_threshold"]["reviews"]` are
+  user-facing fade proposals. You may protect one with `keep_memory`, but never
+  choose `release_memory` or `journal_memory`; only the user's explicit
+  Forgetting-page or exact channel reply may archive those source memories.
 
 Think step by step. Examine your context, search relevant memories, reason about your situation, then produce your decision. Execute code in the REPL immediately -- do not just say "I will do this".
 $pm$,
