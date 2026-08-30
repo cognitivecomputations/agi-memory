@@ -54,10 +54,13 @@ SUPPORTED_CHANNEL_TYPES = [
 
 
 def _worker_metadata() -> dict[str, Any]:
+    from core.agent_api import worker_code_stamp_metadata
+
     return {
         "process_id": os.getpid(),
         "host_name": socket.gethostname(),
         "command": "hexis-channels",
+        **worker_code_stamp_metadata(),
     }
 
 

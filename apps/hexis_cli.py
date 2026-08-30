@@ -5393,6 +5393,21 @@ def _print_rich_status(p: dict[str, Any]) -> None:
             "[muted](the heartbeat only ticks while they are up — start them with `hexis up`)[/muted]"
         )
 
+    # Code/schema version skew (#113): a running worker's own bundled
+    # migrations predate what's actually applied to the DB it shares.
+    skew = p.get("worker_schema_skew") or {}
+    skewed_workers = skew.get("skewed_workers") or []
+    if skewed_workers:
+        names = ", ".join(
+            f"{w.get('mode', '?')}"
+            + (f"/{w.get('instance_name')}" if w.get("instance_name") else "")
+            for w in skewed_workers
+        )
+        console.print(
+            f"  [key]Schema   [/key] [warn]DB is at {skew.get('db_latest_migration')}; "
+            f"{names} predate it[/warn] [muted](run `hexis upgrade`)[/muted]"
+        )
+
     # Memory counts
     memories = p.get("memories", {})
     if memories:

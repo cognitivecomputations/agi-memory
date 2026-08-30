@@ -635,6 +635,45 @@ async def doctor_payload(
                 {"label": "Schema canonical", "status": "WARN", "detail": str(exc)}
             )
 
+        # 2c. Code/schema skew (#113): a running worker's own bundled
+        # migrations are older than what's actually applied to the DB it's
+        # sharing -- someone else (a newer image, a manual `hexis migrate`
+        # from a fresher checkout) moved the schema forward without it.
+        try:
+            skew_raw = await conn.fetchval("SELECT worker_code_schema_skew_report()")
+            skew = json.loads(skew_raw) if isinstance(skew_raw, str) else (skew_raw or {})
+            skewed_workers = skew.get("skewed_workers") or []
+            if skewed_workers:
+                names = ", ".join(
+                    f"{w.get('mode', '?')}"
+                    + (f"/{w.get('instance_name')}" if w.get("instance_name") else "")
+                    + f" (bundled {w.get('bundled_latest_migration', '?')})"
+                    for w in skewed_workers
+                )
+                checks.append(
+                    {
+                        "label": "Worker/schema version",
+                        "status": "WARN",
+                        "detail": (
+                            f"DB is now at {skew.get('db_latest_migration')}; "
+                            f"{len(skewed_workers)} running worker(s) predate it: {names}. "
+                            "Run `hexis upgrade` to rebuild and restart them."
+                        ),
+                    }
+                )
+            else:
+                checks.append(
+                    {
+                        "label": "Worker/schema version",
+                        "status": "OK",
+                        "detail": f"running workers match schema {skew.get('db_latest_migration') or '(none applied)'}",
+                    }
+                )
+        except Exception as exc:
+            checks.append(
+                {"label": "Worker/schema version", "status": "WARN", "detail": str(exc)}
+            )
+
         # 3. RabbitMQ (check config, not connectivity -- avoids dependency)
         try:
             rmq_url = await conn.fetchval(
@@ -1389,6 +1428,16 @@ async def status_payload_rich(
         except Exception:
             payload["workers"] = []
             payload["worker_tasks"] = []
+
+        # Code/schema version skew (#113): a running worker's own bundled
+        # migrations predate what's actually applied to the DB.
+        try:
+            skew_raw = await conn.fetchval("SELECT worker_code_schema_skew_report()")
+            payload["worker_schema_skew"] = (
+                json.loads(skew_raw) if isinstance(skew_raw, str) else (skew_raw or {})
+            )
+        except Exception:
+            payload["worker_schema_skew"] = {}
 
         return payload
     finally:
