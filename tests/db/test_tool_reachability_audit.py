@@ -63,3 +63,51 @@ async def test_doctor_surfaces_reachability_and_audit_health(db_pool):  # noqa: 
     assert by_label["Tool reachability"]["status"] in {"OK", "WARN"}
     assert by_label["Tool reachability"]["detail"]
     assert by_label["Tool surface audit"]["status"] == "OK"
+
+
+async def test_doctor_surfaces_integration_health(db_pool):
+    """#100: a broken connector (e.g. Gmail needing reauth) is otherwise a
+    silent dead end -- heartbeat skips it, and nothing tells the operator
+    until they notice email triage stopped firing."""
+    from core.cli_api import doctor_payload
+    from tests.utils import _db_dsn
+
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM integration_connections WHERE connector_id = 'gmail'"
+        )
+    try:
+        no_connections = await doctor_payload(_db_dsn(), wait_seconds=2)
+        by_label = {c["label"]: c for c in no_connections}
+        assert by_label["Integrations"]["status"] == "WARN"
+        assert "0 connected" in by_label["Integrations"]["detail"]
+
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO integration_connections (connector_id, account_key, status, last_error)
+                VALUES ('gmail', 'eric@example.com', 'needs_reauth', 'refresh token revoked by Google')
+                """
+            )
+        broken = await doctor_payload(_db_dsn(), wait_seconds=2)
+        by_label = {c["label"]: c for c in broken}
+        assert by_label["Integrations"]["status"] == "WARN"
+        assert "gmail" in by_label["Integrations"]["detail"]
+        assert "needs_reauth" in by_label["Integrations"]["detail"]
+        assert "refresh token revoked by Google" in by_label["Integrations"]["detail"]
+
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE integration_connections SET status = 'connected', last_error = NULL "
+                "WHERE connector_id = 'gmail'"
+            )
+        healthy = await doctor_payload(_db_dsn(), wait_seconds=2)
+        by_label = {c["label"]: c for c in healthy}
+        assert by_label["Integrations"]["status"] == "OK"
+        assert "gmail" in by_label["Integrations"]["detail"]
+        assert "eric@example.com" in by_label["Integrations"]["detail"]
+    finally:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM integration_connections WHERE connector_id = 'gmail'"
+            )

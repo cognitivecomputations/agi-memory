@@ -217,15 +217,6 @@ class Appraisal:
     curiosity: float = 0.0
     summary: str = ""
 
-    def to_state_payload(self, source: str = "ingest") -> dict[str, Any]:
-        return {
-            "valence": self.valence,
-            "arousal": self.arousal,
-            "primary_emotion": self.primary_emotion,
-            "intensity": self.intensity,
-            "source": source,
-        }
-
 
 @dataclass
 class Extraction:

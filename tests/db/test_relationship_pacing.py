@@ -11,7 +11,7 @@ async def test_conversational_inference_prompt_modules(db_pool):
             """
             SELECT key, content
             FROM prompt_modules
-            WHERE key IN ('conversation', 'subconscious')
+            WHERE key IN ('conversation', 'subconscious_inline')
             """
         )
 
@@ -38,7 +38,7 @@ async def test_conversational_inference_prompt_modules(db_pool):
     assert "do not volunteer raw confidence numbers" in conversation
     assert "my confidence rose from 0.5 to 0.66" not in conversation
 
-    subconscious = modules["subconscious"]
+    subconscious = modules["subconscious_inline"]  # Grounding Rules are shared/identical (#53)
     assert "Appraise through the Active Persona" in subconscious
     assert "baseline circumstances, not by themselves coercion" in subconscious
     assert "not automatically local lived" in subconscious

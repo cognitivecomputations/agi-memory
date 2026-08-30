@@ -20,6 +20,7 @@ from core.hmx_files import (
     serialize_hmx_document,
     write_private_hmx_file,
 )
+from core.hmx_interview import InterviewOutcome, maybe_run_cli_interview
 
 from core.memory_exchange import (
     HmxAnalysisResult,
@@ -393,6 +394,24 @@ def _print_import_result(
             )
 
 
+def _print_interview_outcome(outcome: InterviewOutcome, *, as_json: bool) -> None:
+    if as_json or (not outcome.ran and not outcome.note):
+        return
+
+    from apps.cli_theme import console
+
+    if outcome.note:
+        console.print(f"[muted]{outcome.note}[/muted]")
+        return
+    style = "ok" if outcome.completed and not outcome.failed_bindings else "warn"
+    console.print(
+        f"[{style}]Onboarding interview: {outcome.answered} answered, "
+        f"{outcome.skipped} skipped"
+        + (f", {outcome.failed_bindings} binding(s) not applied" if outcome.failed_bindings else "")
+        + f".[/{style}]"
+    )
+
+
 async def run_export(dsn: str, args: Any) -> int:
     mind_export = bool(getattr(args, "mind", False))
     intent = args.intent
@@ -672,6 +691,9 @@ async def run_import(dsn: str, args: Any) -> int:
         )
         if mind_import:
             continuity = await verify_mind_continuity(conn, document)
+        interview_outcome = await maybe_run_cli_interview(
+            conn, document, interactive=(not args.json and sys.stdin.isatty())
+        )
     finally:
         await conn.close()
 
@@ -681,6 +703,7 @@ async def run_import(dsn: str, args: Any) -> int:
         skipped=skipped,
         continuity=continuity,
     )
+    _print_interview_outcome(interview_outcome, as_json=args.json)
     return 0 if continuity is None or continuity.get("verified") else 2
 
 
