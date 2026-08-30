@@ -67,7 +67,15 @@ BEGIN
         summary := 'The operation exceeded its execution window and needs retry/backoff or workload reduction.';
     ELSIF error_text LIKE '%network error%'
        OR error_text LIKE '%http error%'
-       OR error_text LIKE '%rate limit%' THEN
+       OR error_text LIKE '%rate limit%'
+       -- DNS/name-resolution failures (#111): the exact class that hit a
+       -- provider outage in the wild ("[Errno -2] Name or service not
+       -- known") and previously fell through to the generic bucket below.
+       OR error_text LIKE '%name or service not known%'
+       OR error_text LIKE '%nodename nor servname%'
+       OR error_text LIKE '%temporary failure in name resolution%'
+       OR error_text LIKE '%getaddrinfo failed%'
+       OR error_text LIKE '%name resolution%' THEN
         category := 'network_or_provider';
         severity := 'medium';
         title := 'Provider/network failure: ' || component;

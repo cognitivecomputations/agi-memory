@@ -18,6 +18,7 @@ from typing import Any
 from core.cognitive_memory_api import RelationshipType
 from core.memory_repo import MemoryRepo
 from services.hexis_rlm import (
+    RlmLoopFailure,
     _make_sync_llm_query,
     _run_loop,
     find_final_answer,
@@ -179,6 +180,27 @@ async def run_slow_ingest_chunk(
                 "iterations": 0,
                 "message_count": 0,
                 "timed_out": True,
+                "duration_seconds": round(duration, 2),
+            },
+        }
+    except RlmLoopFailure as exc:
+        # #111: a total LLM failure -- same honest degrade as the timeout
+        # branch above (a default, conservative assessment) rather than
+        # letting a fabricated decision or an unhandled crash reach the
+        # ingestion pipeline.
+        logger.error(
+            "slow_ingest_chunk got no usable LLM response chunk=%d/%d: %s",
+            chunk_index + 1,
+            total_chunks,
+            exc,
+        )
+        duration = time.perf_counter() - time_start
+        return {
+            "assessment": dict(_DEFAULT_ASSESSMENT),
+            "metrics": {
+                "iterations": 0,
+                "message_count": 0,
+                "llm_error": str(exc),
                 "duration_seconds": round(duration, 2),
             },
         }
