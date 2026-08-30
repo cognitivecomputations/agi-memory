@@ -883,6 +883,11 @@ INSERT INTO config_defaults (key, value, description) VALUES
     ('maintenance.working_memory_promote_min_accesses', '3'::jsonb, 'Working-memory items accessed >= this count are promoted on expiry')
 ON CONFLICT (key) DO NOTHING;
 INSERT INTO config_defaults (key, value, description) VALUES
+    ('maintenance.daily_journal_fallback_enabled', 'true'::jsonb, 'If a local day had meaningful activity and nothing was journaled deliberately, write one minimal fallback entry (issue #114)'),
+    ('maintenance.daily_journal_fallback_hour', '21'::jsonb, 'Local hour (agent.timezone) after which the daily journal fallback may consider stepping in'),
+    ('maintenance.daily_journal_fallback_min_episodes', '3'::jsonb, 'Minimum notable (importance >= 0.5) episodic memories in the local day for the fallback to consider it "meaningful activity"')
+ON CONFLICT (key) DO NOTHING;
+INSERT INTO config_defaults (key, value, description) VALUES
     ('memory.recall_min_trust_level', '0'::jsonb, 'Minimum trust_level to include in recall (0 disables filtering)'),
     ('memory.recall_strength_weight', '0.5'::jsonb, 'How much computed memory strength (recency/reinforcement/decay) reshapes the pure-cosine recall score: 0=pure similarity, 0.5=gentle, 1=score fully scaled by strength'),
     ('memory.recall_low_vividness_threshold', '0.35'::jsonb, 'Recall below this strength/fidelity vividness renders as a hedged reconstruction ("I vaguely recall...")'),

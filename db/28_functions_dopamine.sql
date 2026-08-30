@@ -615,6 +615,7 @@ DECLARE
     activation_cleaned INT;
     ready_transformations JSONB;
     dopamine_drift JSONB;
+    journal_fallback JSONB;
 BEGIN
     IF is_agent_terminated() THEN
         RETURN jsonb_build_object('skipped', true, 'reason', 'terminated');
@@ -665,6 +666,15 @@ BEGIN
         RAISE WARNING 'memory retention pass failed: %', SQLERRM;
     END;
 
+    -- Daily journal fallback (issue #114): a day with real activity and no
+    -- deliberate entry gets one minimal one. Guarded so a failure never breaks
+    -- the maintenance tick.
+    BEGIN
+        journal_fallback := maybe_write_daily_journal_fallback();
+    EXCEPTION WHEN OTHERS THEN
+        RAISE WARNING 'daily journal fallback failed: %', SQLERRM;
+    END;
+
     UPDATE maintenance_state
     SET last_maintenance_at = CURRENT_TIMESTAMP,
         updated_at = CURRENT_TIMESTAMP
@@ -682,6 +692,7 @@ BEGIN
         'memory_activations_cleaned', COALESCE(activation_cleaned, 0),
         'transformations_ready', COALESCE(ready_transformations, '[]'::jsonb),
         'dopamine_drift', COALESCE(dopamine_drift, '{}'::jsonb),
+        'daily_journal_fallback', COALESCE(journal_fallback, jsonb_build_object('skipped', true, 'reason', 'error')),
         'ran_at', CURRENT_TIMESTAMP
     );
 EXCEPTION
