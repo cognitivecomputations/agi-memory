@@ -2132,6 +2132,14 @@ class GetProceduresHandler(ToolHandler):
                         "type": "string",
                         "description": "The task you want to know how to do.",
                     },
+                    "situation": {
+                        "type": "string",
+                        "description": "Alias for task, accepted for compatibility with memory-search wording.",
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Alias for task, accepted for compatibility with memory-search wording.",
+                    },
                     "limit": {
                         "type": "integer",
                         "description": "Maximum procedures to return.",
@@ -2140,7 +2148,7 @@ class GetProceduresHandler(ToolHandler):
                         "maximum": 10,
                     },
                 },
-                "required": ["task"],
+                "required": [],
             },
             category=ToolCategory.MEMORY,
             energy_cost=1,
