@@ -1082,6 +1082,7 @@ DECLARE
     activation_decay INT;
     activation_cleaned INT;
     ready_transformations JSONB;
+    journal_fallback JSONB;
 BEGIN
     IF is_agent_terminated() THEN
         RETURN jsonb_build_object('skipped', true, 'reason', 'terminated');
@@ -1131,6 +1132,14 @@ BEGIN
         RAISE WARNING 'memory retention pass failed: %', SQLERRM;
     END;
 
+    -- Daily journal fallback (issue #114). (Kept in sync with the db/28
+    -- dopamine override, which is the live version.)
+    BEGIN
+        journal_fallback := maybe_write_daily_journal_fallback();
+    EXCEPTION WHEN OTHERS THEN
+        RAISE WARNING 'daily journal fallback failed: %', SQLERRM;
+    END;
+
     UPDATE maintenance_state
     SET last_maintenance_at = CURRENT_TIMESTAMP,
         updated_at = CURRENT_TIMESTAMP
@@ -1147,6 +1156,7 @@ BEGIN
         'activation_boosts_decayed', COALESCE(activation_decay, 0),
         'memory_activations_cleaned', COALESCE(activation_cleaned, 0),
         'transformations_ready', COALESCE(ready_transformations, '[]'::jsonb),
+        'daily_journal_fallback', COALESCE(journal_fallback, jsonb_build_object('skipped', true, 'reason', 'error')),
         'ran_at', CURRENT_TIMESTAMP
     );
 EXCEPTION

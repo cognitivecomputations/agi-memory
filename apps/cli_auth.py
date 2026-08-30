@@ -68,6 +68,23 @@ def register_auth_subparsers(
         ("--client-id", {"default": None, "help": "Override Chutes client ID"}),
     ])
 
+    # ── GitHub (Issues, via a fine-grained/classic PAT) (#102) ────
+    gh = auth_sub.add_parser(
+        "github", parents=[db_parent],
+        help="GitHub API for the github-issues skill (personal access token)",
+    )
+    gh_sub = gh.add_subparsers(dest="github_command")
+    _ghst = gh_sub.add_parser("setup-token", parents=[db_parent], help="Paste a personal access token")
+    _ghst.add_argument("--token", default=None, help="Token value (prompted if omitted)")
+    _ghst.set_defaults(func="auth_github_setup_token")
+    _ghs = gh_sub.add_parser("status", parents=[db_parent], help="Show token status")
+    _ghs.add_argument("--json", action="store_true", help="Output JSON")
+    _ghs.set_defaults(func="auth_github_status")
+    _ghl = gh_sub.add_parser("logout", parents=[db_parent], help="Delete stored credentials")
+    _ghl.add_argument("--yes", "-y", action="store_true", help="Skip confirmation")
+    _ghl.set_defaults(func="auth_github_logout")
+    gh.set_defaults(func="auth_github")
+
     # ── GitHub Copilot ────────────────────────────────────────────
     ghc = auth_sub.add_parser("github-copilot", parents=[db_parent], help="GitHub Copilot (device code)")
     ghc_sub = ghc.add_subparsers(dest="github_copilot_command")
@@ -177,6 +194,16 @@ def dispatch_auth_command(func: str, args: Any, dsn: str) -> int | None:
         return asyncio.run(_anthropic_status(dsn, ws, as_json=bool(getattr(args, "json", False))))
     if func == "auth_anthropic_logout":
         return asyncio.run(_anthropic_logout(dsn, ws, getattr(args, "yes", False)))
+
+    # ── GitHub (#102) ──
+    if func == "auth_github":
+        return asyncio.run(_github_status(dsn, ws, as_json=False))
+    if func == "auth_github_setup_token":
+        return asyncio.run(_github_setup_token(dsn, ws, getattr(args, "token", None)))
+    if func == "auth_github_status":
+        return asyncio.run(_github_status(dsn, ws, as_json=bool(getattr(args, "json", False))))
+    if func == "auth_github_logout":
+        return asyncio.run(_github_logout(dsn, ws, getattr(args, "yes", False)))
 
     # ── Chutes ──
     if func == "auth_chutes":
@@ -720,6 +747,94 @@ async def _anthropic_logout(dsn: str, wait_seconds: int, yes: bool) -> int:
     # Also clear any credential left behind by the removed OAuth login flow.
     delete_auth("oauth.anthropic")
     console.print("[ok]Deleted Anthropic credentials.[/ok]")
+    return 0
+
+
+async def _github_setup_token(dsn: str, wait_seconds: int, token: str | None) -> int:
+    """#102: the github-issues skill dead-ended into "set
+    GITHUB_PERSONAL_ACCESS_TOKEN in the service environment". This is the
+    interim, productized replacement the issue's own Non-Goals sanction: a
+    terminal-only prompt (never chat), verified against GitHub's own API
+    before being stored, so a bad paste fails loudly here instead of at
+    skill-activation time."""
+    import getpass
+
+    from apps.cli_theme import console
+    from core.auth.github_pat import (
+        GithubPatCredentials,
+        save_credentials,
+        validate_pat_format,
+        verify_pat,
+    )
+
+    if not token:
+        console.print(
+            "[dim]Create a fine-grained token scoped to Issues (read/write) on the "
+            "target repo(s) at https://github.com/settings/personal-access-tokens/new[/dim]"
+        )
+        try:
+            token = getpass.getpass("Paste your GitHub personal access token: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            console.print("\n[dim]Aborted.[/dim]")
+            return 1
+
+    error = validate_pat_format(token)
+    if error:
+        _print_err(f"Invalid token: {error}")
+        return 1
+
+    login, verify_error = await verify_pat(token)
+    if verify_error:
+        _print_err(f"Could not verify token: {verify_error}")
+        return 1
+
+    save_credentials(GithubPatCredentials(token=token, login=login))
+    console.print(f"[ok]GitHub token saved and verified as @{login}.[/ok]")
+    return 0
+
+
+async def _github_status(dsn: str, wait_seconds: int, *, as_json: bool) -> int:
+    from core.auth.github_pat import load_credentials
+
+    creds = load_credentials()
+    if not creds:
+        if as_json:
+            sys.stdout.write(json.dumps({"configured": False}, indent=2) + "\n")
+        else:
+            sys.stdout.write("GitHub: not configured. Run `hexis auth github setup-token`.\n")
+        return 0
+
+    redacted = creds.token[:12] + "..." if len(creds.token) > 12 else "***"
+    if as_json:
+        sys.stdout.write(
+            json.dumps(
+                {"configured": True, "login": creds.login, "token_prefix": redacted},
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n"
+        )
+    else:
+        sys.stdout.write(f"GitHub: configured as @{creds.login} ({redacted})\n")
+    return 0
+
+
+async def _github_logout(dsn: str, wait_seconds: int, yes: bool) -> int:
+    from apps.cli_theme import console
+    from core.auth.github_pat import delete_credentials
+
+    if not yes:
+        try:
+            answer = input("Delete stored GitHub credentials? Type 'yes' to confirm: ").strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            console.print("\n[dim]Aborted.[/dim]")
+            return 1
+        if answer != "yes":
+            console.print("[dim]Aborted.[/dim]")
+            return 1
+
+    delete_credentials()
+    console.print("[ok]Deleted GitHub credentials.[/ok]")
     return 0
 
 

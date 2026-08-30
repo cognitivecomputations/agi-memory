@@ -859,7 +859,16 @@ CREATE INDEX IF NOT EXISTS idx_defect_reports_category
     ON defect_reports(category);
 
 INSERT INTO config_defaults (key, value, description) VALUES
-    ('agent.tools', '["recall","sense_memory_availability","request_background_search","recall_recent","recall_episode","explore_concept","explore_cluster","get_procedures","get_strategies","list_recent_episodes","create_goal","schedule_task","list_scheduled_tasks","update_scheduled_task","delete_scheduled_task","queue_user_message","self_repair"]'::jsonb, 'Allowed tool names for agent tool use')
+    -- 9 of the original 17 names here were never registered (#108) --
+    -- recall_recent/recall_episode/explore_cluster/list_recent_episodes had
+    -- no live equivalent, and create_goal/schedule_task/list_scheduled_tasks/
+    -- update_scheduled_task/delete_scheduled_task were superseded by the
+    -- unified manage_goals/manage_schedule tools (core/tools/memory.py's own
+    -- create_memory_tools() docstring says so) but agent.tools was never
+    -- updated to match, so the heartbeat kept advertising dead names and
+    -- lost real capability in the same stroke. Every name below is verified
+    -- registered (tests/db/test_tool_runtime.py).
+    ('agent.tools', '["recall","sense_memory_availability","request_background_search","explore_concept","get_procedures","get_strategies","manage_goals","manage_schedule","queue_user_message","self_repair"]'::jsonb, 'Allowed tool names for agent tool use')
 ON CONFLICT (key) DO NOTHING;
 INSERT INTO config_defaults (key, value, description) VALUES
     ('mcp.legacy_compat_enabled', 'false'::jsonb, 'Expose the old handwritten MCP compatibility tool surface in addition to registry-native tools')
@@ -875,6 +884,11 @@ INSERT INTO config_defaults (key, value, description) VALUES
     ('maintenance.embedding_cache_older_than_days', '7'::jsonb, 'Days before embedding_cache entries are eligible for cleanup'),
     ('maintenance.working_memory_promote_min_importance', '0.75'::jsonb, 'Working-memory items above this importance are promoted on expiry'),
     ('maintenance.working_memory_promote_min_accesses', '3'::jsonb, 'Working-memory items accessed >= this count are promoted on expiry')
+ON CONFLICT (key) DO NOTHING;
+INSERT INTO config_defaults (key, value, description) VALUES
+    ('maintenance.daily_journal_fallback_enabled', 'true'::jsonb, 'If a local day had meaningful activity and nothing was journaled deliberately, write one minimal fallback entry (issue #114)'),
+    ('maintenance.daily_journal_fallback_hour', '21'::jsonb, 'Local hour (agent.timezone) after which the daily journal fallback may consider stepping in'),
+    ('maintenance.daily_journal_fallback_min_episodes', '3'::jsonb, 'Minimum notable (importance >= 0.5) episodic memories in the local day for the fallback to consider it "meaningful activity"')
 ON CONFLICT (key) DO NOTHING;
 INSERT INTO config_defaults (key, value, description) VALUES
     ('memory.recall_min_trust_level', '0'::jsonb, 'Minimum trust_level to include in recall (0 disables filtering)'),

@@ -18,6 +18,7 @@ import pytest
 from core.tools.base import ToolContext, ToolExecutionContext
 from core.tools.memory import (
     DiffMemoryHistoryHandler,
+    GetProceduresHandler,
     GetStrategiesHandler,
     LoadDocumentsHandler,
     OpenDocumentHandler,
@@ -285,6 +286,16 @@ class TestProvenanceTooling:
         handler = GetStrategiesHandler()
         assert handler.validate({"query": "recover from heartbeat failures"}) == []
         assert handler.validate({"situation": "recover from heartbeat failures"}) == []
+
+    async def test_get_procedures_schema_accepts_situation_and_query_aliases(self):
+        """#109: the DB executor (db/38) already coalesces task/situation/query
+        for get_procedures, same as get_strategies -- the Python schema
+        rejected situation/query calls before they ever reached it."""
+        handler = GetProceduresHandler()
+        assert handler.validate({"task": "deploy the worker"}) == []
+        assert handler.validate({"situation": "deploy the worker"}) == []
+        assert handler.validate({"query": "deploy the worker"}) == []
+        assert handler.spec.parameters["required"] == []
 
     async def test_remember_schema_supports_sources_and_confidence(self):
         spec = RememberHandler().spec

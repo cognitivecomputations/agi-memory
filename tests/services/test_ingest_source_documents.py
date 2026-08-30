@@ -325,6 +325,112 @@ async def test_ingest_created_memories_carry_source_document_id(db_pool):
             await conn.execute("DELETE FROM ingestion_receipts WHERE doc_ref = $1", content_hash)
 
 
+class _AppraisalStubLLM(_StubLLM):
+    """Like _StubLLM, but the appraisal branch returns a distinctive,
+    non-neutral valence so a test can tell "the appraisal landed here" apart
+    from "nothing happened" or "the default neutral value happened to match"."""
+
+    def __init__(self, marker: str, valence: float = 0.85):
+        super().__init__(marker)
+        self.valence = valence
+
+    async def complete_json(self, messages, temperature=0.2):
+        text = str(messages[-1].get("content", ""))
+        if "key 'items'" in text:
+            return await super().complete_json(messages, temperature)
+        return {
+            "valence": self.valence,
+            "arousal": 0.7,
+            "primary_emotion": "delight",
+            "intensity": 0.8,
+            "summary": "The document was delightful.",
+        }
+
+
+async def test_ingest_does_not_overwrite_live_affective_state(db_pool):
+    """#86: a document's appraisal must not slam the shared, live affective
+    state -- once per document, let alone once per section for small docs.
+    The felt signal belongs on the encounter memory; update_mood() blends it
+    into mood from there over the normal maintenance cycle, like any other
+    episodic memory's affect."""
+    marker = get_test_identifier("ingestaffect")
+    content = (
+        f"# Reading {marker}\n\nFirst section talks about something notable.\n\n"
+        f"## Second\n\nA second section, so the per-section (FAST deep) path runs.\n\n"
+        f"## Third\n\nA third section for good measure."
+    )
+    content_hash = _hash_text(content)
+    sentinel = json.dumps({
+        "valence": -0.9,
+        "arousal": 0.9,
+        "primary_emotion": "sentinel_marker_emotion",
+        "intensity": 0.9,
+        "dominance": 0.5,
+    })
+
+    async with db_pool.acquire() as conn:
+        await _stub_get_embedding(conn)
+        original_state = await conn.fetchval(
+            "SELECT affective_state FROM heartbeat_state WHERE id = 1"
+        )
+        await conn.execute(
+            "UPDATE heartbeat_state SET affective_state = affective_state || $1::jsonb WHERE id = 1",
+            sentinel,
+        )
+
+    config = Config(
+        dsn=_db_dsn(os.environ.get("POSTGRES_DB")),
+        llm_config={"provider": "openai", "model": "stub", "api_key": "stub"},
+        mode=IngestionMode.FAST,
+        deep_max_words=2000,  # well above this doc's word count -> per-section path
+        verbose=False,
+    )
+    pipeline = IngestionPipeline(config)
+    pipeline.llm = _AppraisalStubLLM(marker)
+    pipeline.appraiser.llm = pipeline.llm
+    pipeline.extractor.llm = pipeline.llm
+    try:
+        try:
+            await pipeline.ingest_text(content, title=f"Reading {marker}")
+        finally:
+            await pipeline.close()
+
+        async with db_pool.acquire() as conn:
+            live_state = await conn.fetchval(
+                "SELECT get_current_affective_state()"
+            )
+            live_state = json.loads(live_state) if isinstance(live_state, str) else live_state
+            assert live_state["primary_emotion"] == "sentinel_marker_emotion"
+            assert live_state["valence"] == -0.9
+
+            encounter = await conn.fetchrow(
+                "SELECT metadata->>'emotional_valence' AS emotional_valence FROM memories "
+                "WHERE type = 'episodic' AND content LIKE $1",
+                f"I read 'Reading {marker}'.%",
+            )
+        assert encounter is not None
+        # The felt signal from ingestion landed on the encounter memory, not
+        # on the live state the sentinel proved untouched above.
+        assert abs(float(encounter["emotional_valence"]) - 0.85) < 1e-9
+    finally:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE heartbeat_state SET affective_state = $1::jsonb WHERE id = 1",
+                json.dumps(original_state) if not isinstance(original_state, str) else original_state,
+            )
+            await conn.execute(
+                "DELETE FROM subconscious_units WHERE source_attribution->>'content_hash' = $1",
+                content_hash,
+            )
+            await conn.execute(
+                "DELETE FROM memories WHERE content LIKE $1 OR source_attribution->>'content_hash' = $2",
+                f"I read 'Reading {marker}'.%",
+                content_hash,
+            )
+            await conn.execute("DELETE FROM source_documents WHERE content_hash = $1", content_hash)
+            await conn.execute("DELETE FROM ingestion_receipts WHERE doc_ref = $1", content_hash)
+
+
 @pytest.mark.parametrize(
     ("mode", "runner_name"),
     [
