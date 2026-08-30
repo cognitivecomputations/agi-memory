@@ -59,6 +59,31 @@ async def test_migrations_recorded_and_idempotent(db_pool):
         )
 
 
+def test_latest_bundled_migration_version_reads_real_migrations_dir():
+    """#113: the value a worker stamps onto its own registration metadata is
+    exactly the highest-versioned file in this checkout's db/migrations/."""
+    from core.migrations import _list_migration_files, latest_bundled_migration_version
+
+    files = _list_migration_files(_DB_ROOT / "migrations")
+    assert files, "expected at least one real migration on disk"
+    assert latest_bundled_migration_version(_DB_ROOT / "migrations") == files[-1].stem
+
+
+def test_latest_bundled_migration_version_missing_dir_returns_none(tmp_path):
+    from core.migrations import latest_bundled_migration_version
+
+    assert latest_bundled_migration_version(tmp_path / "does_not_exist") is None
+
+
+def test_latest_bundled_migration_version_orders_lexicographically(tmp_path):
+    (tmp_path / "0002_second.sql").write_text("-- second", encoding="utf-8")
+    (tmp_path / "0010_tenth.sql").write_text("-- tenth", encoding="utf-8")
+    (tmp_path / "0001_first.sql").write_text("-- first", encoding="utf-8")
+    from core.migrations import latest_bundled_migration_version
+
+    assert latest_bundled_migration_version(tmp_path) == "0010_tenth"
+
+
 async def test_applied_migration_checksum_drift_fails_loudly(db_pool):
     from core.migrations import (
         MigrationChecksumError,

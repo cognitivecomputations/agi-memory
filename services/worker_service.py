@@ -154,10 +154,13 @@ async def tee_outbox_to_web_inbox(
 
 
 def _worker_metadata() -> dict[str, Any]:
+    from core.agent_api import worker_code_stamp_metadata
+
     return {
         "process_id": os.getpid(),
         "host_name": socket.gethostname(),
         "command": "hexis-worker",
+        **worker_code_stamp_metadata(),
     }
 
 
