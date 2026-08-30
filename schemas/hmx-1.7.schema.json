@@ -21,7 +21,8 @@
       "additionalProperties": {"$ref": "#/$defs/sha256"}
     },
     "statistics": {"$ref": "#/$defs/statistics"},
-    "export_warnings": {"type": "array", "items": {"type": "string"}}
+    "export_warnings": {"type": "array", "items": {"type": "string"}},
+    "onboarding_interview": {"$ref": "#/$defs/onboardingInterview"}
   },
   "additionalProperties": true,
   "$defs": {
@@ -553,6 +554,65 @@
         "estimated_embedding_tokens": {"type": "integer", "minimum": 0},
         "estimated_embedding_cost_units": {"type": ["number", "null"]},
         "estimated_uncompressed_bytes": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": true
+    },
+    "onboardingInterviewOption": {
+      "type": "object",
+      "required": ["label", "value"],
+      "properties": {
+        "label": {"type": "string"},
+        "value": {}
+      },
+      "additionalProperties": true
+    },
+    "onboardingInterviewBinding": {
+      "type": "object",
+      "required": ["action"],
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": [
+            "remember",
+            "ingest",
+            "init_identity",
+            "create_goal",
+            "set_guardrail",
+            "create_scheduled_task",
+            "set_config"
+          ]
+        },
+        "params_template": {"type": "object"}
+      },
+      "additionalProperties": true
+    },
+    "onboardingInterviewQuestion": {
+      "type": "object",
+      "required": ["id", "type", "prompt", "binds"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "type": {"type": "string", "enum": ["choice", "freeform"]},
+        "prompt": {"type": "string", "minLength": 1},
+        "options": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/onboardingInterviewOption"}
+        },
+        "binds": {"$ref": "#/$defs/onboardingInterviewBinding"},
+        "required": {"type": "boolean"},
+        "skippable": {"type": "boolean"}
+      },
+      "additionalProperties": true
+    },
+    "onboardingInterview": {
+      "type": "object",
+      "description": "A use case fully defined in one HMX file (#97): questions the agent asks conversationally in the first chat after import, each bound to an action via existing machinery (remember, ingestion, identity, goals, guardrails, scheduled tasks, config).",
+      "required": ["version", "questions"],
+      "properties": {
+        "version": {"type": "integer", "minimum": 1},
+        "questions": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/onboardingInterviewQuestion"}
+        }
       },
       "additionalProperties": true
     }
