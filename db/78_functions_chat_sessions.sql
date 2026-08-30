@@ -804,6 +804,11 @@ BEGIN
             NULLIF(ctx->>'user_source_message_id', ''),
             TRUE
         );
+        -- Every chat surface (web, CLI, API) funnels here, so this is the one
+        -- choke point that can mark real user contact (#112). Without it,
+        -- last_user_contact only ever moved via the RabbitMQ inbox poller,
+        -- leaving chat-only agents permanently reading "Never hours".
+        PERFORM mark_user_contact();
     END IF;
 
     IF NULLIF(COALESCE(p_assistant_text, ''), '') IS NOT NULL THEN

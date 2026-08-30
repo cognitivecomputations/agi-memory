@@ -790,6 +790,129 @@ async def test_legacy_heartbeat_outreach_requires_backing_and_exact_public_targe
             await tr.rollback()
 
 
+async def test_reach_out_user_cooldown_blocks_unsolicited_but_not_reply_or_urgent(
+    db_pool,
+):
+    """#112: heartbeat.user_contact_cooldown_hours was seeded and documented
+    but never enforced. A recent last_user_contact should block a plain
+    'connection' reach-out, but never a reply to something the user just
+    sent, nor a purpose already flagged urgent."""
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            marker = uuid4().hex
+            # Several reach_out_user calls happen below; keep energy topped up
+            # so "Insufficient energy" never masquerades as a cooldown result.
+            await conn.execute(
+                "UPDATE heartbeat_state SET last_user_contact = CURRENT_TIMESTAMP, current_energy = 100 WHERE id = 1"
+            )
+
+            blocked = _j(
+                await conn.fetchval(
+                    "SELECT execute_heartbeat_action($1, 'reach_out_user', $2::jsonb)",
+                    uuid4(),
+                    json.dumps(
+                        {
+                            "message": "just checking in",
+                            "purpose_kind": "connection",
+                            "purpose_reference": f"connection-{marker}",
+                        }
+                    ),
+                )
+            )
+            assert blocked["success"] is False
+            assert blocked["error"] == "User contact cooldown active"
+            assert blocked["cooldown_hours"] == pytest.approx(4.0)
+
+            # A reply to a real inbound message is not "unsolicited" -- it
+            # sails through the cooldown gate (and may still succeed/fail on
+            # other grounds, but never on the cooldown).
+            session_id = await conn.fetchval(
+                """
+                INSERT INTO channel_sessions(channel_type, channel_id, sender_id)
+                VALUES ('email', $1, $2) RETURNING id
+                """,
+                f"thread:{marker}",
+                f"{marker}@example.com",
+            )
+            inbound_id = f"inbound:{marker}"
+            await conn.execute(
+                """
+                INSERT INTO channel_messages(session_id, direction, content, platform_message_id)
+                VALUES ($1, 'inbound', 'hello', $2)
+                """,
+                session_id,
+                inbound_id,
+            )
+            reply = _j(
+                await conn.fetchval(
+                    "SELECT execute_heartbeat_action($1, 'reach_out_user', $2::jsonb)",
+                    uuid4(),
+                    json.dumps(
+                        {
+                            "message": "replying to you",
+                            "purpose_kind": "reply",
+                            "purpose_reference": inbound_id,
+                        }
+                    ),
+                )
+            )
+            assert reply["success"] is True
+            assert reply.get("error") != "User contact cooldown active"
+
+            # An urgent, user-assigned goal is also not "unsolicited".
+            urgent_goal_id = await conn.fetchval(
+                """
+                INSERT INTO memories (
+                    type, goal_origin, content, importance, trust_level, status, metadata
+                ) VALUES (
+                    'goal', 'user_request'::goal_source, $1, 0.7, 0.8, 'active',
+                    '{"priority":"urgent","urgent":true}'::jsonb
+                )
+                RETURNING id
+                """,
+                f"Urgent outbound goal {marker}",
+            )
+            urgent = _j(
+                await conn.fetchval(
+                    "SELECT execute_heartbeat_action($1, 'reach_out_user', $2::jsonb)",
+                    uuid4(),
+                    json.dumps(
+                        {
+                            "message": "about your urgent goal",
+                            "purpose_kind": "goal",
+                            "purpose_reference": str(urgent_goal_id),
+                        }
+                    ),
+                )
+            )
+            assert urgent["success"] is True
+            assert urgent.get("error") != "User contact cooldown active"
+
+            # Once the cooldown window has actually elapsed, the same
+            # 'connection' purpose that was blocked above now succeeds.
+            await conn.execute(
+                "UPDATE heartbeat_state SET last_user_contact = CURRENT_TIMESTAMP - INTERVAL '5 hours', current_energy = 100 WHERE id = 1"
+            )
+            allowed = _j(
+                await conn.fetchval(
+                    "SELECT execute_heartbeat_action($1, 'reach_out_user', $2::jsonb)",
+                    uuid4(),
+                    json.dumps(
+                        {
+                            "message": "just checking in",
+                            "purpose_kind": "connection",
+                            "purpose_reference": f"connection-{marker}",
+                        }
+                    ),
+                )
+            )
+            assert allowed["success"] is True
+        finally:
+            await tr.rollback()
+
+
 async def test_z_0223_migration_is_self_contained_for_existing_installations(db_pool):
     migration = (
         Path(__file__).resolve().parents[2]

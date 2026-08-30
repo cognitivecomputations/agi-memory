@@ -109,6 +109,47 @@ async def test_record_hydrate_and_clear_chat_session(db_pool):
             await tr.rollback()
 
 
+async def test_recording_a_user_turn_marks_user_contact(db_pool):
+    """#112: web/CLI/API chat all funnel through record_chat_session_turn, so
+    this is the one choke point that must mark real user contact. Before this
+    fix, last_user_contact only ever moved via the RabbitMQ inbox poller and
+    every chat-only agent's heartbeat prompt read "Never hours" forever."""
+    session_id = str(uuid4())
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            await _stub_get_embedding(conn)
+            before = await conn.fetchval(
+                "SELECT last_user_contact FROM heartbeat_state WHERE id = 1"
+            )
+
+            await conn.fetchval(
+                "SELECT record_chat_session_turn($1::uuid, 'hi there', 'hello!', 'chat', '{}'::jsonb)",
+                session_id,
+            )
+
+            after = await conn.fetchval(
+                "SELECT last_user_contact FROM heartbeat_state WHERE id = 1"
+            )
+            assert after is not None
+            if before is not None:
+                assert after > before
+
+            # An assistant-only turn (no user text) is not user contact.
+            before_assistant_only = after
+            await conn.fetchval(
+                "SELECT record_chat_session_turn($1::uuid, NULL, 'a follow-up note', 'chat', '{}'::jsonb)",
+                session_id,
+            )
+            after_assistant_only = await conn.fetchval(
+                "SELECT last_user_contact FROM heartbeat_state WHERE id = 1"
+            )
+            assert after_assistant_only == before_assistant_only
+        finally:
+            await tr.rollback()
+
+
 async def test_chat_session_history_survives_memory_write_failure(db_pool):
     session_id = str(uuid4())
 
