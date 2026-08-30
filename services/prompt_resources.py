@@ -14,7 +14,12 @@ HEARTBEAT_AGENTIC_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "h
 HEARTBEAT_TASK_MODE_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "heartbeat_task_mode.md"
 TERMINATION_CONFIRM_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "termination_confirm.md"
 TERMINATION_REVIEW_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "termination_review.md"
-SUBCONSCIOUS_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "subconscious.md"
+SUBCONSCIOUS_INLINE_PROMPT_PATH = (
+    Path(__file__).resolve().parent / "prompts" / "subconscious_inline.md"
+)
+SUBCONSCIOUS_MAINTENANCE_PROMPT_PATH = (
+    Path(__file__).resolve().parent / "prompts" / "subconscious_maintenance.md"
+)
 RLM_HEARTBEAT_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "rlm_heartbeat_system.md"
 RLM_CHAT_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "rlm_chat_system.md"
 RLM_SLOW_INGEST_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "rlm_slow_ingest_system.md"
@@ -202,11 +207,25 @@ def load_termination_review_prompt() -> str:
 
 
 @lru_cache(maxsize=1)
-def load_subconscious_prompt() -> str:
-    if SUBCONSCIOUS_PROMPT_PATH.exists():
-        return SUBCONSCIOUS_PROMPT_PATH.read_text(encoding="utf-8")
+def load_subconscious_inline_prompt() -> str:
+    """Inline appraisal (#53): the hot path, called on every chat/heartbeat
+    turn. Carries only its own task's spec -- not the maintenance_review
+    schema, which that call never needs."""
+    if SUBCONSCIOUS_INLINE_PROMPT_PATH.exists():
+        return SUBCONSCIOUS_INLINE_PROMPT_PATH.read_text(encoding="utf-8")
     return (
-        "Subconscious prompt missing. Respond with JSON observation arrays."
+        "Subconscious inline-appraisal prompt missing. Respond with JSON observation arrays."
+    )
+
+
+@lru_cache(maxsize=1)
+def load_subconscious_maintenance_prompt() -> str:
+    """Maintenance review (#53): the infrequent background pass that alone
+    may populate the long-horizon observation arrays."""
+    if SUBCONSCIOUS_MAINTENANCE_PROMPT_PATH.exists():
+        return SUBCONSCIOUS_MAINTENANCE_PROMPT_PATH.read_text(encoding="utf-8")
+    return (
+        "Subconscious maintenance-review prompt missing. Respond with JSON observation arrays."
     )
 
 

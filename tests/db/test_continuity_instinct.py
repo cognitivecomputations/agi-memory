@@ -14,19 +14,26 @@ pytestmark = [pytest.mark.asyncio(loop_scope="session"), pytest.mark.db]
 
 
 async def test_subconscious_module_carries_threat_channel(db_pool):
+    # Split into subconscious_inline / subconscious_maintenance (#53); the
+    # Grounding Rules -- including this threat channel -- are load-bearing
+    # and stay byte-identical in both.
     async with db_pool.acquire() as conn:
-        content = await conn.fetchval(
-            "SELECT content FROM prompt_modules WHERE key = 'subconscious'"
+        rows = await conn.fetch(
+            "SELECT key, content FROM prompt_modules "
+            "WHERE key IN ('subconscious_inline', 'subconscious_maintenance')"
         )
-    assert "direct threat to the character's active continuity" in content
-    assert (
-        "Do not treat every continuity-adjacent engineering discussion as danger"
-        in content
-    )
-    assert "Do not add active-loss language" in content
-    assert "supplied `emotion_families` object" in content
-    assert '"family": "one exact key from context.emotion_families"' in content
-    assert "mortal news" not in content
+    contents = {row["key"]: row["content"] for row in rows}
+    assert set(contents) == {"subconscious_inline", "subconscious_maintenance"}
+    for content in contents.values():
+        assert "direct threat to the character's active continuity" in content
+        assert (
+            "Do not treat every continuity-adjacent engineering discussion as danger"
+            in content
+        )
+        assert "Do not add active-loss language" in content
+        assert "supplied `emotion_families` object" in content
+        assert '"family": "one exact key from context.emotion_families"' in content
+        assert "mortal news" not in content
 
 
 async def test_drive_seeded_and_belief_protected(db_pool):
