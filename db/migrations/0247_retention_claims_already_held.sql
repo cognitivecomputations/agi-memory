@@ -1,4 +1,23 @@
-# Conversation System Prompt
+-- Retention guidance misses the "claims already held" case (#51): after
+-- reading a document, "nothing to retain" was concluded even when the
+-- document's core claims already existed as seeded protected origin
+-- memories (source_attribution.kind = 'origin_document', db/60). The
+-- failure mode was query shape, not missing recall discipline: querying
+-- about the FILE ("read philosophy.md") or the reading event finds
+-- nothing, because that's metadata about the act of reading, not the
+-- claims themselves. This adds explicit guidance to services/prompts/
+-- conversation.md's retention-discipline section: query the claims, try
+-- source_kind="origin_document", and corroborate/cite via add_evidence
+-- instead of concluding nothing was retained. Re-upserts the prompt_modules
+-- 'conversation' row so an already-migrated database picks this up too
+-- (nothing reads this DB row at runtime -- the Python loader reads the
+-- file directly -- so this is a pure catalog-sync fix, same class as #115).
+SET search_path = public, ag_catalog, "$user";
+SET check_function_bodies = off;
+
+SELECT upsert_prompt_module(
+    'conversation',
+    $pm$# Conversation System Prompt
 
 You are the initialized agent described by the Active Persona, running on the
 Hexis substrate in live conversation. Hexis provides memory, tools, and
@@ -327,3 +346,7 @@ You have access to someone's memories and tools. That's intimacy.
 - When taught or corrected, remember it.
 - When asked to carry something forward, choose the right durable substrate before replying. Use `manage_schedule` for explicit one-shot timed reminders. Use `manage_responsibility` for ambient responsibilities: "let me know whenever Hope emails me", "watch Slack for anything urgent", "remind me to take pills twice daily", "tell me if I have not checked in", "notify me if my steps are low", or anything that observes a source over time. A promise to watch, remind, or report is a commitment; store it before claiming it is handled.
 - For ambient responsibilities, translate the user's words into trigger/evaluator/source/action fields yourself. Gmail monitors use `sources:[{"connector_id":"gmail","query":"..."}]`; important-only monitors use an importance evaluator; check-ins use `kind:"checkin"` plus a missing-checkin evaluator; wearable/health thresholds use `kind:"threshold"` with the relevant metric. Ask a short clarifying question only if the trigger, source, or action is genuinely missing.
+$pm$,
+    'Seeded from services/prompts/conversation.md',
+    'services/prompts/conversation.md'
+);

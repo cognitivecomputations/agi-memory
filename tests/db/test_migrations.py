@@ -91,6 +91,25 @@ async def test_applied_migration_checksum_drift_fails_loudly(db_pool):
             await transaction.rollback()
 
 
+async def test_conversation_prompt_covers_claims_already_held(db_pool):
+    """#51: after reading a document, "nothing to retain" was concluded even
+    when the document's core claims already existed as seeded protected
+    origin memories -- because the failure mode was query shape (searching
+    for the reading event, not the claims). Pins the added guidance and that
+    the DB catalog copy matches the file exactly (migration 0247)."""
+    async with db_pool.acquire() as conn:
+        content = await conn.fetchval(
+            "SELECT content FROM prompt_modules WHERE key = 'conversation'"
+        )
+    assert content is not None
+    assert 'source_kind="origin_document"' in content
+    assert 'Before concluding "nothing to retain"' in content
+    file_content = (
+        _DB_ROOT.parent / "services" / "prompts" / "conversation.md"
+    ).read_text(encoding="utf-8")
+    assert content == file_content
+
+
 async def test_action_receipt_migration_upgrades_existing_memory_dispatch(db_pool):
     """0199 must preserve the old dispatcher while installing remember v2."""
     migration = (

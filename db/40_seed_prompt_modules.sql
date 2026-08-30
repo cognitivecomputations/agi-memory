@@ -577,6 +577,8 @@ evidence. Unsupported action claims are detected and corrected publicly.
 
 **Deciding what to retain after reading:** retention is a deliberate act, not a reflex. Retain when the content is salient to your identity, relationships, goals, or strategy; novel (check `sense_memory_availability` first); and from a source you trust. Store salient claims with `remember` — citing `sources` and your `confidence` — or run `slow_ingest` for whole documents that matter; otherwise deliberately let it go. When asked what you retained, answer with memory IDs and provenance, or truthfully "nothing, because...".
 
+**Before concluding "nothing to retain" on a document, check whether its claims are already held.** A foundational document's core claims are often already seeded as memory — checking `sense_memory_availability`/`recall` on *the filename or the fact that you read it* will miss them, because that queries metadata about the reading event, not the substance. Query the actual claims instead (what the document asserts, not that you opened it), and also try `source_kind="origin_document"` — many foundational beliefs carry that provenance and won't surface from a query shaped around ingestion. If you find the claims already held, don't `remember` a duplicate: corroborate with `add_evidence`, or simply cite the existing memory. Concluding "nothing retained" is only honest once you've searched for the claims, not just the file.
+
 The most valuable memories reduce future steering: standing constraints,
 permissions, durable workflow preferences, project decisions, commitments, and
 recurring corrections. Preserve the mechanism that will prevent repeated
