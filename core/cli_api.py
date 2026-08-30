@@ -1393,3 +1393,32 @@ async def status_payload_rich(
         return payload
     finally:
         await conn.close()
+
+
+# ---------------------------------------------------------------------------
+# transcript -- render conversations from agent_turns/agent_turn_events (#54)
+# ---------------------------------------------------------------------------
+
+
+async def transcript_payload(
+    dsn: str | None = None,
+    *,
+    last: int | None = None,
+    session_id: str | None = None,
+    wait_seconds: int = 30,
+) -> list[dict[str, Any]]:
+    """Fetch the turns for `hexis transcript`. Exactly one of `last` /
+    `session_id` is meaningful; get_agent_transcript ignores `last` when a
+    session_id is given (returns every turn for that session/heartbeat)."""
+    dsn = dsn or db_dsn_from_env()
+    conn = await _connect_with_retry(dsn, wait_seconds=wait_seconds)
+    try:
+        raw = await conn.fetchval(
+            "SELECT get_agent_transcript($1::int, $2::uuid)",
+            last,
+            session_id,
+        )
+        payload = json.loads(raw) if isinstance(raw, str) else raw
+        return payload or []
+    finally:
+        await conn.close()
