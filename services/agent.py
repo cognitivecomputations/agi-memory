@@ -25,7 +25,7 @@ from services.prompt_resources import (
     load_conversation_prompt,
     load_heartbeat_agentic_prompt,
     load_heartbeat_task_mode_prompt,
-    load_subconscious_prompt,
+    load_subconscious_inline_prompt,
 )
 from services.skill_runtime import (
     format_skills_prompt,
@@ -485,7 +485,7 @@ async def run_subconscious_appraisal(
     user_prompt = "Context (JSON):\n" + _bounded_subconscious_json(payload, total_chars)
 
     request_messages = [
-        {"role": "system", "content": load_subconscious_prompt().strip()},
+        {"role": "system", "content": load_subconscious_inline_prompt().strip()},
         {"role": "user", "content": user_prompt},
     ]
     try:
