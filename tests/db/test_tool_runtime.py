@@ -13,6 +13,30 @@ def _coerce_json(value):
     return value
 
 
+async def test_agent_tools_default_names_are_all_registered(db_pool):
+    """#108: agent.tools (rendered into the heartbeat's advertised "Tools:"
+    block) named 9 tool names that were never registered -- recall_recent,
+    recall_episode, explore_cluster, list_recent_episodes, create_goal,
+    schedule_task, list_scheduled_tasks, update_scheduled_task,
+    delete_scheduled_task -- causing live "Unknown tool" heartbeat failures.
+    Every name in the default must resolve to a real handler."""
+    from core.tools.registry import create_default_registry
+
+    async with db_pool.acquire() as conn:
+        raw = await conn.fetchval(
+            "SELECT value FROM config_defaults WHERE key = 'agent.tools'"
+        )
+    names = _coerce_json(raw)
+    assert isinstance(names, list) and names
+
+    registry = create_default_registry(pool=None)
+    registered = set(registry.list_names())
+    unregistered = [n for n in names if n not in registered]
+    assert not unregistered, (
+        f"agent.tools default advertises unregistered tool(s): {unregistered}"
+    )
+
+
 async def test_tool_catalog_specs_and_policy_are_db_owned(db_pool):
     async with db_pool.acquire() as conn:
         tr = conn.transaction()

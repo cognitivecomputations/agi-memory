@@ -129,6 +129,16 @@ def _list_migration_files(migrations_dir: Path) -> list[Path]:
     )
 
 
+def latest_bundled_migration_version(migrations_dir: Path | None = None) -> str | None:
+    """The highest-versioned migration file bundled in THIS process's own
+    db/migrations/ (#113). A worker records this at registration; comparing
+    it against schema_migrations' actual latest applied version is how
+    `hexis status`/`hexis doctor` detect a running worker whose code predates
+    migrations someone else already applied to the shared database."""
+    files = _list_migration_files(migrations_dir or MIGRATIONS_DIR)
+    return files[-1].stem if files else None
+
+
 def _migration_summary(sql: str) -> str:
     """First header-comment line of a migration — its own one-line story."""
     for line in sql.splitlines():

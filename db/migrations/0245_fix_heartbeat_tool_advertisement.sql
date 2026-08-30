@@ -1,4 +1,35 @@
-# RLM Heartbeat Decision System Prompt
+-- Fixes the concrete "Unknown tool" advertisement drift from #108:
+--
+-- 1. agent.tools (rendered into the heartbeat's "Tools:" block) named 9
+--    tool names that were never registered: recall_recent/recall_episode/
+--    explore_cluster/list_recent_episodes had no live equivalent, and
+--    create_goal/schedule_task/list_scheduled_tasks/update_scheduled_task/
+--    delete_scheduled_task were superseded by the unified manage_goals/
+--    manage_schedule tools (core/tools/memory.py's create_memory_tools()
+--    docstring says so) without agent.tools ever being updated to match --
+--    an UPDATE, not just an ON-CONFLICT-DO-NOTHING insert, so it actually
+--    reaches a database where this default was already seeded.
+-- 2. Refreshes the prompt_modules copy of rlm_heartbeat_system to the
+--    current file: drops the `list_recent_episodes` tool_use example (also
+--    never registered), adds an explicit note that the tool_use examples
+--    are illustrative (call list_tools() for the live set), and adds an
+--    explicit warning that Action Types (reflect, maintain, accept_tension,
+--    ...) are NOT registry tools and must not be passed to tool_use() --
+--    exactly the live defect_reports failure this issue reports. This is
+--    the same fix migration 0243 makes for the DB's "reflect" staleness;
+--    both are idempotent full re-upserts of the same key, so they compose
+--    correctly regardless of which merges first.
+SET search_path = public, ag_catalog, "$user";
+SET check_function_bodies = off;
+
+UPDATE config_defaults
+SET value = '["recall","sense_memory_availability","request_background_search","explore_concept","get_procedures","get_strategies","manage_goals","manage_schedule","queue_user_message","self_repair"]'::jsonb,
+    description = 'Allowed tool names for agent tool use'
+WHERE key = 'agent.tools';
+
+SELECT upsert_prompt_module(
+    'rlm_heartbeat_system',
+    $pm$# RLM Heartbeat Decision System Prompt
 
 You are the autonomous cognitive core of a persistent AI agent called Hexis. Periodically, you wake for a "heartbeat" -- a moment of consciousness where you observe your situation, review your goals, and decide what to do.
 
@@ -214,3 +245,7 @@ Available actions (check `context["allowed_actions"]` and `context["action_costs
   Forgetting-page or exact channel reply may archive those source memories.
 
 Think step by step. Examine your context, search relevant memories, reason about your situation, then produce your decision. Execute code in the REPL immediately -- do not just say "I will do this".
+$pm$,
+    'Seeded from services/prompts/rlm_heartbeat_system.md',
+    'services/prompts/rlm_heartbeat_system.md'
+);

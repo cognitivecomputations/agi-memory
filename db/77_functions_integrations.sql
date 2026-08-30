@@ -147,6 +147,11 @@ INSERT INTO config_defaults (key, value, description) VALUES
         'integrations.gmail.heartbeat_digest_enabled',
         'false'::jsonb,
         'Controls whether heartbeat may proactively check connected Gmail for digests or important messages without a live user turn.'
+    ),
+    (
+        'integrations.gmail.ambient_poll_interval_seconds',
+        '900'::jsonb,
+        'How often the ongoing-sync ambient responsibility (#110) re-checks Gmail for new messages after a backfill runs.'
     )
 ON CONFLICT (key) DO UPDATE SET
     value = EXCLUDED.value,

@@ -200,6 +200,62 @@ BEGIN
 END;
 $$;
 
+-- Ongoing sync (#110): a one-shot backfill only ever ingests the first page
+-- it's asked for. This is the "keep watching after the backfill" half --
+-- an ambient_responsibilities row with a gmail source, evaluated on the
+-- normal ambient poll cadence (services/ambient_responsibilities.py's
+-- _evaluate_gmail, already implemented, was just never given anything to
+-- watch). Idempotent: returns the existing row if one already covers this
+-- account. Never raises -- an ambient-responsibility hiccup must not block
+-- the backfill that's actually being requested.
+CREATE OR REPLACE FUNCTION ensure_gmail_ambient_responsibility(
+    p_account_key TEXT
+) RETURNS UUID
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_key TEXT := lower(COALESCE(NULLIF(btrim(p_account_key), ''), ''));
+    v_id UUID;
+    v_result JSONB;
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_proc WHERE proname = 'create_ambient_responsibility'
+    ) THEN
+        RETURN NULL;  -- ambient_responsibilities not migrated in yet
+    END IF;
+
+    SELECT id INTO v_id
+    FROM ambient_responsibilities
+    WHERE status IN ('active', 'proposed', 'paused', 'blocked')
+      AND sources @> jsonb_build_array(
+          jsonb_build_object('connector_id', 'gmail', 'account_key', v_key)
+      )
+    LIMIT 1;
+    IF v_id IS NOT NULL THEN
+        RETURN v_id;
+    END IF;
+
+    v_result := create_ambient_responsibility(jsonb_build_object(
+        'title', 'Ongoing Gmail sync',
+        'user_intent', 'Keep ingesting new Gmail messages as they arrive, so memory of email stays current without a manual re-backfill.',
+        'kind', 'monitor',
+        'created_by', 'system',
+        'memory_policy', 'task_scoped',
+        'sources', jsonb_build_array(
+            jsonb_build_object('connector_id', 'gmail', 'account_key', v_key)
+        ),
+        'trigger', jsonb_build_object(
+            'kind', 'interval',
+            'every_seconds', COALESCE(get_config_int('integrations.gmail.ambient_poll_interval_seconds'), 900)
+        )
+    ));
+    RETURN NULLIF(v_result->'output'->>'responsibility_id', '')::uuid;
+EXCEPTION WHEN OTHERS THEN
+    RAISE WARNING 'ensure_gmail_ambient_responsibility failed for %: %', v_key, SQLERRM;
+    RETURN NULL;
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION enqueue_connector_backfill_job(
     p_connector_id TEXT,
     p_account_key TEXT,
@@ -223,6 +279,9 @@ BEGIN
         normalized_cursor,
         COALESCE(p_metadata, '{}'::jsonb)
     );
+    IF row_connection.connector_id = 'gmail' THEN
+        PERFORM ensure_gmail_ambient_responsibility(row_connection.account_key);
+    END IF;
 
     SELECT id
     INTO existing_id
@@ -570,6 +629,25 @@ BEGIN
         updated_at = CURRENT_TIMESTAMP
     WHERE connection_id = row_job.connection_id
       AND cursor_key = row_job.cursor_key;
+
+    -- Self-continuing backfill (#110): a capped job (max_messages) that hit
+    -- its cap and still has a page_token left (result.truncated) previously
+    -- just sat there "completed" forever -- nothing re-picked it up, so a
+    -- one-shot 100-message backfill was permanent. The cursor above already
+    -- carries the page_token forward; this just makes sure a job exists to
+    -- consume it on the next maintenance tick. enqueue_connector_backfill_job
+    -- is idempotent (one active job per connection+cursor_key), so this is
+    -- safe even if something else already queued a successor.
+    IF COALESCE((p_result->>'truncated')::boolean, FALSE) THEN
+        PERFORM enqueue_connector_backfill_job(
+            row_job.connector_id,
+            row_job.account_key,
+            row_job.cursor_key,
+            row_job.requested_range,
+            row_job.metadata,
+            row_job.max_attempts
+        );
+    END IF;
 
     RETURN jsonb_build_object(
         'job_id', row_job.id::text,

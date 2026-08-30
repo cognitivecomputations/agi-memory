@@ -859,7 +859,16 @@ CREATE INDEX IF NOT EXISTS idx_defect_reports_category
     ON defect_reports(category);
 
 INSERT INTO config_defaults (key, value, description) VALUES
-    ('agent.tools', '["recall","sense_memory_availability","request_background_search","recall_recent","recall_episode","explore_concept","explore_cluster","get_procedures","get_strategies","list_recent_episodes","create_goal","schedule_task","list_scheduled_tasks","update_scheduled_task","delete_scheduled_task","queue_user_message","self_repair"]'::jsonb, 'Allowed tool names for agent tool use')
+    -- 9 of the original 17 names here were never registered (#108) --
+    -- recall_recent/recall_episode/explore_cluster/list_recent_episodes had
+    -- no live equivalent, and create_goal/schedule_task/list_scheduled_tasks/
+    -- update_scheduled_task/delete_scheduled_task were superseded by the
+    -- unified manage_goals/manage_schedule tools (core/tools/memory.py's own
+    -- create_memory_tools() docstring says so) but agent.tools was never
+    -- updated to match, so the heartbeat kept advertising dead names and
+    -- lost real capability in the same stroke. Every name below is verified
+    -- registered (tests/db/test_tool_runtime.py).
+    ('agent.tools', '["recall","sense_memory_availability","request_background_search","explore_concept","get_procedures","get_strategies","manage_goals","manage_schedule","queue_user_message","self_repair"]'::jsonb, 'Allowed tool names for agent tool use')
 ON CONFLICT (key) DO NOTHING;
 INSERT INTO config_defaults (key, value, description) VALUES
     ('mcp.legacy_compat_enabled', 'false'::jsonb, 'Expose the old handwritten MCP compatibility tool surface in addition to registry-native tools')

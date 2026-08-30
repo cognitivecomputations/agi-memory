@@ -403,3 +403,114 @@ class TestLegacyPathUnchanged:
             if calls:
                 call_input = calls[0].get("input", {})
                 assert call_input.get("kind") == "heartbeat_decision"
+
+
+class TestTotalLlmFailure:
+    """#111: a total LLM failure inside _run_loop must raise, not fabricate
+    a well-formed-looking decision string ('RLM loop timed out' with empty
+    actions) that gets persisted as a real, successful heartbeat."""
+
+    @pytest.mark.asyncio(loop_scope="session")
+    async def test_run_loop_raises_when_every_llm_call_fails(self, monkeypatch):
+        import services.hexis_rlm as rlm
+        from services.rlm_repl import HexisLocalREPL
+
+        async def always_fails(messages, llm_config, max_tokens=4096):
+            raise ConnectionError("[Errno -2] Name or service not known")
+
+        monkeypatch.setattr(rlm, "_llm_completion", always_fails)
+
+        repl = HexisLocalREPL()
+        repl.setup(context_payload="heartbeat")
+        loop = asyncio.get_running_loop()
+        try:
+            with pytest.raises(rlm.RlmLoopFailure, match="Name or service not known"):
+                await loop.run_in_executor(
+                    None,
+                    rlm._run_loop,
+                    repl,
+                    {"provider": "test", "model": "test"},
+                    loop,
+                    "system",
+                    3,
+                )
+        finally:
+            repl.cleanup()
+
+    @pytest.mark.asyncio(loop_scope="session")
+    async def test_run_loop_does_not_raise_if_repair_call_succeeds(self, monkeypatch):
+        """The main loop failing is not itself a total failure -- only a
+        failure of the one-more-chance repair call after it is."""
+        import services.hexis_rlm as rlm
+        from services.rlm_repl import HexisLocalREPL
+
+        calls = {"n": 0}
+
+        async def fails_then_recovers(messages, llm_config, max_tokens=4096):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise ConnectionError("[Errno -2] Name or service not known")
+            return "FINAL(recovered)"
+
+        monkeypatch.setattr(rlm, "_llm_completion", fails_then_recovers)
+
+        repl = HexisLocalREPL()
+        repl.setup(context_payload="heartbeat")
+        loop = asyncio.get_running_loop()
+        try:
+            result = await loop.run_in_executor(
+                None,
+                rlm._run_loop,
+                repl,
+                {"provider": "test", "model": "test"},
+                loop,
+                "system",
+                1,
+            )
+        finally:
+            repl.cleanup()
+
+        assert result["final_answer"] == "recovered"
+
+    @pytest.mark.asyncio(loop_scope="session")
+    async def test_run_chat_turn_answers_honestly_on_total_failure(self, monkeypatch):
+        """The chat path has no legacy fallback to hand off to, so it must
+        still answer the user -- honestly, not with a fabricated decision."""
+        import services.hexis_rlm as rlm
+
+        async def always_fails(messages, llm_config, max_tokens=4096):
+            raise ConnectionError("[Errno -2] Name or service not known")
+
+        monkeypatch.setattr(rlm, "_llm_completion", always_fails)
+
+        result = await rlm.run_chat_turn(
+            user_message="hello",
+            llm_config={"provider": "test", "model": "test"},
+            dsn="postgresql://unused/unused",
+            max_iterations=1,
+        )
+        assert "trouble reaching" in result["response"]
+        assert result["metrics"]["iterations"] == 0
+
+    @pytest.mark.asyncio(loop_scope="session")
+    async def test_run_heartbeat_decision_propagates_total_failure(self, monkeypatch):
+        """The heartbeat path, unlike chat, has a legacy-path fallback one
+        level up (services/external_calls.py) -- so it must let a total
+        failure propagate as a real exception rather than swallow it."""
+        import services.hexis_rlm as rlm
+
+        async def always_fails(messages, llm_config, max_tokens=4096):
+            raise ConnectionError("[Errno -2] Name or service not known")
+
+        monkeypatch.setattr(rlm, "_llm_completion", always_fails)
+
+        with pytest.raises(rlm.RlmLoopFailure):
+            await rlm.run_heartbeat_decision(
+                heartbeat_id="test-hb",
+                turn_snapshot={"energy": {"current": 10}},
+                llm_config={"provider": "test", "model": "test"},
+                dsn="postgresql://unused/unused",
+                tool_registry=None,
+                loop=asyncio.get_running_loop(),
+                max_iterations=1,
+            )
