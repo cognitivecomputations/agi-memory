@@ -635,6 +635,39 @@ async def doctor_payload(
                 {"label": "Schema canonical", "status": "WARN", "detail": str(exc)}
             )
 
+        # 2c. Stale tool definitions (#115): sync_tool_definitions only ever
+        # upserts, so a renamed/removed tool advertises to chat/heartbeat
+        # forever unless something notices. Advisory only -- never auto-deleted.
+        try:
+            stale_raw = await conn.fetchval("SELECT stale_tool_definitions()")
+            stale = json.loads(stale_raw) if isinstance(stale_raw, str) else (stale_raw or [])
+            if stale:
+                names = ", ".join(f"{t['name']} ({t['age_days']}d)" for t in stale[:8])
+                more = f" and {len(stale) - 8} more" if len(stale) > 8 else ""
+                checks.append(
+                    {
+                        "label": "Tool definitions",
+                        "status": "WARN",
+                        "detail": (
+                            f"{len(stale)} tool_definitions row(s) unsynced by any process "
+                            f"in 14+ days -- likely renamed/removed: {names}{more}. "
+                            "Verify, then remove manually if confirmed stale."
+                        ),
+                    }
+                )
+            else:
+                checks.append(
+                    {
+                        "label": "Tool definitions",
+                        "status": "OK",
+                        "detail": "no stale (unsynced) tool definitions",
+                    }
+                )
+        except Exception as exc:
+            checks.append(
+                {"label": "Tool definitions", "status": "WARN", "detail": str(exc)}
+            )
+
         # 3. RabbitMQ (check config, not connectivity -- avoids dependency)
         try:
             rmq_url = await conn.fetchval(

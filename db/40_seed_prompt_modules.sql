@@ -2544,6 +2544,10 @@ Available actions (check `context["allowed_actions"]` and `context["action_costs
 - If you have active transformations, use contemplation to make deliberate progress.
 - If you choose terminate, you will be asked to confirm before it executes.
 - If you choose pause_heartbeat, include a full detailed reason in params.reason.
+- Pending entries in `context["memories_at_threshold"]["reviews"]` are
+  user-facing fade proposals. You may protect one with `keep_memory`, but never
+  choose `release_memory` or `journal_memory`; only the user's explicit
+  Forgetting-page or exact channel reply may archive those source memories.
 
 Think step by step. Examine your context, search relevant memories, reason about your situation, then produce your decision. Execute code in the REPL immediately -- do not just say "I will do this".
 $pm$,

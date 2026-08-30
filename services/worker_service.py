@@ -153,6 +153,13 @@ async def tee_outbox_to_web_inbox(
     return delivered
 
 
+def _worker_logger_name(mode: str) -> str:
+    """Distinguish heartbeat_worker/maintenance_worker in aggregated logs
+    (#115) -- "both" (a single combined process) gets its own neutral name
+    rather than reusing either container's specific one."""
+    return f"{mode}_worker" if mode in ("heartbeat", "maintenance") else "worker"
+
+
 def _worker_metadata() -> dict[str, Any]:
     return {
         "process_id": os.getpid(),
@@ -1589,6 +1596,15 @@ def main() -> int:
         help="Target a specific instance (overrides HEXIS_INSTANCE env var).",
     )
     args = p.parse_args()
+    # Both worker kinds run this same entrypoint, differentiated only by
+    # --mode; the module logger was hardcoded to "heartbeat_worker" for all
+    # of them, so hexis_maintenance_worker's own logs were indistinguishable
+    # from the heartbeat container's (#115). Every subsequent `logger.*` call
+    # in this module resolves the name at call time against the module
+    # global, so reassigning it here (before any logging happens) retargets
+    # the whole run.
+    global logger
+    logger = logging.getLogger(_worker_logger_name(args.mode))
     asyncio.run(_amain(args.mode, args.instance))
     return 0
 

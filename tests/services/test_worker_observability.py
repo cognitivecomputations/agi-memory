@@ -5,7 +5,15 @@ from unittest.mock import AsyncMock
 import pytest
 
 from services import worker_service
-from services.worker_service import MaintenanceWorker, _result_has_work
+from services.worker_service import MaintenanceWorker, _result_has_work, _worker_logger_name
+
+
+def test_worker_logger_name_distinguishes_heartbeat_and_maintenance():
+    """#115: the maintenance container logged under the heartbeat_worker
+    logger name, making the two indistinguishable in aggregated logs."""
+    assert _worker_logger_name("heartbeat") == "heartbeat_worker"
+    assert _worker_logger_name("maintenance") == "maintenance_worker"
+    assert _worker_logger_name("both") == "worker"
 
 
 def test_result_has_work_filters_idle_poll_results():

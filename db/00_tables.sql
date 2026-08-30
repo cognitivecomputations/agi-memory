@@ -865,6 +865,9 @@ INSERT INTO config_defaults (key, value, description) VALUES
     ('mcp.legacy_compat_enabled', 'false'::jsonb, 'Expose the old handwritten MCP compatibility tool surface in addition to registry-native tools')
 ON CONFLICT (key) DO NOTHING;
 INSERT INTO config_defaults (key, value, description) VALUES
+    ('tools.definition_stale_days', '14'::jsonb, 'A tool_definitions row untouched by any process sync for this long is flagged by hexis doctor as a likely renamed/removed tool (#115); never auto-deleted')
+ON CONFLICT (key) DO NOTHING;
+INSERT INTO config_defaults (key, value, description) VALUES
     ('maintenance.maintenance_interval_seconds', '60'::jsonb, 'Seconds between subconscious maintenance ticks'),
     ('maintenance.subconscious_enabled', 'false'::jsonb, 'Enable subconscious decider (LLM-based pattern detection)'),
     ('maintenance.subconscious_interval_seconds', '300'::jsonb, 'Seconds between subconscious decider runs'),
