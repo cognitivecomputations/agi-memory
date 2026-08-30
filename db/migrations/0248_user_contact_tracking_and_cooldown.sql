@@ -196,7 +196,15 @@ BEGIN
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION execute_heartbeat_action(
+-- Targets execute_heartbeat_action_legacy_contradictions, not
+-- execute_heartbeat_action: migration 0233 (db/migrations/0233_contradiction_events.sql,
+-- mirrored in the baseline as db/46j_functions_contradictions.sql) renamed
+-- the original full-body function to this name and installed a thin
+-- resolve_contradiction/accept_tension gate under the execute_heartbeat_action
+-- name instead. A bare CREATE OR REPLACE FUNCTION execute_heartbeat_action(...)
+-- here would silently clobber that gate on any install that has already
+-- applied 0233 -- which is every install, since 0233 predates this one.
+CREATE OR REPLACE FUNCTION execute_heartbeat_action_legacy_contradictions(
     p_heartbeat_id UUID,
     p_action TEXT,
     p_params JSONB DEFAULT '{}'
