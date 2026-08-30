@@ -72,7 +72,17 @@ CREATE OR REPLACE FUNCTION find_semantic_evidence_targets(
     LIMIT p_limit;
 $$;
 
-CREATE OR REPLACE FUNCTION _execute_memory_tool_dispatch(
+-- Targets _execute_memory_tool_dispatch_legacy_temporal, not
+-- _execute_memory_tool_dispatch: migration 0234 (db/migrations/0234_temporal_memory_history.sql,
+-- mirrored in the baseline as db/46k_functions_temporal_memory.sql) renamed
+-- the original dispatcher to this name and installed a thin
+-- recall_at_time/diff_memory_history-aware wrapper under the
+-- _execute_memory_tool_dispatch name instead. A bare CREATE OR REPLACE
+-- FUNCTION _execute_memory_tool_dispatch(...) here would silently clobber
+-- that wrapper on any install that has already applied 0234 -- which is
+-- every install, since 0234 predates this one. (Same class of bug as the
+-- one caught in #112's migration 0248 -- see that migration's comment.)
+CREATE OR REPLACE FUNCTION _execute_memory_tool_dispatch_legacy_temporal(
     p_tool_name TEXT,
     p_args JSONB
 ) RETURNS JSONB
