@@ -927,6 +927,57 @@ async def doctor_payload(
                 }
             )
 
+        # 8b. Integrations (#100): Gmail and every other OAuth/API-key
+        # connector share one status model (integration_connections.status).
+        # A broken connection is a silent dead end otherwise -- heartbeat
+        # skips it, and nothing tells the operator until they notice email
+        # triage stopped firing.
+        try:
+            status = await conn.fetchval("SELECT integration_status(NULL)")
+            payload = _coerce_json_value(status) or {}
+            connections = [c for c in payload.get("connections", []) if isinstance(c, dict)]
+            broken = [c for c in connections if c.get("status") in ("needs_reauth", "revoked", "error")]
+            healthy = [c for c in connections if c.get("status") == "connected"]
+            if broken:
+                names = ", ".join(
+                    f"{c.get('connector_id')} ({c.get('account_key')}): {c.get('status')}"
+                    + (f" — {c.get('last_error')}" if c.get("last_error") else "")
+                    for c in broken
+                )
+                checks.append(
+                    {
+                        "label": "Integrations",
+                        "status": "WARN",
+                        "detail": f"{len(broken)} connection(s) need attention: {names}. "
+                        "Reconnect via the web dashboard's Integrations page.",
+                    }
+                )
+            elif healthy:
+                names = ", ".join(f"{c.get('connector_id')} ({c.get('account_key')})" for c in healthy)
+                checks.append(
+                    {
+                        "label": "Integrations",
+                        "status": "OK",
+                        "detail": f"{len(healthy)} connected ({names})",
+                    }
+                )
+            else:
+                checks.append(
+                    {
+                        "label": "Integrations",
+                        "status": "WARN",
+                        "detail": "0 connected (Gmail, Spotify, etc. — connect one via the web dashboard's Integrations page)",
+                    }
+                )
+        except Exception as exc:
+            checks.append(
+                {
+                    "label": "Integrations",
+                    "status": "WARN",
+                    "detail": f"integration status unavailable ({exc})",
+                }
+            )
+
         # 9. Tools
         try:
             import asyncpg
