@@ -82,7 +82,7 @@ describe("forgetting", () => {
       decision: "journal",
       journal_content: "Keep the lesson, not every launch detail.",
     }));
-    expect(screen.getByText(/1 source memory entered one recoverable gist/)).toBeInTheDocument();
+    expect(await screen.findByText(/1 source memory entered one recoverable gist/)).toBeInTheDocument();
   });
 
   it("reports exact source count and stored fidelity after compression", async () => {
