@@ -410,6 +410,7 @@ _HELP_GROUPS = [
         [
             ("chat", "Chat in the terminal"),
             ("chat-sessions", "List, inspect, export, and fork chat sessions"),
+            ("transcript", "Render a conversation with tool calls, signals, and corrections"),
             ("ui", "Start the web dashboard"),
             ("open", "Open the web dashboard in your browser"),
             ("tunnel", "Serve the dashboard privately over Tailscale HTTPS"),
@@ -1068,6 +1069,28 @@ def build_parser() -> argparse.ArgumentParser:
         "--raw", action="store_true", help="Show raw status (legacy format)"
     )
     status.set_defaults(func="status")
+
+    transcript = sub.add_parser(
+        "transcript",
+        parents=[_db],
+        help="Render a conversation from the DB (turns, tool calls, corrections)",
+    )
+    transcript_selector = transcript.add_mutually_exclusive_group()
+    transcript_selector.add_argument(
+        "--last", type=int, default=None, help="Render the last N turns (default 20)"
+    )
+    transcript_selector.add_argument(
+        "--session", dest="session_id", default=None,
+        help="Render every turn for this chat session or heartbeat id",
+    )
+    transcript_format = transcript.add_mutually_exclusive_group()
+    transcript_format.add_argument(
+        "--md", action="store_true", help="Render as Markdown (default)"
+    )
+    transcript_format.add_argument(
+        "--json", action="store_true", help="Render as JSON"
+    )
+    transcript.set_defaults(func="transcript")
 
     # Source-document filing cabinet (docs) + RecMem desk (desk)
     docs = sub.add_parser(
@@ -4516,6 +4539,113 @@ def _print_alive_demo(result: dict[str, Any]) -> None:
             sys.stdout.write(f"  Evidence: {rendered}\n")
         if proof.get("next_step"):
             sys.stdout.write(f"  Next: {proof['next_step']}\n")
+
+
+def _format_transcript_event(event: dict[str, Any]) -> str | None:
+    """One `[tag] ...` line per turn_id-scoped agent_turn_events row, or None
+    to skip an event type that carries no standalone signal worth a line."""
+    kind = event.get("event_type")
+    payload = event.get("payload") or {}
+    if kind == "tool_start":
+        args = json.dumps(payload.get("arguments") or {}, default=str)
+        if len(args) > 100:
+            args = args[:97] + "..."
+        return f"- [tool] calling `{payload.get('tool_name', '?')}`({args})"
+    if kind == "tool_result":
+        ok = "ok" if payload.get("success") else "FAILED"
+        duration = payload.get("duration")
+        duration_s = f"{float(duration):.2f}s" if duration is not None else "?"
+        line = (
+            f"- [tool] `{payload.get('tool_name', '?')}` -> {ok} "
+            f"({duration_s}, energy {payload.get('energy_spent', 0)})"
+        )
+        if not payload.get("success") and payload.get("error"):
+            line += f" — {payload['error']}"
+        return line
+    if kind == "energy_exhausted":
+        return (
+            f"- [energy] exhausted (budget {payload.get('budget')}, "
+            f"spent {payload.get('spent')})"
+        )
+    if kind == "claim_flagged":
+        return f"- [claim] flagged {len(payload.get('flagged') or [])} unverified statement(s)"
+    if kind == "question":
+        return f"- [question] {str(payload.get('question') or payload.get('text') or '')[:200]}"
+    if kind == "approval_request":
+        return f"- [approval] requested for `{payload.get('tool_name', payload.get('action', '?'))}`"
+    if kind == "error":
+        return f"- [error] {str(payload.get('error') or payload.get('message') or '')[:300]}"
+    if kind == "phase_change":
+        return f"- [phase] -> {payload.get('phase', '?')}"
+    return None
+
+
+def _split_transcript_user_message(raw: str | None) -> tuple[str, str | None]:
+    """Chat turns store the FULL assembled prompt as `user_message` --
+    subconscious signals, the continuity packet, identity/memory context,
+    then the literal text a human typed after a stable '[USER MESSAGE]'
+    marker (see services/agent.py's enriched_parts / services/chat.py). Pull
+    out just what was actually said, plus the '## Subconscious Signals'
+    block if present -- that block lives nowhere else, so this is the only
+    way a transcript can show it as the issue asks. Heartbeat turns carry no
+    marker and pass through unchanged."""
+    if not raw:
+        return raw or "", None
+    marker = "[USER MESSAGE]\n"
+    idx = raw.rfind(marker)
+    prefix, clean = (raw[:idx], raw[idx + len(marker):]) if idx != -1 else ("", raw)
+    signals = None
+    sig_idx = prefix.find("## Subconscious Signals")
+    if sig_idx != -1:
+        rest = prefix[sig_idx:]
+        end = rest.find("\n## ", 1)
+        signals = (rest[:end] if end != -1 else rest).strip()
+    return clean.strip(), signals
+
+
+def _render_transcript_markdown(turns: list[dict[str, Any]]) -> str:
+    """Render `hexis transcript` turns as Markdown -- one command to share or
+    archive an interaction (#54)."""
+    if not turns:
+        return "No turns found.\n"
+    lines: list[str] = []
+    for i, turn in enumerate(turns, 1):
+        label = turn.get("session_id") or turn.get("heartbeat_id")
+        heading = f"## Turn {i} — {turn.get('mode', '?')} — {turn.get('created_at', '?')}"
+        if label:
+            heading += f" (session: {label})"
+        lines.append(heading)
+        lines.append("")
+        user_text, signals = _split_transcript_user_message(turn.get("user_message"))
+        if user_text:
+            lines.append(f"**You:** {user_text}")
+            lines.append("")
+        if signals:
+            lines.append(signals)
+            lines.append("")
+        for event in turn.get("events") or []:
+            formatted = _format_transcript_event(event)
+            if formatted:
+                lines.append(formatted)
+        if turn.get("events"):
+            lines.append("")
+        if turn.get("reply_text"):
+            lines.append(f"**Agent:** {turn['reply_text']}")
+        else:
+            lines.append(f"_(turn {turn.get('status', 'unfinished')}"
+                          f"{': ' + turn['stopped_reason'] if turn.get('stopped_reason') else ''})_")
+        meta_bits = []
+        if turn.get("iterations") is not None:
+            meta_bits.append(f"{turn['iterations']} iteration(s)")
+        if turn.get("energy_spent") is not None:
+            meta_bits.append(f"{turn['energy_spent']} energy")
+        if meta_bits:
+            lines.append("")
+            lines.append(f"_{', '.join(meta_bits)}_")
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+    return "\n".join(lines)
 
 
 def _print_maturity_scorecard(result: dict[str, Any]) -> None:
@@ -8114,6 +8244,21 @@ def _dispatch(argv: list[str] | None = None) -> int:
             sys.stdout.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
         else:
             _print_rich_status(payload)
+        return 0
+    if func == "transcript":
+        dsn = _get_dsn(args)
+        turns = asyncio.run(
+            cli_api.transcript_payload(
+                dsn,
+                last=args.last if not args.session_id else None,
+                session_id=args.session_id,
+                wait_seconds=args.wait_seconds,
+            )
+        )
+        if args.json:
+            sys.stdout.write(json.dumps(turns, indent=2, sort_keys=True, default=str) + "\n")
+        else:
+            sys.stdout.write(_render_transcript_markdown(turns))
         return 0
     if func == "retention":
         dsn = _get_dsn(args)

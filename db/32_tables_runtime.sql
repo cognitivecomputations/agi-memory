@@ -273,6 +273,11 @@ CREATE TABLE IF NOT EXISTS agent_turns (
 
 CREATE INDEX IF NOT EXISTS idx_agent_turns_status_created
     ON agent_turns (status, created_at DESC);
+-- `hexis transcript --session <id>` (#54) looks up by either grouping.
+CREATE INDEX IF NOT EXISTS idx_agent_turns_session
+    ON agent_turns (session_id, created_at) WHERE session_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_agent_turns_heartbeat
+    ON agent_turns (heartbeat_id, created_at) WHERE heartbeat_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS agent_turn_events (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
