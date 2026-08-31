@@ -893,6 +893,8 @@ DECLARE
     identity_updated BOOLEAN;
     pause_reason TEXT;
     outbound_purpose JSONB;
+    v_last_user_contact TIMESTAMPTZ;
+    v_cooldown_hours FLOAT;
 BEGIN
     BEGIN
         action_kind := p_action::heartbeat_action;
@@ -947,6 +949,30 @@ BEGIN
                     ELSE 'Cite an existing goal, responsibility, reply thread, or explicit user request.'
                 END
             );
+        END IF;
+
+        -- Cooldown on unsolicited contact (#112): heartbeat.user_contact_cooldown_hours
+        -- was seeded and documented but never enforced. A reply to something the
+        -- user just sent, or a purpose already flagged urgent (an assigned goal,
+        -- an urgent responsibility), is not "unsolicited" and skips the cooldown.
+        IF p_action = 'reach_out_user'
+           AND COALESCE(outbound_purpose->>'kind', '') <> 'reply'
+           AND NOT COALESCE((outbound_purpose->>'urgent_backed')::boolean, FALSE) THEN
+            SELECT last_user_contact INTO v_last_user_contact FROM heartbeat_state WHERE id = 1;
+            v_cooldown_hours := GREATEST(COALESCE(get_config_float('heartbeat.user_contact_cooldown_hours'), 4.0), 0.0);
+            IF v_last_user_contact IS NOT NULL
+               AND v_last_user_contact > CURRENT_TIMESTAMP - (v_cooldown_hours * INTERVAL '1 hour') THEN
+                RETURN jsonb_build_object(
+                    'success', false,
+                    'error', 'User contact cooldown active',
+                    'last_user_contact', v_last_user_contact,
+                    'cooldown_hours', v_cooldown_hours,
+                    'next_step', format(
+                        'Wait until %s hours have passed since the last user contact (%s), or use a reply/urgent purpose instead.',
+                        v_cooldown_hours, v_last_user_contact
+                    )
+                );
+            END IF;
         END IF;
     END IF;
 
