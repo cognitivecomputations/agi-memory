@@ -15,7 +15,7 @@ What you need before installing Hexis.
 
 | Dependency | Version | Purpose |
 |------------|---------|---------|
-| [Docker Desktop](https://docs.docker.com/get-docker/) | 20.10+ | Runs PostgreSQL (the agent's brain) |
+| Docker Engine + Compose | Docker 20.10+, Compose v2+ | Runs PostgreSQL (the agent's brain). Use [Docker Desktop](https://docs.docker.com/get-docker/) or the Docker CLI with [Colima](https://github.com/abiosoft/colima) on macOS |
 | [uv](https://docs.astral.sh/uv/) | Current | Installs the Hexis CLI into an isolated environment; downloads Python automatically if missing. The [install script](installation.md) sets it up for you |
 | Local embedding sidecar | Current | Generates embeddings for memory storage |
 
@@ -27,7 +27,7 @@ Installed is not enough — Docker's daemon and the embedding sidecar must both 
 
 ```bash
 docker --version          # Docker version 20.10+
-docker info               # daemon is running (errors if not — start Docker Desktop)
+docker info               # daemon is running (Docker Desktop, Colima, or Docker Engine)
 docker compose version    # Docker Compose v2+
 embeddinggemma --help
 uv --version              # or: python3 --version (3.10+) if managing Python yourself
@@ -63,7 +63,7 @@ See [Auth Providers](../integrations/auth/index.md) for setup details on each pr
 
 ## Platform Support
 
-Hexis runs on macOS, Linux, and Windows (via WSL2). Docker Desktop handles the PostgreSQL container across all platforms.
+Hexis runs on macOS, Linux, and Windows (via WSL2). It uses the active Docker context, so Docker Desktop and Colima both work without project-specific Compose changes.
 
 ## Next Steps
 

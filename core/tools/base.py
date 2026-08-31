@@ -14,7 +14,7 @@ import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, TYPE_CHECKING
+from typing import Any, Awaitable, Callable, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .registry import ToolRegistry
@@ -60,6 +60,9 @@ class ToolErrorType(str, Enum):
     BOUNDARY_VIOLATION = "boundary_violation"
     APPROVAL_REQUIRED = "approval_required"
     DISABLED = "disabled"
+    OUTBOUND_BLOCKED = "outbound_blocked"
+    PURPOSE_REQUIRED = "purpose_required"
+    CONTACT_BUDGET_EXHAUSTED = "contact_budget_exhausted"
 
     # Filesystem
     FILE_NOT_FOUND = "file_not_found"
@@ -88,6 +91,39 @@ class ToolErrorType(str, Enum):
     RATE_LIMITED = "rate_limited"
 
 
+@dataclass(frozen=True)
+class OutboundSpec:
+    """Declares the recipient and content carried by a messaging tool.
+
+    The dispatcher consumes this descriptor before provider code runs.  Keeping
+    transport shape here makes STOP, purpose, cadence, and disclosure policy
+    impossible to bypass by adding one more provider handler.
+    """
+
+    recipient_arg: str | None
+    body_arg: str
+    channel: str
+    additional_recipient_args: tuple[str, ...] = ()
+    thread_arg: str | None = None
+    html_body_arg: str | None = None
+    fixed_recipient: str | None = None
+    primary_recipient: bool = False
+    public_recipient: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "recipient_arg": self.recipient_arg,
+            "additional_recipient_args": list(self.additional_recipient_args),
+            "body_arg": self.body_arg,
+            "html_body_arg": self.html_body_arg,
+            "thread_arg": self.thread_arg,
+            "channel": self.channel,
+            "fixed_recipient": self.fixed_recipient,
+            "primary_recipient": self.primary_recipient,
+            "public_recipient": self.public_recipient,
+        }
+
+
 @dataclass
 class ToolSpec:
     """Tool definition exposed to LLMs."""
@@ -104,9 +140,63 @@ class ToolSpec:
     # Operator/system machinery, deliberately unbound by skills (#99): the
     # coverage test requires every non-internal tool to be reachable.
     internal: bool = False
+    # Any provider action that communicates with a person or public audience
+    # must declare its transport shape here.  ToolRegistry enforces the known
+    # network-messaging surface at registration time.
+    outbound: OutboundSpec | None = None
+    # Most tools are short-lived. A tool that owns its own bounded wait (such
+    # as ask_user) can opt out of the registry's generic two-minute wrapper.
+    execution_timeout_seconds: float | None = 120.0
     allowed_contexts: set[ToolContext] = field(
-        default_factory=lambda: {ToolContext.HEARTBEAT, ToolContext.CHAT, ToolContext.MCP}
+        default_factory=lambda: {
+            ToolContext.HEARTBEAT,
+            ToolContext.CHAT,
+            ToolContext.MCP,
+        }
     )
+
+    def __post_init__(self) -> None:
+        """Expose the mandatory purpose contract on every outbound tool."""
+        if self.outbound is None:
+            return
+        properties = self.parameters.setdefault("properties", {})
+        properties.setdefault(
+            "purpose_kind",
+            {
+                "type": "string",
+                "enum": [
+                    "goal",
+                    "responsibility",
+                    "reply",
+                    "user_request",
+                    "connection",
+                ],
+                "description": "Why this communication is legitimate.",
+            },
+        )
+        properties.setdefault(
+            "purpose_reference",
+            {
+                "type": "string",
+                "description": (
+                    "Durable goal/responsibility id, inbound thread/message id, "
+                    "or trusted user-turn/session reference supporting the purpose."
+                ),
+            },
+        )
+        properties.setdefault(
+            "urgency",
+            {
+                "type": "string",
+                "enum": ["low", "normal", "high", "urgent"],
+                "default": "normal",
+                "description": "Urgency used by the contact-attention budget.",
+            },
+        )
+        required = self.parameters.setdefault("required", [])
+        for name in ("purpose_kind", "purpose_reference"):
+            if name not in required:
+                required.append(name)
 
     def to_openai_function(self) -> dict[str, Any]:
         """Convert to OpenAI function calling format."""
@@ -205,6 +295,13 @@ class ToolExecutionContext:
     # Group-context turn (#92/#96): recall-class tools exclude private
     # memories when the audience is a shared room.
     is_group: bool = False
+    # Set only by a transport that proved this turn belongs to the configured
+    # operator. Conversation allowlists are not sufficient authority.
+    is_operator: bool = False
+    surface: str = "chat"
+    # Transport-neutral event bridge. Tool handlers emit semantic events; the
+    # agent loop records and projects them to SSE, CLI, or channels.
+    event_callback: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None
 
     # Policy flags (can be overridden per-context)
     allow_network: bool = True
@@ -212,8 +309,32 @@ class ToolExecutionContext:
     allow_file_write: bool = False
     allow_file_read: bool = True
 
+    # Exact one-shot proof returned by an operator approval callback. The DB
+    # policy consumes this request id only when tool, arguments, and context all
+    # match the approved request.
+    action_approved: bool = False
+    approval_request_id: str | None = None
+    approval_channel: str | None = None
+
     # Registry reference (set by registry during execution)
     registry: "ToolRegistry | None" = None
+
+    @property
+    def trusted_goal_origin(self) -> str:
+        """Map the authenticated execution surface to durable goal provenance.
+
+        Model-authored arguments are intentionally excluded: a model cannot grant
+        itself the energy and outbound permissions attached to a user-assigned goal.
+        """
+        if self.tool_context == ToolContext.CHAT:
+            return "user_request"
+        if self.tool_context == ToolContext.MCP:
+            return "external"
+        return "derived"
+
+    async def emit_event(self, event: str, data: dict[str, Any]) -> None:
+        if self.event_callback is not None:
+            await self.event_callback(event, data)
 
     def resolve_path(self, path: str) -> str:
         """Resolve a path relative to workspace."""
@@ -298,9 +419,9 @@ class ToolHandler(ABC):
 
         # Check required fields
         required = schema.get("required", [])
-        for field in required:
-            if field not in arguments:
-                errors.append(f"Missing required field: {field}")
+        for schema_field in required:
+            if schema_field not in arguments:
+                errors.append(f"Missing required field: {schema_field}")
 
         # Check types for provided fields
         properties = schema.get("properties", {})

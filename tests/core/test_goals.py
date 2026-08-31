@@ -7,10 +7,8 @@ validation, missing params, and DB integration.
 
 from __future__ import annotations
 
-import json
 import uuid
-from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -19,7 +17,6 @@ from core.tools.base import (
     ToolContext,
     ToolErrorType,
     ToolExecutionContext,
-    ToolResult,
 )
 from core.tools.goals import ManageGoalsHandler, create_goal_tools
 
@@ -31,13 +28,18 @@ pytestmark = [pytest.mark.asyncio(loop_scope="session")]
 # ============================================================================
 
 
-def _make_exec_context(*, pool=None, registry=None) -> ToolExecutionContext:
+def _make_exec_context(
+    *,
+    pool=None,
+    registry=None,
+    tool_context: ToolContext = ToolContext.HEARTBEAT,
+) -> ToolExecutionContext:
     """Build a ToolExecutionContext with optional mocked registry."""
     reg = registry or MagicMock()
     if pool:
         reg.pool = pool
     ctx = ToolExecutionContext(
-        tool_context=ToolContext.HEARTBEAT,
+        tool_context=tool_context,
         call_id=str(uuid.uuid4()),
     )
     ctx.registry = reg
@@ -72,6 +74,18 @@ class TestGoalsSpec:
         tools = create_goal_tools()
         assert len(tools) == 1
         assert isinstance(tools[0], ManageGoalsHandler)
+
+    @pytest.mark.parametrize(
+        ("tool_context", "expected"),
+        [
+            (ToolContext.CHAT, "user_request"),
+            (ToolContext.HEARTBEAT, "derived"),
+            (ToolContext.MCP, "external"),
+        ],
+    )
+    def test_goal_origin_comes_from_execution_context(self, tool_context, expected):
+        ctx = _make_exec_context(tool_context=tool_context)
+        assert ctx.trusted_goal_origin == expected
 
 
 # ============================================================================
@@ -194,10 +208,82 @@ class TestGoalsIntegration:
         assert "goal_id" in output
         assert output["title"] == "Test Goal from pytest"
         assert output["priority"] == "queued"
+        assert output["origin"] == "derived"
 
         # Cleanup: goals are stored in the 'memories' table with type='goal'
         async with db_pool.acquire() as conn:
-            await conn.execute("DELETE FROM memories WHERE id = $1::uuid", output["goal_id"])
+            assert (
+                await conn.fetchval(
+                    "SELECT goal_origin::text FROM memories WHERE id = $1::uuid",
+                    output["goal_id"],
+                )
+                == "derived"
+            )
+            await conn.execute(
+                "DELETE FROM memories WHERE id = $1::uuid", output["goal_id"]
+            )
+
+    async def test_model_source_cannot_forge_user_assignment(self, db_pool):
+        handler = ManageGoalsHandler()
+        registry = MagicMock(pool=db_pool)
+        title = f"Autonomous origin {uuid.uuid4()}"
+        ctx = _make_exec_context(registry=registry, tool_context=ToolContext.HEARTBEAT)
+
+        result = await handler.execute(
+            {"action": "create", "title": title, "source": "user_request"},
+            ctx,
+        )
+
+        try:
+            assert result.success
+            assert result.output["origin"] == "derived"
+            async with db_pool.acquire() as conn:
+                assert (
+                    await conn.fetchval(
+                        "SELECT goal_origin::text FROM memories WHERE id = $1::uuid",
+                        result.output["goal_id"],
+                    )
+                    == "derived"
+                )
+        finally:
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    "DELETE FROM memories WHERE id = $1::uuid", result.output["goal_id"]
+                )
+
+    async def test_user_assignment_upgrades_duplicate_autonomous_goal(self, db_pool):
+        handler = ManageGoalsHandler()
+        registry = MagicMock(pool=db_pool)
+        title = f"Origin upgrade {uuid.uuid4()}"
+        heartbeat_ctx = _make_exec_context(
+            registry=registry, tool_context=ToolContext.HEARTBEAT
+        )
+        chat_ctx = _make_exec_context(registry=registry, tool_context=ToolContext.CHAT)
+
+        autonomous = await handler.execute(
+            {"action": "create", "title": title}, heartbeat_ctx
+        )
+        assigned = await handler.execute(
+            {"action": "create", "title": title, "source": "curiosity"}, chat_ctx
+        )
+
+        try:
+            assert autonomous.success and assigned.success
+            assert autonomous.output["goal_id"] == assigned.output["goal_id"]
+            async with db_pool.acquire() as conn:
+                assert (
+                    await conn.fetchval(
+                        "SELECT goal_origin::text FROM memories WHERE id = $1::uuid",
+                        assigned.output["goal_id"],
+                    )
+                    == "user_request"
+                )
+        finally:
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    "DELETE FROM memories WHERE id = $1::uuid",
+                    assigned.output["goal_id"],
+                )
 
     async def test_create_goal_invalid_source_defaults(self, db_pool):
         handler = ManageGoalsHandler()
@@ -218,7 +304,9 @@ class TestGoalsIntegration:
 
         # Cleanup
         async with db_pool.acquire() as conn:
-            await conn.execute("DELETE FROM memories WHERE id = $1::uuid", result.output["goal_id"])
+            await conn.execute(
+                "DELETE FROM memories WHERE id = $1::uuid", result.output["goal_id"]
+            )
 
     async def test_list_goals(self, db_pool):
         handler = ManageGoalsHandler()

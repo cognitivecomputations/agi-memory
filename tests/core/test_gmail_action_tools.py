@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from uuid import uuid4
 
 import pytest
 
@@ -17,7 +18,9 @@ def _j(value):
     return json.loads(value) if isinstance(value, str) else value
 
 
-async def test_gmail_send_heartbeat_requires_connector_action_policy(db_pool, monkeypatch, tmp_path):
+async def test_gmail_send_heartbeat_requires_connector_action_policy(
+    db_pool, monkeypatch, tmp_path
+):
     import core.auth.store as auth_store
     import services.gmail_actions as gmail_actions
 
@@ -72,8 +75,17 @@ async def test_gmail_send_heartbeat_requires_connector_action_policy(db_pool, mo
 
     monkeypatch.setattr(gmail_actions, "send_gmail_message", fake_send_gmail_message)
     async with db_pool.acquire() as conn:
-        policy = _j(await conn.fetchval(
+        goal_id = await conn.fetchval(
             """
+            INSERT INTO memories(type, goal_origin, content, importance, trust_level, status, metadata)
+            VALUES ('goal', 'user_request', $1, 0.7, 0.8, 'active', '{"priority":"active"}'::jsonb)
+            RETURNING id
+            """,
+            f"Gmail send policy test {uuid4()}",
+        )
+        policy = _j(
+            await conn.fetchval(
+                """
             SELECT grant_connector_action_policy(
                 'gmail',
                 'send',
@@ -88,7 +100,13 @@ async def test_gmail_send_heartbeat_requires_connector_action_policy(db_pool, mo
                 'user'
             )
             """
-        ))
+            )
+        )
+
+    call_args.update(
+        purpose_kind="goal",
+        purpose_reference=str(goal_id),
+    )
 
     allowed = await registry.execute("gmail_send", call_args, ctx)
 
@@ -101,8 +119,16 @@ async def test_gmail_send_heartbeat_requires_connector_action_policy(db_pool, mo
             ORDER BY created_at DESC
             """
         )
-        await conn.execute("DELETE FROM connector_action_audit WHERE context->>'call_id' = 'gmail-send-policy'")
-        await conn.execute("DELETE FROM connector_action_policies WHERE source_session_id = 'gmail-send-policy'")
+        await conn.execute(
+            "DELETE FROM connector_action_audit WHERE context->>'call_id' = 'gmail-send-policy'"
+        )
+        await conn.execute(
+            "DELETE FROM connector_action_policies WHERE source_session_id = 'gmail-send-policy'"
+        )
+        await conn.execute(
+            "DELETE FROM outbound_events WHERE request_key LIKE 'tool:gmail-send-policy:%'"
+        )
+        await conn.execute("DELETE FROM memories WHERE id = $1", goal_id)
 
     assert allowed.success
     assert allowed.output["message_id"] == "sent-1"

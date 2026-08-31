@@ -364,6 +364,7 @@ async def capability_maturity_scorecard(conn) -> dict[str, Any]:
             (SELECT count(*) FROM tool_executions WHERE error_type = 'boundary_violation') AS observed_boundary_refusals,
             to_regprocedure('public.next_agent_step(uuid)') IS NOT NULL AS has_energy_runtime,
             COALESCE(get_config_float('heartbeat.max_energy'), 0) AS max_energy,
+            heartbeat_bank_capacity() AS energy_bank_capacity,
             (SELECT current_energy FROM heartbeat_state WHERE id = 1) AS current_energy,
             (SELECT count(*) FROM agent_turn_events WHERE event_type = 'energy_exhausted') AS observed_energy_stops,
             to_regclass('public.skill_improvement_proposals') IS NOT NULL AS has_skill_proposals,
@@ -459,9 +460,13 @@ async def capability_maturity_scorecard(conn) -> dict[str, Any]:
     )
     if float(f["max_energy"] or 0) > 0:
         energy_level = 2
-        energy_evidence.append(f"maximum energy configured at {f['max_energy']}")
+        energy_evidence.append(
+            f"normal reserve {f['max_energy']} with bank capacity {f['energy_bank_capacity']}"
+        )
     current_energy = float(f["current_energy"] or 0)
-    if energy_level >= 2 and 0 <= current_energy <= float(f["max_energy"] or 0):
+    if energy_level >= 2 and 0 <= current_energy <= float(
+        f["energy_bank_capacity"] or 0
+    ):
         energy_level = 3
         energy_evidence.append(
             f"current energy {current_energy} is within configured bounds"

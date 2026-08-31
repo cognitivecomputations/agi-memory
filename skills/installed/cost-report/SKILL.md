@@ -5,6 +5,7 @@ category: analytics
 requires:
   tools: [query_usage]
 contexts: [heartbeat, chat]
+aliases: [cost, costs, spend, spent, usage, tokens, budget, bill, billing]
 bound_tools: [query_usage]
 ---
 

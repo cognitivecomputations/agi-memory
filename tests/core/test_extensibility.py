@@ -365,6 +365,12 @@ class TestSkillSpec:
                 "config": ["tavily"],
             },
             "contexts": ["heartbeat", "chat"],
+            "blueprint": {
+                "title": "Weekly research prompt",
+                "rationale": "A recurring prompt keeps the research review visible.",
+                "schedule": "weekly:friday:16:00",
+                "message": "Open Hexis for the weekly research review.",
+            },
         }
         content = "# Research\n\nUse web_search to find things."
 
@@ -376,6 +382,8 @@ class TestSkillSpec:
         assert SkillContext.HEARTBEAT in spec.contexts
         assert SkillContext.CHAT in spec.contexts
         assert spec.source == "test"
+        assert spec.blueprint is not None
+        assert spec.blueprint["schedule"] == "weekly:friday:16:00"
 
     def test_requirements_met(self):
         from skills.base import SkillSpec

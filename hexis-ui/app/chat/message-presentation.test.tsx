@@ -39,4 +39,35 @@ describe("MessagePresentationView", () => {
     expect(container.querySelector("img")).not.toBeInTheDocument();
     expect(screen.getByText('<img src=x onerror="alert(1)">')).toBeInTheDocument();
   });
+
+  it("renders expandable low-trust citations and links inline markers", () => {
+    const { container } = render(
+      <MessagePresentationView
+        presentation={{
+          tone: "warning",
+          blocks: [
+            { type: "text", text: "Quarterly.[^mem-123]" },
+            {
+              type: "citation",
+              citation_id: "mem-123",
+              label: "Manning agreement",
+              href: "/documents?document=doc-123",
+              trust_level: 0.42,
+              low_trust: true,
+              source_kind: "document",
+              locator: { page_start: 4 },
+            },
+          ],
+        }}
+      />
+    );
+
+    expect(container.querySelector('a[href="#citation-mem-123"]')).toBeInTheDocument();
+    expect(screen.getByText("Low trust")).toBeInTheDocument();
+    expect(screen.getByText("page 4")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Open source →" })).toHaveAttribute(
+      "href",
+      "/documents?document=doc-123"
+    );
+  });
 });

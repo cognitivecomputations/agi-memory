@@ -18,10 +18,18 @@ from typing import Any, Callable, Awaitable
 from core.integration_reliability import (
     IntegrationHttpError,
     format_provider_error,
+    request_bytes_response,
     request_json,
 )
 
-from .base import ChannelAdapter, ChannelCapabilities, ChannelMessage, parse_allowlist, resolve_channel_token
+from .base import (
+    ChannelAdapter,
+    ChannelCapabilities,
+    ChannelMessage,
+    parse_allowlist,
+    resolve_channel_token,
+    resolve_forward_all,
+)
 from .media import Attachment
 
 logger = logging.getLogger(__name__)
@@ -50,16 +58,28 @@ class WhatsAppAdapter(ChannelAdapter):
     Requires a Meta Business app with WhatsApp API configured.
     """
 
-    def __init__(self, config: dict[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        config: dict[str, Any] | None = None,
+        *,
+        forward_all: bool | None = None,
+    ) -> None:
         self._config = config or {}
+        self._forward_all = resolve_forward_all(self._config, forward_all)
         self._on_message: Callable[[ChannelMessage], Awaitable[None]] | None = None
         self._connected = False
         self._access_token: str | None = None
         self._phone_number_id: str | None = None
         self._verify_token: str | None = None
         self._app_secret: str | None = None
-        self._webhook_port = int(self._config.get("webhook_port") or os.getenv("WHATSAPP_WEBHOOK_PORT") or DEFAULT_WEBHOOK_PORT)
-        self._allowed_numbers = self._parse_allowlist(self._config.get("allowed_numbers"))
+        self._webhook_port = int(
+            self._config.get("webhook_port")
+            or os.getenv("WHATSAPP_WEBHOOK_PORT")
+            or DEFAULT_WEBHOOK_PORT
+        )
+        self._allowed_numbers = self._parse_allowlist(
+            self._config.get("allowed_numbers")
+        )
         self._session = None
         self._site = None
         self._runner = None
@@ -93,7 +113,9 @@ class WhatsAppAdapter(ChannelAdapter):
     ) -> None:
         from aiohttp import web
 
-        self._access_token = _resolve_token(self._config, "access_token", "WHATSAPP_ACCESS_TOKEN")
+        self._access_token = _resolve_token(
+            self._config, "access_token", "WHATSAPP_ACCESS_TOKEN"
+        )
         if not self._access_token:
             raise RuntimeError(
                 "WhatsApp access token not found. Set WHATSAPP_ACCESS_TOKEN env var "
@@ -101,7 +123,9 @@ class WhatsAppAdapter(ChannelAdapter):
             )
 
         self._phone_number_id = str(
-            self._config.get("phone_number_id") or os.getenv("WHATSAPP_PHONE_NUMBER_ID") or ""
+            self._config.get("phone_number_id")
+            or os.getenv("WHATSAPP_PHONE_NUMBER_ID")
+            or ""
         )
         if not self._phone_number_id:
             raise RuntimeError(
@@ -110,9 +134,13 @@ class WhatsAppAdapter(ChannelAdapter):
             )
 
         self._verify_token = str(
-            self._config.get("verify_token") or os.getenv("WHATSAPP_VERIFY_TOKEN") or "hexis_verify"
+            self._config.get("verify_token")
+            or os.getenv("WHATSAPP_VERIFY_TOKEN")
+            or "hexis_verify"
         )
-        self._app_secret = _resolve_token(self._config, "app_secret", "WHATSAPP_APP_SECRET")
+        self._app_secret = _resolve_token(
+            self._config, "app_secret", "WHATSAPP_APP_SECRET"
+        )
 
         self._on_message = on_message
 
@@ -175,9 +203,7 @@ class WhatsAppAdapter(ChannelAdapter):
         if not signature.startswith("sha256="):
             return False
 
-        expected = hmac.new(
-            self._app_secret.encode(), body, hashlib.sha256
-        ).hexdigest()
+        expected = hmac.new(self._app_secret.encode(), body, hashlib.sha256).hexdigest()
         return hmac.compare_digest(f"sha256={expected}", signature)
 
     async def _handle_webhook(self, request) -> Any:
@@ -210,8 +236,10 @@ class WhatsAppAdapter(ChannelAdapter):
                     if change.get("field") != "messages":
                         continue
 
-                    contacts = {c["wa_id"]: c.get("profile", {}).get("name", c["wa_id"])
-                                for c in value.get("contacts", [])}
+                    contacts = {
+                        c["wa_id"]: c.get("profile", {}).get("name", c["wa_id"])
+                        for c in value.get("contacts", [])
+                    }
 
                     for message in value.get("messages", []):
                         await self._handle_message(message, contacts)
@@ -226,10 +254,12 @@ class WhatsAppAdapter(ChannelAdapter):
         if not sender:
             return
 
-        # Check allowlist
+        gate_hint: str | None = None
         if self._allowed_numbers is not None:
             if sender not in self._allowed_numbers:
-                return
+                if not self._forward_all:
+                    return
+                gate_hint = "not_allowlisted"
 
         text = ""
         attachments: list[Attachment] = []
@@ -239,38 +269,46 @@ class WhatsAppAdapter(ChannelAdapter):
         elif msg_type == "image":
             img = message.get("image", {})
             text = img.get("caption", "")
-            attachments.append(Attachment(
-                url="",  # Requires media download via API
-                filename=f"image_{message.get('id', '')}.jpg",
-                mime_type=img.get("mime_type", "image/jpeg"),
-                platform_id=img.get("id"),
-            ))
+            attachments.append(
+                Attachment(
+                    url="",  # Requires media download via API
+                    filename=f"image_{message.get('id', '')}.jpg",
+                    mime_type=img.get("mime_type", "image/jpeg"),
+                    platform_id=img.get("id"),
+                )
+            )
         elif msg_type == "document":
             doc = message.get("document", {})
             text = doc.get("caption", "")
-            attachments.append(Attachment(
-                url="",
-                filename=doc.get("filename", f"doc_{message.get('id', '')}"),
-                mime_type=doc.get("mime_type"),
-                platform_id=doc.get("id"),
-            ))
+            attachments.append(
+                Attachment(
+                    url="",
+                    filename=doc.get("filename", f"doc_{message.get('id', '')}"),
+                    mime_type=doc.get("mime_type"),
+                    platform_id=doc.get("id"),
+                )
+            )
         elif msg_type == "audio":
             audio = message.get("audio", {})
-            attachments.append(Attachment(
-                url="",
-                filename=f"audio_{message.get('id', '')}",
-                mime_type=audio.get("mime_type"),
-                platform_id=audio.get("id"),
-            ))
+            attachments.append(
+                Attachment(
+                    url="",
+                    filename=f"audio_{message.get('id', '')}",
+                    mime_type=audio.get("mime_type"),
+                    platform_id=audio.get("id"),
+                )
+            )
         elif msg_type == "video":
             video = message.get("video", {})
             text = video.get("caption", "")
-            attachments.append(Attachment(
-                url="",
-                filename=f"video_{message.get('id', '')}",
-                mime_type=video.get("mime_type"),
-                platform_id=video.get("id"),
-            ))
+            attachments.append(
+                Attachment(
+                    url="",
+                    filename=f"video_{message.get('id', '')}",
+                    mime_type=video.get("mime_type"),
+                    platform_id=video.get("id"),
+                )
+            )
         else:
             # Unsupported message type
             return
@@ -290,7 +328,12 @@ class WhatsAppAdapter(ChannelAdapter):
             message_id=message.get("id", timestamp),
             attachments=attachments,
             metadata={
+                # WhatsApp group JIDs end in @g.us; a 1:1 sender is a bare
+                # number or @s.whatsapp.net.
+                "is_group": str(sender or "").endswith("@g.us"),
                 "message_type": msg_type,
+                "is_mention": False,
+                **({"gate_hint": gate_hint} if gate_hint else {}),
             },
         )
 
@@ -300,6 +343,53 @@ class WhatsAppAdapter(ChannelAdapter):
     async def stop(self) -> None:
         self._connected = False
         await self._cleanup()
+
+    async def download_attachment(
+        self, attachment: Attachment, *, max_size: int
+    ) -> Attachment:
+        """Resolve a WhatsApp media ID, then fetch it with the same token."""
+
+        if (
+            attachment.local_path
+            or not attachment.platform_id
+            or not self._access_token
+        ):
+            return attachment
+        if attachment.size is not None and attachment.size > max_size:
+            return attachment
+        headers = {"Authorization": f"Bearer {self._access_token}"}
+        metadata = await request_json(
+            "whatsapp-media",
+            "GET",
+            f"{GRAPH_API_BASE}/{attachment.platform_id}",
+            headers=headers,
+            timeout=20.0,
+            attempts=3,
+            max_delay=5.0,
+        )
+        media_url = str(metadata.get("url") or "") if isinstance(metadata, dict) else ""
+        from .media import is_safe_url, materialize_attachment_bytes
+
+        if not media_url or not is_safe_url(media_url):
+            logger.warning("WhatsApp returned an unsafe or empty media URL")
+            return attachment
+        response = await request_bytes_response(
+            "whatsapp-media",
+            "GET",
+            media_url,
+            headers=headers,
+            timeout=30.0,
+            attempts=3,
+            max_delay=10.0,
+            follow_redirects=True,
+            max_bytes=max_size,
+        )
+        return materialize_attachment_bytes(
+            attachment,
+            response.content,
+            content_type=response.headers.get("content-type"),
+            prefix="hexis-whatsapp-",
+        )
 
     async def send(
         self,

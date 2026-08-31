@@ -13,7 +13,7 @@ import uuid
 
 import pytest
 
-from core.memory_exchange import export_hmx, iter_hmx_jsonl
+from core.memory_exchange import export_hmx, iter_hmx_jsonl, verify_mind_continuity
 
 pytestmark = [pytest.mark.asyncio(loop_scope="session")]
 
@@ -98,6 +98,22 @@ async def _seed_world(conn) -> dict:
 
 
 class TestPortExport:
+    async def test_current_port_export_proves_lineage_and_protected_continuity(
+        self, db_pool
+    ):
+        async with db_pool.acquire() as conn:
+            await _prepare(conn)
+            source = await export_hmx(conn, intent="port")
+
+            verification = await verify_mind_continuity(conn, source)
+
+        assert verification["verified"] is True
+        assert verification["lineage"]["matches"] is True
+        assert all(
+            check["matches"]
+            for check in verification["protected_sections"].values()
+        )
+
     async def test_port_export_wire_contract(self, db_pool):
         async with db_pool.acquire() as conn:
             await _prepare(conn)

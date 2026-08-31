@@ -12,9 +12,16 @@ import requests
 logger = logging.getLogger(__name__)
 
 
-RABBITMQ_MANAGEMENT_URL = os.getenv("RABBITMQ_MANAGEMENT_URL", "http://rabbitmq:15672").rstrip("/")
-RABBITMQ_USER = os.getenv("RABBITMQ_USER", "hexis")
-RABBITMQ_PASSWORD = os.getenv("RABBITMQ_PASSWORD", "hexis_password")
+RABBITMQ_MANAGEMENT_URL = os.getenv(
+    "RABBITMQ_MANAGEMENT_URL",
+    f"http://localhost:{os.getenv('RABBITMQ_MANAGEMENT_PORT', '45673')}",
+).rstrip("/")
+RABBITMQ_USER = os.getenv("RABBITMQ_USER") or os.getenv(
+    "RABBITMQ_DEFAULT_USER", "hexis"
+)
+RABBITMQ_PASSWORD = os.getenv("RABBITMQ_PASSWORD") or os.getenv(
+    "RABBITMQ_DEFAULT_PASS", "hexis_password"
+)
 RABBITMQ_VHOST = os.getenv("RABBITMQ_VHOST", "/")
 RABBITMQ_OUTBOX_QUEUE = os.getenv("RABBITMQ_OUTBOX_QUEUE", "hexis.outbox")
 RABBITMQ_INBOX_QUEUE = os.getenv("RABBITMQ_INBOX_QUEUE", "hexis.inbox")
@@ -31,7 +38,9 @@ class RabbitMQBridge:
             return "%2F"
         return requests.utils.quote(RABBITMQ_VHOST, safe="")
 
-    async def _request(self, method: str, path: str, payload: dict | None = None) -> requests.Response:
+    async def _request(
+        self, method: str, path: str, payload: dict | None = None
+    ) -> requests.Response:
         url = f"{RABBITMQ_MANAGEMENT_URL}{path}"
         auth = (RABBITMQ_USER, RABBITMQ_PASSWORD)
 
@@ -54,7 +63,9 @@ class RabbitMQBridge:
                     payload={"durable": True, "auto_delete": False, "arguments": {}},
                 )
                 if r.status_code not in (200, 201, 204):
-                    raise RuntimeError(f"rabbitmq queue declare {q!r} HTTP {r.status_code}: {r.text[:200]}")
+                    raise RuntimeError(
+                        f"rabbitmq queue declare {q!r} HTTP {r.status_code}: {r.text[:200]}"
+                    )
         except Exception as e:
             logger.warning("RabbitMQ ensure_ready failed: %s", e)
             return
@@ -84,7 +95,9 @@ class RabbitMQBridge:
                 )
                 ok = resp.status_code == 200 and bool(resp.json().get("routed"))
                 if not ok:
-                    raise RuntimeError(f"publish not routed: HTTP {resp.status_code} body={resp.text[:200]}")
+                    raise RuntimeError(
+                        f"publish not routed: HTTP {resp.status_code} body={resp.text[:200]}"
+                    )
                 published += 1
             except Exception as e:
                 logger.warning("Failed to publish outbox message: %s", e)
@@ -116,13 +129,19 @@ class RabbitMQBridge:
             },
         )
         if resp.status_code != 200:
-            raise RuntimeError(f"inbox publish HTTP {resp.status_code}: {resp.text[:200]}")
+            raise RuntimeError(
+                f"inbox publish HTTP {resp.status_code}: {resp.text[:200]}"
+            )
         try:
             routed = bool(resp.json().get("routed"))
         except Exception as exc:
-            raise RuntimeError(f"inbox publish returned invalid JSON: {resp.text[:200]}") from exc
+            raise RuntimeError(
+                f"inbox publish returned invalid JSON: {resp.text[:200]}"
+            ) from exc
         if not routed:
-            raise RuntimeError(f"inbox message was not routed to {RABBITMQ_INBOX_QUEUE!r}")
+            raise RuntimeError(
+                f"inbox message was not routed to {RABBITMQ_INBOX_QUEUE!r}"
+            )
         return True
 
     async def poll_inbox_messages(self, max_messages: int = 10) -> int:
@@ -147,7 +166,9 @@ class RabbitMQBridge:
                 },
             )
             if resp.status_code != 200:
-                raise RuntimeError(f"inbox get HTTP {resp.status_code}: {resp.text[:200]}")
+                raise RuntimeError(
+                    f"inbox get HTTP {resp.status_code}: {resp.text[:200]}"
+                )
             msgs = resp.json()
             if not isinstance(msgs, list):
                 return 0
@@ -177,7 +198,9 @@ class RabbitMQBridge:
                     await conn.execute("SELECT mark_user_contact()")
                 ingested += 1
             except Exception as e:
-                logger.warning("Failed to ingest inbox message to working memory: %s", e)
+                logger.warning(
+                    "Failed to ingest inbox message to working memory: %s", e
+                )
                 return ingested
 
         return ingested

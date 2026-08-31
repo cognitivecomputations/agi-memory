@@ -862,7 +862,8 @@ BEGIN
                 pending_sources[idx],
                 pending_priorities[idx],
                 NULL,
-                pending_due_ats[idx]
+                pending_due_ats[idx],
+                'user_request'::goal_source
             )
         );
     END LOOP;

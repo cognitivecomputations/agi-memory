@@ -419,6 +419,32 @@ def read_build_id() -> str | None:
         return None
 
 
+def worker_code_stamp_metadata() -> dict[str, str]:
+    """Build/migration stamp for a worker's registration metadata (#113):
+    what code this process actually is, so `hexis status`/`hexis doctor` can
+    flag a running worker whose bundled db/migrations/ predates migrations
+    someone else already applied to the database it shares. Shared by every
+    worker kind (heartbeat/maintenance, channel) so the stamp means the same
+    thing everywhere. Never raises -- a worker must never fail to start
+    over a diagnostic stamp."""
+    metadata: dict[str, str] = {}
+    try:
+        build_id = read_build_id()
+        if build_id:
+            metadata["build_id"] = build_id
+    except Exception:
+        pass
+    try:
+        from core.migrations import latest_bundled_migration_version
+
+        bundled = latest_bundled_migration_version()
+        if bundled:
+            metadata["bundled_latest_migration"] = bundled
+    except Exception:
+        pass
+    return metadata
+
+
 async def record_build_change(conn, service: str) -> None:
     """Journal a 'my running code changed' entry (#93) when this service's
     build stamp differs from the last one it ran under. Advisory: never

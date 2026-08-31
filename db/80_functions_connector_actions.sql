@@ -408,6 +408,20 @@ BEGIN
         explicit_action_approved := FALSE;
     END;
 
+    IF explicit_action_approved THEN
+        RETURN jsonb_build_object(
+            'allowed', TRUE,
+            'action_required', TRUE,
+            'authorization_kind', 'operator_exact_once_approval',
+            'connector_id', action->>'connector_id',
+            'account_key', account,
+            'action_kind', action->>'action_kind',
+            'target', target,
+            'sensitivity', action->>'sensitivity',
+            'reason', 'identity-checked exact tool arguments approved by the operator'
+        );
+    END IF;
+
     FOR row_policy IN
         SELECT *
         FROM connector_action_policies
@@ -575,7 +589,6 @@ CREATE OR REPLACE FUNCTION evaluate_tool_call(
     p_context JSONB DEFAULT '{}'::jsonb
 ) RETURNS JSONB
 LANGUAGE plpgsql
-STABLE
 AS $$
 DECLARE
     tool tool_definitions%ROWTYPE;
@@ -587,6 +600,8 @@ DECLARE
     max_per_tool INT;
     boundary TEXT;
     action_policy JSONB;
+    approval_ok BOOLEAN := FALSE;
+    approval_request UUID;
 BEGIN
     SELECT * INTO tool FROM tool_definitions WHERE name = p_tool_name;
     IF NOT FOUND THEN
@@ -620,11 +635,40 @@ BEGIN
         RETURN jsonb_build_object('allowed', false, 'reason', 'Boundary restriction: ' || boundary, 'error_type', 'boundary_violation', 'energy_cost', cost);
     END IF;
 
-    IF tool.requires_approval AND ctx <> 'chat' AND NOT is_tool_approved(tool.name) THEN
+    IF tool.requires_approval AND NULLIF(p_context->>'approval_request_id', '') IS NOT NULL THEN
+        BEGIN
+            approval_request := (p_context->>'approval_request_id')::uuid;
+            approval_ok := consume_operator_tool_approval(
+                approval_request, tool.name, p_arguments, p_context
+            );
+        EXCEPTION WHEN OTHERS THEN
+            approval_ok := FALSE;
+        END;
+    END IF;
+
+    IF tool.requires_approval
+       AND NULLIF(p_context->>'approval_request_id', '') IS NOT NULL
+       AND NOT approval_ok THEN
+        RETURN jsonb_build_object(
+            'allowed', false,
+            'reason', format('The operator approval proof for tool %L is invalid, expired, mismatched, or already consumed', tool.name),
+            'error_type', 'approval_required',
+            'energy_cost', cost
+        );
+    END IF;
+
+    IF tool.requires_approval
+       AND ctx <> 'chat'
+       AND NOT is_tool_approved(tool.name)
+       AND NOT approval_ok THEN
         RETURN jsonb_build_object('allowed', false, 'reason', format('Tool %L requires approval for autonomous use', tool.name), 'error_type', 'approval_required', 'energy_cost', cost);
     END IF;
 
-    action_policy := evaluate_connector_action_call(p_tool_name, COALESCE(p_arguments, '{}'::jsonb), p_context);
+    action_policy := evaluate_connector_action_call(
+        p_tool_name,
+        COALESCE(p_arguments, '{}'::jsonb),
+        p_context || jsonb_build_object('action_approved', approval_ok)
+    );
     IF NOT COALESCE((action_policy->>'allowed')::boolean, FALSE) THEN
         RETURN jsonb_build_object(
             'allowed', false,
@@ -641,7 +685,8 @@ BEGIN
         'supports_parallel', tool.supports_parallel,
         'execution_kind', tool.execution_kind,
         'driver', tool.driver,
-        'connector_action', action_policy
+        'connector_action', action_policy,
+        'operator_approval_request_id', CASE WHEN approval_ok THEN approval_request::text ELSE NULL END
     );
 END;
 $$;

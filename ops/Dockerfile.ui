@@ -5,8 +5,9 @@ RUN apt-get update -y \
     && apt-get install -y --no-install-recommends openssl \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
-COPY hexis-ui/package.json hexis-ui/bun.lock* ./
-RUN npm install --legacy-peer-deps --ignore-scripts
+ENV NEXT_TELEMETRY_DISABLED=1
+COPY hexis-ui/package.json hexis-ui/package-lock.json ./
+RUN npm ci --ignore-scripts
 COPY hexis-ui/ .
 COPY services/prompts/ /services/prompts/
 COPY characters/ /characters/
@@ -21,6 +22,7 @@ RUN apt-get update -y \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 ENV NODE_ENV=production
+ENV NEXT_TELEMETRY_DISABLED=1
 ENV HEXIS_PROMPTS_DIR=/services/prompts
 ENV HEXIS_CHARACTERS_DIR=/characters
 COPY --from=builder /app/.next/standalone ./

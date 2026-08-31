@@ -7,6 +7,7 @@ import pytest
 
 from core.providers.google_code_assist import (
     _build_headers,
+    _build_request_body,
     _build_url,
     _convert_messages,
     _convert_tools,
@@ -103,6 +104,21 @@ def test_convert_tools_basic():
 def test_convert_tools_empty():
     assert _convert_tools(None) is None
     assert _convert_tools([]) is None
+
+
+def test_request_body_preserves_stable_prefix_and_volatile_tail():
+    body = _build_request_body(
+        [
+            {"role": "system", "content": "STABLE"},
+            {"role": "system", "content": "VOLATILE"},
+            {"role": "user", "content": "hello"},
+        ],
+        None,
+        system_prompt=None,
+        project_id="project",
+    )
+
+    assert body["systemInstruction"] == {"parts": [{"text": "STABLE\n\nVOLATILE"}]}
 
 
 def test_parse_candidates_text():

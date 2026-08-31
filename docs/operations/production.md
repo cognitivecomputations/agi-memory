@@ -58,6 +58,18 @@ hexis-worker --mode heartbeat --instance production
 hexis-worker --mode maintenance --instance production
 ```
 
+For a single-user macOS or Linux host installed with uv, prefer the managed
+desktop lifecycle instead of authoring units by hand:
+
+```bash
+hexis service install --env-file /path/to/production.env --enable-linger
+hexis service status
+```
+
+`--enable-linger` applies only to Linux and is an explicit choice. Multi-user
+servers and orchestrated deployments should continue to use deployment-owned
+system units, containers, or Kubernetes workloads.
+
 Key properties:
 - **Stateless** -- kill and restart freely
 - **Advisory locks** -- prevent double-execution

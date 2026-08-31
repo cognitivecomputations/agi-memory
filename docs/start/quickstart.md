@@ -13,7 +13,7 @@ Get a running agent in 3 commands.
 
 ## Prerequisites
 
-- [Docker Desktop](https://docs.docker.com/get-docker/) -- installed **and running**
+- A running Docker daemon with Compose -- [Docker Desktop](https://docs.docker.com/get-docker/), or Docker CLI + [Colima](https://github.com/abiosoft/colima) on macOS
 - Local embedding sidecar -- `hexis init` starts it and downloads the ~300M-parameter embedding model on first use
 - For the default command below: a **ChatGPT Plus/Pro subscription** (browser OAuth, no API key). Without one, pick any provider from [Other Providers](#other-providers) instead.
 
@@ -60,14 +60,18 @@ hexis init --character jarvis --api-key sk-...
 # Anthropic
 hexis init --provider anthropic --model claude-sonnet-4-20250514 --api-key sk-ant-...
 
-# Local OpenAI-compatible endpoint
-hexis init --provider openai_compatible --model local-model --character hexis
+# Custom OpenAI-compatible endpoint
+# Set OPENAI_BASE_URL and OPENAI_API_KEY in .env first (see .env.example).
+hexis init --provider openai_compatible --model your-model-id --character hexis \
+  --api-key-env OPENAI_API_KEY
 
 # Express defaults (no character card)
 hexis init --api-key sk-ant-...
 ```
 
-`hexis init` auto-detects the provider from API key prefixes. For all supported providers, see [Auth Providers](../integrations/auth/index.md).
+`hexis init` auto-detects the provider from API key prefixes. `--api-key-env`
+reads a named variable from `.env`, keeping the key out of shell history. For
+all supported providers, see [Auth Providers](../integrations/auth/index.md).
 
 ## Verify It Worked
 
@@ -84,11 +88,13 @@ hexis maturity  # shows live capability levels and exact next steps
 hexis up
 ```
 
-`hexis up` starts the heartbeat and maintenance workers by default. Once init and consent are complete, the heartbeat runs hourly unless it is explicitly paused.
+`hexis up` starts the heartbeat and maintenance workers by default. Once init and
+consent are complete, the heartbeat uses a 60-minute base cadence, stretching to
+90 minutes while quiet and shortening toward 15 minutes as drive urgency rises.
 
 ## What Just Happened
 
-1. `hexis init` started the default stack (the database, queue, heartbeat worker, and maintenance worker), started the embedding sidecar, downloaded the embedding model if needed, configured your chosen character's identity/personality/values, and ran a consent flow where the agent agreed to begin.
+1. `hexis init` started the default stack (database, queue, heartbeat and maintenance workers, API, dashboard, and delivery relay), started the embedding sidecar, downloaded the embedding model if needed, configured your chosen character's identity/personality/values, and ran a consent flow where the agent agreed to begin.
 2. `hexis chat` opened an interactive conversation with memory enrichment -- your messages are augmented with relevant memories, and the agent forms new memories from the conversation.
 
 ## Next Steps

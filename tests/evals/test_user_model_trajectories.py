@@ -16,8 +16,7 @@ def _j(value: Any) -> Any:
 
 
 async def _stub_get_embedding(conn) -> None:
-    await conn.execute(
-        """
+    await conn.execute("""
         CREATE OR REPLACE FUNCTION get_embedding(text_contents TEXT[])
         RETURNS vector[] AS $$
             SELECT COALESCE(
@@ -29,8 +28,7 @@ async def _stub_get_embedding(conn) -> None:
             )
             FROM unnest(text_contents)
         $$ LANGUAGE sql;
-        """
-    )
+        """)
 
 
 async def _set_json_config(conn, key: str, value: Any) -> None:
@@ -38,8 +36,9 @@ async def _set_json_config(conn, key: str, value: Any) -> None:
 
 
 async def _connect_slack(conn, marker: str, account_key: str) -> None:
-    attempt = _j(await conn.fetchval(
-        """
+    attempt = _j(
+        await conn.fetchval(
+            """
         SELECT start_connection_attempt(
             'slack',
             '["live_chat", "send", "ingest_live"]'::jsonb,
@@ -52,8 +51,9 @@ async def _connect_slack(conn, marker: str, account_key: str) -> None:
             CURRENT_TIMESTAMP + INTERVAL '10 minutes'
         )
         """,
-        marker,
-    ))
+            marker,
+        )
+    )
     await conn.fetchval(
         """
         SELECT complete_connection_attempt(
@@ -189,14 +189,18 @@ async def test_rules_trajectory_preserves_evidence_and_review_gate(db_pool):
             )
 
             totals = await _run_synthesis_until_idle(conn)
-            before_context = _j(await conn.fetchval("SELECT get_approved_user_model_context(20)"))
+            before_context = _j(
+                await conn.fetchval("SELECT get_approved_user_model_context(20)")
+            )
             before_rendered = await conn.fetchval(
                 "SELECT render_user_model_context($1::jsonb)",
                 json.dumps(before_context),
             )
             claims = await _claims(conn, marker)
             await _approve_all(conn, claims)
-            after_context = _j(await conn.fetchval("SELECT get_approved_user_model_context(20)"))
+            after_context = _j(
+                await conn.fetchval("SELECT get_approved_user_model_context(20)")
+            )
             after_rendered = await conn.fetchval(
                 "SELECT render_user_model_context($1::jsonb)",
                 json.dumps(after_context),
@@ -224,7 +228,9 @@ async def test_rules_trajectory_preserves_evidence_and_review_gate(db_pool):
     assert routine["evidence_count"] == 1
 
 
-async def test_rules_trajectory_rejects_ephemeral_quoted_and_third_party_false_positives(db_pool):
+async def test_rules_trajectory_rejects_ephemeral_quoted_and_third_party_false_positives(
+    db_pool,
+):
     marker = get_test_identifier("user_model_false_positive")
     account = f"channel:slack:{marker}"
     async with db_pool.acquire() as conn:
@@ -237,7 +243,7 @@ async def test_rules_trajectory_rejects_ephemeral_quoted_and_third_party_false_p
             await _connect_slack(conn, marker, account)
             messages = [
                 f"Message:\nThis is just a test. I like emerald buttons {marker}.",
-                f"Message:\nDana wrote: \"I like orange dashboards {marker}.\"",
+                f'Message:\nDana wrote: "I like orange dashboards {marker}."',
                 f"Message:\nPlease review this forwarded note.\n> I prefer vendor X {marker}\nI need your summary.",
                 f"Message:\nPretend I like midnight standups {marker} for this sample.",
             ]
@@ -309,7 +315,18 @@ async def test_llm_stub_trajectory_supersedes_stale_claim_and_renders_only_curre
             ]
         return []
 
-    monkeypatch.setattr(cognition, "extract_user_model_claims_llm", fake_llm_claims)
+    async def fake_llm_claims_batch(conn, items, *, provenance=None):
+        results = {}
+        for item in items:
+            source_id = str(item.get("source_item_id") or "")
+            results[source_id] = await fake_llm_claims(conn, item)
+            if provenance is not None:
+                provenance[source_id] = "llm"
+        return results
+
+    monkeypatch.setattr(
+        cognition, "extract_user_model_claims_llm_batch", fake_llm_claims_batch
+    )
 
     async with db_pool.acquire() as conn:
         tr = conn.transaction()
@@ -338,17 +355,23 @@ async def test_llm_stub_trajectory_supersedes_stale_claim_and_renders_only_curre
             )
 
             totals = await _run_synthesis_until_idle(conn, limit=1)
-            claims = {claim["claim_key"]: claim for claim in await _claims(conn, marker)}
+            claims = {
+                claim["claim_key"]: claim for claim in await _claims(conn, marker)
+            }
             await conn.fetchval(
                 "SELECT review_user_model_claim($1::uuid, 'approve', 'current preference', 'test')",
                 claims[new_key]["id"],
             )
-            context = _j(await conn.fetchval("SELECT get_approved_user_model_context(20)"))
+            context = _j(
+                await conn.fetchval("SELECT get_approved_user_model_context(20)")
+            )
             rendered = await conn.fetchval(
                 "SELECT render_user_model_context($1::jsonb)",
                 json.dumps(context),
             )
-            refreshed = {claim["claim_key"]: claim for claim in await _claims(conn, marker)}
+            refreshed = {
+                claim["claim_key"]: claim for claim in await _claims(conn, marker)
+            }
         finally:
             await tr.rollback()
 

@@ -13,7 +13,9 @@ async def test_get_goals_by_priority_filters(db_pool, ensure_embedding_service):
         tr = conn.transaction()
         await tr.start()
         try:
-            await conn.execute("SELECT set_config('heartbeat.max_active_goals', '10'::jsonb)")
+            await conn.execute(
+                "SELECT set_config('heartbeat.max_active_goals', '10'::jsonb)"
+            )
 
             active_id = await conn.fetchval(
                 "SELECT create_goal($1, $2, $3, $4, NULL, NULL)",
@@ -40,6 +42,7 @@ async def test_get_goals_by_priority_filters(db_pool, ensure_embedding_service):
             )
             assert queued_rows
             assert all(row["priority"] == "queued" for row in queued_rows)
+            assert all(row["origin"] == "derived" for row in queued_rows)
             assert queued_id in {row["id"] for row in queued_rows}
 
             assert active_id != queued_id
@@ -47,7 +50,9 @@ async def test_get_goals_by_priority_filters(db_pool, ensure_embedding_service):
             await tr.rollback()
 
 
-async def test_get_worldview_snapshot_filters_by_confidence(db_pool, ensure_embedding_service):
+async def test_get_worldview_snapshot_filters_by_confidence(
+    db_pool, ensure_embedding_service
+):
     async with db_pool.acquire() as conn:
         tr = conn.transaction()
         await tr.start()
@@ -73,9 +78,7 @@ async def test_get_worldview_snapshot_filters_by_confidence(db_pool, ensure_embe
             assert high_id is not None
             assert low_id is not None
 
-            rows = await conn.fetch(
-                "SELECT * FROM get_worldview_snapshot(10, 0.5)"
-            )
+            rows = await conn.fetch("SELECT * FROM get_worldview_snapshot(10, 0.5)")
             contents = {row["content"] for row in rows}
             assert any("High confidence" in content for content in contents)
             assert all("Low confidence" not in content for content in contents)
@@ -83,7 +86,9 @@ async def test_get_worldview_snapshot_filters_by_confidence(db_pool, ensure_embe
             await tr.rollback()
 
 
-async def test_get_emotional_patterns_context_returns_entries(db_pool, ensure_embedding_service):
+async def test_get_emotional_patterns_context_returns_entries(
+    db_pool, ensure_embedding_service
+):
     async with db_pool.acquire() as conn:
         tr = conn.transaction()
         await tr.start()
@@ -127,7 +132,9 @@ async def test_get_emotional_patterns_context_returns_entries(db_pool, ensure_em
             )
             assert kind == "emotional_pattern"
 
-            result = _coerce_json(await conn.fetchval("SELECT get_emotional_patterns_context(5)"))
+            result = _coerce_json(
+                await conn.fetchval("SELECT get_emotional_patterns_context(5)")
+            )
             assert result
             assert any(pattern in entry.get("pattern", "") for entry in result)
         finally:
@@ -196,7 +203,9 @@ async def test_get_subconscious_and_chat_contexts(db_pool, ensure_embedding_serv
             await tr.rollback()
 
 
-async def test_subconscious_observations_and_chat_turn_memory(db_pool, ensure_embedding_service):
+async def test_subconscious_observations_and_chat_turn_memory(
+    db_pool, ensure_embedding_service
+):
     async with db_pool.acquire() as conn:
         tr = conn.transaction()
         await tr.start()
@@ -234,7 +243,9 @@ async def test_subconscious_observations_and_chat_turn_memory(db_pool, ensure_em
                     "hi there",
                     session_id,
                     None,
-                    json.dumps({"importance": 0.4, "metadata": {"type": "conversation"}}),
+                    json.dumps(
+                        {"importance": 0.4, "metadata": {"type": "conversation"}}
+                    ),
                 )
             )
             raw_unit_id = chat_result["raw_unit_id"]
@@ -258,7 +269,9 @@ async def test_subconscious_observations_and_chat_turn_memory(db_pool, ensure_em
                     "I will remember that and check in carefully.",
                     session_id,
                     None,
-                    json.dumps({"importance": 0.99, "metadata": {"type": "conversation"}}),
+                    json.dumps(
+                        {"importance": 0.99, "metadata": {"type": "conversation"}}
+                    ),
                 )
             )
             memory_id = promoted["promoted_memory_id"]
@@ -273,7 +286,9 @@ async def test_subconscious_observations_and_chat_turn_memory(db_pool, ensure_em
             await tr.rollback()
 
 
-async def test_get_contradictions_context_returns_pairs(db_pool, ensure_embedding_service):
+async def test_get_contradictions_context_returns_pairs(
+    db_pool, ensure_embedding_service
+):
     async with db_pool.acquire() as conn:
         tr = conn.transaction()
         await tr.start()

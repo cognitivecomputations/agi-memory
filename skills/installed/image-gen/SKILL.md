@@ -6,6 +6,7 @@ requires:
   tools: [generate_image]
   env: [OPENAI_API_KEY]
 contexts: [heartbeat, chat]
+aliases: [image, picture, draw, illustration, generate, visual, art]
 bound_tools: [generate_image]
 ---
 

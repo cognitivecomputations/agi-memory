@@ -291,13 +291,13 @@ CREATE OR REPLACE FUNCTION channel_setting_names(
 ) RETURNS TEXT[] AS $$
 DECLARE
     catalog JSONB := '{
-        "discord":  ["bot_token", "allowed_guilds"],
-        "telegram": ["bot_token", "allowed_chat_ids"],
-        "slack":    ["bot_token", "app_token", "allowed_channels"],
-        "signal":   ["phone_number", "api_url", "allowed_numbers"],
-        "whatsapp": ["access_token", "phone_number_id", "verify_token", "webhook_port", "allowed_numbers"],
-        "imessage": ["api_url", "password", "allowed_handles"],
-        "matrix":   ["homeserver", "user_id", "access_token", "allowed_rooms"]
+        "discord":  ["bot_token", "operator_user_id", "allowed_guilds"],
+        "telegram": ["bot_token", "operator_user_id", "allowed_chat_ids"],
+        "slack":    ["bot_token", "app_token", "signing_secret", "operator_user_id", "allowed_channels"],
+        "signal":   ["phone_number", "api_url", "operator_user_id", "allowed_numbers"],
+        "whatsapp": ["access_token", "phone_number_id", "verify_token", "webhook_port", "operator_user_id", "allowed_numbers"],
+        "imessage": ["api_url", "password", "operator_recipient", "allowed_handles"],
+        "matrix":   ["homeserver", "user_id", "access_token", "operator_user_id", "allowed_rooms"]
     }'::jsonb;
 BEGIN
     IF NOT catalog ? COALESCE(p_channel, '') THEN

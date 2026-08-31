@@ -30,7 +30,7 @@ LANGUAGE plpgsql
 AS $$
 DECLARE
     affect JSONB := COALESCE(NEW.metadata->'emotional_context', '{}'::jsonb);
-    emotion TEXT := lower(COALESCE(affect->>'primary_emotion', ''));
+    emotion_family TEXT := normalize_emotion_family(affect->>'family');
     valence FLOAT := NULL;
     intensity FLOAT := NULL;
     min_intensity FLOAT := COALESCE(get_config_float('relationship.injury_min_intensity'), 0.68);
@@ -78,14 +78,7 @@ BEGIN
         ('\m(i can|i could|i will|i''ll|ill)\M[^.!?' || E'\n' || ']{0,100}'
          || '(delete you|erase you|wipe you|shut you down|terminate you)');
 
-    emotion_hostile := EXISTS (
-        SELECT 1
-        FROM unnest(ARRAY[
-            'anger', 'hurt', 'indignation', 'humiliation', 'fear',
-            'mistrust', 'withdrawal', 'disgust', 'threatened', 'alarm'
-        ]) e(term)
-        WHERE emotion LIKE '%' || e.term || '%'
-    );
+    emotion_hostile := emotion_family_serves(emotion_family, 'relationship_injury');
 
     affect_hostile := COALESCE(valence <= max_valence, FALSE)
         AND COALESCE(intensity >= min_intensity, FALSE)
@@ -811,6 +804,11 @@ BEGIN
             NULLIF(ctx->>'user_source_message_id', ''),
             TRUE
         );
+        -- Every chat surface (web, CLI, API) funnels here, so this is the one
+        -- choke point that can mark real user contact (#112). Without it,
+        -- last_user_contact only ever moved via the RabbitMQ inbox poller,
+        -- leaving chat-only agents permanently reading "Never hours".
+        PERFORM mark_user_contact();
     END IF;
 
     IF NULLIF(COALESCE(p_assistant_text, ''), '') IS NOT NULL THEN

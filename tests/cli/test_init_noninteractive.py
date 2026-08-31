@@ -8,6 +8,9 @@ import pytest
 
 from apps.hexis_init import (
     _PROVIDER_ENV_VARS,
+    _resolve_noninteractive_api_key_env,
+    _resolve_noninteractive_endpoint,
+    _resolve_noninteractive_provider,
     _write_env_var,
     build_parser,
     detect_provider,
@@ -91,6 +94,7 @@ def test_build_parser_noninteractive_flags():
         "--character", "hexis",
         "--provider", "anthropic",
         "--model", "claude-sonnet-4-20250514",
+        "--endpoint", "https://llm.example/v1",
         "--name", "Alice",
         "--no-docker",
         "--no-pull",
@@ -99,6 +103,7 @@ def test_build_parser_noninteractive_flags():
     assert args.character == "hexis"
     assert args.provider == "anthropic"
     assert args.model == "claude-sonnet-4-20250514"
+    assert args.endpoint == "https://llm.example/v1"
     assert args.name == "Alice"
     assert args.no_docker is True
     assert args.no_pull is True
@@ -108,9 +113,11 @@ def test_build_parser_defaults():
     parser = build_parser()
     args = parser.parse_args([])
     assert args.api_key is None
+    assert args.api_key_env is None
     assert args.character is None
     assert args.provider is None
     assert args.model is None
+    assert args.endpoint is None
     assert args.name is None
     assert args.no_docker is False
     assert args.no_pull is False
@@ -126,12 +133,102 @@ def test_default_models_derive_from_live_catalog():
     models.dev catalog via model_catalog.recommended_default (Bar #1)."""
     from apps.tui import model_catalog
 
-    # Every provider maps to a models.dev slug.
-    for provider in _PROVIDER_ENV_VARS:
+    # Catalog-backed providers map to models.dev. A custom endpoint cannot:
+    # its model list is defined by that server, so callers pass --model.
+    for provider in set(_PROVIDER_ENV_VARS) - {"openai_compatible"}:
         assert provider in model_catalog.PROVIDER_SLUG, f"No catalog slug for {provider}"
     # The flagship heuristic picks a sensible non-variant default.
     assert model_catalog.recommended_default(
         "openai", ["gpt-5.5-pro", "gpt-5.5", "gpt-5.4-mini"]) == "gpt-5.5"
+
+
+# ---------------------------------------------------------------------------
+# Safe custom-endpoint configuration
+# ---------------------------------------------------------------------------
+
+
+def test_openai_compatible_resolves_explicit_endpoint_and_key_env(monkeypatch):
+    monkeypatch.setenv("INFERENCE_API_KEY", "test-key")
+    args = build_parser().parse_args([
+        "--provider", "openai_compatible",
+        "--model", "served-model",
+        "--endpoint", "https://llm.example/v1",
+        "--api-key-env", "INFERENCE_API_KEY",
+    ])
+
+    provider = _resolve_noninteractive_provider(args)
+    endpoint, source = _resolve_noninteractive_endpoint(args, provider)
+
+    assert provider == "openai_compatible"
+    assert endpoint == "https://llm.example/v1"
+    assert source == "--endpoint"
+    assert _resolve_noninteractive_api_key_env(args, provider) == "INFERENCE_API_KEY"
+
+
+def test_openai_compatible_uses_documented_env_endpoint(monkeypatch):
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://llm.example/v1")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    args = build_parser().parse_args([
+        "--provider", "openai_compatible",
+        "--model", "served-model",
+        "--api-key-env", "OPENAI_API_KEY",
+    ])
+
+    endpoint, source = _resolve_noninteractive_endpoint(args, "openai_compatible")
+
+    assert endpoint == "https://llm.example/v1"
+    assert source == "OPENAI_BASE_URL"
+    assert _resolve_noninteractive_api_key_env(args, "openai_compatible") == "OPENAI_API_KEY"
+
+
+def test_openai_compatible_requires_endpoint(monkeypatch):
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    args = build_parser().parse_args([
+        "--provider", "openai_compatible",
+        "--model", "served-model",
+        "--api-key-env", "OPENAI_API_KEY",
+    ])
+
+    with pytest.raises(ValueError, match="--endpoint URL or set OPENAI_BASE_URL"):
+        _resolve_noninteractive_endpoint(args, "openai_compatible")
+
+
+def test_api_key_env_must_be_set(monkeypatch):
+    monkeypatch.delenv("MISSING_API_KEY", raising=False)
+    args = build_parser().parse_args([
+        "--provider", "openai_compatible",
+        "--model", "served-model",
+        "--endpoint", "https://llm.example/v1",
+        "--api-key-env", "MISSING_API_KEY",
+    ])
+
+    with pytest.raises(ValueError, match="MISSING_API_KEY is not set"):
+        _resolve_noninteractive_api_key_env(args, "openai_compatible")
+
+
+def test_ambient_key_requires_explicit_selection(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "ambient-key")
+    args = build_parser().parse_args([
+        "--provider", "openai",
+        "--model", "served-model",
+    ])
+
+    with pytest.raises(ValueError, match="--api-key-env OPENAI_API_KEY"):
+        _resolve_noninteractive_api_key_env(args, "openai")
+
+
+def test_standard_openai_does_not_inherit_custom_endpoint(monkeypatch):
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://unrelated.example/v1")
+    args = build_parser().parse_args([
+        "--provider", "openai",
+        "--model", "served-model",
+        "--api-key", "sk-test-key",
+    ])
+
+    endpoint, source = _resolve_noninteractive_endpoint(args, "openai")
+
+    assert endpoint == ""
+    assert source == ""
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +248,8 @@ async def test_cli_init_help():
     )
     assert p.returncode == 0
     assert "--api-key" in p.stdout
+    assert "--api-key-env" in p.stdout
+    assert "--endpoint" in p.stdout
     assert "--character" in p.stdout
     assert "--provider" in p.stdout
     assert "--no-docker" in p.stdout

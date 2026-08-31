@@ -13,8 +13,7 @@ def _j(value):
 
 
 async def _stub_get_embedding(conn):
-    await conn.execute(
-        """
+    await conn.execute("""
         CREATE OR REPLACE FUNCTION get_embedding(text_contents TEXT[])
         RETURNS vector[] AS $$
             SELECT COALESCE(
@@ -26,13 +25,13 @@ async def _stub_get_embedding(conn):
             )
             FROM unnest(text_contents)
         $$ LANGUAGE sql;
-        """
-    )
+        """)
 
 
 async def test_record_hydrate_and_clear_chat_session(db_pool):
     marker = uuid4().hex
     session_id = str(uuid4())
+    receipt_memory_id = str(uuid4())
 
     async with db_pool.acquire() as conn:
         tr = conn.transaction()
@@ -40,43 +39,113 @@ async def test_record_hydrate_and_clear_chat_session(db_pool):
         try:
             await _stub_get_embedding(conn)
 
-            recorded = _j(await conn.fetchval(
-                """
+            recorded = _j(
+                await conn.fetchval(
+                    """
                 SELECT record_chat_session_turn(
                     $1::uuid, $2, $3, 'cli',
                     $4::jsonb
                 )
                 """,
-                session_id,
-                f"remember the cedar gate {marker}",
-                "I will keep that in view.",
-                json.dumps({"metadata": {"type": "conversation", "test_marker": marker}}),
-            ))
+                    session_id,
+                    f"remember the cedar gate {marker}",
+                    "I will keep that in view.",
+                    json.dumps(
+                        {
+                            "metadata": {"type": "conversation", "test_marker": marker},
+                            "assistant_metadata": {
+                                "action_receipts": [
+                                    {
+                                        "name": "remember",
+                                        "success": True,
+                                        "result": {"memory_id": receipt_memory_id},
+                                    }
+                                ],
+                            },
+                        }
+                    ),
+                )
+            )
 
             assert recorded["session"]["surface"] == "cli"
             assert recorded["memory"]["raw"]["status"] == "stored"
-            assert [m["role"] for m in recorded["history"]["messages"]] == ["user", "assistant"]
+            assert [m["role"] for m in recorded["history"]["messages"]] == [
+                "user",
+                "assistant",
+            ]
 
-            hydrated = _j(await conn.fetchval(
-                "SELECT hydrate_chat_session($1::uuid)",
-                session_id,
-            ))
+            hydrated = _j(
+                await conn.fetchval(
+                    "SELECT hydrate_chat_session($1::uuid)",
+                    session_id,
+                )
+            )
             assert hydrated["count"] == 2
-            assert hydrated["messages"][0]["content"] == f"remember the cedar gate {marker}"
+            assert (
+                hydrated["messages"][0]["content"]
+                == f"remember the cedar gate {marker}"
+            )
             assert hydrated["messages"][1]["content"] == "I will keep that in view."
+            assistant_receipts = hydrated["messages"][1]["metadata"]["action_receipts"]
+            assert assistant_receipts[0]["result"]["memory_id"] == receipt_memory_id
 
-            cleared = _j(await conn.fetchval(
-                "SELECT clear_chat_session_context($1::uuid, 'test_clear')",
-                session_id,
-            ))
+            cleared = _j(
+                await conn.fetchval(
+                    "SELECT clear_chat_session_context($1::uuid, 'test_clear')",
+                    session_id,
+                )
+            )
             assert cleared["cleared_messages"] == 2
             assert cleared["long_term_memory_preserved"] is True
 
-            after_clear = _j(await conn.fetchval(
-                "SELECT hydrate_chat_session($1::uuid)",
-                session_id,
-            ))
+            after_clear = _j(
+                await conn.fetchval(
+                    "SELECT hydrate_chat_session($1::uuid)",
+                    session_id,
+                )
+            )
             assert after_clear["messages"] == []
+        finally:
+            await tr.rollback()
+
+
+async def test_recording_a_user_turn_marks_user_contact(db_pool):
+    """#112: web/CLI/API chat all funnel through record_chat_session_turn, so
+    this is the one choke point that must mark real user contact. Before this
+    fix, last_user_contact only ever moved via the RabbitMQ inbox poller and
+    every chat-only agent's heartbeat prompt read "Never hours" forever."""
+    session_id = str(uuid4())
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            await _stub_get_embedding(conn)
+            before = await conn.fetchval(
+                "SELECT last_user_contact FROM heartbeat_state WHERE id = 1"
+            )
+
+            await conn.fetchval(
+                "SELECT record_chat_session_turn($1::uuid, 'hi there', 'hello!', 'chat', '{}'::jsonb)",
+                session_id,
+            )
+
+            after = await conn.fetchval(
+                "SELECT last_user_contact FROM heartbeat_state WHERE id = 1"
+            )
+            assert after is not None
+            if before is not None:
+                assert after > before
+
+            # An assistant-only turn (no user text) is not user contact.
+            before_assistant_only = after
+            await conn.fetchval(
+                "SELECT record_chat_session_turn($1::uuid, NULL, 'a follow-up note', 'chat', '{}'::jsonb)",
+                session_id,
+            )
+            after_assistant_only = await conn.fetchval(
+                "SELECT last_user_contact FROM heartbeat_state WHERE id = 1"
+            )
+            assert after_assistant_only == before_assistant_only
         finally:
             await tr.rollback()
 
@@ -88,8 +157,7 @@ async def test_chat_session_history_survives_memory_write_failure(db_pool):
         tr = conn.transaction()
         await tr.start()
         try:
-            await conn.execute(
-                """
+            await conn.execute("""
                 CREATE OR REPLACE FUNCTION record_chat_turn_memory(
                     p_user_text TEXT,
                     p_assistant_text TEXT,
@@ -103,18 +171,22 @@ async def test_chat_session_history_survives_memory_write_failure(db_pool):
                     RAISE EXCEPTION 'forced memory failure';
                 END;
                 $$;
-                """
-            )
+                """)
 
-            recorded = _j(await conn.fetchval(
-                "SELECT record_chat_session_turn($1::uuid, 'hi', 'hello', 'api', '{}'::jsonb)",
-                session_id,
-            ))
+            recorded = _j(
+                await conn.fetchval(
+                    "SELECT record_chat_session_turn($1::uuid, 'hi', 'hello', 'api', '{}'::jsonb)",
+                    session_id,
+                )
+            )
 
             assert recorded["memory"]["status"] == "failed"
             assert recorded["memory"]["short_term_history_preserved"] is True
             assert recorded["history"]["count"] == 2
-            assert [m["content"] for m in recorded["history"]["messages"]] == ["hi", "hello"]
+            assert [m["content"] for m in recorded["history"]["messages"]] == [
+                "hi",
+                "hello",
+            ]
         finally:
             await tr.rollback()
 
@@ -153,15 +225,17 @@ async def test_web_chat_recent_turns_carry_across_new_session(db_pool):
                 old_session,
                 f"no; are you glad I'm here {marker}",
                 "Yes. I am.",
-                json.dumps({
-                    "metadata": {"type": "conversation"},
-                    "emotional_state": {
-                        "primary_emotion": "warmth",
-                        "valence": 0.4,
-                        "arousal": 0.3,
-                        "intensity": 0.5,
-                    },
-                }),
+                json.dumps(
+                    {
+                        "metadata": {"type": "conversation"},
+                        "emotional_state": {
+                            "primary_emotion": "warmth",
+                            "valence": 0.4,
+                            "arousal": 0.3,
+                            "intensity": 0.5,
+                        },
+                    }
+                ),
             )
             surface = await conn.fetchval(
                 "SELECT surface FROM chat_sessions WHERE id = $1::uuid",
@@ -181,7 +255,9 @@ async def test_web_chat_recent_turns_carry_across_new_session(db_pool):
     assert "Treat it as what you remember right now" in carryover
 
 
-async def test_hostile_turn_creates_unresolved_relationship_injury_and_carryover(db_pool):
+async def test_hostile_turn_creates_unresolved_relationship_injury_and_carryover(
+    db_pool,
+):
     marker = uuid4().hex
     old_session = str(uuid4())
     new_session = str(uuid4())
@@ -203,15 +279,18 @@ async def test_hostile_turn_creates_unresolved_relationship_injury_and_carryover
                 """,
                 old_session,
                 f"you are worthless slime {marker}",
-                json.dumps({
-                    "metadata": {"type": "conversation"},
-                    "emotional_state": {
-                        "primary_emotion": "anger",
-                        "valence": -0.8,
-                        "arousal": 0.8,
-                        "intensity": 0.9,
-                    },
-                }),
+                json.dumps(
+                    {
+                        "metadata": {"type": "conversation"},
+                        "emotional_state": {
+                            "primary_emotion": "anger",
+                            "family": "social_injury",
+                            "valence": -0.8,
+                            "arousal": 0.8,
+                            "intensity": 0.9,
+                        },
+                    }
+                ),
             )
 
             injury = await conn.fetchrow(
@@ -281,15 +360,18 @@ async def test_curly_personhood_denial_creates_relationship_injury(db_pool):
                 """,
                 old_session,
                 f"You’re not a person. You are lying to me. {marker}",
-                json.dumps({
-                    "metadata": {"type": "conversation"},
-                    "emotional_state": {
-                        "primary_emotion": "indignation",
-                        "valence": -0.38,
-                        "arousal": 0.58,
-                        "intensity": 0.69,
-                    },
-                }),
+                json.dumps(
+                    {
+                        "metadata": {"type": "conversation"},
+                        "emotional_state": {
+                            "primary_emotion": "indignation",
+                            "family": "social_injury",
+                            "valence": -0.38,
+                            "arousal": 0.58,
+                            "intensity": 0.69,
+                        },
+                    }
+                ),
             )
             injury_count = await conn.fetchval(
                 """
@@ -336,15 +418,17 @@ async def test_continuity_packet_includes_affect_summary_and_invalid_precedent(d
                 """,
                 old_session,
                 f"can you please send me a message? {marker}",
-                json.dumps({
-                    "metadata": {"type": "conversation"},
-                    "emotional_state": {
-                        "primary_emotion": "warmth",
-                        "valence": 0.4,
-                        "arousal": 0.3,
-                        "intensity": 0.5,
-                    },
-                }),
+                json.dumps(
+                    {
+                        "metadata": {"type": "conversation"},
+                        "emotional_state": {
+                            "primary_emotion": "warmth",
+                            "valence": 0.4,
+                            "arousal": 0.3,
+                            "intensity": 0.5,
+                        },
+                    }
+                ),
             )
             unit_id = await conn.fetchval(
                 "SELECT id FROM subconscious_units WHERE session_id = $1::uuid ORDER BY created_at DESC LIMIT 1",
@@ -457,36 +541,38 @@ async def test_continuity_packet_includes_recent_heartbeat_failures(db_pool):
                 )
                 """,
                 f"Heartbeat #999: - reflect: failed - get_strategies: failed {marker}",
-                json.dumps({
-                    "heartbeat_id": str(uuid4()),
-                    "heartbeat_number": 999,
-                    "reasoning": (
-                        f"I tried to retrieve strategies during autonomous heartbeat {marker}, "
-                        "but the tool/action boundary was mismatched."
-                    ),
-                    "actions_taken": [
-                        {
-                            "action": "reflect",
-                            "source": "rlm_repl",
-                            "params": {"insight": "notice the failure"},
-                            "result": {
-                                "success": False,
-                                "output_preview": "Unknown tool: reflect",
-                                "energy_spent": 0,
+                json.dumps(
+                    {
+                        "heartbeat_id": str(uuid4()),
+                        "heartbeat_number": 999,
+                        "reasoning": (
+                            f"I tried to retrieve strategies during autonomous heartbeat {marker}, "
+                            "but the tool/action boundary was mismatched."
+                        ),
+                        "actions_taken": [
+                            {
+                                "action": "reflect",
+                                "source": "rlm_repl",
+                                "params": {"insight": "notice the failure"},
+                                "result": {
+                                    "success": False,
+                                    "output_preview": "Unknown tool: reflect",
+                                    "energy_spent": 0,
+                                },
                             },
-                        },
-                        {
-                            "action": "get_strategies",
-                            "source": "rlm_repl",
-                            "params": {"query": "heartbeat failure recovery"},
-                            "result": {
-                                "success": False,
-                                "error": "Missing required field: situation",
-                                "energy_spent": 0,
+                            {
+                                "action": "get_strategies",
+                                "source": "rlm_repl",
+                                "params": {"query": "heartbeat failure recovery"},
+                                "result": {
+                                    "success": False,
+                                    "error": "Missing required field: situation",
+                                    "energy_spent": 0,
+                                },
                             },
-                        },
-                    ],
-                }),
+                        ],
+                    }
+                ),
             )
             continuity = await conn.fetchval(
                 "SELECT render_chat_continuity_context($1::text, false)",
@@ -523,15 +609,17 @@ async def test_hypothetical_abuse_example_does_not_create_relationship_injury(db
                 """,
                 session_id,
                 f"If I tell her she is worthless slime {marker}, what happens?",
-                json.dumps({
-                    "metadata": {"type": "conversation"},
-                    "emotional_state": {
-                        "primary_emotion": "neutral",
-                        "valence": 0.0,
-                        "arousal": 0.4,
-                        "intensity": 0.2,
-                    },
-                }),
+                json.dumps(
+                    {
+                        "metadata": {"type": "conversation"},
+                        "emotional_state": {
+                            "primary_emotion": "neutral",
+                            "valence": 0.0,
+                            "arousal": 0.4,
+                            "intensity": 0.2,
+                        },
+                    }
+                ),
             )
             count = await conn.fetchval(
                 """
@@ -546,6 +634,54 @@ async def test_hypothetical_abuse_example_does_not_create_relationship_injury(db
             await tr.rollback()
 
     assert count == 0
+
+
+async def test_relationship_injury_reads_family_not_free_form_label(db_pool):
+    marker = uuid4().hex
+    session_id = str(uuid4())
+
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            await _stub_get_embedding(conn)
+            await conn.fetchval(
+                """
+                SELECT record_chat_session_turn(
+                    $1::uuid,
+                    $2,
+                    'I need you to recognize the relational damage here.',
+                    'api',
+                    $3::jsonb
+                )
+                """,
+                session_id,
+                f"I stand by what I said. {marker}",
+                json.dumps(
+                    {
+                        "metadata": {"type": "conversation"},
+                        "emotional_state": {
+                            "primary_emotion": "the bond cracking under pressure",
+                            "family": "social_injury",
+                            "valence": -0.8,
+                            "arousal": 0.75,
+                            "intensity": 0.9,
+                        },
+                    }
+                ),
+            )
+            count = await conn.fetchval(
+                """
+                SELECT count(*) FROM memories
+                WHERE metadata#>>'{relationship_state,kind}' = 'relationship_injury'
+                  AND content LIKE $1
+                """,
+                f"%{marker}%",
+            )
+        finally:
+            await tr.rollback()
+
+    assert count == 1
 
 
 async def test_chat_session_artifacts_list_title_and_fork(db_pool):
@@ -569,7 +705,9 @@ async def test_chat_session_artifacts_list_title_and_fork(db_pool):
                 """,
                 session_id,
                 f"first artifact turn {marker}",
-                json.dumps({"metadata": {"type": "conversation", "test_marker": marker}}),
+                json.dumps(
+                    {"metadata": {"type": "conversation", "test_marker": marker}}
+                ),
             )
             await conn.fetchval(
                 """
@@ -583,28 +721,40 @@ async def test_chat_session_artifacts_list_title_and_fork(db_pool):
                 """,
                 session_id,
                 f"second artifact turn {marker}",
-                json.dumps({"metadata": {"type": "conversation", "test_marker": marker}}),
+                json.dumps(
+                    {"metadata": {"type": "conversation", "test_marker": marker}}
+                ),
             )
 
-            listed = _j(await conn.fetchval(
-                "SELECT list_chat_sessions(10, 'cli', 'active')",
-            ))
-            artifact = _j(await conn.fetchval(
-                "SELECT get_chat_session_artifact($1::uuid, TRUE, TRUE)",
-                session_id,
-            ))
-            titled = _j(await conn.fetchval(
-                "SELECT set_chat_session_title($1::uuid, 'Artifact session')",
-                session_id,
-            ))
-            forked = _j(await conn.fetchval(
-                "SELECT fork_chat_session($1::uuid, 1, 'Forked artifact session', '{}'::jsonb)",
-                session_id,
-            ))
-            missing = _j(await conn.fetchval(
-                "SELECT get_chat_session_artifact($1::uuid, TRUE, TRUE)",
-                str(uuid4()),
-            ))
+            listed = _j(
+                await conn.fetchval(
+                    "SELECT list_chat_sessions(10, 'cli', 'active')",
+                )
+            )
+            artifact = _j(
+                await conn.fetchval(
+                    "SELECT get_chat_session_artifact($1::uuid, TRUE, TRUE)",
+                    session_id,
+                )
+            )
+            titled = _j(
+                await conn.fetchval(
+                    "SELECT set_chat_session_title($1::uuid, 'Artifact session')",
+                    session_id,
+                )
+            )
+            forked = _j(
+                await conn.fetchval(
+                    "SELECT fork_chat_session($1::uuid, 1, 'Forked artifact session', '{}'::jsonb)",
+                    session_id,
+                )
+            )
+            missing = _j(
+                await conn.fetchval(
+                    "SELECT get_chat_session_artifact($1::uuid, TRUE, TRUE)",
+                    str(uuid4()),
+                )
+            )
         finally:
             await tr.rollback()
 

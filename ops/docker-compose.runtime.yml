@@ -128,6 +128,8 @@ services:
       XAI_API_KEY: ${XAI_API_KEY:-}
       HEXIS_LLM_CONSCIOUS_API_KEY: ${HEXIS_LLM_CONSCIOUS_API_KEY:-}
       HEXIS_LLM_SUBCONSCIOUS_API_KEY: ${HEXIS_LLM_SUBCONSCIOUS_API_KEY:-}
+    volumes:
+      - ~/.hexis:/root/.hexis
     networks:
       - private
       - public
@@ -159,6 +161,8 @@ services:
       XAI_API_KEY: ${XAI_API_KEY:-}
       HEXIS_LLM_CONSCIOUS_API_KEY: ${HEXIS_LLM_CONSCIOUS_API_KEY:-}
       HEXIS_LLM_SUBCONSCIOUS_API_KEY: ${HEXIS_LLM_SUBCONSCIOUS_API_KEY:-}
+    volumes:
+      - ~/.hexis:/root/.hexis
     networks:
       - private
       - public
@@ -167,8 +171,6 @@ services:
     image: ghcr.io/quixiai/hexis-worker:${HEXIS_IMAGE_TAG:-latest}
     container_name: hexis_api
     restart: unless-stopped
-    profiles:
-      - active
     command: ["hexis-api", "--host", "0.0.0.0", "--port", "43817"]
     depends_on:
       db:
@@ -177,6 +179,8 @@ services:
         condition: service_healthy
     ports:
       - "${HEXIS_BIND_ADDRESS:-127.0.0.1}:${HEXIS_API_PORT:-43817}:43817"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:43817/health', timeout=3).read()"]
       interval: 10s
@@ -192,6 +196,7 @@ services:
       EMBEDDING_MODEL_ID: ${EMBEDDING_MODEL_ID:-unsloth/embeddinggemma-300m}
       EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-768}
       HEXIS_CORS_ORIGINS: ${HEXIS_CORS_ORIGINS:-http://localhost:3477,http://localhost:3000}
+      HEXIS_TTS_URL: ${HEXIS_TTS_URL:-http://host.docker.internal:42667}
       RABBITMQ_MANAGEMENT_URL: http://rabbitmq:15672
       RABBITMQ_USER: ${RABBITMQ_DEFAULT_USER:-hexis}
       RABBITMQ_PASSWORD: ${RABBITMQ_DEFAULT_PASS:-hexis_password}
@@ -201,6 +206,8 @@ services:
       XAI_API_KEY: ${XAI_API_KEY:-}
       HEXIS_LLM_CONSCIOUS_API_KEY: ${HEXIS_LLM_CONSCIOUS_API_KEY:-}
       HEXIS_LLM_SUBCONSCIOUS_API_KEY: ${HEXIS_LLM_SUBCONSCIOUS_API_KEY:-}
+    volumes:
+      - ~/.hexis:/root/.hexis
     networks:
       - private
       - public
@@ -209,8 +216,6 @@ services:
     image: ghcr.io/quixiai/hexis-channels:${HEXIS_IMAGE_TAG:-latest}
     container_name: hexis_channel_worker
     restart: unless-stopped
-    profiles:
-      - active
     command: ["hexis-channels"]
     depends_on:
       db:
@@ -248,6 +253,8 @@ services:
       XAI_API_KEY: ${XAI_API_KEY:-}
       HEXIS_LLM_CONSCIOUS_API_KEY: ${HEXIS_LLM_CONSCIOUS_API_KEY:-}
       HEXIS_LLM_SUBCONSCIOUS_API_KEY: ${HEXIS_LLM_SUBCONSCIOUS_API_KEY:-}
+    volumes:
+      - ~/.hexis:/root/.hexis
     networks:
       - private
       - public
@@ -258,6 +265,8 @@ services:
     restart: unless-stopped
     depends_on:
       db:
+        condition: service_healthy
+      api:
         condition: service_healthy
     ports:
       - "${HEXIS_BIND_ADDRESS:-127.0.0.1}:${HEXIS_UI_PORT:-3477}:3477"

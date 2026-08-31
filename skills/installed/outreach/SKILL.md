@@ -5,6 +5,7 @@ category: communication
 requires:
   tools: [discord_send]
 contexts: [heartbeat, chat]
+aliases: [outreach, reach, introduce, intro, follow, followup, pitch]
 bound_tools: [discord_send, slack_send, telegram_send, signal_send, queue_user_message]
 ---
 

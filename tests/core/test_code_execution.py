@@ -344,7 +344,9 @@ class TestCodeExecutionSpec:
         assert spec.name == "execute_code"
         assert spec.energy_cost == 3
         assert spec.is_read_only is False
-        assert spec.requires_approval is False
+        # Arbitrary Python in-process, persistent globals, bridged to the whole
+        # tool registry — unsandboxed. A person says yes or it does not run.
+        assert spec.requires_approval is True
         assert spec.supports_parallel is False
 
     def test_openai_function_format(self):

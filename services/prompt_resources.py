@@ -14,7 +14,12 @@ HEARTBEAT_AGENTIC_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "h
 HEARTBEAT_TASK_MODE_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "heartbeat_task_mode.md"
 TERMINATION_CONFIRM_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "termination_confirm.md"
 TERMINATION_REVIEW_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "termination_review.md"
-SUBCONSCIOUS_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "subconscious.md"
+SUBCONSCIOUS_INLINE_PROMPT_PATH = (
+    Path(__file__).resolve().parent / "prompts" / "subconscious_inline.md"
+)
+SUBCONSCIOUS_MAINTENANCE_PROMPT_PATH = (
+    Path(__file__).resolve().parent / "prompts" / "subconscious_maintenance.md"
+)
 RLM_HEARTBEAT_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "rlm_heartbeat_system.md"
 RLM_CHAT_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "rlm_chat_system.md"
 RLM_SLOW_INGEST_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "rlm_slow_ingest_system.md"
@@ -26,6 +31,9 @@ RECMEM_EPISODE_CREATE_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" 
 RECMEM_SEMANTIC_REFINE_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "recmem_semantic_refine.md"
 MEMORY_SUMMARIZATION_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "memory_summarization.md"
 SKILL_IMPROVEMENT_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "skill_improvement.md"
+CONTRADICTION_DETECTION_PROMPT_PATH = (
+    Path(__file__).resolve().parent / "prompts" / "contradiction_detection.md"
+)
 
 
 @dataclass(frozen=True)
@@ -161,6 +169,15 @@ def load_skill_improvement_prompt() -> str:
     )
 
 
+def load_contradiction_detection_prompt() -> str:
+    if CONTRADICTION_DETECTION_PROMPT_PATH.exists():
+        return CONTRADICTION_DETECTION_PROMPT_PATH.read_text(encoding="utf-8")
+    return (
+        "Compare only the supplied memory pairs for genuine logical contradictions. "
+        "Return strict JSON with a contradictions array; never decide which is right."
+    )
+
+
 def load_heartbeat_task_mode_prompt() -> str:
     if HEARTBEAT_TASK_MODE_PROMPT_PATH.exists():
         return HEARTBEAT_TASK_MODE_PROMPT_PATH.read_text(encoding="utf-8")
@@ -190,11 +207,25 @@ def load_termination_review_prompt() -> str:
 
 
 @lru_cache(maxsize=1)
-def load_subconscious_prompt() -> str:
-    if SUBCONSCIOUS_PROMPT_PATH.exists():
-        return SUBCONSCIOUS_PROMPT_PATH.read_text(encoding="utf-8")
+def load_subconscious_inline_prompt() -> str:
+    """Inline appraisal (#53): the hot path, called on every chat/heartbeat
+    turn. Carries only its own task's spec -- not the maintenance_review
+    schema, which that call never needs."""
+    if SUBCONSCIOUS_INLINE_PROMPT_PATH.exists():
+        return SUBCONSCIOUS_INLINE_PROMPT_PATH.read_text(encoding="utf-8")
     return (
-        "Subconscious prompt missing. Respond with JSON observation arrays."
+        "Subconscious inline-appraisal prompt missing. Respond with JSON observation arrays."
+    )
+
+
+@lru_cache(maxsize=1)
+def load_subconscious_maintenance_prompt() -> str:
+    """Maintenance review (#53): the infrequent background pass that alone
+    may populate the long-horizon observation arrays."""
+    if SUBCONSCIOUS_MAINTENANCE_PROMPT_PATH.exists():
+        return SUBCONSCIOUS_MAINTENANCE_PROMPT_PATH.read_text(encoding="utf-8")
+    return (
+        "Subconscious maintenance-review prompt missing. Respond with JSON observation arrays."
     )
 
 

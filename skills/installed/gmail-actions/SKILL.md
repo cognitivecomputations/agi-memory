@@ -5,6 +5,7 @@ category: communication
 requires:
   tools: [gmail_send, gmail_reply, gmail_label, gmail_spam_triage, gmail_delete, connector_action_policy_status]
 contexts: [chat, heartbeat]
+aliases: [email, emails, mail, inbox, message, reply, send, unread, archive, spam]
 bound_tools: [gmail_send, gmail_reply, gmail_label, gmail_spam_triage, gmail_delete, connector_action_policy_status]
 ---
 

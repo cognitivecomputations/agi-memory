@@ -116,9 +116,11 @@ Beyond the normalized text, ingestion now preserves three more layers:
 All paths converge on the same pipeline and receipts:
 
 1. **CLI bulk** — `hexis ingest --file/--input/--url/--github/--stdin`.
-2. **Chat** — large pastes become attachments; dropped/picked files upload
-   their original bytes (`POST /api/ingest/file`) and ingest as durable
-   background jobs.
+2. **Chat** — attaching a file preserves its original bytes and reads its text
+   immediately (`POST /api/attachments`), so the agent can discuss it in the
+   same turn; sending the message starts the durable background job
+   (`POST /api/attachments/{artifact_id}/ingest`). Large pastes attach the
+   same way. Nothing is ingested until the message is actually sent.
 3. **Web UI** — the **Ingest** page: multi-file upload, paste box, URL field,
    and a live job list showing what ran, what is pending, and what failed and why.
 4. **The agent itself** — `url_ingest`/`git_ingest` during heartbeats. Sources

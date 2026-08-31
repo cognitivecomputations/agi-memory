@@ -18,7 +18,6 @@ import hashlib
 import json
 import logging
 import os
-import time
 from typing import Any, TYPE_CHECKING
 
 import requests
@@ -43,9 +42,16 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-RABBITMQ_MANAGEMENT_URL = os.getenv("RABBITMQ_MANAGEMENT_URL", "http://rabbitmq:15672").rstrip("/")
-RABBITMQ_USER = os.getenv("RABBITMQ_USER", "hexis")
-RABBITMQ_PASSWORD = os.getenv("RABBITMQ_PASSWORD", "hexis_password")
+RABBITMQ_MANAGEMENT_URL = os.getenv(
+    "RABBITMQ_MANAGEMENT_URL",
+    f"http://localhost:{os.getenv('RABBITMQ_MANAGEMENT_PORT', '45673')}",
+).rstrip("/")
+RABBITMQ_USER = os.getenv("RABBITMQ_USER") or os.getenv(
+    "RABBITMQ_DEFAULT_USER", "hexis"
+)
+RABBITMQ_PASSWORD = os.getenv("RABBITMQ_PASSWORD") or os.getenv(
+    "RABBITMQ_DEFAULT_PASS", "hexis_password"
+)
 RABBITMQ_VHOST = os.getenv("RABBITMQ_VHOST", "/")
 RABBITMQ_OUTBOX_QUEUE = os.getenv("RABBITMQ_OUTBOX_QUEUE", "hexis.outbox")
 POLL_INTERVAL = float(os.getenv("OUTBOX_POLL_INTERVAL", "2.0"))
@@ -53,6 +59,16 @@ RECOVERED_DELIVERY_MARKER = (
     "Recovered delivery: Hexis restarted or lost confirmation during the previous "
     "send attempt, so this may duplicate an earlier message.\n\n"
 )
+
+# These envelopes are created by trusted control-plane functions specifically
+# for the configured operator.  Generic ``channel_message`` envelopes are not
+# on this list: an explicit channel target may be a third party and must carry
+# its own backed purpose unless address resolution proves it is the operator.
+_PRIMARY_USER_OUTBOX_KINDS = frozenset({"user", "operator_approval"})
+
+
+def _is_primary_user_envelope(payload: dict[str, Any]) -> bool:
+    return str(payload.get("_outbox_kind") or "") in _PRIMARY_USER_OUTBOX_KINDS
 
 
 class ChannelOutboxConsumer:
@@ -114,7 +130,11 @@ class ChannelOutboxConsumer:
         for msg in msgs:
             raw_payload = msg.get("payload")
             try:
-                body = json.loads(raw_payload) if isinstance(raw_payload, str) else raw_payload
+                body = (
+                    json.loads(raw_payload)
+                    if isinstance(raw_payload, str)
+                    else raw_payload
+                )
             except Exception:
                 continue
 
@@ -125,7 +145,9 @@ class ChannelOutboxConsumer:
                 await self._process_message(body)
                 processed += 1
             except Exception:
-                logger.exception("Failed to process outbox message: %s", str(body)[:200])
+                logger.exception(
+                    "Failed to process outbox message: %s", str(body)[:200]
+                )
 
         return processed + recovered
 
@@ -142,6 +164,7 @@ class ChannelOutboxConsumer:
         message, content = _resolve_payload_message(payload)
         if not content:
             return
+        payload["_outbox_kind"] = kind
 
         delivery_mode = str(payload.get("delivery_mode") or "last_active")
         outbox_msg_id = str(body.get("id") or "")
@@ -153,7 +176,9 @@ class ChannelOutboxConsumer:
         # this queue, like any external system. Every user-bound message gets a
         # copy there (config-gated), so the UI can show it even when no chat
         # platform is configured. Silent deliveries stay silent everywhere.
-        if not (isinstance(delivery_info, dict) and delivery_info.get("mode") == "silent"):
+        if not (
+            isinstance(delivery_info, dict) and delivery_info.get("mode") == "silent"
+        ):
             await self._deliver_web_inbox(body)
         # Explicit web_inbox delivery (#98): the tee above IS the delivery —
         # skip channel routing so e.g. an incubated memory never lands in a
@@ -163,7 +188,9 @@ class ChannelOutboxConsumer:
         if isinstance(delivery_info, dict) and delivery_info.get("mode") == "channel":
             # Override delivery to route to specific channel+topic
             payload["target_channel"] = delivery_info.get("channel", "")
-            payload["target_id"] = delivery_info.get("target_id", payload.get("target_id", ""))
+            payload["target_id"] = delivery_info.get(
+                "target_id", payload.get("target_id", "")
+            )
             payload["thread_id"] = delivery_info.get("topic", "")
             delivery_mode = "direct"
         elif isinstance(delivery_info, dict) and delivery_info.get("mode") == "webhook":
@@ -175,7 +202,28 @@ class ChannelOutboxConsumer:
             return
 
         if delivery_mode == "direct":
-            await self._deliver_direct(message, content, payload, outbox_msg_id)
+            delivered = await self._deliver_direct(
+                message, content, payload, outbox_msg_id
+            )
+            if kind == "operator_approval" and delivered:
+                request_id = str(payload.get("approval_request_id") or "")
+                if request_id:
+                    try:
+                        async with self._pool.acquire() as conn:
+                            await conn.fetchval(
+                                """
+                                SELECT mark_operator_tool_approval_slack_delivered(
+                                    $1::uuid, $2, NULL
+                                )
+                                """,
+                                request_id,
+                                str(payload.get("target_id") or ""),
+                            )
+                    except Exception:
+                        logger.warning(
+                            "Failed to mark operator approval Slack delivery",
+                            exc_info=True,
+                        )
         elif delivery_mode == "broadcast":
             await self._deliver_broadcast(message, content, payload, outbox_msg_id)
         else:
@@ -196,6 +244,7 @@ class ChannelOutboxConsumer:
         Advisory by design: a failure here never blocks routing to the other
         endpoints, and the gate is DB config (channel.web_inbox.enabled).
         """
+        inbox_id = None
         try:
             async with self._pool.acquire() as conn:
                 enabled = await conn.fetchval(
@@ -203,11 +252,19 @@ class ChannelOutboxConsumer:
                 )
                 if not enabled:
                     return
-                await conn.fetchval(
+                inbox_id = await conn.fetchval(
                     "SELECT web_inbox_deliver($1::jsonb)", json.dumps(body, default=str)
                 )
         except Exception:
             logger.warning("Web inbox delivery failed (non-fatal)", exc_info=True)
+            return
+        if inbox_id is not None:
+            try:
+                from services.web_push import deliver_web_push
+
+                await deliver_web_push(self._pool, body)
+            except Exception:
+                logger.warning("Web Push delivery failed (non-fatal)", exc_info=True)
 
     async def _deliver_by_domain(
         self,
@@ -240,24 +297,39 @@ class ChannelOutboxConsumer:
             if not channel_type or not target_id:
                 return False
             thread_id = str(route.get("topic") or "") or None
+            recipient_identity = (
+                str(
+                    route.get("sender_id")
+                    or payload.get("sender_id")
+                    or payload.get("target_user")
+                    or ""
+                )
+                or None
+            )
             if await self._skip_if_unreachable(
-                outbox_msg_id, channel_type, target_id, None, content, f"domain:{domain}"
+                outbox_msg_id,
+                channel_type,
+                target_id,
+                None,
+                content,
+                f"domain:{domain}",
             ):
                 return True
             delivered = await self._send_with_obligation(
                 outbox_msg_id=outbox_msg_id,
                 channel_type=channel_type,
                 channel_id=target_id,
-                sender_id=thread_id,
+                sender_id=recipient_identity,
                 thread_id=thread_id,
                 message=message,
                 content=content,
                 delivery_mode=f"domain:{domain}",
+                payload=payload,
             )
             return delivered
-        except Exception as e:
-            await self._mark_unreachable_target(channel_type, target_id, e)
-            logger.warning("Domain routing for %s failed: %s", domain, e)
+        except Exception as exc:
+            await self._mark_unreachable_target(channel_type, target_id, exc)
+            logger.warning("Domain routing for %s failed: %s", domain, exc)
             return False
 
     async def _deliver_direct(
@@ -266,34 +338,39 @@ class ChannelOutboxConsumer:
         content: str,
         payload: dict,
         outbox_msg_id: str,
-    ) -> None:
+    ) -> bool:
         """Send to an explicit channel + target, optionally with thread/topic."""
         channel_type = str(payload.get("target_channel") or "")
         target_id = str(payload.get("target_id") or "")
         if not channel_type or not target_id:
             logger.warning("Direct delivery missing target_channel/target_id")
-            return
+            return False
 
         thread_id = str(payload.get("thread_id") or "") or None
+        recipient_identity = (
+            str(payload.get("sender_id") or payload.get("target_user") or "") or None
+        )
 
         if await self._skip_if_unreachable(
             outbox_msg_id, channel_type, target_id, thread_id, content, "direct"
         ):
-            return
+            return False
 
         try:
-            await self._send_with_obligation(
+            return await self._send_with_obligation(
                 outbox_msg_id=outbox_msg_id,
                 channel_type=channel_type,
                 channel_id=target_id,
-                sender_id=thread_id,
+                sender_id=recipient_identity,
                 thread_id=thread_id,
                 message=message,
                 content=content,
                 delivery_mode="direct",
+                payload=payload,
             )
-        except Exception as e:
+        except Exception:
             logger.debug("Direct delivery failed", exc_info=True)
+            return False
 
     async def _deliver_last_active(
         self,
@@ -320,7 +397,12 @@ class ChannelOutboxConsumer:
         resolved_sender = row["sender_id"]
 
         if await self._skip_if_unreachable(
-            outbox_msg_id, channel_type, channel_id, resolved_sender, content, "last_active"
+            outbox_msg_id,
+            channel_type,
+            channel_id,
+            resolved_sender,
+            content,
+            "last_active",
         ):
             return
 
@@ -334,8 +416,9 @@ class ChannelOutboxConsumer:
                 message=message,
                 content=content,
                 delivery_mode="last_active",
+                payload=payload,
             )
-        except Exception as e:
+        except Exception:
             logger.debug("Last-active delivery failed", exc_info=True)
 
     async def _deliver_broadcast(
@@ -368,8 +451,9 @@ class ChannelOutboxConsumer:
                     message=message,
                     content=content,
                     delivery_mode="broadcast",
+                    payload=payload,
                 )
-            except Exception as e:
+            except Exception:
                 logger.debug("Broadcast delivery failed", exc_info=True)
 
     async def _deliver_webhook(
@@ -393,8 +477,46 @@ class ChannelOutboxConsumer:
         }
         headers = {"Content-Type": "application/json"}
 
-        if await self._skip_if_unreachable(outbox_msg_id, "webhook", url, None, content, "webhook"):
+        if await self._skip_if_unreachable(
+            outbox_msg_id, "webhook", url, None, content, "webhook"
+        ):
             return
+
+        from services.outbound_safety import (
+            finalize_outbox_outbound,
+            prepare_outbox_outbound,
+        )
+
+        primary_hint = _is_primary_user_envelope(payload)
+        public_hint = str(payload.get("_outbox_kind") or "") == "public"
+        webhook_target = (
+            "webhook:" + hashlib.sha256(url.encode("utf-8", "replace")).hexdigest()[:16]
+        )
+        preparation = await prepare_outbox_outbound(
+            self._pool,
+            request_key=f"outbox:{outbox_msg_id or 'anonymous'}:{webhook_target}",
+            channel="webhook",
+            recipient=webhook_target,
+            identity_address=None,
+            body=content,
+            payload=payload,
+            primary_hint=primary_hint,
+            public_hint=public_hint,
+        )
+        if not preparation.allowed:
+            await self._log_delivery(
+                outbox_msg_id,
+                "webhook",
+                url,
+                None,
+                content,
+                "webhook",
+                False,
+                preparation.error,
+            )
+            return
+        content = str(preparation.arguments.get("message") or content)
+        body["content"] = content
 
         try:
             await request_text_response(
@@ -408,9 +530,18 @@ class ChannelOutboxConsumer:
                 max_delay=5.0,
                 retry_unsafe_methods=False,
             )
+            await finalize_outbox_outbound(self._pool, preparation, delivered=True)
             await self._clear_unreachable_target("webhook", url)
-            await self._log_delivery(outbox_msg_id, "webhook", url, None, content, "webhook", True)
+            await self._log_delivery(
+                outbox_msg_id, "webhook", url, None, content, "webhook", True
+            )
         except IntegrationHttpError as e:
+            await finalize_outbox_outbound(
+                self._pool,
+                preparation,
+                delivered=False,
+                error=format_provider_error("Webhook", e),
+            )
             await self._mark_unreachable_target("webhook", url, e)
             await self._log_delivery(
                 outbox_msg_id,
@@ -423,8 +554,13 @@ class ChannelOutboxConsumer:
                 format_provider_error("Webhook", e),
             )
         except Exception as e:
+            await finalize_outbox_outbound(
+                self._pool, preparation, delivered=False, error=str(e)
+            )
             await self._mark_unreachable_target("webhook", url, e)
-            await self._log_delivery(outbox_msg_id, "webhook", url, None, content, "webhook", False, str(e))
+            await self._log_delivery(
+                outbox_msg_id, "webhook", url, None, content, "webhook", False, str(e)
+            )
 
     async def _send_with_obligation(
         self,
@@ -437,6 +573,7 @@ class ChannelOutboxConsumer:
         message: str | MessagePresentation,
         content: str,
         delivery_mode: str,
+        payload: dict[str, Any] | None = None,
         obligation_id: str | None = None,
         already_claimed: bool = False,
         recovered: bool = False,
@@ -451,6 +588,7 @@ class ChannelOutboxConsumer:
                 content,
                 message,
                 delivery_mode,
+                payload,
             )
             if obligation.get("already_delivered"):
                 return True
@@ -467,6 +605,45 @@ class ChannelOutboxConsumer:
             outbound_content = RECOVERED_DELIVERY_MARKER + content
             outbound_message = _prepend_recovery_marker(message, content)
 
+        from services.outbound_safety import prepare_outbox_outbound
+
+        policy_payload = payload or {}
+        primary_hint = _is_primary_user_envelope(policy_payload)
+        public_hint = str(policy_payload.get("_outbox_kind") or "") == "public"
+        preparation = await prepare_outbox_outbound(
+            self._pool,
+            request_key=(
+                f"outbox:{outbox_msg_id or 'anonymous'}:{obligation_id or channel_type + ':' + channel_id}"
+            ),
+            channel=channel_type,
+            recipient=channel_id,
+            identity_address=sender_id,
+            body=outbound_content,
+            payload=policy_payload,
+            thread_reference=thread_id,
+            primary_hint=primary_hint,
+            public_hint=public_hint,
+        )
+        if not preparation.allowed:
+            exc = RuntimeError(preparation.error or "Outbound policy denied delivery")
+            if obligation_id:
+                await self._mark_delivery_obligation_failed(obligation_id, exc)
+            await self._log_delivery(
+                outbox_msg_id,
+                channel_type,
+                channel_id,
+                sender_id,
+                outbound_content,
+                delivery_mode,
+                False,
+                str(exc),
+            )
+            return False
+        governed_content = str(preparation.arguments.get("message") or outbound_content)
+        if governed_content != outbound_content:
+            outbound_message = governed_content
+        outbound_content = governed_content
+
         try:
             msg_id = await self._manager.send(
                 channel_type,
@@ -475,6 +652,14 @@ class ChannelOutboxConsumer:
                 thread_id=thread_id,
             )
             _require_delivery_id(msg_id, channel_type, channel_id)
+            from services.outbound_safety import finalize_outbox_outbound
+
+            await finalize_outbox_outbound(
+                self._pool,
+                preparation,
+                delivered=True,
+                provider_message_id=msg_id,
+            )
             if obligation_id:
                 await self._mark_delivery_obligation_delivered(obligation_id)
             await self._clear_unreachable_target(channel_type, channel_id)
@@ -489,6 +674,14 @@ class ChannelOutboxConsumer:
             )
             return True
         except Exception as exc:
+            from services.outbound_safety import finalize_outbox_outbound
+
+            await finalize_outbox_outbound(
+                self._pool,
+                preparation,
+                delivered=False,
+                error=bounded_delivery_error(exc),
+            )
             if obligation_id:
                 await self._mark_delivery_obligation_failed(obligation_id, exc)
             await self._mark_unreachable_target(channel_type, channel_id, exc)
@@ -512,7 +705,9 @@ class ChannelOutboxConsumer:
                     25,
                 )
         except Exception:
-            logger.debug("Failed to claim recoverable delivery obligations", exc_info=True)
+            logger.debug(
+                "Failed to claim recoverable delivery obligations", exc_info=True
+            )
             return 0
 
         rows = _coerce_json_list(raw)
@@ -552,6 +747,11 @@ class ChannelOutboxConsumer:
                 message=message,
                 content=content,
                 delivery_mode=delivery_mode,
+                payload=(
+                    row.get("message", {}).get("_outbound_payload", {})
+                    if isinstance(row.get("message"), dict)
+                    else {}
+                ),
                 obligation_id=str(row.get("id") or ""),
                 already_claimed=True,
                 recovered=bool(row.get("needs_marker")),
@@ -585,7 +785,7 @@ class ChannelOutboxConsumer:
 
         reason = str(info.get("reason") or "target is temporarily marked unreachable")
         suppress_until = info.get("suppress_until")
-        error = f"Skipped delivery: target marked unreachable"
+        error = "Skipped delivery: target marked unreachable"
         if suppress_until:
             error += f" until {suppress_until}"
         if reason:
@@ -602,7 +802,9 @@ class ChannelOutboxConsumer:
         )
         return True
 
-    async def _clear_unreachable_target(self, channel_type: str, channel_id: str) -> None:
+    async def _clear_unreachable_target(
+        self, channel_type: str, channel_id: str
+    ) -> None:
         try:
             async with self._pool.acquire() as conn:
                 await conn.fetchval(
@@ -646,6 +848,7 @@ class ChannelOutboxConsumer:
         content: str,
         message: str | MessagePresentation,
         delivery_mode: str,
+        payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         key = _delivery_obligation_key(
             outbox_msg_id,
@@ -657,6 +860,8 @@ class ChannelOutboxConsumer:
             content,
         )
         try:
+            message_wire = _message_to_wire(message)
+            message_wire["_outbound_payload"] = payload or {}
             async with self._pool.acquire() as conn:
                 raw = await conn.fetchval(
                     """
@@ -671,7 +876,7 @@ class ChannelOutboxConsumer:
                     sender_id,
                     thread_id,
                     content,
-                    json.dumps(_message_to_wire(message), default=str),
+                    json.dumps(message_wire, default=str),
                     delivery_mode,
                 )
             return _coerce_json_object(raw)
@@ -757,7 +962,9 @@ def _vhost_path() -> str:
     return requests.utils.quote(RABBITMQ_VHOST, safe="")
 
 
-async def _rmq_request(method: str, path: str, payload: dict | None = None) -> requests.Response:
+async def _rmq_request(
+    method: str, path: str, payload: dict | None = None
+) -> requests.Response:
     url = f"{RABBITMQ_MANAGEMENT_URL}{path}"
     auth = (RABBITMQ_USER, RABBITMQ_PASSWORD)
 
@@ -784,10 +991,14 @@ def _resolve_payload_message(
     return presentation, mirror
 
 
-def _require_delivery_id(message_id: str | None, channel_type: str, channel_id: str) -> None:
+def _require_delivery_id(
+    message_id: str | None, channel_type: str, channel_id: str
+) -> None:
     if message_id:
         return
-    raise RuntimeError(f"{channel_type} delivery to {channel_id} did not return a platform message id.")
+    raise RuntimeError(
+        f"{channel_type} delivery to {channel_id} did not return a platform message id."
+    )
 
 
 def _coerce_json_object(raw: Any) -> dict[str, Any]:
@@ -854,7 +1065,9 @@ def _target_unreachable_error_kind(exc: BaseException) -> str | None:
     )
     if any(signal in text for signal in signals):
         return "not_found"
-    if "forbidden" in text and ("chat" in text or "bot" in text or "user" in text or "recipient" in text):
+    if "forbidden" in text and (
+        "chat" in text or "bot" in text or "user" in text or "recipient" in text
+    ):
         return "forbidden"
     return None
 
@@ -889,7 +1102,9 @@ def _delivery_obligation_key(
     thread_id: str | None,
     content: str,
 ) -> str:
-    source = outbox_msg_id or hashlib.sha256(content.encode("utf-8", "replace")).hexdigest()
+    source = (
+        outbox_msg_id or hashlib.sha256(content.encode("utf-8", "replace")).hexdigest()
+    )
     payload = "|".join(
         [
             source,

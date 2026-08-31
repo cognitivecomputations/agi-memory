@@ -7,7 +7,9 @@ from tests.utils import embed_pending_memories, get_test_identifier, _db_dsn
 
 pytestmark = [pytest.mark.asyncio(loop_scope="session"), pytest.mark.core]
 
-EMBEDDING_DIMENSION = int(os.getenv("EMBEDDING_DIMENSION", os.getenv("EMBEDDING_DIM", "768")))
+EMBEDDING_DIMENSION = int(
+    os.getenv("EMBEDDING_DIMENSION", os.getenv("EMBEDDING_DIM", "768"))
+)
 
 
 @pytest.fixture(scope="module")
@@ -48,7 +50,11 @@ async def test_api_semantic_sources_affect_trust(cognitive_memory_client, db_poo
 
     test_id = get_test_identifier("api_trust")
     content = f"API claim from twitter {test_id}"
-    source_a = {"kind": "twitter", "ref": f"https://twitter.com/example/status/{test_id}", "trust": 0.2}
+    source_a = {
+        "kind": "twitter",
+        "ref": f"https://twitter.com/example/status/{test_id}",
+        "trust": 0.2,
+    }
     source_b = {"kind": "paper", "ref": f"doi:10.0000/{test_id}", "trust": 0.9}
 
     mid = await cognitive_memory_client.remember(
@@ -75,7 +81,9 @@ async def test_api_semantic_sources_affect_trust(cognitive_memory_client, db_poo
             await conn.execute("DELETE FROM memories WHERE id = $1", mid)
 
 
-async def test_api_remember_links_concepts_and_find_by_concept(cognitive_memory_client, db_pool):
+async def test_api_remember_links_concepts_and_find_by_concept(
+    cognitive_memory_client, db_pool
+):
     """Test that remember() links concepts and find_by_concept() retrieves them.
     Phase 2 (ReduceScopeCreep): Concepts are now graph-only.
     """
@@ -108,14 +116,18 @@ async def test_api_hydrate_returns_context(cognitive_memory_client, db_pool):
     test_id = get_test_identifier("api_hydrate")
     content = f"Hydrate memory {test_id}"
 
-    mid = await cognitive_memory_client.remember(content, type=MemoryType.SEMANTIC, importance=0.7)
+    mid = await cognitive_memory_client.remember(
+        content, type=MemoryType.SEMANTIC, importance=0.7
+    )
     try:
         # Writes are pending until the embedding pass runs (async, 0129).
         async with db_pool.acquire() as conn:
             await embed_pending_memories(conn)
         # Use a larger limit because the embedding model may not strongly encode
         # random suffixes, making many "Hydrate memory ..." entries near-ties.
-        ctx = await cognitive_memory_client.hydrate(content, include_goals=True, memory_limit=50)
+        ctx = await cognitive_memory_client.hydrate(
+            content, include_goals=True, memory_limit=50
+        )
         assert ctx.memories
         assert any(test_id in m.content for m in ctx.memories)
         assert isinstance(ctx.identity, list)
@@ -141,29 +153,35 @@ async def test_api_hold_and_search_working(cognitive_memory_client, db_pool):
             await conn.execute("DELETE FROM working_memory WHERE id = $1", wid)
 
 
-async def test_api_connect_memories_creates_graph_edge(cognitive_memory_client, db_pool):
+async def test_api_connect_memories_creates_graph_edge(
+    cognitive_memory_client, db_pool
+):
     """Test that connect_memories creates a graph edge.
     Note: relationship_discoveries table removed in Phase 8 - verify graph edge instead.
     """
     from core.cognitive_memory_api import MemoryType, RelationshipType
 
     test_id = get_test_identifier("api_connect")
-    a = await cognitive_memory_client.remember(f"Conn A {test_id}", type=MemoryType.SEMANTIC, importance=0.6)
-    b = await cognitive_memory_client.remember(f"Conn B {test_id}", type=MemoryType.SEMANTIC, importance=0.6)
+    a = await cognitive_memory_client.remember(
+        f"Conn A {test_id}", type=MemoryType.SEMANTIC, importance=0.6
+    )
+    b = await cognitive_memory_client.remember(
+        f"Conn B {test_id}", type=MemoryType.SEMANTIC, importance=0.6
+    )
     ctx = f"context {test_id}"
 
     try:
-        await cognitive_memory_client.connect_memories(a, b, RelationshipType.ASSOCIATED, confidence=0.9, context=ctx)
+        await cognitive_memory_client.connect_memories(
+            a, b, RelationshipType.ASSOCIATED, confidence=0.9, context=ctx
+        )
         async with db_pool.acquire() as conn:
             await conn.execute("SET LOCAL search_path = public, ag_catalog;")
-            n = await conn.fetchval(
-                f"""
+            n = await conn.fetchval(f"""
                 SELECT COUNT(*) FROM cypher('memory_graph', $$
                     MATCH (x:MemoryNode {{memory_id: '{a}'}})-[r:ASSOCIATED]->(y:MemoryNode {{memory_id: '{b}'}})
                     RETURN r
                 $$) as (r agtype)
-                """
-            )
+                """)
             assert int(n) >= 1, "Graph edge should be created by connect_memories"
     finally:
         async with db_pool.acquire() as conn:
@@ -171,61 +189,69 @@ async def test_api_connect_memories_creates_graph_edge(cognitive_memory_client, 
             await conn.execute("DELETE FROM memories WHERE id = $1", b)
 
 
-async def test_api_remember_batch_raw_success_creates_graph_nodes(cognitive_memory_client, db_pool):
+async def test_api_remember_batch_raw_success_creates_graph_nodes(
+    cognitive_memory_client, db_pool
+):
     from core.cognitive_memory_api import MemoryType
 
     test_id = get_test_identifier("api_batch_raw_ok")
     contents = [f"Batch raw A {test_id}", f"Batch raw B {test_id}"]
     emb = [[0.01] * EMBEDDING_DIMENSION, [0.02] * EMBEDDING_DIMENSION]
 
-    ids = await cognitive_memory_client.remember_batch_raw(contents, emb, type=MemoryType.SEMANTIC, importance=0.55)
+    ids = await cognitive_memory_client.remember_batch_raw(
+        contents, emb, type=MemoryType.SEMANTIC, importance=0.55
+    )
     assert len(ids) == 2
 
     try:
         # Verify rows exist
         async with db_pool.acquire() as conn:
-            count = await conn.fetchval("SELECT COUNT(*) FROM memories WHERE id = ANY($1::uuid[])", ids)
+            count = await conn.fetchval(
+                "SELECT COUNT(*) FROM memories WHERE id = ANY($1::uuid[])", ids
+            )
             assert int(count) == 2
 
             # Verify graph nodes exist
             await conn.execute("LOAD 'age';")
             await conn.execute("SET search_path = public, ag_catalog;")
             for mid in ids:
-                node_count = await conn.fetchval(
-                    f"""
+                node_count = await conn.fetchval(f"""
                     SELECT COUNT(*) FROM cypher('memory_graph', $$
                         MATCH (n:MemoryNode {{memory_id: '{mid}'}})
                         RETURN n
                     $$) as (n agtype)
-                    """
-                )
+                    """)
                 assert int(node_count) >= 1
     finally:
         async with db_pool.acquire() as conn:
             await conn.execute("LOAD 'age';")
             await conn.execute("SET search_path = public, ag_catalog;")
             for mid in ids:
-                await conn.execute(
-                    f"""
+                await conn.execute(f"""
                     SELECT * FROM cypher('memory_graph', $$
                         MATCH (n:MemoryNode {{memory_id: '{mid}'}})
                         DETACH DELETE n
                     $$) as (v agtype)
-                    """
-                )
+                    """)
             await conn.execute("DELETE FROM memories WHERE id = ANY($1::uuid[])", ids)
 
 
-async def test_api_remember_batch_raw_dimension_mismatch_raises(cognitive_memory_client):
+async def test_api_remember_batch_raw_dimension_mismatch_raises(
+    cognitive_memory_client,
+):
     from core.cognitive_memory_api import MemoryType
 
     with pytest.raises(ValueError):
-        await cognitive_memory_client.remember_batch_raw(["x"], [[0.0]], type=MemoryType.SEMANTIC)
+        await cognitive_memory_client.remember_batch_raw(
+            ["x"], [[0.0]], type=MemoryType.SEMANTIC
+        )
 
 
 async def test_api_hydrate_batch_returns_many(cognitive_memory_client):
     test_id = get_test_identifier("api_hydrate_batch")
-    res = await cognitive_memory_client.hydrate_batch([f"q1 {test_id}", f"q2 {test_id}", f"q3 {test_id}"], include_goals=False)
+    res = await cognitive_memory_client.hydrate_batch(
+        [f"q1 {test_id}", f"q2 {test_id}", f"q3 {test_id}"], include_goals=False
+    )
     assert len(res) == 3
 
 
@@ -272,11 +298,13 @@ async def test_api_create_goal_sets_due_at(cognitive_memory_client, db_pool):
     async with db_pool.acquire() as conn:
         # Phase 6: Goals are now in memories table with type='goal'
         stored = await conn.fetchrow(
-            "SELECT (metadata->>'due_at')::timestamptz as due_at FROM memories WHERE id = $1::uuid AND type = 'goal'",
+            "SELECT (metadata->>'due_at')::timestamptz as due_at, goal_origin::text as origin "
+            "FROM memories WHERE id = $1::uuid AND type = 'goal'",
             goal_id,
         )
         assert stored is not None
         assert stored["due_at"] is not None
+        assert stored["origin"] == "user_request"
 
 
 async def test_api_queue_user_message_creates_outbox(cognitive_memory_client, db_pool):
@@ -321,7 +349,14 @@ async def test_api_ingestion_receipts_roundtrip(cognitive_memory_client):
 
     # record_ingestion_receipts is now a no-op that returns the count
     inserted = await cognitive_memory_client.record_ingestion_receipts(
-        [{"source_file": src, "chunk_index": 0, "content_hash": content_hash, "memory_id": str(mid)}]
+        [
+            {
+                "source_file": src,
+                "chunk_index": 0,
+                "content_hash": content_hash,
+                "memory_id": str(mid),
+            }
+        ]
     )
     assert inserted == 1  # Returns count, not actual inserts
 
@@ -340,7 +375,9 @@ async def test_api_sync_wrapper_basic(db_pool, ensure_embedding_service):
     def _remember():
         mem = CognitiveMemorySync.connect(dsn, min_size=1, max_size=2)
         try:
-            mid = mem.remember(f"Sync memory {test_id}", type=MemoryType.SEMANTIC, importance=0.6)
+            mid = mem.remember(
+                f"Sync memory {test_id}", type=MemoryType.SEMANTIC, importance=0.6
+            )
             assert mid is not None
         finally:
             mem.close()

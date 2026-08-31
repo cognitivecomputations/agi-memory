@@ -592,15 +592,24 @@ class IngestionPipeline:
         base_context = await self._build_appraisal_context(doc)
         use_deep = doc.word_count <= self.config.deep_max_words
 
-        overall_appraisal = None
-        if not use_deep:
-            sample = self._sample_content(content)
-            overall_appraisal = await self.appraiser.appraise(content=sample, context=base_context, mode=mode)
-            await self.store.set_affective_state(overall_appraisal)
-            metrics.appraisal_valence = overall_appraisal.valence
-            metrics.appraisal_arousal = overall_appraisal.arousal
-            metrics.appraisal_emotion = overall_appraisal.primary_emotion
-            metrics.appraisal_intensity = overall_appraisal.intensity
+        # #86: ingestion appraisals no longer overwrite the live affective
+        # state (store.set_affective_state used to slam
+        # set_current_affective_state -- once per doc here, once per
+        # SECTION in the deep branch below, last-write-wins over whatever
+        # the agent was actually feeling mid-conversation). Reading still
+        # feels like something, but that feeling is recorded on the
+        # encounter memory's own emotional_valence -- update_mood()
+        # blends it into mood from there over the normal maintenance
+        # cycle, the same as any other episodic memory's affect. A
+        # doc-level sample is computed unconditionally now (previously
+        # only for non-deep docs) so a small document's encounter memory
+        # gets its own real appraisal instead of a neutral default.
+        sample = self._sample_content(content)
+        overall_appraisal = await self.appraiser.appraise(content=sample, context=base_context, mode=mode)
+        metrics.appraisal_valence = overall_appraisal.valence
+        metrics.appraisal_arousal = overall_appraisal.arousal
+        metrics.appraisal_emotion = overall_appraisal.primary_emotion
+        metrics.appraisal_intensity = overall_appraisal.intensity
 
         encounter_id = receipts.get(f"enc:{doc_ref}")
         if encounter_id is None:
@@ -646,7 +655,10 @@ class IngestionPipeline:
                 *[_appraise_and_extract(s) for s in active_sections]
             )
             for section, (appraisal, extractions) in zip(active_sections, deep_results):
-                await self.store.set_affective_state(appraisal)
+                # #86: per-section appraisals still shape extraction/decay
+                # (below) and metrics, but no longer overwrite live
+                # affective state -- that was the "30 times in quick
+                # succession" thrash this issue is about.
                 metrics.appraisal_valence = appraisal.valence
                 metrics.appraisal_arousal = appraisal.arousal
                 metrics.appraisal_emotion = appraisal.primary_emotion

@@ -23,6 +23,7 @@ def test_register_auth_subparsers_creates_providers():
         "openai-codex",
         "anthropic",
         "chutes",
+        "github",
         "github-copilot",
         "qwen-portal",
         "minimax-portal",
@@ -51,8 +52,10 @@ def test_register_auth_subparsers_login_variants():
         args = top.parse_args([provider, "login"])
         assert hasattr(args, "func"), f"{provider} login should set func"
 
-    # Anthropic uses "setup-token" instead of "login"
+    # Anthropic and GitHub use "setup-token" instead of "login"
     args = top.parse_args(["anthropic", "setup-token"])
+    assert hasattr(args, "func")
+    args = top.parse_args(["github", "setup-token"])
     assert hasattr(args, "func")
 
 
@@ -68,7 +71,7 @@ def test_register_auth_subparsers_logout():
     register_auth_subparsers(auth_sub, parent)
 
     for provider in [
-        "openai-codex", "anthropic", "chutes", "github-copilot",
+        "openai-codex", "anthropic", "chutes", "github", "github-copilot",
         "qwen-portal", "minimax-portal", "google-gemini-cli", "google-antigravity",
     ]:
         args = top.parse_args([provider, "logout"])

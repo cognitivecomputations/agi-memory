@@ -33,13 +33,13 @@ jobs:
           - image: hexis-ui
             dockerfile: ops/Dockerfile.ui
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: docker/setup-qemu-action@v3
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -51,7 +51,7 @@ jobs:
       # `latest` therefore always means "newest release", never "tip of main".
       # Packaged installs pin their exact version via HEXIS_IMAGE_TAG (see
       # ops/docker-compose.runtime.yml); `latest` is only the fallback.
-      - uses: docker/metadata-action@v5
+      - uses: docker/metadata-action@v6
         id: meta
         with:
           images: ghcr.io/quixiai/${{ matrix.image }}
@@ -85,7 +85,7 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-python@v5
         with:

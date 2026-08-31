@@ -12,9 +12,7 @@ Covers:
 
 from __future__ import annotations
 
-import asyncio
 import json
-from datetime import datetime, timezone
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -32,12 +30,14 @@ class TestAttachment:
     def test_from_dict_basic(self):
         from channels.media import Attachment
 
-        att = Attachment.from_dict({
-            "url": "https://example.com/file.png",
-            "filename": "file.png",
-            "mime_type": "image/png",
-            "size": 1024,
-        })
+        att = Attachment.from_dict(
+            {
+                "url": "https://example.com/file.png",
+                "filename": "file.png",
+                "mime_type": "image/png",
+                "size": 1024,
+            }
+        )
         assert att.url == "https://example.com/file.png"
         assert att.filename == "file.png"
         assert att.mime_type == "image/png"
@@ -92,7 +92,9 @@ class TestAttachment:
     def test_describe_kb_file(self):
         from channels.media import Attachment
 
-        att = Attachment(url="https://example.com/mid.txt", size=5 * 1024, filename="mid.txt")
+        att = Attachment(
+            url="https://example.com/mid.txt", size=5 * 1024, filename="mid.txt"
+        )
         desc = att.describe()
         assert "5KB" in desc
 
@@ -240,6 +242,30 @@ class TestSlackAdapter:
 
         assert SlackAdapter().is_connected is False
 
+    async def test_operator_dm_bypasses_room_allowlist_for_approval_reply(self):
+        from channels.slack_adapter import SlackAdapter
+
+        adapter = SlackAdapter(
+            {"allowed_channels": ["C-ALLOWED"], "operator_user_id": "U-OWNER"}
+        )
+        adapter._bot_user_id = "U-BOT"
+        adapter._on_message = AsyncMock()
+        client = MagicMock()
+        client.users_info = AsyncMock(return_value={"user": {"profile": {}}})
+
+        await adapter._handle_slack_message(
+            {
+                "user": "U-OWNER",
+                "channel": "D-PRIVATE",
+                "channel_type": "im",
+                "text": "approve 12345678",
+                "ts": "171.1",
+            },
+            client,
+        )
+
+        adapter._on_message.assert_awaited_once()
+
     def test_token_resolution_env(self, monkeypatch):
         from channels.slack_adapter import _resolve_token
 
@@ -308,7 +334,9 @@ class TestSignalAdapter:
         calls: list[dict[str, Any]] = []
 
         async def fake_request_json(provider, method, url, **kwargs):
-            calls.append({"provider": provider, "method": method, "url": url, "kwargs": kwargs})
+            calls.append(
+                {"provider": provider, "method": method, "url": url, "kwargs": kwargs}
+            )
             return {"timestamp": "signal-ts-1"}
 
         monkeypatch.setattr("channels.signal_adapter.request_json", fake_request_json)
@@ -372,7 +400,9 @@ class TestWhatsAppAdapter:
         calls: list[dict[str, Any]] = []
 
         async def fake_request_json(provider, method, url, **kwargs):
-            calls.append({"provider": provider, "method": method, "url": url, "kwargs": kwargs})
+            calls.append(
+                {"provider": provider, "method": method, "url": url, "kwargs": kwargs}
+            )
             return {"messages": [{"id": "wamid.1"}]}
 
         monkeypatch.setattr("channels.whatsapp_adapter.request_json", fake_request_json)
@@ -417,12 +447,38 @@ class TestIMessageAdapter:
         from channels.imessage_adapter import IMessageAdapter
 
         assert IMessageAdapter._parse_allowlist("*") is None
-        assert IMessageAdapter._parse_allowlist(["user@icloud.com"]) == {"user@icloud.com"}
+        assert IMessageAdapter._parse_allowlist(["user@icloud.com"]) == {
+            "user@icloud.com"
+        }
 
     def test_not_connected_by_default(self):
         from channels.imessage_adapter import IMessageAdapter
 
         assert IMessageAdapter().is_connected is False
+
+    async def test_operator_reply_bypasses_conversation_allowlist(self):
+        from channels.imessage_adapter import IMessageAdapter
+
+        adapter = IMessageAdapter(
+            {
+                "allowed_handles": ["friend@example.com"],
+                "operator_recipient": "+15551234567",
+            }
+        )
+        adapter._on_message = AsyncMock()
+
+        await adapter._handle_message(
+            {
+                "guid": "message-1",
+                "isFromMe": False,
+                "text": "deny 12345678",
+                "handle": {"address": "+15551234567"},
+                "chats": [{"guid": "chat-1", "isGroup": False}],
+                "attachments": [],
+            }
+        )
+
+        adapter._on_message.assert_awaited_once()
 
     def test_config_resolution(self, monkeypatch):
         from channels.imessage_adapter import _resolve_config
@@ -437,7 +493,9 @@ class TestIMessageAdapter:
         calls: list[dict[str, Any]] = []
 
         async def fake_request_json(provider, method, url, **kwargs):
-            calls.append({"provider": provider, "method": method, "url": url, "kwargs": kwargs})
+            calls.append(
+                {"provider": provider, "method": method, "url": url, "kwargs": kwargs}
+            )
             return {"data": {"guid": "imessage-guid-1"}}
 
         monkeypatch.setattr("channels.imessage_adapter.request_json", fake_request_json)
@@ -481,7 +539,9 @@ class TestMatrixAdapter:
         from channels.matrix_adapter import MatrixAdapter
 
         assert MatrixAdapter._parse_allowlist("*") is None
-        assert MatrixAdapter._parse_allowlist(["!abc:matrix.org"]) == {"!abc:matrix.org"}
+        assert MatrixAdapter._parse_allowlist(["!abc:matrix.org"]) == {
+            "!abc:matrix.org"
+        }
 
     def test_not_connected_by_default(self):
         from channels.matrix_adapter import MatrixAdapter
@@ -511,6 +571,7 @@ class _EditableAdapter:
     @property
     def capabilities(self):
         from channels.base import ChannelCapabilities
+
         return ChannelCapabilities(edit_message=True, max_message_length=4000)
 
     async def send(self, channel_id, text, *, reply_to=None, thread_id=None):
@@ -519,7 +580,9 @@ class _EditableAdapter:
         return msg_id
 
     async def edit_message(self, channel_id, message_id, text):
-        self.edits.append({"channel_id": channel_id, "message_id": message_id, "text": text})
+        self.edits.append(
+            {"channel_id": channel_id, "message_id": message_id, "text": text}
+        )
         return True
 
 
@@ -628,7 +691,9 @@ class TestSlashCommands:
         async def handler(args, pool):
             return f"Custom: {args}"
 
-        registry.register(ChannelCommand(name="test", description="Test", handler=handler))
+        registry.register(
+            ChannelCommand(name="test", description="Test", handler=handler)
+        )
         assert registry.has("test")
 
     async def test_execute_help(self):
@@ -667,6 +732,7 @@ class _MockAdapterWithEdit:
     @property
     def capabilities(self):
         from channels.base import ChannelCapabilities
+
         return ChannelCapabilities(
             typing_indicator=True,
             edit_message=True,
@@ -695,6 +761,21 @@ class _MockAdapterWithEdit:
 
 
 class TestManagerCommandRouting:
+    @pytest.fixture(autouse=True)
+    def _allow_governed_replies(self, monkeypatch):
+        """Keep manager routing tests focused on routing through the governor.
+
+        The database-backed outbound tests prove the authorization and ledger
+        behavior.  These tests deliberately use a MagicMock pool, so provide
+        an allowed reply decision while retaining the real wrapper.
+        """
+        from services.outbound_safety import OutboundPreparation
+
+        async def allow(*args, body: str, **kwargs):
+            return OutboundPreparation(allowed=True, arguments={"message": body})
+
+        monkeypatch.setattr("services.outbound_safety.prepare_outbox_outbound", allow)
+
     def test_typing_failure_enters_cooldown_until_success(self):
         from channels.manager import ChannelManager
 
@@ -735,6 +816,276 @@ class TestManagerCommandRouting:
         assert len(adapter._sent) == 1
         assert "Available Commands" in adapter._sent[0]["text"]
 
+    async def test_private_numbered_automation_reply_is_not_sent_to_conversation(self):
+        from channels.base import ChannelMessage
+        from channels.manager import ChannelManager
+
+        pool = MagicMock()
+        manager = ChannelManager(pool=pool)
+        manager._check_user_allowed = AsyncMock(return_value=True)
+        adapter = _MockAdapterWithEdit("telegram")
+        manager.register(adapter)
+        msg = ChannelMessage(
+            channel_type="telegram",
+            channel_id="private-1",
+            sender_id="user1",
+            sender_name="User",
+            content="1 A1B2C3D4",
+            message_id="m1",
+            metadata={"is_group": False},
+        )
+
+        with (
+            patch(
+                "services.automation_suggestions.resolve_automation_suggestion_from_inbound",
+                new=AsyncMock(
+                    return_value={
+                        "recognized": True,
+                        "matched": True,
+                        "message": "Accepted Morning briefing. The scheduled task is active.",
+                    }
+                ),
+            ) as resolve,
+            patch("channels.manager.stream_channel_message") as conversation,
+        ):
+            await manager._handle_message(msg)
+
+        resolve.assert_awaited_once_with(
+            pool,
+            channel="telegram",
+            actor="user1",
+            text="1 A1B2C3D4",
+        )
+        conversation.assert_not_called()
+        assert adapter._sent[0]["text"].startswith("Accepted Morning briefing")
+
+    async def test_verified_operator_contradiction_reply_is_not_conversation(self):
+        from channels.base import ChannelMessage
+        from channels.manager import ChannelManager
+
+        pool = MagicMock()
+        manager = ChannelManager(pool=pool)
+        manager._check_user_allowed = AsyncMock(return_value=True)
+        adapter = _MockAdapterWithEdit("signal")
+        manager.register(adapter)
+        msg = ChannelMessage(
+            channel_type="signal",
+            channel_id="private-1",
+            sender_id="owner-1",
+            sender_name="Owner",
+            content="3 ABC12345",
+            message_id="m1",
+            metadata={"is_group": False},
+        )
+
+        with (
+            patch(
+                "services.operator_policy_corrections.channel_sender_is_operator",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "services.contradictions.resolve_contradiction_from_inbound",
+                new=AsyncMock(
+                    return_value={
+                        "recognized": True,
+                        "matched": True,
+                        "message": "Recorded: both memories remain valid as context-dependent.",
+                    }
+                ),
+            ) as resolve,
+            patch("channels.manager.stream_channel_message") as conversation,
+        ):
+            await manager._handle_message(msg)
+
+        resolve.assert_awaited_once_with(
+            pool,
+            channel="signal",
+            actor="owner-1",
+            text="3 ABC12345",
+        )
+        conversation.assert_not_called()
+        assert adapter._sent[0]["text"].startswith("Recorded: both memories")
+
+    async def test_verified_operator_memory_fade_reply_is_not_conversation(self):
+        from channels.base import ChannelMessage
+        from channels.manager import ChannelManager
+
+        pool = MagicMock()
+        manager = ChannelManager(pool=pool)
+        manager._check_user_allowed = AsyncMock(return_value=True)
+        adapter = _MockAdapterWithEdit("signal")
+        manager.register(adapter)
+        msg = ChannelMessage(
+            channel_type="signal",
+            channel_id="private-1",
+            sender_id="owner-1",
+            sender_name="Owner",
+            content="journal ABC12345: Keep the lesson.",
+            message_id="m1",
+            metadata={"is_group": False},
+        )
+
+        with (
+            patch(
+                "services.operator_policy_corrections.channel_sender_is_operator",
+                new=AsyncMock(return_value=True),
+            ),
+            patch(
+                "services.retention_surface.resolve_memory_fade_review_from_inbound",
+                new=AsyncMock(
+                    return_value={
+                        "recognized": True,
+                        "matched": True,
+                        "message": "Journal recorded. The sources remain recoverable.",
+                    }
+                ),
+            ) as resolve,
+            patch(
+                "services.skill_improvement.resolve_learning_review_from_inbound"
+            ) as learning,
+            patch("channels.manager.stream_channel_message") as conversation,
+        ):
+            await manager._handle_message(msg)
+
+        resolve.assert_awaited_once_with(
+            pool,
+            channel="signal",
+            actor="owner-1",
+            text="journal ABC12345: Keep the lesson.",
+        )
+        learning.assert_not_called()
+        conversation.assert_not_called()
+        assert adapter._sent[0]["text"].startswith("Journal recorded")
+
+    async def test_allowlisted_nonoperator_cannot_decide_a_contradiction(self):
+        from channels.base import ChannelMessage
+        from channels.manager import ChannelManager
+
+        pool = MagicMock()
+        manager = ChannelManager(pool=pool)
+        manager._check_user_allowed = AsyncMock(return_value=True)
+        adapter = _MockAdapterWithEdit("signal")
+        manager.register(adapter)
+        msg = ChannelMessage(
+            channel_type="signal",
+            channel_id="private-1",
+            sender_id="contact-1",
+            sender_name="Contact",
+            content="1 ABC12345",
+            message_id="m1",
+            metadata={"is_group": False},
+        )
+
+        with (
+            patch(
+                "services.operator_policy_corrections.channel_sender_is_operator",
+                new=AsyncMock(return_value=False),
+            ),
+            patch(
+                "services.contradictions.resolve_contradiction_from_inbound"
+            ) as resolve,
+            patch(
+                "services.automation_suggestions.resolve_automation_suggestion_from_inbound",
+                new=AsyncMock(return_value={"recognized": False}),
+            ),
+            patch(
+                "channels.manager.stream_channel_message", new=AsyncMock()
+            ) as conversation,
+        ):
+            await manager._handle_message(msg)
+
+        resolve.assert_not_called()
+        conversation.assert_awaited_once()
+
+    async def test_question_reply_resumes_paused_turn_before_conversation(self):
+        from channels.base import ChannelMessage
+        from channels.manager import ChannelManager
+
+        pool = MagicMock()
+        manager = ChannelManager(pool=pool)
+        manager._check_user_allowed = AsyncMock(return_value=True)
+        adapter = _MockAdapterWithEdit("telegram")
+        manager.register(adapter)
+        msg = ChannelMessage(
+            channel_type="telegram",
+            channel_id="private-1",
+            sender_id="user1",
+            sender_name="User",
+            content="2",
+            message_id="m1",
+        )
+
+        with (
+            patch(
+                "services.agent_questions.resolve_agent_question_from_inbound",
+                new=AsyncMock(
+                    return_value={
+                        "recognized": True,
+                        "ok": True,
+                        "answer": "Hartford",
+                        "message": "Thanks — continuing with your answer.",
+                    }
+                ),
+            ) as resolve,
+            patch(
+                "channels.manager.stream_channel_message", new=AsyncMock()
+            ) as conversation,
+        ):
+            await manager._handle_message(msg)
+
+        resolve.assert_awaited_once_with(
+            pool,
+            channel="telegram",
+            channel_id="private-1",
+            actor="user1",
+            text="2",
+        )
+        conversation.assert_not_called()
+        assert adapter._sent[0]["text"] == "Thanks — continuing with your answer."
+
+    async def test_group_number_is_left_as_conversation_text(self):
+        from channels.base import ChannelMessage
+        from channels.manager import ChannelManager
+
+        pool = MagicMock()
+        manager = ChannelManager(pool=pool)
+        manager._check_user_allowed = AsyncMock(return_value=True)
+        adapter = _MockAdapterWithEdit("slack")
+        manager.register(adapter)
+        msg = ChannelMessage(
+            channel_type="slack",
+            channel_id="group-1",
+            sender_id="user1",
+            sender_name="User",
+            content="1 A1B2C3D4",
+            message_id="m1",
+            metadata={"is_group": True},
+        )
+
+        with (
+            patch(
+                "services.operator_approval.resolve_operator_approval_from_inbound",
+                new=AsyncMock(return_value={"recognized": False}),
+            ),
+            patch(
+                "services.automation_suggestions.resolve_automation_suggestion_from_inbound"
+            ) as resolve,
+            patch(
+                "channels.manager.stream_channel_message", new=AsyncMock()
+            ) as conversation,
+        ):
+            await manager._handle_message(msg)
+
+        resolve.assert_not_called()
+        conversation.assert_awaited_once()
+        routed_msg, routed_pool, routed_adapter = conversation.await_args.args
+        assert routed_msg is msg
+        assert routed_pool is pool
+        from services.outbound_safety import GovernedReplyAdapter
+
+        assert isinstance(routed_adapter, GovernedReplyAdapter)
+        assert routed_adapter._adapter is adapter
+
 
 # ============================================================================
 # Outbox Consumer (unit tests)
@@ -742,6 +1093,20 @@ class TestManagerCommandRouting:
 
 
 class TestOutboxConsumer:
+    @pytest.fixture(autouse=True)
+    def _allow_outbound_policy(self, monkeypatch):
+        """Keep transport-unit tests focused on delivery mechanics.
+
+        The real DB policy and fail-closed outbox integration have dedicated
+        tests.  A MagicMock pool cannot produce an authorize_outbound result.
+        """
+        from services.outbound_safety import OutboundPreparation
+
+        async def allow(*args, body: str, **kwargs):
+            return OutboundPreparation(allowed=True, arguments={"message": body})
+
+        monkeypatch.setattr("services.outbound_safety.prepare_outbox_outbound", allow)
+
     async def test_deliver_direct(self):
         from channels.outbox import ChannelOutboxConsumer
 
@@ -769,7 +1134,9 @@ class TestOutboxConsumer:
         }
         await consumer._process_message(body)
 
-        manager.send.assert_called_once_with("discord", "ch123", "Hello from heartbeat", thread_id=None)
+        manager.send.assert_called_once_with(
+            "discord", "ch123", "Hello from heartbeat", thread_id=None
+        )
 
     async def test_empty_content_skipped(self):
         from channels.outbox import ChannelOutboxConsumer
@@ -809,7 +1176,9 @@ class TestOutboxConsumer:
         }
 
         await consumer._process_message(body)
-        manager.send.assert_called_once_with("telegram", "chat-42", "Scheduled update", thread_id="cron-topic")
+        manager.send.assert_called_once_with(
+            "telegram", "chat-42", "Scheduled update", thread_id="cron-topic"
+        )
 
     async def test_webhook_delivery_branch(self):
         from channels.outbox import ChannelOutboxConsumer
@@ -841,7 +1210,9 @@ class TestOutboxConsumer:
         consumer = ChannelOutboxConsumer(manager, pool)
         consumer._log_delivery = AsyncMock()
 
-        with patch("channels.outbox.request_text_response", new=AsyncMock()) as mock_post:
+        with patch(
+            "channels.outbox.request_text_response", new=AsyncMock()
+        ) as mock_post:
             await consumer._deliver_webhook(
                 "Hello webhook",
                 {"content": "Hello webhook"},
@@ -891,11 +1262,13 @@ class TestOutboxConsumer:
 
         pool = MagicMock()
         mock_conn = AsyncMock()
-        mock_conn.fetchval = AsyncMock(return_value={
-            "skip": True,
-            "reason": "chat not found",
-            "suppress_until": "2026-07-24T00:00:00Z",
-        })
+        mock_conn.fetchval = AsyncMock(
+            return_value={
+                "skip": True,
+                "reason": "chat not found",
+                "suppress_until": "2026-07-24T00:00:00Z",
+            }
+        )
         pool.acquire.return_value.__aenter__ = AsyncMock(return_value=mock_conn)
         pool.acquire.return_value.__aexit__ = AsyncMock(return_value=False)
 
@@ -924,10 +1297,12 @@ class TestOutboxConsumer:
 
         pool = MagicMock()
         mock_conn = AsyncMock()
-        mock_conn.fetchval = AsyncMock(side_effect=[
-            {"skip": False},
-            {"success": True, "failure_count": 1},
-        ])
+        mock_conn.fetchval = AsyncMock(
+            side_effect=[
+                {"skip": False},
+                {"success": True, "failure_count": 1},
+            ]
+        )
         pool.acquire.return_value.__aenter__ = AsyncMock(return_value=mock_conn)
         pool.acquire.return_value.__aexit__ = AsyncMock(return_value=False)
 
@@ -982,10 +1357,12 @@ class TestOutboxConsumer:
 
         pool = MagicMock()
         mock_conn = AsyncMock()
-        mock_conn.fetchval = AsyncMock(side_effect=[
-            '{"skip": false}',
-            True,
-        ])
+        mock_conn.fetchval = AsyncMock(
+            side_effect=[
+                '{"skip": false}',
+                True,
+            ]
+        )
         pool.acquire.return_value.__aenter__ = AsyncMock(return_value=mock_conn)
         pool.acquire.return_value.__aexit__ = AsyncMock(return_value=False)
 
@@ -1018,11 +1395,16 @@ class TestChannelEnergy:
 
     async def _cleanup(self, conn, sender_id: str):
         session_ids = await conn.fetch(
-            "SELECT id FROM channel_sessions WHERE sender_id = $1", sender_id,
+            "SELECT id FROM channel_sessions WHERE sender_id = $1",
+            sender_id,
         )
         for row in session_ids:
-            await conn.execute("DELETE FROM channel_messages WHERE session_id = $1", row["id"])
-        await conn.execute("DELETE FROM channel_sessions WHERE sender_id = $1", sender_id)
+            await conn.execute(
+                "DELETE FROM channel_messages WHERE session_id = $1", row["id"]
+            )
+        await conn.execute(
+            "DELETE FROM channel_sessions WHERE sender_id = $1", sender_id
+        )
 
     async def test_default_free_energy(self, db_pool):
         """Default energy cost is 0 (free), so messages should always be allowed.
@@ -1035,14 +1417,16 @@ class TestChannelEnergy:
             try:
                 raw = await conn.fetchval(
                     "SELECT prepare_channel_turn($1::jsonb)",
-                    json.dumps({
-                        "channel_type": "test_free",
-                        "channel_id": "ch1",
-                        "sender_id": sender_id,
-                        "sender_name": "User",
-                        "content": "Hello",
-                        "message_id": "m1",
-                    }),
+                    json.dumps(
+                        {
+                            "channel_type": "test_free",
+                            "channel_id": "ch1",
+                            "sender_id": sender_id,
+                            "sender_name": "User",
+                            "content": "Hello",
+                            "message_id": "m1",
+                        }
+                    ),
                 )
                 turn = json.loads(raw) if isinstance(raw, str) else raw
                 assert turn["allowed"] is True
@@ -1071,6 +1455,7 @@ class TestBaseABCExtensions:
             @property
             def capabilities(self):
                 from channels.base import ChannelCapabilities
+
                 return ChannelCapabilities()
 
             async def start(self, on_message):
@@ -1102,6 +1487,7 @@ class TestBaseABCExtensions:
             @property
             def capabilities(self):
                 from channels.base import ChannelCapabilities
+
                 return ChannelCapabilities()
 
             async def start(self, on_message):

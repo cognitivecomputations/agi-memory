@@ -263,6 +263,85 @@ class TestCanonicalSchema:
         validate_hmx_document(env)
 
 
+class TestOnboardingInterviewSchema:
+    """#97: a use case fully defined in one HMX file -- the envelope's
+    optional onboarding_interview section, part of the open HMX standard."""
+
+    def _envelope(self):
+        plan = resolve_export_sections("port")
+        return build_envelope(
+            intent="port",
+            plan=plan,
+            instance_id="hexis_test",
+            schema_version="0004_hmx_export_functions",
+            embedding_model="embeddinggemma:300m",
+            embedding_dimension=768,
+            lineage_id="11111111-2222-3333-4444-555555555555",
+            relationship_edge_types=["SUPPORTS"],
+        )
+
+    def _question(self, **overrides):
+        question = {
+            "id": "q1",
+            "type": "choice",
+            "prompt": "What should I call you?",
+            "options": [
+                {"label": "Boss", "value": "boss"},
+                {"label": "Friend", "value": "friend"},
+            ],
+            "binds": {"action": "remember", "params_template": {"content": "{{answer}}"}},
+        }
+        question.update(overrides)
+        return question
+
+    def test_well_formed_interview_is_valid(self):
+        env = self._envelope()
+        env["onboarding_interview"] = {"version": 1, "questions": [self._question()]}
+        validate_hmx_document(env)
+
+    def test_freeform_question_without_options_is_valid(self):
+        env = self._envelope()
+        # A freeform question legitimately omits 'options' entirely.
+        question = self._question(id="q2", type="freeform", prompt="Anything else I should know?")
+        del question["options"]
+        env["onboarding_interview"] = {"version": 1, "questions": [question]}
+        validate_hmx_document(env)
+
+    def test_required_and_skippable_flags_are_valid(self):
+        env = self._envelope()
+        env["onboarding_interview"] = {
+            "version": 1,
+            "questions": [self._question(required=True, skippable=False)],
+        }
+        validate_hmx_document(env)
+
+    def test_missing_binds_is_rejected(self):
+        env = self._envelope()
+        question = self._question()
+        del question["binds"]
+        env["onboarding_interview"] = {"version": 1, "questions": [question]}
+        with pytest.raises(HmxSchemaError, match="'binds' is a required property"):
+            validate_hmx_document(env)
+
+    def test_unknown_binding_action_is_rejected(self):
+        env = self._envelope()
+        question = self._question(binds={"action": "launch_missiles"})
+        env["onboarding_interview"] = {"version": 1, "questions": [question]}
+        with pytest.raises(HmxSchemaError):
+            validate_hmx_document(env)
+
+    def test_option_missing_value_is_rejected(self):
+        env = self._envelope()
+        question = self._question(options=[{"label": "Boss"}])
+        env["onboarding_interview"] = {"version": 1, "questions": [question]}
+        with pytest.raises(HmxSchemaError, match="'value' is a required property"):
+            validate_hmx_document(env)
+
+    def test_document_without_interview_section_still_validates(self):
+        # The section is optional -- every existing HMX document stays valid.
+        validate_hmx_document(self._envelope())
+
+
 class TestJsonlTransport:
     def _envelope(self):
         plan = resolve_export_sections(

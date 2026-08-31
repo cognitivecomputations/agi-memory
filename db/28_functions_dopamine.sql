@@ -48,6 +48,7 @@ DECLARE
     mood_valence FLOAT;
     mood_arousal FLOAT;
     primary_emotion TEXT;
+    emotion_family TEXT;
     source TEXT;
     updated_at TIMESTAMPTZ;
     mood_updated_at TIMESTAMPTZ;
@@ -108,6 +109,7 @@ BEGIN
     da_phasic := LEAST(1.0, GREATEST(-1.0, COALESCE(da_phasic, 0.0)));
 
     primary_emotion := COALESCE(NULLIF(p_state->>'primary_emotion', ''), 'neutral');
+    emotion_family := normalize_emotion_family(p_state->>'family');
     secondary_emotion := NULLIF(p_state->>'secondary_emotion', '');
     trigger_summary := NULLIF(p_state->>'trigger_summary', '');
     source := COALESCE(NULLIF(p_state->>'source', ''), 'derived');
@@ -133,7 +135,8 @@ BEGIN
         'dopamine_spike_at', da_spike_at,
         'dopamine_spike_rpe', da_spike_rpe,
         'dopamine_spike_trigger', da_spike_trigger
-    );
+    ) || CASE WHEN emotion_family IS NULL THEN '{}'::jsonb
+              ELSE jsonb_build_object('family', emotion_family) END;
 END;
 $$ LANGUAGE plpgsql STABLE;
 
@@ -490,6 +493,7 @@ DECLARE
     dominance FLOAT;
     intensity FLOAT;
     primary_emotion TEXT;
+    emotion_family TEXT;
     source TEXT;
     da_tonic FLOAT;
 BEGIN
@@ -511,6 +515,9 @@ BEGIN
     dominance := COALESCE(dominance, NULLIF(state->>'dominance', '')::float, 0.5);
     intensity := COALESCE(intensity, NULLIF(state->>'intensity', '')::float, 0.5);
     primary_emotion := COALESCE(NULLIF(context->>'primary_emotion', ''), NULLIF(state->>'primary_emotion', ''), 'neutral');
+    emotion_family := CASE WHEN context ? 'primary_emotion'
+                           THEN normalize_emotion_family(context->>'family')
+                           ELSE normalize_emotion_family(state->>'family') END;
     source := COALESCE(NULLIF(context->>'source', ''), NULLIF(state->>'source', ''), 'derived');
 
     valence := LEAST(1.0, GREATEST(-1.0, valence));
@@ -530,7 +537,8 @@ BEGIN
         'primary_emotion', primary_emotion,
         'intensity', intensity,
         'source', source
-    );
+    ) || CASE WHEN emotion_family IS NULL THEN '{}'::jsonb
+              ELSE jsonb_build_object('family', emotion_family) END;
 
     NEW.metadata := meta || jsonb_build_object(
         'emotional_context', context,
@@ -607,6 +615,7 @@ DECLARE
     activation_cleaned INT;
     ready_transformations JSONB;
     dopamine_drift JSONB;
+    journal_fallback JSONB;
 BEGIN
     IF is_agent_terminated() THEN
         RETURN jsonb_build_object('skipped', true, 'reason', 'terminated');
@@ -657,6 +666,15 @@ BEGIN
         RAISE WARNING 'memory retention pass failed: %', SQLERRM;
     END;
 
+    -- Daily journal fallback (issue #114): a day with real activity and no
+    -- deliberate entry gets one minimal one. Guarded so a failure never breaks
+    -- the maintenance tick.
+    BEGIN
+        journal_fallback := maybe_write_daily_journal_fallback();
+    EXCEPTION WHEN OTHERS THEN
+        RAISE WARNING 'daily journal fallback failed: %', SQLERRM;
+    END;
+
     UPDATE maintenance_state
     SET last_maintenance_at = CURRENT_TIMESTAMP,
         updated_at = CURRENT_TIMESTAMP
@@ -674,6 +692,7 @@ BEGIN
         'memory_activations_cleaned', COALESCE(activation_cleaned, 0),
         'transformations_ready', COALESCE(ready_transformations, '[]'::jsonb),
         'dopamine_drift', COALESCE(dopamine_drift, '{}'::jsonb),
+        'daily_journal_fallback', COALESCE(journal_fallback, jsonb_build_object('skipped', true, 'reason', 'error')),
         'ran_at', CURRENT_TIMESTAMP
     );
 EXCEPTION
@@ -824,6 +843,7 @@ DECLARE
     emo JSONB := CASE WHEN jsonb_typeof(signals->'emotional_state') = 'object'
                       THEN signals->'emotional_state' ELSE '{}'::jsonb END;
     primary_emotion TEXT := lower(COALESCE(emo->>'primary_emotion', ''));
+    emotion_family TEXT := normalize_emotion_family(emo->>'family');
     valence FLOAT := COALESCE(NULLIF(emo->>'valence', '')::float, 0.0);
     intensity FLOAT := COALESCE(NULLIF(emo->>'intensity', '')::float, 0.0);
     confidence FLOAT := COALESCE(NULLIF(emo->>'confidence', '')::float, 0.0);
@@ -836,10 +856,7 @@ BEGIN
     IF valence >= 0.35
        AND intensity >= 0.35
        AND confidence >= COALESCE(get_config_float('subconscious.min_signal_confidence'), 0.6)
-       AND primary_emotion IN (
-           'affection', 'appreciation', 'gratitude', 'warmth', 'connection',
-           'joy', 'pride', 'relief', 'trust', 'fondness', 'love'
-       ) THEN
+       AND emotion_family_serves(emotion_family, 'social_reward') THEN
         recorded := record_social_reward(
             primary_emotion,
             valence,
@@ -856,6 +873,7 @@ BEGIN
         'recorded', recorded IS NOT NULL,
         'event', COALESCE(recorded, '{}'::jsonb),
         'primary_emotion', primary_emotion,
+        'family', emotion_family,
         'valence', valence,
         'intensity', intensity,
         'confidence', confidence

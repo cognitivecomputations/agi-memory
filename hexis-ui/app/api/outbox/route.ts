@@ -9,14 +9,24 @@ type DbRow = Record<string, unknown>;
  * The agent's outbox (RabbitMQ hexis.outbox) is her always-available way to
  * reach the user; the channel worker tees every user-bound message into
  * web_inbox (db/76), and this route serves that feed plus any resource
- * requests awaiting an operator decision.
+ * requests, automation suggestions, and memory contradictions awaiting an
+ * operator decision.
  */
 export async function GET() {
   try {
-    const [inboxRows, requestRows] = await Promise.all([
+    const [inboxRows, requestRows, automationRows, contradictionRows, nodePairingRows] = await Promise.all([
       prisma.$queryRawUnsafe<DbRow[]>("SELECT get_web_inbox(30) AS feed"),
       prisma.$queryRawUnsafe<DbRow[]>(
         "SELECT list_resource_requests('pending', 20) AS requests"
+      ),
+      prisma.$queryRawUnsafe<DbRow[]>(
+        "SELECT list_automation_suggestions('pending', 20) AS automations"
+      ),
+      prisma.$queryRawUnsafe<DbRow[]>(
+        "SELECT list_contradiction_cases('pending', 20) AS contradictions"
+      ),
+      prisma.$queryRawUnsafe<DbRow[]>(
+        "SELECT list_node_pairing_requests('pending', 20) AS node_pairings"
       ),
     ]);
     const feed = normalizeJsonValue(inboxRows[0]?.feed) || {
@@ -24,10 +34,16 @@ export async function GET() {
       messages: [],
     };
     const pendingRequests = normalizeJsonValue(requestRows[0]?.requests) || [];
+    const pendingAutomations = normalizeJsonValue(automationRows[0]?.automations) || [];
+    const pendingContradictions = normalizeJsonValue(contradictionRows[0]?.contradictions) || [];
+    const pendingNodePairings = normalizeJsonValue(nodePairingRows[0]?.node_pairings) || [];
     return NextResponse.json({
       unread: Number(feed.unread || 0),
       messages: feed.messages || [],
       pending_requests: pendingRequests,
+      pending_automations: pendingAutomations,
+      pending_contradictions: pendingContradictions,
+      pending_node_pairings: pendingNodePairings,
     });
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : "Failed to load inbox";

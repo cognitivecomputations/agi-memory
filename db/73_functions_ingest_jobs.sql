@@ -13,7 +13,13 @@ INSERT INTO config_defaults (key, value, description) VALUES
     ('ingest.job_batch_size', '1'::jsonb,
      'Ingestion jobs claimed per maintenance tick'),
     ('ingest.upload_max_bytes', '104857600'::jsonb,
-     'Maximum file size accepted by the upload API; larger files use the synchronous CLI path')
+     'Maximum file size accepted by the upload API; larger files use the synchronous CLI path'),
+    ('ingest.attachment_text_chars', '60000'::jsonb,
+     'Maximum characters of an attached file''s text carried into the turn it is attached to'),
+    ('ingest.attachment_read_timeout_s', '25'::jsonb,
+     'Seconds the composer waits for an attached file''s text before leaving it to background ingestion'),
+    ('ingest.attachment_read_max_bytes', '26214400'::jsonb,
+     'Largest attachment read synchronously at attach time; bigger files go straight to background ingestion')
 ON CONFLICT (key) DO NOTHING;
 
 

@@ -242,6 +242,50 @@ BEGIN
 END;
 $$;
 
+-- Append trusted multimodal context produced inside the tool runtime. This is
+-- separate from append_agent_message so arbitrary text callers cannot smuggle
+-- provider-specific content shapes into the authoritative turn log.
+CREATE OR REPLACE FUNCTION append_agent_visual_message(
+    p_turn_id UUID,
+    p_label TEXT,
+    p_data_url TEXT
+) RETURNS JSONB
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    turn agent_turns%ROWTYPE;
+BEGIN
+    IF COALESCE(p_data_url, '') !~ '^data:image/(png|jpeg|webp|gif);base64,' THEN
+        RAISE EXCEPTION 'visual message requires a supported image data URL';
+    END IF;
+    UPDATE agent_turns
+    SET messages = COALESCE(messages, '[]'::jsonb)
+            || jsonb_build_array(jsonb_build_object(
+                'role', 'user',
+                'content', jsonb_build_array(
+                    jsonb_build_object(
+                        'type', 'input_text',
+                        'text', format('[Fresh tool-provided visual context: %s]',
+                            COALESCE(NULLIF(p_label, ''), 'image'))
+                    ),
+                    jsonb_build_object(
+                        'type', 'input_image',
+                        'image_url', p_data_url,
+                        'detail', 'auto'
+                    )
+                )
+            )),
+        updated_at = CURRENT_TIMESTAMP
+    WHERE id = p_turn_id
+    RETURNING * INTO turn;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'agent turn not found: %', p_turn_id;
+    END IF;
+    RETURN jsonb_build_object('turn_id', p_turn_id::text, 'messages', turn.messages);
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION finish_agent_turn(
     p_turn_id UUID,
     p_result JSONB DEFAULT '{}'::jsonb
@@ -326,4 +370,64 @@ CREATE OR REPLACE FUNCTION apply_tool_use_result(
 LANGUAGE sql
 AS $$
     SELECT apply_external_call_result(p_call, p_result);
+$$;
+
+-- Renders conversations for `hexis transcript` (#54): everything is already in
+-- Postgres (agent_turns for the exchange, agent_turn_events for the tool/
+-- subconscious signal trace -- keyed by turn_id, a tighter join than the
+-- loosely-typed tool_executions audit table); this just assembles it. Exactly
+-- one of p_last / p_session_id is meaningful at a time: p_session_id (a
+-- chat_sessions.id OR a heartbeat_id) returns every turn for that session in
+-- order; otherwise the most recent p_last turns across all sessions/modes.
+CREATE OR REPLACE FUNCTION get_agent_transcript(
+    p_last INT DEFAULT 20,
+    p_session_id UUID DEFAULT NULL
+) RETURNS JSONB
+LANGUAGE sql STABLE
+AS $$
+    WITH selected_turns AS (
+        SELECT *
+        FROM agent_turns
+        WHERE p_session_id IS NULL
+           OR session_id = p_session_id
+           OR heartbeat_id = p_session_id
+        ORDER BY created_at DESC
+        LIMIT CASE WHEN p_session_id IS NULL THEN GREATEST(COALESCE(p_last, 20), 1) END
+    )
+    SELECT COALESCE(jsonb_agg(
+        jsonb_build_object(
+            'id', t.id,
+            'mode', t.mode,
+            'session_id', t.session_id,
+            'heartbeat_id', t.heartbeat_id,
+            'status', t.status,
+            'stopped_reason', t.stopped_reason,
+            'user_message', t.user_message,
+            'reply_text', COALESCE(t.result->>'visible_text', t.result->>'text'),
+            'iterations', COALESCE((t.result->>'iterations')::int, (t.runtime_state->>'iterations')::int),
+            'energy_spent', COALESCE((t.result->>'energy_spent')::numeric, (t.runtime_state->>'energy_spent')::numeric),
+            'created_at', t.created_at,
+            'completed_at', t.completed_at,
+            'events', COALESCE(ev.events, '[]'::jsonb)
+        ) ORDER BY t.created_at
+    ), '[]'::jsonb)
+    FROM selected_turns t
+    LEFT JOIN LATERAL (
+        SELECT jsonb_agg(
+            jsonb_build_object(
+                'event_type', e.event_type,
+                'payload', e.payload,
+                'created_at', e.created_at
+            ) ORDER BY e.created_at
+        ) AS events
+        FROM agent_turn_events e
+        WHERE e.turn_id = t.id
+          -- The signals worth a transcript line; llm_request/response and raw
+          -- text_delta streaming chunks would just be noise here.
+          AND e.event_type IN (
+              'tool_start', 'tool_result', 'energy_exhausted',
+              'claim_flagged', 'question', 'approval_request',
+              'error', 'phase_change'
+          )
+    ) ev ON true;
 $$;

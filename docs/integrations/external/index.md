@@ -9,12 +9,14 @@ section: integrations
 
 # External Integrations
 
-Connect Hexis to external services for calendar, email, CRM, productivity, search, and media.
+Connect Hexis to external services for everyday life, calendar, email, CRM,
+productivity, search, and media.
 
 ## Quick Links
 
 | Page | Services |
 |------|----------|
+| [Everyday Life](everyday-life.md) | Notion, Spotify, Home Assistant, Open-Meteo weather, Trello |
 | [Calendar and Email](calendar-and-email.md) | Google Calendar, SMTP email, SendGrid |
 | [CRM](crm.md) | HubSpot, Contacts system |
 | [Productivity](productivity.md) | Todoist, Asana |
@@ -42,6 +44,11 @@ API keys are stored as environment variable names in the database config, not as
 
 | Service | Tools | Energy Cost |
 |---------|-------|-------------|
+| Notion | `notion_search`, `notion_get_page`, `notion_query_data_source`, `notion_create_page` | 2-3 |
+| Spotify | `spotify_search`, `spotify_playback_state`, `spotify_control_playback` | 1-3 |
+| Home Assistant | `home_assistant_states`, `home_assistant_call_service` | 1-3 |
+| Open-Meteo weather | `weather_forecast` | 1 |
+| Trello | `trello_list_boards`, `trello_list_cards`, `trello_create_card`, `trello_update_card` | 1-3 |
 | Google Calendar | `calendar_events`, `calendar_create`, `calendar_update`, `calendar_delete`, `meeting_prep` | 2-4 |
 | Email (SMTP) | `email_send`, `email_list`, `email_read`, `email_search`, `email_forward` | 2-4 |
 | Email (SendGrid) | `email_send_sendgrid` | 4 |

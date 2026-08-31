@@ -25,7 +25,10 @@ All environment variables used by Hexis, configured via `.env`.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `HEXIS_BIND_ADDRESS` | `127.0.0.1` | Bind address for all services (set to `0.0.0.0` to expose) |
+| `HEXIS_BIND_ADDRESS` | `127.0.0.1` | Bind address for all services. Keep loopback in OSS; use a tailnet or authenticated reverse proxy for remote access. |
+| `HEXIS_UI_PORT` | `3477` | Host dashboard port; `hexis tunnel` derives its loopback proxy target from this value |
+| `HEXIS_UI_PUBLIC_URL` | *(auto-discovered)* | Authoritative private HTTPS dashboard URL for `hexis doctor` when Tailscale discovery is unavailable |
+| `HEXIS_WEB_PUSH_VAPID_PRIVATE_KEY_FILE` | `~/.hexis/web-push-vapid-private.pem` | Persistent VAPID EC private-key path; created only after explicit notification setup |
 
 ## Embedding Service
 
@@ -35,15 +38,31 @@ All environment variables used by Hexis, configured via `.env`.
 | `EMBEDDING_MODEL_ID` | `embeddinggemma:300m-qat-q4_0` | Model identifier |
 | `EMBEDDING_DIMENSION` | `768` | Vector dimension |
 
-## LLM API Keys
+## LLM Providers
 
 | Variable | Description |
 |----------|-------------|
-| `OPENAI_API_KEY` | OpenAI Platform API key |
+| `OPENAI_API_KEY` | OpenAI Platform or OpenAI-compatible API key |
+| `OPENAI_BASE_URL` | Base URL for `openai_compatible`; also used by cloud voice-note transcription after the user selects it |
 | `ANTHROPIC_API_KEY` | Anthropic API key |
-| `GROK_API_KEY` | Grok API key |
+| `GEMINI_API_KEY` | Google Gemini API key |
+| `XAI_API_KEY` | xAI Grok API key |
 
 These are only needed for API-key providers. OAuth providers store credentials in the database.
+
+## Local Audio Analysis
+
+| Variable | Description |
+|----------|-------------|
+| `HF_TOKEN` | Hugging Face token used only to download the configured pyannote diarization model after its terms are accepted |
+| `HUGGING_FACE_HUB_TOKEN` | Accepted fallback name for `HF_TOKEN` |
+| `XDG_CACHE_HOME` | Optional cache root; audio-analysis artifacts default to `$XDG_CACHE_HOME/hexis/audio-analysis` |
+
+## Local Speech Output
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HEXIS_TTS_URL` | Host: `http://127.0.0.1:42667`; Docker API: `http://host.docker.internal:42667` | Advanced Piper-compatible endpoint override. Only credential-free local HTTP hosts are accepted. |
 
 ## RabbitMQ
 
@@ -51,6 +70,19 @@ These are only needed for API-key providers. OAuth providers store credentials i
 |----------|---------|-------------|
 | `RABBITMQ_DEFAULT_USER` | `hexis` | RabbitMQ user |
 | `RABBITMQ_DEFAULT_PASS` | `hexis_password` | RabbitMQ password |
+| `RABBITMQ_MANAGEMENT_PORT` | `45673` | Host-mapped RabbitMQ management port used by host workers |
+| `RABBITMQ_MANAGEMENT_URL` | `http://localhost:${RABBITMQ_MANAGEMENT_PORT}` | Exact management endpoint; Docker workers override this with the container endpoint |
+| `RABBITMQ_USER` | `RABBITMQ_DEFAULT_USER` | Optional worker-specific user override |
+| `RABBITMQ_PASSWORD` | `RABBITMQ_DEFAULT_PASS` | Optional worker-specific password override |
+
+## Host Worker Services
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HEXIS_ENV_FILE` | *(unset)* | Explicit environment file loaded before worker runtime imports. `hexis service install --env-file` writes only this path into the managed unit; it never copies file values. |
+
+Normally you choose this through `hexis service install`; do not set it to a
+different file in ambient shell startup unless that difference is intentional.
 
 ## API Server
 
@@ -91,6 +123,18 @@ These are only needed for API-key providers. OAuth providers store credentials i
 | `ANTIGRAVITY_OAUTH_CLIENT_SECRET` | Google Antigravity OAuth client secret |
 
 ## External Service API Keys
+
+The first-class Notion, Home Assistant, and Trello setup flows accept an
+environment variable **name** chosen in the Connections page; they do not silently
+consume a conventional variable. Names such as `NOTION_TOKEN`,
+`HOME_ASSISTANT_TOKEN`, `TRELLO_API_KEY`, and `TRELLO_TOKEN` are examples only.
+Spotify likewise uses `SPOTIFY_CLIENT_ID` only when the user explicitly selects
+that name during setup. Weather requires no credential.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HEXIS_SPOTIFY_REDIRECT_URI` | *(derived)* | Exact Spotify OAuth callback override. HTTP callbacks must use `127.0.0.1` or `::1`; HTTPS callbacks may use a private reverse-proxy URL. |
+| `HEXIS_API_URL` / `HEXIS_API_BASE_URL` | `http://127.0.0.1:43817` | API base used to derive the Spotify callback when no exact redirect override is set. |
 
 | Variable | Description |
 |----------|-------------|

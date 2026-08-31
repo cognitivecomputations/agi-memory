@@ -17,7 +17,7 @@ Connect Hexis to authentication providers, messaging channels, and external serv
 |---------|-------------|
 | [Auth Providers](auth/index.md) | OAuth, device code, and token-based LLM authentication |
 | [Channels](channels/index.md) | Discord, Telegram, Slack, Signal, WhatsApp, iMessage, Matrix |
-| [External Services](external/index.md) | Calendar, email, CRM, productivity, search, media |
+| [External Services](external/index.md) | Everyday life, calendar, email, CRM, productivity, search, media |
 
 ## Integration Status
 
@@ -38,6 +38,11 @@ Connect Hexis to authentication providers, messaging channels, and external serv
 | iMessage | Channel | AppleScript | macOS only |
 | Matrix | Channel | Access token | Stable |
 | Google Calendar | External | OAuth | Stable |
+| Notion | External | Integration token reference | Stable |
+| Spotify | External | OAuth PKCE | Stable |
+| Home Assistant | External | Long-lived token reference | Stable |
+| Weather (Open-Meteo) | External | None | Stable |
+| Trello | External | API key and token references | Stable |
 | Email (SMTP) | External | SMTP credentials | Stable |
 | Email (SendGrid) | External | API key | Stable |
 | HubSpot | External | API key | Stable |

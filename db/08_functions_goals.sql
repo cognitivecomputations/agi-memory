@@ -67,13 +67,34 @@ BEGIN
     );
 END;
 $$ LANGUAGE plpgsql;
+CREATE OR REPLACE FUNCTION normalize_memory_goal_origin()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NEW.type = 'goal'::memory_type THEN
+        IF NEW.metadata->>'origin' = 'initialization' THEN
+            NEW.goal_origin := 'user_request'::goal_source;
+        ELSIF NEW.goal_origin IS NULL THEN
+            -- Raw/legacy inserts have no authenticated execution context.
+            -- metadata.source is model-authored description, never authority.
+            NEW.goal_origin := 'derived'::goal_source;
+        END IF;
+    ELSE
+        NEW.goal_origin := NULL;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Seven-argument authority-aware implementation. Callers crossing a tool or
+-- transport boundary must pass p_origin from trusted execution context.
 CREATE OR REPLACE FUNCTION create_goal(
     p_title TEXT,
-    p_description TEXT DEFAULT NULL,
-    p_source goal_source DEFAULT 'curiosity',
-    p_priority goal_priority DEFAULT 'queued',
-    p_parent_id UUID DEFAULT NULL,
-    p_due_at TIMESTAMPTZ DEFAULT NULL
+    p_description TEXT,
+    p_source goal_source,
+    p_priority goal_priority,
+    p_parent_id UUID,
+    p_due_at TIMESTAMPTZ,
+    p_origin goal_source
 )
 RETURNS UUID AS $$
 DECLARE
@@ -82,6 +103,7 @@ DECLARE
     max_active INT;
     goal_embedding vector;
     goal_metadata JSONB;
+    resolved_origin goal_source := COALESCE(p_origin, 'derived'::goal_source);
 BEGIN
     -- Dedup: return existing active goal with same title
     SELECT id INTO new_goal_id
@@ -89,6 +111,15 @@ BEGIN
     WHERE type = 'goal' AND content = p_title AND status = 'active'
     LIMIT 1;
     IF new_goal_id IS NOT NULL THEN
+        -- A direct user assignment upgrades an existing autonomous goal; less
+        -- authoritative duplicate observations never downgrade it.
+        IF resolved_origin = 'user_request'::goal_source THEN
+            UPDATE memories
+            SET goal_origin = 'user_request'::goal_source,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = new_goal_id
+              AND goal_origin IS DISTINCT FROM 'user_request'::goal_source;
+        END IF;
         RETURN new_goal_id;
     END IF;
 
@@ -115,9 +146,10 @@ BEGIN
         'last_touched', CURRENT_TIMESTAMP,
         'parent_goal_id', p_parent_id
     );
-    INSERT INTO memories (type, content, embedding, importance, metadata)
+    INSERT INTO memories (type, goal_origin, content, embedding, importance, metadata)
     VALUES (
         'goal'::memory_type,
+        resolved_origin,
         p_title,
         goal_embedding,
         0.7,
@@ -145,6 +177,29 @@ BEGIN
     RETURN new_goal_id;
 END;
 $$ LANGUAGE plpgsql;
+
+-- Compatibility entry point for legacy database callers. It deliberately
+-- defaults to derived: metadata.source is descriptive model output, not proof
+-- that the user assigned the goal. Trusted callers use the seven-argument form.
+CREATE OR REPLACE FUNCTION create_goal(
+    p_title TEXT,
+    p_description TEXT DEFAULT NULL,
+    p_source goal_source DEFAULT 'curiosity',
+    p_priority goal_priority DEFAULT 'queued',
+    p_parent_id UUID DEFAULT NULL,
+    p_due_at TIMESTAMPTZ DEFAULT NULL
+)
+RETURNS UUID AS $$
+    SELECT create_goal(
+        p_title,
+        p_description,
+        COALESCE(p_source, 'curiosity'::goal_source),
+        COALESCE(p_priority, 'queued'::goal_priority),
+        p_parent_id,
+        p_due_at,
+        'derived'::goal_source
+    );
+$$ LANGUAGE sql;
 CREATE OR REPLACE FUNCTION sync_goal_node(p_goal_id UUID)
 RETURNS BOOLEAN AS $$
 BEGIN
