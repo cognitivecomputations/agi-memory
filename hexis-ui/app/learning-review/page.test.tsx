@@ -67,7 +67,7 @@ describe("learning review", () => {
       action: "correct",
       correction: "The planning call is on Friday.",
     }));
-    expect(screen.getByText(/prior version remains queryable/)).toBeInTheDocument();
+    expect(await screen.findByText(/prior version remains queryable/)).toBeInTheDocument();
   });
 
   it("asks again before forgetting a load-bearing memory", async () => {
