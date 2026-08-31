@@ -116,6 +116,25 @@ async def test_applied_migration_checksum_drift_fails_loudly(db_pool):
             await transaction.rollback()
 
 
+async def test_rlm_heartbeat_prompt_module_matches_current_file(db_pool):
+    """#115: the file (what load_rlm_heartbeat_prompt() actually reads) was
+    fixed in c08c8f5 to stop telling the model `reflect` is a tool_use
+    target, and the baseline seed picked that up for fresh installs, but no
+    migration ever refreshed the prompt_modules catalog row itself -- so an
+    already-migrated database kept serving the stale text to anything
+    reading the DB copy. Migration 0243 re-upserts it; this pins the fix."""
+    async with db_pool.acquire() as conn:
+        content = await conn.fetchval(
+            "SELECT content FROM prompt_modules WHERE key = 'rlm_heartbeat_system'"
+        )
+    assert content is not None
+    assert "recall, reflect, reach_out_user" not in content
+    file_content = (
+        _DB_ROOT.parent / "services" / "prompts" / "rlm_heartbeat_system.md"
+    ).read_text(encoding="utf-8")
+    assert content == file_content
+
+
 async def test_conversation_prompt_covers_claims_already_held(db_pool):
     """#51: after reading a document, "nothing to retain" was concluded even
     when the document's core claims already existed as seeded protected

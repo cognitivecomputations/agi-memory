@@ -1169,3 +1169,31 @@ BEGIN
     RETURN result;
 END;
 $$ LANGUAGE plpgsql STABLE;
+
+-- sync_tool_definitions() only ever upserts (#115): a renamed or removed tool
+-- keeps advertising to the chat/heartbeat path forever, since nothing prunes
+-- rows that stop appearing in every process's sync payload. Deliberately NOT
+-- auto-deleted: every worker/API/channel/MCP process syncs its own
+-- in-memory registry independently, so a name absent from one process's
+-- payload does not mean it is gone everywhere -- an aggressive per-call
+-- diff-delete would risk erasing a tool another still-running process
+-- legitimately serves (Experience Bar: no destructive action on a timer or
+-- by default). Instead this surfaces candidates -- names untouched by ANY
+-- sync for longer than the configured threshold -- for `hexis doctor` to
+-- WARN on, matching the read-only posture of worker_code_schema_skew_report.
+CREATE OR REPLACE FUNCTION stale_tool_definitions()
+RETURNS JSONB
+LANGUAGE sql STABLE
+AS $$
+    SELECT COALESCE(jsonb_agg(
+        jsonb_build_object(
+            'name', name,
+            'updated_at', updated_at,
+            'age_days', round(EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - updated_at)) / 86400.0, 1)
+        ) ORDER BY updated_at
+    ), '[]'::jsonb)
+    FROM tool_definitions
+    WHERE updated_at < CURRENT_TIMESTAMP - (
+        GREATEST(COALESCE(get_config_int('tools.definition_stale_days'), 14), 1) || ' days'
+    )::interval;
+$$;

@@ -106,7 +106,7 @@ hexis/
 - `clusters` - Thematic groupings with centroid embeddings
 - `memory_neighborhoods` - Precomputed associative neighbors (hot-path optimization)
 - `memories` (type=`worldview`, `goal`) - Beliefs, boundaries, and goals stored as memories
-- `external_calls` - Queue for LLM/embedding requests
+- `external_driver_calls` - Queue for LLM/embedding requests (LLM calls also route through `gateway_events`)
 - `memory_graph` (Apache AGE) - Graph nodes/edges for multi-hop reasoning
 
 ### Key Database Functions
