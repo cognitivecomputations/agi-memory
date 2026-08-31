@@ -45,8 +45,16 @@ OPENAI_COMPATIBLE = {
 _CODEX_DEFAULT_BASE_URL = "https://chatgpt.com/backend-api"
 _CODEX_JWT_CLAIM_PATH = "https://api.openai.com/auth"
 
-# OpenAI client cache: (api_key, base_url, provider) -> client
-_openai_clients: dict[tuple[str, str, str], Any] = {}
+# OpenAI client cache: (api_key, base_url, provider, headers) -> client
+_openai_clients: dict[
+    tuple[str, str, str, tuple[tuple[str, Any], ...]],
+    Any,
+] = {}
+
+# The OpenAI SDK requires a non-empty credential even when a compatible local
+# server does not authenticate. This value is only an SDK adapter sentinel; it
+# is never persisted and is used only for the explicitly key-optional provider.
+_LOCAL_OPENAI_COMPATIBLE_API_KEY = "local-key"
 
 # LLM retry configuration
 _LLM_MAX_RETRIES = 4
@@ -124,13 +132,17 @@ def _get_openai_client(api_key: str | None, base_url: str | None, provider: str,
     if openai is None:
         raise RuntimeError("openai package is required for OpenAI-compatible providers.")
 
+    effective_api_key = api_key
+    if provider == "openai_compatible" and not effective_api_key:
+        effective_api_key = _LOCAL_OPENAI_COMPATIBLE_API_KEY
+
     # Include headers in cache key to handle cases like github-copilot
     headers_key = tuple(sorted((default_headers or {}).items())) if default_headers else ()
-    cache_key = (api_key or "", base_url or "", provider, headers_key)
+    cache_key = (effective_api_key or "", base_url or "", provider, headers_key)
     if cache_key in _openai_clients:
         return _openai_clients[cache_key]
 
-    client_kwargs: dict[str, Any] = {"api_key": api_key, "base_url": base_url}
+    client_kwargs: dict[str, Any] = {"api_key": effective_api_key, "base_url": base_url}
     if default_headers:
         client_kwargs["default_headers"] = default_headers
 
@@ -692,7 +704,6 @@ def normalize_llm_config(config: dict[str, Any] | None, *, default_model: str = 
             "anthropic": "ANTHROPIC_API_KEY",
             "grok": "XAI_API_KEY",
             "gemini": "GEMINI_API_KEY",
-            "openai_compatible": "OPENAI_API_KEY",
             "openai-chat-completions-endpoint": "OPENAI_API_KEY",
         }
         env_name = provider_env_map.get(provider)

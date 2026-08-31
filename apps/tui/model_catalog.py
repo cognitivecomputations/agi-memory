@@ -39,7 +39,7 @@ PROVIDER_SLUG: dict[str, str] = {
 
 # Non-chat model ids to hide from the dropdown (still typeable as free text).
 _NON_CHAT_RE = re.compile(
-    r"embed|tts|whisper|moderation|rerank|image|audio|video|dall.?e|imagen|"
+    r"embed|minilm|tts|whisper|moderation|rerank|image|audio|video|dall.?e|imagen|"
     r"veo|sora|guard|ocr|speech|transcrib",
     re.IGNORECASE,
 )
@@ -158,9 +158,46 @@ def chat_models(provider_block: dict) -> list[str]:
     return ids
 
 
-async def fetch_models(provider: str, *, endpoint: str | None = None) -> list[str]:
+async def _fetch_openai_compatible_models(
+    endpoint: str,
+    *,
+    api_key: str | None = None,
+) -> list[str]:
+    """Read model ids from the selected OpenAI-compatible server."""
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
+    data = await request_json(
+        "openai_compatible_models",
+        "GET",
+        f"{endpoint.rstrip('/')}/models",
+        headers=headers,
+        timeout=_TIMEOUT,
+        attempts=2,
+        max_delay=2.0,
+    )
+    rows = data.get("data", []) if isinstance(data, dict) else []
+    models: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        model_id = str(row.get("id") or "").strip()
+        if model_id and not _NON_CHAT_RE.search(model_id) and model_id not in models:
+            models.append(model_id)
+    return models
+
+
+async def fetch_models(
+    provider: str,
+    *,
+    endpoint: str | None = None,
+    api_key: str | None = None,
+) -> list[str]:
     """Best-effort current chat model ids for *provider* (newest first)."""
-    _ = endpoint
+    if provider == "openai_compatible":
+        if not endpoint:
+            return []
+        # Let callers surface endpoint/auth/network failures. Cloud-catalog
+        # lookup below remains best-effort because its list is only advisory.
+        return await _fetch_openai_compatible_models(endpoint, api_key=api_key)
     try:
         slug = PROVIDER_SLUG.get(provider)
         if not slug:

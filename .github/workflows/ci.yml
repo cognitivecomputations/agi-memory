@@ -117,6 +117,25 @@ jobs:
           docker logs hexisdb | tail -100 || true
           cat /tmp/fake_emb.log || true
 
+  # ------------------------------------------- locked dashboard install + build
+  ui:
+    runs-on: ubuntu-latest
+    env:
+      NEXT_TELEMETRY_DISABLED: "1"
+    defaults:
+      run:
+        working-directory: hexis-ui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: hexis-ui/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+
   # ------------------------------------------- prove an existing baked DB upgrades
   # cleanly (published image when accessible, local DB build as a fallback).
   migration-survivor:
@@ -182,7 +201,7 @@ jobs:
   # ------------------------------------------------ single required branch check
   all-checks-pass:
     if: always()
-    needs: [lint, test, migration-survivor, workflow-lint]
+    needs: [lint, test, ui, migration-survivor, workflow-lint]
     runs-on: ubuntu-latest
     steps:
       - name: Verify every required lane passed
