@@ -19,6 +19,33 @@ BEGIN
     );
 END;
 $$;
+CREATE OR REPLACE FUNCTION normalize_emotion_family(p_family TEXT)
+RETURNS TEXT AS $$
+DECLARE
+    candidate TEXT := lower(NULLIF(btrim(COALESCE(p_family, '')), ''));
+    families JSONB := COALESCE(get_config('emotion.families'), '{}'::jsonb);
+BEGIN
+    IF candidate IS NOT NULL AND jsonb_typeof(families) = 'object' AND families ? candidate THEN
+        RETURN candidate;
+    END IF;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql STABLE;
+CREATE OR REPLACE FUNCTION emotion_family_serves(p_family TEXT, p_consumer TEXT)
+RETURNS BOOLEAN AS $$
+DECLARE
+    family TEXT := normalize_emotion_family(p_family);
+    configured JSONB := COALESCE(get_config('emotion.family_consumers'), '{}'::jsonb);
+    accepted JSONB;
+BEGIN
+    IF family IS NULL OR NULLIF(btrim(COALESCE(p_consumer, '')), '') IS NULL
+       OR jsonb_typeof(configured) <> 'object' THEN
+        RETURN FALSE;
+    END IF;
+    accepted := configured->p_consumer;
+    RETURN jsonb_typeof(accepted) = 'array' AND accepted ? family;
+END;
+$$ LANGUAGE plpgsql STABLE;
 CREATE OR REPLACE FUNCTION normalize_affective_state(p_state JSONB)
 RETURNS JSONB AS $$
 DECLARE
@@ -32,6 +59,7 @@ DECLARE
     mood_valence FLOAT;
     mood_arousal FLOAT;
     primary_emotion TEXT;
+    emotion_family TEXT;
     source TEXT;
     updated_at TIMESTAMPTZ;
     mood_updated_at TIMESTAMPTZ;
@@ -102,6 +130,7 @@ BEGIN
     mood_arousal := LEAST(1.0, GREATEST(0.0, mood_arousal));
 
     primary_emotion := COALESCE(NULLIF(p_state->>'primary_emotion', ''), 'neutral');
+    emotion_family := normalize_emotion_family(p_state->>'family');
     secondary_emotion := NULLIF(p_state->>'secondary_emotion', '');
     trigger_summary := NULLIF(p_state->>'trigger_summary', '');
     source := COALESCE(NULLIF(p_state->>'source', ''), 'derived');
@@ -121,7 +150,8 @@ BEGIN
         'mood_valence', mood_valence,
         'mood_arousal', mood_arousal,
         'mood_updated_at', mood_updated_at
-    );
+    ) || CASE WHEN emotion_family IS NULL THEN '{}'::jsonb
+              ELSE jsonb_build_object('family', emotion_family) END;
 END;
 $$ LANGUAGE plpgsql STABLE;
 CREATE OR REPLACE FUNCTION get_current_affective_state()
@@ -147,6 +177,12 @@ DECLARE
 BEGIN
     SELECT affective_state INTO current_state FROM heartbeat_state WHERE id = 1;
     merged_state := COALESCE(current_state, '{}'::jsonb) || COALESCE(p_state, '{}'::jsonb);
+    -- A new free-form label without a structured family must not inherit a
+    -- stale family from the previous state.
+    IF COALESCE(p_state, '{}'::jsonb) ? 'primary_emotion'
+       AND NOT COALESCE(p_state, '{}'::jsonb) ? 'family' THEN
+        merged_state := jsonb_set(merged_state, '{family}', 'null'::jsonb, true);
+    END IF;
     merged_state := jsonb_set(merged_state, '{updated_at}', to_jsonb(CURRENT_TIMESTAMP), true);
     merged_state := normalize_affective_state(merged_state);
 
@@ -169,7 +205,8 @@ BEGIN
         'primary_emotion', COALESCE(st->>'primary_emotion', 'neutral'),
         'intensity', (st->>'intensity')::float,
         'source', COALESCE(st->>'source', 'derived')
-    );
+    ) || CASE WHEN normalize_emotion_family(st->>'family') IS NULL THEN '{}'::jsonb
+              ELSE jsonb_build_object('family', normalize_emotion_family(st->>'family')) END;
 EXCEPTION
     WHEN OTHERS THEN
         RETURN jsonb_build_object(
@@ -194,6 +231,7 @@ DECLARE
     new_arousal FLOAT;
     new_intensity FLOAT;
     new_primary TEXT;
+    new_family TEXT;
     dominance FLOAT;
 BEGIN
     current_state := get_current_affective_state();
@@ -202,6 +240,8 @@ BEGIN
     new_intensity := COALESCE((current_state->>'intensity')::float, 0.5);
     dominance := COALESCE((current_state->>'dominance')::float, 0.5);
     new_primary := COALESCE(NULLIF(p_target_emotion, ''), current_state->>'primary_emotion', 'neutral');
+    new_family := CASE WHEN NULLIF(p_target_emotion, '') IS NULL
+                       THEN normalize_emotion_family(current_state->>'family') END;
 
     CASE p_regulation_type
         WHEN 'suppress' THEN
@@ -235,6 +275,7 @@ BEGIN
         'arousal', new_arousal,
         'dominance', dominance,
         'primary_emotion', new_primary,
+        'family', new_family,
         'intensity', new_intensity,
         'source', 'regulated',
         'trigger_summary', format('Regulated via %s', p_regulation_type)
@@ -254,13 +295,11 @@ CREATE OR REPLACE FUNCTION sense_memory_availability(
 ) RETURNS JSONB AS $$
 DECLARE
     query_emb vector;
-    zero_vec vector;
     estimated_count INT;
     top_similarity FLOAT;
     activation_id UUID;
 BEGIN
     query_emb := COALESCE(p_query_embedding, (get_embedding(ARRAY[ensure_embedding_prefix(p_query, 'search_query')]))[1]);
-    zero_vec := array_fill(0.0::float, ARRAY[embedding_dimension()])::vector;
 
     SELECT
         COUNT(*),
@@ -269,8 +308,8 @@ BEGIN
     FROM memories
     WHERE status = 'active'
       AND (valid_until IS NULL OR valid_until > CURRENT_TIMESTAMP)
+      AND embedding_status = 'embedded'
       AND embedding IS NOT NULL
-      AND embedding <> zero_vec
       AND (1 - (embedding <=> query_emb)) > 0.5
     LIMIT 100;
 
@@ -721,6 +760,7 @@ DECLARE
     dominance FLOAT;
     intensity FLOAT;
     primary_emotion TEXT;
+    emotion_family TEXT;
     source TEXT;
 BEGIN
     meta := COALESCE(NEW.metadata, '{}'::jsonb);
@@ -757,6 +797,9 @@ BEGIN
     dominance := COALESCE(dominance, NULLIF(state->>'dominance', '')::float, 0.5);
     intensity := COALESCE(intensity, NULLIF(state->>'intensity', '')::float, 0.5);
     primary_emotion := COALESCE(NULLIF(context->>'primary_emotion', ''), NULLIF(state->>'primary_emotion', ''), 'neutral');
+    emotion_family := CASE WHEN context ? 'primary_emotion'
+                           THEN normalize_emotion_family(context->>'family')
+                           ELSE normalize_emotion_family(state->>'family') END;
     source := COALESCE(NULLIF(context->>'source', ''), NULLIF(state->>'source', ''), 'derived');
 
     valence := LEAST(1.0, GREATEST(-1.0, valence));
@@ -771,7 +814,8 @@ BEGIN
         'primary_emotion', primary_emotion,
         'intensity', intensity,
         'source', source
-    );
+    ) || CASE WHEN emotion_family IS NULL THEN '{}'::jsonb
+              ELSE jsonb_build_object('family', emotion_family) END;
 
     NEW.metadata := meta || jsonb_build_object(
         'emotional_context', context,
@@ -845,7 +889,9 @@ BEGIN
         'transformations_ready', check_transformation_readiness(),
         'energy', jsonb_build_object(
             'current', state_record.current_energy,
-            'max', get_config_float('heartbeat.max_energy')
+            'max', get_config_float('heartbeat.max_energy'),
+            'bank_capacity', heartbeat_bank_capacity(),
+            'next_regen_multiplier', heartbeat_outcome_regen_multiplier()
         ),
         'allowed_actions', allowed_actions,
         'action_costs', action_costs,
@@ -923,7 +969,9 @@ BEGIN
         'transformations_ready', check_transformation_readiness(),
         'energy', jsonb_build_object(
             'current', state_record.current_energy,
-            'max', get_config_float('heartbeat.max_energy')
+            'max', get_config_float('heartbeat.max_energy'),
+            'bank_capacity', heartbeat_bank_capacity(),
+            'next_regen_multiplier', heartbeat_outcome_regen_multiplier()
         ),
         'allowed_actions', allowed_actions,
         'action_costs', action_costs,

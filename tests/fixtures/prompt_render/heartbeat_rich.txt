@@ -21,7 +21,7 @@ Budget:
 Day of week: Tuesday, Hour: 12
 
 ## Environment
-- Time since last user interaction: 3 hours
+- Time since last user interaction: 3.0 hours
 - Pending events: 2
 - Journal: no entries yet
 

@@ -17,10 +17,17 @@ from core.integration_reliability import (
     IntegrationHttpError,
     compute_backoff_seconds,
     format_provider_error,
+    request_bytes_response,
     request_json,
 )
 
-from .base import ChannelAdapter, ChannelCapabilities, ChannelMessage, parse_allowlist, resolve_channel_token
+from .base import (
+    ChannelAdapter,
+    ChannelCapabilities,
+    ChannelMessage,
+    parse_allowlist,
+    resolve_forward_all,
+)
 from .media import Attachment
 
 logger = logging.getLogger(__name__)
@@ -34,7 +41,11 @@ def _resolve_token(config: dict[str, Any]) -> str | None:
     Phone numbers are short strings, so we can't use the generic
     resolve_channel_token (which requires len > 20 for raw values).
     """
-    phone_env = config.get("phone_number") or config.get("phone_number_env") or "SIGNAL_PHONE_NUMBER"
+    phone_env = (
+        config.get("phone_number")
+        or config.get("phone_number_env")
+        or "SIGNAL_PHONE_NUMBER"
+    )
     token = os.getenv(str(phone_env)) if phone_env else None
     if token:
         return token
@@ -56,13 +67,25 @@ class SignalAdapter(ChannelAdapter):
     Requires signal-cli-rest-api running as a sidecar service.
     """
 
-    def __init__(self, config: dict[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        config: dict[str, Any] | None = None,
+        *,
+        forward_all: bool | None = None,
+    ) -> None:
         self._config = config or {}
+        self._forward_all = resolve_forward_all(self._config, forward_all)
         self._on_message: Callable[[ChannelMessage], Awaitable[None]] | None = None
         self._connected = False
-        self._api_url = str(self._config.get("api_url") or os.getenv("SIGNAL_API_URL") or DEFAULT_API_URL).rstrip("/")
+        self._api_url = str(
+            self._config.get("api_url")
+            or os.getenv("SIGNAL_API_URL")
+            or DEFAULT_API_URL
+        ).rstrip("/")
         self._phone_number: str | None = None
-        self._allowed_numbers = self._parse_allowlist(self._config.get("allowed_numbers"))
+        self._allowed_numbers = self._parse_allowlist(
+            self._config.get("allowed_numbers")
+        )
         self._session = None
 
     @staticmethod
@@ -104,7 +127,9 @@ class SignalAdapter(ChannelAdapter):
         self._on_message = on_message
         self._session = aiohttp.ClientSession()
         self._connected = True
-        logger.info("Signal adapter started for %s via %s", self._phone_number, self._api_url)
+        logger.info(
+            "Signal adapter started for %s via %s", self._phone_number, self._api_url
+        )
 
         try:
             await self._listen_sse()
@@ -166,7 +191,9 @@ class SignalAdapter(ChannelAdapter):
                     max_delay=120.0,
                     jitter=0.2,
                 )
-                logger.exception("Signal SSE stream error, reconnecting in %.1fs", delay_s)
+                logger.exception(
+                    "Signal SSE stream error, reconnecting in %.1fs", delay_s
+                )
                 await asyncio.sleep(delay_s)
 
     async def _handle_sse_event(self, data_str: str) -> None:
@@ -185,10 +212,12 @@ class SignalAdapter(ChannelAdapter):
         if not source:
             return
 
-        # Check allowlist
+        gate_hint: str | None = None
         if self._allowed_numbers is not None:
             if source not in self._allowed_numbers:
-                return
+                if not self._forward_all:
+                    return
+                gate_hint = "not_allowlisted"
 
         text = data_message.get("message", "")
         group_info = data_message.get("groupInfo")
@@ -198,13 +227,15 @@ class SignalAdapter(ChannelAdapter):
         # Convert attachments
         attachments: list[Attachment] = []
         for att in data_message.get("attachments", []):
-            attachments.append(Attachment(
-                url=att.get("url", ""),
-                filename=att.get("filename"),
-                mime_type=att.get("contentType"),
-                size=att.get("size"),
-                platform_id=att.get("id"),
-            ))
+            attachments.append(
+                Attachment(
+                    url=att.get("url", ""),
+                    filename=att.get("filename"),
+                    mime_type=att.get("contentType"),
+                    size=att.get("size"),
+                    platform_id=att.get("id"),
+                )
+            )
 
         sender_name = envelope.get("sourceName") or source
 
@@ -218,6 +249,8 @@ class SignalAdapter(ChannelAdapter):
             attachments=attachments,
             metadata={
                 "is_group": group_info is not None,
+                "is_mention": False,
+                **({"gate_hint": gate_hint} if gate_hint else {}),
             },
         )
 
@@ -229,6 +262,38 @@ class SignalAdapter(ChannelAdapter):
         if self._session and not self._session.closed:
             await self._session.close()
         self._session = None
+
+    async def download_attachment(
+        self, attachment: Attachment, *, max_size: int
+    ) -> Attachment:
+        """Fetch sidecar-hosted media while keeping the configured host explicit."""
+
+        if attachment.local_path or not attachment.url:
+            return attachment
+        if attachment.size is not None and attachment.size > max_size:
+            return attachment
+        from urllib.parse import urlparse
+
+        if urlparse(attachment.url).netloc != urlparse(self._api_url).netloc:
+            return await super().download_attachment(attachment, max_size=max_size)
+        response = await request_bytes_response(
+            "signal-media",
+            "GET",
+            attachment.url,
+            timeout=30.0,
+            attempts=3,
+            max_delay=5.0,
+            follow_redirects=False,
+            max_bytes=max_size,
+        )
+        from .media import materialize_attachment_bytes
+
+        return materialize_attachment_bytes(
+            attachment,
+            response.content,
+            content_type=response.headers.get("content-type"),
+            prefix="hexis-signal-",
+        )
 
     async def send(
         self,

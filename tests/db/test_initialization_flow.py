@@ -27,7 +27,12 @@ async def test_get_init_profile_and_merge(db_pool):
             _coerce_json(
                 await conn.fetchval(
                     "SELECT merge_init_profile($1::jsonb)",
-                    json.dumps({"agent": {"voice": "calm"}, "relationship": {"type": "partner"}}),
+                    json.dumps(
+                        {
+                            "agent": {"voice": "calm"},
+                            "relationship": {"type": "partner"},
+                        }
+                    ),
                 )
             )
             profile = _coerce_json(await conn.fetchval("SELECT get_init_profile()"))
@@ -45,18 +50,24 @@ async def test_init_llm_config_and_mode(db_pool):
         await tr.start()
         try:
             await conn.execute("LOAD 'age';")
-            await conn.execute(
-                """
+            await conn.execute("""
                 UPDATE heartbeat_state
                 SET init_stage = 'not_started',
                     init_data = '{}'::jsonb,
                     init_started_at = NULL,
                     init_completed_at = NULL
                 WHERE id = 1
-                """
-            )
-            heartbeat_cfg = {"provider": "openai", "model": "gpt-4o", "api_key_env": "OPENAI_API_KEY"}
-            sub_cfg = {"provider": "anthropic", "model": "claude-sonnet-4-5-latest", "api_key_env": "ANTHROPIC_API_KEY"}
+                """)
+            heartbeat_cfg = {
+                "provider": "openai",
+                "model": "gpt-4o",
+                "api_key_env": "OPENAI_API_KEY",
+            }
+            sub_cfg = {
+                "provider": "anthropic",
+                "model": "claude-sonnet-4-5-latest",
+                "api_key_env": "ANTHROPIC_API_KEY",
+            }
 
             status = _coerce_json(
                 await conn.fetchval(
@@ -67,14 +78,21 @@ async def test_init_llm_config_and_mode(db_pool):
             )
             assert status["stage"] == "llm"
 
-            stored = _coerce_json(await conn.fetchval("SELECT get_config('llm.heartbeat')"))
+            stored = _coerce_json(
+                await conn.fetchval("SELECT get_config('llm.heartbeat')")
+            )
             assert stored["provider"] == "openai"
-            stored_sub = _coerce_json(await conn.fetchval("SELECT get_config('llm.subconscious')"))
+            stored_sub = _coerce_json(
+                await conn.fetchval("SELECT get_config('llm.subconscious')")
+            )
             assert stored_sub["provider"] == "anthropic"
 
             mode_status = _coerce_json(await conn.fetchval("SELECT init_mode('raw')"))
             assert mode_status["stage"] == "mode"
-            assert _coerce_json(await conn.fetchval("SELECT get_config('agent.mode')")) == "raw"
+            assert (
+                _coerce_json(await conn.fetchval("SELECT get_config('agent.mode')"))
+                == "raw"
+            )
         finally:
             await tr.rollback()
 
@@ -84,16 +102,14 @@ async def test_init_heartbeat_settings_updates_config(db_pool):
         tr = conn.transaction()
         await tr.start()
         try:
-            await conn.execute(
-                """
+            await conn.execute("""
                 UPDATE heartbeat_state
                 SET init_stage = 'not_started',
                     init_data = '{}'::jsonb,
                     init_started_at = NULL,
                     init_completed_at = NULL
                 WHERE id = 1
-                """
-            )
+                """)
             payload = _coerce_json(
                 await conn.fetchval(
                     """
@@ -118,22 +134,34 @@ async def test_init_heartbeat_settings_updates_config(db_pool):
             )
             assert payload["stage"] == "heartbeat"
 
-            interval = await conn.fetchval("SELECT get_config_int('heartbeat.heartbeat_interval_minutes')")
-            tokens = await conn.fetchval("SELECT get_config_int('heartbeat.max_decision_tokens')")
+            interval = await conn.fetchval(
+                "SELECT get_config_int('heartbeat.heartbeat_interval_minutes')"
+            )
+            tokens = await conn.fetchval(
+                "SELECT get_config_int('heartbeat.max_decision_tokens')"
+            )
             assert interval == 15
             assert tokens == 512
 
-            allowed = _coerce_json(await conn.fetchval("SELECT get_config('heartbeat.allowed_actions')"))
+            allowed = _coerce_json(
+                await conn.fetchval("SELECT get_config('heartbeat.allowed_actions')")
+            )
             assert allowed == ["observe", "rest"]
-            costs = _coerce_json(await conn.fetchval("SELECT get_config('heartbeat.cost_rest')"))
+            costs = _coerce_json(
+                await conn.fetchval("SELECT get_config('heartbeat.cost_rest')")
+            )
             assert float(costs) == 0.1
-            tools = _coerce_json(await conn.fetchval("SELECT get_config('agent.tools')"))
+            tools = _coerce_json(
+                await conn.fetchval("SELECT get_config('agent.tools')")
+            )
             assert tools == ["recall", "reflect"]
         finally:
             await tr.rollback()
 
 
-async def test_init_identity_personality_values_worldview(db_pool, ensure_embedding_service):
+async def test_init_identity_personality_values_worldview(
+    db_pool, ensure_embedding_service
+):
     async with db_pool.acquire() as conn:
         tr = conn.transaction()
         await tr.start()
@@ -212,7 +240,9 @@ async def test_init_identity_personality_values_worldview(db_pool, ensure_embedd
             await tr.rollback()
 
 
-async def test_init_boundaries_interests_goals_relationship(db_pool, ensure_embedding_service):
+async def test_init_boundaries_interests_goals_relationship(
+    db_pool, ensure_embedding_service
+):
     async with db_pool.acquire() as conn:
         tr = conn.transaction()
         await tr.start()
@@ -220,10 +250,20 @@ async def test_init_boundaries_interests_goals_relationship(db_pool, ensure_embe
             boundaries = _coerce_json(
                 await conn.fetchval(
                     "SELECT init_boundaries($1::jsonb)",
-                    json.dumps([
-                        {"content": "No harm", "response_type": "refuse", "type": "ethical"},
-                        {"content": "No secrets", "response_type": "refuse", "type": "privacy"},
-                    ]),
+                    json.dumps(
+                        [
+                            {
+                                "content": "No harm",
+                                "response_type": "refuse",
+                                "type": "ethical",
+                            },
+                            {
+                                "content": "No secrets",
+                                "response_type": "refuse",
+                                "type": "privacy",
+                            },
+                        ]
+                    ),
                 )
             )
             assert boundaries["stage"] == "boundaries"
@@ -239,10 +279,27 @@ async def test_init_boundaries_interests_goals_relationship(db_pool, ensure_embe
             goals = _coerce_json(
                 await conn.fetchval(
                     "SELECT init_goals($1::jsonb)",
-                    json.dumps({"goals": [{"title": "Learn", "priority": "queued", "source": "curiosity"}]}),
+                    json.dumps(
+                        {
+                            "goals": [
+                                {
+                                    "title": "Learn",
+                                    "priority": "queued",
+                                    "source": "curiosity",
+                                }
+                            ]
+                        }
+                    ),
                 )
             )
             assert goals["stage"] == "goals"
+            assert (
+                await conn.fetchval(
+                    "SELECT goal_origin::text FROM memories "
+                    "WHERE type = 'goal' AND metadata->>'title' = 'Learn'"
+                )
+                == "user_request"
+            )
 
             relationship = _coerce_json(
                 await conn.fetchval(
@@ -266,15 +323,15 @@ async def test_request_consent_and_init_consent(db_pool, ensure_embedding_servic
         tr = conn.transaction()
         await tr.start()
         try:
-            await conn.execute(
-                """
+            await conn.execute("""
                 UPDATE heartbeat_state
                 SET init_stage = 'relationship',
                     init_data = '{}'::jsonb
                 WHERE id = 1
-                """
+                """)
+            consent_request = _coerce_json(
+                await conn.fetchval("SELECT request_consent('{}'::jsonb)")
             )
-            consent_request = _coerce_json(await conn.fetchval("SELECT request_consent('{}'::jsonb)"))
             assert consent_request["queued"] is True
             assert consent_request["external_call"]["call_type"] == "think"
 
@@ -334,26 +391,22 @@ async def test_init_with_defaults_and_reset(db_pool, ensure_embedding_service):
                 )
             )
             assert result["status"]["stage"] == "consent"
-            assert await conn.fetchval(
-                """
+            assert await conn.fetchval("""
                 SELECT EXISTS (
                     SELECT 1 FROM memories
                     WHERE type = 'worldview'
                       AND status = 'active'
                       AND content = 'I am in a co-development partnership with Tester.'
                 )
-                """
-            )
-            assert not await conn.fetchval(
-                """
+                """)
+            assert not await conn.fetchval("""
                 SELECT EXISTS (
                     SELECT 1 FROM memories
                     WHERE type = 'worldview'
                       AND status = 'active'
                       AND content = 'My relationship with Tester is partner.'
                 )
-                """
-            )
+                """)
 
             status = _coerce_json(
                 await timed_db_call(
@@ -411,10 +464,18 @@ async def test_character_card_is_stored_in_config_and_exposed_to_prompt(
             assert profile["agent"]["name"] == "Samantha"
             assert profile["agent"]["voice"] == "warm and charismatic"
             assert profile["character_card"]["spec"] == "chara_card_v2"
-            assert profile["character_card"]["data"]["system_prompt"] == card["data"]["system_prompt"]
+            assert (
+                profile["character_card"]["data"]["system_prompt"]
+                == card["data"]["system_prompt"]
+            )
 
-            context = _coerce_json(await conn.fetchval("SELECT get_agent_profile_context()"))
-            assert context["persona"]["character_instructions"] == card["data"]["system_prompt"]
+            context = _coerce_json(
+                await conn.fetchval("SELECT get_agent_profile_context()")
+            )
+            assert (
+                context["persona"]["character_instructions"]
+                == card["data"]["system_prompt"]
+            )
             assert context["persona"]["scenario"] == card["data"]["scenario"]
             assert context["persona"]["example_dialogue"] == card["data"]["mes_example"]
         finally:
@@ -428,8 +489,16 @@ async def test_run_full_initialization(db_pool, ensure_embedding_service):
         try:
             payload = {
                 "llm": {
-                    "heartbeat": {"provider": "openai", "model": "gpt-4o", "api_key_env": "OPENAI_API_KEY"},
-                    "subconscious": {"provider": "openai", "model": "gpt-4o", "api_key_env": "OPENAI_API_KEY"},
+                    "heartbeat": {
+                        "provider": "openai",
+                        "model": "gpt-4o",
+                        "api_key_env": "OPENAI_API_KEY",
+                    },
+                    "subconscious": {
+                        "provider": "openai",
+                        "model": "gpt-4o",
+                        "api_key_env": "OPENAI_API_KEY",
+                    },
                 },
                 "mode": "persona",
                 "heartbeat": {
@@ -442,8 +511,15 @@ async def test_run_full_initialization(db_pool, ensure_embedding_service):
                 "worldview": {"ethics": "kindness"},
                 "boundaries": ["No harm"],
                 "interests": ["learning"],
-                "goals": {"goals": [{"title": "Grow", "priority": "queued", "source": "identity"}]},
-                "relationship": {"user": {"name": "User"}, "relationship": {"type": "partner"}},
+                "goals": {
+                    "goals": [
+                        {"title": "Grow", "priority": "queued", "source": "identity"}
+                    ]
+                },
+                "relationship": {
+                    "user": {"name": "User"},
+                    "relationship": {"type": "partner"},
+                },
                 "consent": {"decision": "decline"},
             }
 

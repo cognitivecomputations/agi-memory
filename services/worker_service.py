@@ -6,16 +6,21 @@ import json
 import logging
 import os
 import socket
+from collections import deque
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from typing import Any
 import asyncpg
-from dotenv import load_dotenv
+
+# Import order is intentional: this loads the explicitly selected environment
+# before modules below derive process-level connection constants.
+from services import worker_environment as _worker_environment  # noqa: F401
 
 from core.agent_api import db_dsn_from_env
 from core.gateway import EventSource, Gateway, GatewayConsumer, GatewayEvent
 from core.rabbitmq_bridge import RabbitMQBridge
 from core.state import (
+    has_pending_inbound_disposition_wake,
     is_agent_terminated,
     mark_subconscious_decider_run,
     recompute_cron_next_runs,
@@ -45,12 +50,13 @@ from services.connector_cognition import (
 from services.gmail_backfill import run_gmail_backfill_step
 from services.ambient_responsibilities import run_ambient_responsibility_step
 from services.summarization import run_memory_summarization_step
-from services.skill_improvement import run_skill_improvement_review_step
+from services.skill_improvement import (
+    apply_approved_learning_skill_step,
+    run_skill_improvement_review_step,
+)
 from services.reconsolidation import run_reconsolidation_step
+from services.retention_surface import publish_retention_surface
 from services.subconscious import run_subconscious_decider
-
-
-load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -62,7 +68,9 @@ POLL_INTERVAL = float(os.getenv("WORKER_POLL_INTERVAL", 1.0))
 MAX_RETRIES = int(os.getenv("WORKER_MAX_RETRIES", 3))
 WORKER_STORM_MAX_STARTS = int(os.getenv("WORKER_STORM_MAX_STARTS", 5))
 WORKER_STORM_WINDOW_SECONDS = int(os.getenv("WORKER_STORM_WINDOW_SECONDS", 120))
-WORKER_STORM_BACKOFF_CAP_SECONDS = int(os.getenv("WORKER_STORM_BACKOFF_CAP_SECONDS", 300))
+WORKER_STORM_BACKOFF_CAP_SECONDS = int(
+    os.getenv("WORKER_STORM_BACKOFF_CAP_SECONDS", 300)
+)
 
 
 def _json_payload(value: Any) -> str:
@@ -93,14 +101,18 @@ async def channel_adapters_active(conn: asyncpg.Connection) -> bool:
     delivery.
     """
     try:
-        return bool(await conn.fetchval(
-            "SELECT EXISTS (SELECT 1 FROM channel_adapter_runtime WHERE configured OR running)"
-        ))
+        return bool(
+            await conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM channel_adapter_runtime WHERE configured OR running)"
+            )
+        )
     except Exception:
         return True
 
 
-async def tee_outbox_to_web_inbox(conn: asyncpg.Connection, messages: list[dict]) -> int:
+async def tee_outbox_to_web_inbox(
+    conn: asyncpg.Connection, messages: list[dict]
+) -> int:
     """Make dashboard delivery independent of the channel worker.
 
     ChannelOutboxConsumer also tees RabbitMQ messages into web_inbox. This
@@ -141,18 +153,30 @@ async def tee_outbox_to_web_inbox(conn: asyncpg.Connection, messages: list[dict]
     return delivered
 
 
+def _worker_logger_name(mode: str) -> str:
+    """Distinguish heartbeat_worker/maintenance_worker in aggregated logs
+    (#115) -- "both" (a single combined process) gets its own neutral name
+    rather than reusing either container's specific one."""
+    return f"{mode}_worker" if mode in ("heartbeat", "maintenance") else "worker"
+
+
 def _worker_metadata() -> dict[str, Any]:
+    from core.agent_api import worker_code_stamp_metadata
+
     return {
         "process_id": os.getpid(),
         "host_name": socket.gethostname(),
         "command": "hexis-worker",
+        **worker_code_stamp_metadata(),
     }
 
 
 async def _recover_worker_runtime(pool: asyncpg.Pool) -> None:
     try:
         async with pool.acquire() as conn:
-            await conn.fetchval("SELECT recover_interrupted_worker_runs($1::interval)", "10 minutes")
+            await conn.fetchval(
+                "SELECT recover_interrupted_worker_runs($1::interval)", "10 minutes"
+            )
     except Exception:
         logger.debug("worker runtime recovery unavailable", exc_info=True)
 
@@ -205,7 +229,9 @@ async def _register_worker_instance(
     metadata = _worker_metadata()
     try:
         await _recover_worker_runtime(pool)
-        storm = await _record_worker_start_and_maybe_backoff(pool, mode, instance, metadata)
+        storm = await _record_worker_start_and_maybe_backoff(
+            pool, mode, instance, metadata
+        )
         if isinstance(storm, dict):
             metadata["start_storm"] = storm
         async with pool.acquire() as conn:
@@ -378,7 +404,9 @@ async def _record_worker_task_outcome(
             )
         return str(run_id) if run_id else None
     except Exception:
-        logger.debug("worker task outcome recording failed for %s", task_type, exc_info=True)
+        logger.debug(
+            "worker task outcome recording failed for %s", task_type, exc_info=True
+        )
         return None
 
 
@@ -395,24 +423,55 @@ class HeartbeatWorker:
     dequeues and executes the actual heartbeat logic.
     """
 
+    BELIEF_UPDATES_BUFFER_SIZE = 32
+
     def __init__(self, instance: str | None = None):
         self.instance = instance or os.getenv("HEXIS_INSTANCE")
         self.pool: asyncpg.Pool | None = None
+        self.tool_registry = None
         self.running = False
         self.worker_id: str | None = None
+        self._belief_listener = None
+        self._belief_updates_recent: deque[dict[str, Any]] = deque(
+            maxlen=self.BELIEF_UPDATES_BUFFER_SIZE
+        )
 
     async def connect(self) -> None:
         self.pool = await asyncpg.create_pool(
-            dsn=db_dsn_from_env(self.instance), min_size=1, max_size=5,
+            dsn=db_dsn_from_env(self.instance),
+            min_size=1,
+            max_size=5,
         )
-        self.worker_id = await _register_worker_instance(self.pool, "heartbeat", self.instance)
+        self.worker_id = await _register_worker_instance(
+            self.pool, "heartbeat", self.instance
+        )
+        from services.belief_propagation import BeliefUpdateListener
+
+        self._belief_listener = BeliefUpdateListener(self.pool, worker_id="heartbeat")
+        self._belief_listener.add_handler(self._record_belief_update)
+        await self._belief_listener.start()
         logger.info("HeartbeatWorker connected to database")
 
     async def disconnect(self) -> None:
+        if self._belief_listener is not None:
+            await self._belief_listener.stop()
+            self._belief_listener = None
         if self.pool:
             await _mark_worker_stopped(self.pool, self.worker_id, reason="shutdown")
             await self.pool.close()
             logger.info("HeartbeatWorker disconnected")
+
+    async def _record_belief_update(self, payload: dict[str, Any]) -> None:
+        self._belief_updates_recent.append(payload)
+        logger.info(
+            "Belief update received: memory=%s kind=%s log=%s",
+            payload.get("memory_id"),
+            payload.get("change_kind"),
+            payload.get("log_id"),
+        )
+
+    def get_recent_belief_updates(self) -> list[dict[str, Any]]:
+        return list(self._belief_updates_recent)
 
     async def _submit_heartbeat_if_due(self) -> dict[str, Any]:
         if not self.pool:
@@ -439,7 +498,10 @@ class HeartbeatWorker:
                 f"heartbeat:{heartbeat_id or 'unknown'}",
                 payload,
             )
-            result = {"heartbeat_id": str(heartbeat_id) if heartbeat_id else None, "submitted": True}
+            result = {
+                "heartbeat_id": str(heartbeat_id) if heartbeat_id else None,
+                "submitted": True,
+            }
             await _complete_worker_task_run(self.pool, run_id, result)
             return result
         except Exception:
@@ -450,7 +512,10 @@ class HeartbeatWorker:
                 "failed to submit heartbeat event",
                 {"heartbeat_id": str(heartbeat_id) if heartbeat_id else None},
             )
-            return {"failed": True, "heartbeat_id": str(heartbeat_id) if heartbeat_id else None}
+            return {
+                "failed": True,
+                "heartbeat_id": str(heartbeat_id) if heartbeat_id else None,
+            }
 
     async def run(self) -> None:
         self.running = True
@@ -461,13 +526,17 @@ class HeartbeatWorker:
             while self.running:
                 try:
                     await _mark_worker_seen(self.pool, self.worker_id)
+                    await self._probe_capabilities_if_due()
                     if await self._is_agent_terminated():
                         logger.info("Agent is terminated; heartbeat timer exiting.")
                         break
                     if not await self._is_agent_ready():
                         await asyncio.sleep(POLL_INTERVAL)
                         continue
-                    if not await self._is_active_hour():
+                    if (
+                        not await self._is_active_hour()
+                        and not await self._has_pending_inbound_wake()
+                    ):
                         logger.debug("Outside active hours; skipping heartbeat.")
                         await asyncio.sleep(POLL_INTERVAL * 10)
                         continue
@@ -481,6 +550,21 @@ class HeartbeatWorker:
     def stop(self) -> None:
         self.running = False
         logger.info("HeartbeatWorker (timer) stopping...")
+
+    async def _probe_capabilities_if_due(self) -> dict[str, Any]:
+        if not self.pool or self.tool_registry is None:
+            return {"skipped": True, "reason": "registry_not_ready"}
+        from services.capability_probe import run_probe_if_due
+
+        results = await run_probe_if_due(
+            self.pool,
+            self.tool_registry,
+            worker_name="heartbeat",
+            worker_id=self.worker_id,
+        )
+        if results is None:
+            return {"skipped": True, "reason": "not_due"}
+        return {"measured": len(results)}
 
     async def _is_agent_terminated(self) -> bool:
         if not self.pool:
@@ -496,7 +580,11 @@ class HeartbeatWorker:
             return False
         try:
             async with self.pool.acquire() as conn:
-                return bool(await conn.fetchval("SELECT is_agent_configured() AND is_init_complete()"))
+                return bool(
+                    await conn.fetchval(
+                        "SELECT is_agent_configured() AND is_init_complete()"
+                    )
+                )
         except Exception:
             return False
 
@@ -510,6 +598,12 @@ class HeartbeatWorker:
             return bool(result) if result is not None else True
         except Exception:
             return True
+
+    async def _has_pending_inbound_wake(self) -> bool:
+        if not self.pool:
+            return False
+        async with self.pool.acquire() as conn:
+            return await has_pending_inbound_disposition_wake(conn)
 
 
 # ---------------------------------------------------------------------------
@@ -574,7 +668,9 @@ def create_heartbeat_handler(
             try:
                 await tee_outbox_to_web_inbox(conn, messages)
             except Exception:
-                logger.warning("web_inbox tee failed for heartbeat outbox", exc_info=True)
+                logger.warning(
+                    "web_inbox tee failed for heartbeat outbox", exc_info=True
+                )
             if bridge and await channel_adapters_active(conn):
                 await bridge.publish_outbox_payloads(messages)
 
@@ -634,7 +730,10 @@ def create_heartbeat_handler(
                 except Exception as exc:
                     logger.error(f"Heartbeat finalization failed: {exc}")
 
-                return {"path": "agentic", "stopped_reason": result.get("stopped_reason")}
+                return {
+                    "path": "agentic",
+                    "stopped_reason": result.get("stopped_reason"),
+                }
 
             # Legacy heartbeat path
             external_calls = payload.get("external_calls")
@@ -649,7 +748,9 @@ def create_heartbeat_handler(
                 if not isinstance(call_input, dict):
                     call_input = {}
                 try:
-                    result = await call_processor.process_call_payload(conn, call_type, call_input)
+                    result = await call_processor.process_call_payload(
+                        conn, call_type, call_input
+                    )
                     applied = await call_processor.apply_result(conn, call, result)
                 except Exception as exc:
                     logger.error(f"Error processing external call: {exc}")
@@ -675,7 +776,9 @@ def create_heartbeat_handler(
                             pre_executed_actions=result.get("rlm_repl_actions"),
                         )
                     except Exception:
-                        await conn.fetchval("SELECT release_active_heartbeat($1)", str(heartbeat_id))
+                        await conn.fetchval(
+                            "SELECT release_active_heartbeat($1)", str(heartbeat_id)
+                        )
                         raise
                     if isinstance(exec_result, dict):
                         outbox_messages = exec_result.get("outbox_messages")
@@ -709,8 +812,12 @@ class MaintenanceWorker:
         self.worker_id: str | None = None
 
     async def connect(self) -> None:
-        self.pool = await asyncpg.create_pool(dsn=db_dsn_from_env(self.instance), min_size=1, max_size=5)
-        self.worker_id = await _register_worker_instance(self.pool, "maintenance", self.instance)
+        self.pool = await asyncpg.create_pool(
+            dsn=db_dsn_from_env(self.instance), min_size=1, max_size=5
+        )
+        self.worker_id = await _register_worker_instance(
+            self.pool, "maintenance", self.instance
+        )
         logger.info("Connected to database")
         self.bridge = RabbitMQBridge(self.pool)
         await self.bridge.ensure_ready()
@@ -743,7 +850,18 @@ class MaintenanceWorker:
             logger.exception("Maintenance task %s failed", task_type)
             return {"failed": True, "error": str(exc)}
 
-        if _result_has_work(result):
+        if isinstance(result, dict) and result.get("failed"):
+            await _record_worker_task_outcome(
+                self.pool,
+                self.worker_id,
+                task_type,
+                status="failed",
+                started_at=started_at,
+                finished_at=datetime.now(timezone.utc),
+                result=result,
+                error=str(result.get("error") or "task reported failure"),
+            )
+        elif _result_has_work(result):
             await _record_worker_task_outcome(
                 self.pool,
                 self.worker_id,
@@ -755,8 +873,12 @@ class MaintenanceWorker:
             )
         return result
 
-    def _maintenance_task_runners(self) -> list[tuple[str, Callable[[], Awaitable[Any]]]]:
+    def _maintenance_task_runners(
+        self,
+    ) -> list[tuple[str, Callable[[], Awaitable[Any]]]]:
         return [
+            ("capability_probe", self._probe_capabilities_if_due),
+            ("automation_suggestions", self._run_automation_suggestions),
             ("inbox_poll", self._run_inbox_poll),
             ("outbox_delivery", self._run_outbox_delivery),
             ("scheduled_tasks", self._run_scheduled_tasks),
@@ -766,17 +888,57 @@ class MaintenanceWorker:
             ("subconscious_decider", self._run_subconscious_if_due),
             ("reconsolidation", self._run_reconsolidation_if_pending),
             ("memory_embedding", self._run_memory_embedding),
+            ("contradiction_detection", self._run_contradiction_detection),
+            ("contradiction_digest", self._run_contradiction_digest),
             ("recmem", self._run_recmem_if_enabled),
             ("source_chunk_embedding", self._run_source_chunk_embedding),
             ("memory_summarization", self._run_memory_rest_if_enabled),
+            ("retention_surface", self._run_retention_surface),
             ("conscious_extraction", self._run_extraction_if_enabled),
             ("origin_seed", self._run_origin_seed_if_enabled),
             ("skill_improvement", self._run_skill_improvement_if_due),
+            ("learning_skill_application", self._run_approved_learning_skill),
             ("gmail_backfill", self._run_gmail_backfill_jobs),
             ("channel_backfill", self._run_channel_backfill_jobs),
             ("connector_cognition", self._run_connector_cognition),
+            ("belief_update_retention", self._prune_belief_update_log),
             ("ingestion_jobs", self._run_ingestion_jobs),
         ]
+
+    async def _prune_belief_update_log(self) -> dict[str, Any]:
+        if not self.pool:
+            return {"skipped": True, "reason": "no_pool"}
+        async with self.pool.acquire() as conn:
+            deleted = int(await conn.fetchval("SELECT prune_belief_update_log()") or 0)
+        if deleted:
+            logger.info("Pruned %s stale belief-update events", deleted)
+            return {"deleted": deleted}
+        return {"skipped": True, "reason": "nothing_expired"}
+
+    async def _probe_capabilities_if_due(self) -> dict[str, Any]:
+        if not self.pool or self.tool_registry is None:
+            return {"skipped": True, "reason": "registry_not_ready"}
+        from services.capability_probe import run_probe_if_due
+
+        results = await run_probe_if_due(
+            self.pool,
+            self.tool_registry,
+            worker_name="maintenance",
+            worker_id=self.worker_id,
+        )
+        if results is None:
+            return {"skipped": True, "reason": "not_due"}
+        return {"measured": len(results)}
+
+    async def _run_automation_suggestions(self) -> dict[str, Any]:
+        if not self.pool:
+            return {"skipped": True, "reason": "no_pool"}
+        from services.automation_suggestions import refresh_automation_suggestions
+
+        result = await refresh_automation_suggestions(self.pool)
+        if not result.get("skipped"):
+            logger.info("Automation suggestion refresh: %s", result)
+        return result
 
     async def _publish_outbox(self, messages: list[dict]) -> None:
         if not messages:
@@ -784,7 +946,9 @@ class MaintenanceWorker:
         if self.bridge:
             await self.bridge.publish_outbox_payloads(messages)
 
-    async def _tee_outbox_to_web_inbox(self, conn: asyncpg.Connection, messages: list[dict]) -> int:
+    async def _tee_outbox_to_web_inbox(
+        self, conn: asyncpg.Connection, messages: list[dict]
+    ) -> int:
         return await tee_outbox_to_web_inbox(conn, messages)
 
     async def _run_inbox_poll(self) -> dict[str, Any]:
@@ -824,9 +988,13 @@ class MaintenanceWorker:
                 published = len(ids)
                 broker = "skipped_no_adapters"
             if published > 0:
-                await conn.fetchval("SELECT mark_outbox_published($1::uuid[])", ids[:published])
+                await conn.fetchval(
+                    "SELECT mark_outbox_published($1::uuid[])", ids[:published]
+                )
             if published < len(ids):
-                await conn.fetchval("SELECT requeue_outbox($1::uuid[])", ids[published:])
+                await conn.fetchval(
+                    "SELECT requeue_outbox($1::uuid[])", ids[published:]
+                )
             return {
                 "claimed": len(ids),
                 "published": int(published),
@@ -848,7 +1016,11 @@ class MaintenanceWorker:
                 if delivered:
                     payload["web_inbox_delivered"] = delivered
                 await self._publish_outbox(outbox_messages)
-            executed = payload.get("ran") or payload.get("executed_count") or payload.get("executed")
+            executed = (
+                payload.get("ran")
+                or payload.get("executed_count")
+                or payload.get("executed")
+            )
             ran_tasks = payload.get("ran_tasks") or []
             if executed:
                 try:
@@ -868,7 +1040,11 @@ class MaintenanceWorker:
                     logger.warning("Cron recompute failed (non-fatal)", exc_info=True)
             if executed:
                 return payload
-            return {"skipped": True, "reason": "no_due_scheduled_tasks", "payload": payload}
+            return {
+                "skipped": True,
+                "reason": "no_due_scheduled_tasks",
+                "payload": payload,
+            }
 
     async def _run_ambient_responsibilities(self) -> dict[str, Any]:
         if not self.pool:
@@ -888,7 +1064,11 @@ class MaintenanceWorker:
                 await Gateway(self.pool).record(
                     EventSource.CRON,
                     "cron::ambient_responsibility",
-                    {"summary": {k: v for k, v in payload.items() if k != "outbox_messages"}},
+                    {
+                        "summary": {
+                            k: v for k, v in payload.items() if k != "outbox_messages"
+                        }
+                    },
                 )
             except Exception:
                 logger.debug("Gateway record failed (non-fatal)", exc_info=True)
@@ -945,6 +1125,28 @@ class MaintenanceWorker:
             if not result.get("skipped"):
                 logger.info(f"Reconsolidation step: {result}")
             return result
+
+    async def _run_contradiction_detection(self) -> dict[str, Any]:
+        if not self.pool:
+            return {"skipped": True, "reason": "no_pool"}
+        from services.contradictions import run_contradiction_detection_step
+
+        async with self.pool.acquire() as conn:
+            result = await run_contradiction_detection_step(conn)
+        if not result.get("skipped"):
+            logger.info("Contradiction detection: %s", result)
+        return result
+
+    async def _run_contradiction_digest(self) -> dict[str, Any]:
+        if not self.pool:
+            return {"skipped": True, "reason": "no_pool"}
+        from services.contradictions import publish_contradiction_digest
+
+        async with self.pool.acquire() as conn:
+            result = await publish_contradiction_digest(conn)
+        if not result.get("skipped"):
+            logger.info("Contradiction review digest: %s", result)
+        return result
 
     async def _run_ingestion_jobs(self) -> dict[str, Any]:
         """Durable ingestion jobs (#87): the queue table is the state — no
@@ -1014,7 +1216,9 @@ class MaintenanceWorker:
             should_sweep = bool(await conn.fetchval("SELECT should_run_recmem_sweep()"))
             if should_sweep:
                 sweep_result = await run_recmem_sweep_step(conn)
-                await conn.fetchval("SELECT mark_recmem_sweep_run($1::jsonb)", json.dumps(sweep_result))
+                await conn.fetchval(
+                    "SELECT mark_recmem_sweep_run($1::jsonb)", json.dumps(sweep_result)
+                )
                 if sweep_result.get("processed", 0):
                     logger.info("RecMem sweep step: %s", sweep_result)
                 summary["sweep"] = sweep_result
@@ -1023,17 +1227,29 @@ class MaintenanceWorker:
             # Scene consolidation (#73): sessions gone quiet become one
             # episode_create task covering the whole conversation.
             if bool(await conn.fetchval("SELECT should_run_scene_consolidation()")):
-                scene_result = await conn.fetchval("SELECT enqueue_scene_consolidations()")
-                scene_doc = json.loads(scene_result) if isinstance(scene_result, str) else (scene_result or {})
+                scene_result = await conn.fetchval(
+                    "SELECT enqueue_scene_consolidations()"
+                )
+                scene_doc = (
+                    json.loads(scene_result)
+                    if isinstance(scene_result, str)
+                    else (scene_result or {})
+                )
                 await conn.fetchval(
-                    "SELECT mark_scene_consolidation_run($1::jsonb)", json.dumps(scene_doc)
+                    "SELECT mark_scene_consolidation_run($1::jsonb)",
+                    json.dumps(scene_doc),
                 )
                 if scene_doc.get("enqueued"):
                     logger.info("Scene consolidation: %s", scene_doc)
                     did_work = True
                 summary["scene_consolidation"] = scene_doc
 
-            task_batch_size = int(await conn.fetchval("SELECT COALESCE(get_config_int('memory.recmem_task_batch_size'), 3)") or 3)
+            task_batch_size = int(
+                await conn.fetchval(
+                    "SELECT COALESCE(get_config_int('memory.recmem_task_batch_size'), 3)"
+                )
+                or 3
+            )
             consolidation_results = []
             for _ in range(max(task_batch_size, 1)):
                 result = await run_recmem_consolidation_step(conn)
@@ -1075,12 +1291,22 @@ class MaintenanceWorker:
         if not self.pool:
             return {"skipped": True, "reason": "no_pool"}
         async with self.pool.acquire() as conn:
-            if not bool(await conn.fetchval("SELECT COALESCE(get_config_bool('retention.enabled'), false)")):
+            if not bool(
+                await conn.fetchval(
+                    "SELECT COALESCE(get_config_bool('retention.enabled'), false)"
+                )
+            ):
                 return {"skipped": True, "reason": "retention_disabled"}
             result = await run_memory_summarization_step(conn)
             if not result.get("skipped"):
                 logger.info("Memory summarization: %s", result)
             return result
+
+    async def _run_retention_surface(self) -> dict[str, Any]:
+        if not self.pool:
+            return {"skipped": True, "reason": "no_pool"}
+        async with self.pool.acquire() as conn:
+            return await publish_retention_surface(conn)
 
     async def _run_extraction_if_enabled(self) -> dict[str, Any]:
         """Sweep conscious episodes (chat turns + heartbeat episodes) into
@@ -1107,16 +1333,30 @@ class MaintenanceWorker:
             logger.info("Origin memories seeded: %s", result)
         if result.get("seeded"):
             return result
-        return {"skipped": True, "reason": "origin_memories_already_seeded", "result": result}
+        return {
+            "skipped": True,
+            "reason": "origin_memories_already_seeded",
+            "result": result,
+        }
 
     async def _run_skill_improvement_if_due(self) -> dict[str, Any]:
         if not self.pool:
             return {"skipped": True, "reason": "no_pool"}
         async with self.pool.acquire() as conn:
-            result = await run_skill_improvement_review_step(conn, registry=self.tool_registry)
+            result = await run_skill_improvement_review_step(
+                conn, registry=self.tool_registry
+            )
             if not result.get("skipped"):
                 logger.info("Skill-improvement review: %s", result)
             return result
+
+    async def _run_approved_learning_skill(self) -> dict[str, Any]:
+        if not self.pool:
+            return {"skipped": True, "reason": "no_pool"}
+        return await apply_approved_learning_skill_step(
+            self.pool,
+            registry=self.tool_registry,
+        )
 
     async def run(self) -> None:
         self.running = True
@@ -1158,7 +1398,11 @@ class MaintenanceWorker:
             return False
         try:
             async with self.pool.acquire() as conn:
-                return bool(await conn.fetchval("SELECT is_agent_configured() AND is_init_complete()"))
+                return bool(
+                    await conn.fetchval(
+                        "SELECT is_agent_configured() AND is_init_complete()"
+                    )
+                )
         except Exception:
             return False
 
@@ -1197,12 +1441,14 @@ def create_webhook_handler(*, pool: asyncpg.Pool):
                     """,
                     f"Received webhook from {source_name}: {summary}",
                     json.dumps({"type": "webhook", "source": source_name}),
-                    json.dumps({
-                        "kind": "webhook",
-                        "ref": str(event.correlation_id),
-                        "label": f"webhook:{source_name}",
-                        "trust": 0.7,
-                    }),
+                    json.dumps(
+                        {
+                            "kind": "webhook",
+                            "ref": str(event.correlation_id),
+                            "label": f"webhook:{source_name}",
+                            "trust": 0.7,
+                        }
+                    ),
                 )
         except Exception as exc:
             logger.warning("Failed to record webhook memory: %s", exc)
@@ -1227,16 +1473,21 @@ async def _amain(mode: str, instance: str | None = None) -> None:
     # no-op if already current). Never wipes data.
     try:
         from core.agent_api import apply_migrations
+
         applied = await apply_migrations(dsn)
         if applied:
-            logger.info("applied %d schema migration(s) on startup: %s", len(applied), applied)
+            logger.info(
+                "applied %d schema migration(s) on startup: %s", len(applied), applied
+            )
     except Exception as exc:
         logger.warning("startup migration check failed (continuing): %s", exc)
     consumer_pool = await asyncpg.create_pool(dsn, min_size=2, max_size=10)
     from core.usage import set_usage_pool
+
     set_usage_pool(consumer_pool)
     try:
         from core.agent_api import record_build_change
+
         async with consumer_pool.acquire() as conn:
             await record_build_change(conn, "worker")
     except Exception:
@@ -1249,9 +1500,10 @@ async def _amain(mode: str, instance: str | None = None) -> None:
     mcp_manager = None
     call_processor = ExternalCallProcessor(max_retries=MAX_RETRIES)
     try:
-        from core.tools import create_default_registry, create_mcp_manager
+        from core.tools import create_full_registry, create_mcp_manager
 
-        tool_registry = create_default_registry(consumer_pool)
+        tool_registry = await create_full_registry(consumer_pool)
+        hb_timer.tool_registry = tool_registry
         maint_worker.tool_registry = tool_registry
         call_processor.set_tool_registry(tool_registry)
         logger.info("Tool registry initialized for consumer")
@@ -1260,9 +1512,11 @@ async def _amain(mode: str, instance: str | None = None) -> None:
         # binding them is activated, so nothing eager-loads here. The legacy
         # eager mode remains behind mcp.skill_gated=false.
         async with consumer_pool.acquire() as conn:
-            skill_gated = bool(await conn.fetchval(
-                "SELECT COALESCE(get_config_bool('mcp.skill_gated'), TRUE)"
-            ))
+            skill_gated = bool(
+                await conn.fetchval(
+                    "SELECT COALESCE(get_config_bool('mcp.skill_gated'), TRUE)"
+                )
+            )
         if skill_gated:
             logger.info("MCP is skill-gated; servers connect on skill activation")
         else:
@@ -1321,6 +1575,7 @@ async def _amain(mode: str, instance: str | None = None) -> None:
                 pass
         try:
             from core.tools.mcp_runtime import MCPRuntime
+
             await MCPRuntime.instance().shutdown()
         except Exception:
             pass
@@ -1328,7 +1583,9 @@ async def _amain(mode: str, instance: str | None = None) -> None:
 
 
 def main() -> int:
-    p = argparse.ArgumentParser(prog="hexis-worker", description="Run Hexis background workers.")
+    p = argparse.ArgumentParser(
+        prog="hexis-worker", description="Run Hexis background workers."
+    )
     p.add_argument(
         "--mode",
         choices=["heartbeat", "maintenance", "both"],
@@ -1336,11 +1593,21 @@ def main() -> int:
         help="Which worker to run.",
     )
     p.add_argument(
-        "--instance", "-i",
+        "--instance",
+        "-i",
         default=os.getenv("HEXIS_INSTANCE"),
         help="Target a specific instance (overrides HEXIS_INSTANCE env var).",
     )
     args = p.parse_args()
+    # Both worker kinds run this same entrypoint, differentiated only by
+    # --mode; the module logger was hardcoded to "heartbeat_worker" for all
+    # of them, so hexis_maintenance_worker's own logs were indistinguishable
+    # from the heartbeat container's (#115). Every subsequent `logger.*` call
+    # in this module resolves the name at call time against the module
+    # global, so reassigning it here (before any logging happens) retargets
+    # the whole run.
+    global logger
+    logger = logging.getLogger(_worker_logger_name(args.mode))
     asyncio.run(_amain(args.mode, args.instance))
     return 0
 

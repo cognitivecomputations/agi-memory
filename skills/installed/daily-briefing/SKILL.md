@@ -4,7 +4,8 @@ description: Compile a comprehensive daily briefing from calendar, contacts, goa
 category: productivity
 requires:
   tools: [recall, calendar_events]
-contexts: [heartbeat]
+contexts: [heartbeat, chat]
+aliases: [briefing, brief, today, morning, agenda, day, catch]
 bound_tools: [recall, calendar_events, search_contacts, aggregate_signals]
 ---
 

@@ -1,0 +1,81 @@
+[tools]
+# Python 3.12 matches the version used by CI and release builds.
+python = "3.12"
+uv = "0.12"
+bun = "1.4.0"
+# The CLI and Compose client work with either Docker Desktop or Colima.
+docker-cli = "29"
+docker-compose = "5"
+
+[tasks.setup]
+description = "Create the Python environment and install source dependencies"
+depends = ["setup:python", "setup:ui", "setup:docker"]
+
+[tasks."setup:python"]
+hide = true
+run = '''
+uv sync --locked --inexact --python 3.12
+if [ ! -f .env ]; then
+  cp .env.local .env
+fi
+'''
+
+[tasks."setup:ui"]
+hide = true
+dir = "hexis-ui"
+run = "bun install"
+
+[tasks."setup:docker"]
+hide = true
+run = '''
+if ! docker compose version >/dev/null 2>&1; then
+  docker_config_dir="${DOCKER_CONFIG:-$HOME/.docker}"
+  compose_plugin_dir="$docker_config_dir/cli-plugins"
+  compose_plugin_path="$compose_plugin_dir/docker-compose"
+
+  if [ -e "$compose_plugin_path" ] || [ -L "$compose_plugin_path" ]; then
+    echo "Docker Compose is not discoverable, and a plugin already exists at $compose_plugin_path." >&2
+    exit 1
+  fi
+
+  mkdir -p "$compose_plugin_dir"
+  ln -s "$(mise which docker-compose)" "$compose_plugin_path"
+fi
+docker compose version
+'''
+
+[tasks."docker:check"]
+description = "Verify that a Docker daemon and Compose are available"
+run = '''
+if ! docker info >/dev/null 2>&1; then
+  echo "No Docker daemon is reachable. Start Docker Desktop, or on macOS run: mise run docker:colima" >&2
+  exit 1
+fi
+docker compose version
+'''
+
+[tasks."docker:colima"]
+description = "Install and start Colima as the Docker daemon on macOS"
+tools = { colima = "0.10.3", lima = "2.2.0" }
+run = '''
+if [ "$(uname -s)" != "Darwin" ]; then
+  echo "docker:colima is only supported on macOS." >&2
+  exit 1
+fi
+
+macos_major="$(sw_vers -productVersion | cut -d. -f1)"
+if [ "$macos_major" -lt 13 ]; then
+  echo "docker:colima requires macOS 13 or newer for VZ and VirtioFS." >&2
+  echo "Use Docker Desktop or configure a compatible Docker daemon manually." >&2
+  exit 1
+fi
+
+if docker info >/dev/null 2>&1; then
+  echo "A Docker daemon is already running; leaving it unchanged."
+  exit 0
+fi
+
+colima start --runtime docker --vm-type vz --mount-type virtiofs --cpu 4 --memory 8 --disk 60
+docker info >/dev/null
+echo "Colima is running and Docker is ready."
+'''

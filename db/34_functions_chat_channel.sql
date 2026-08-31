@@ -156,7 +156,10 @@ BEGIN
             'arousal', LEAST(1.0, GREATEST(0.0, COALESCE(NULLIF(p_context#>>'{emotional_state,arousal}', '')::float, 0.5))),
             'intensity', LEAST(1.0, GREATEST(0.0, COALESCE(NULLIF(p_context#>>'{emotional_state,intensity}', '')::float, 0.5))),
             'primary_emotion', COALESCE(NULLIF(p_context#>>'{emotional_state,primary_emotion}', ''), 'neutral'),
-            'source', 'appraisal');
+            'source', 'appraisal')
+            || CASE WHEN normalize_emotion_family(p_context#>>'{emotional_state,family}') IS NULL
+                    THEN '{}'::jsonb
+                    ELSE jsonb_build_object('family', normalize_emotion_family(p_context#>>'{emotional_state,family}')) END;
     ELSE
         affect_ctx := (SELECT jsonb_build_object(
             'valence', COALESCE(NULLIF(s->>'valence', '')::float, 0.0),
@@ -164,6 +167,9 @@ BEGIN
             'intensity', COALESCE(NULLIF(s->>'intensity', '')::float, 0.5),
             'primary_emotion', COALESCE(NULLIF(s->>'primary_emotion', ''), 'neutral'),
             'source', 'state_snapshot')
+            || CASE WHEN normalize_emotion_family(s->>'family') IS NULL
+                    THEN '{}'::jsonb
+                    ELSE jsonb_build_object('family', normalize_emotion_family(s->>'family')) END
             FROM get_current_affective_state() s(s));
     END IF;
     metadata := metadata || jsonb_build_object('emotional_context', affect_ctx);

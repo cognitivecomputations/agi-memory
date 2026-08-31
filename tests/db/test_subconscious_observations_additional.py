@@ -8,14 +8,24 @@ from tests.utils import _coerce_json, get_test_identifier
 pytestmark = [pytest.mark.asyncio(loop_scope="session"), pytest.mark.db]
 
 
-async def test_apply_brainstormed_goals_creates_goals(db_pool, ensure_embedding_service):
+async def test_apply_brainstormed_goals_creates_goals(
+    db_pool, ensure_embedding_service
+):
     async with db_pool.acquire() as conn:
         tr = conn.transaction()
         await tr.start()
         try:
             goals = [
-                {"title": f"Goal A {get_test_identifier('brainstorm')}", "priority": "queued", "source": "curiosity"},
-                {"title": f"Goal B {get_test_identifier('brainstorm')}", "priority": "queued", "source": "curiosity"},
+                {
+                    "title": f"Goal A {get_test_identifier('brainstorm')}",
+                    "priority": "queued",
+                    "source": "user_request",
+                },
+                {
+                    "title": f"Goal B {get_test_identifier('brainstorm')}",
+                    "priority": "queued",
+                    "source": "curiosity",
+                },
             ]
             result = _coerce_json(
                 await conn.fetchval(
@@ -38,11 +48,23 @@ async def test_apply_brainstormed_goals_creates_goals(db_pool, ensure_embedding_
                 titles,
             )
             assert int(count) == 2
+            origins = await conn.fetch(
+                """
+                SELECT goal_origin::text AS origin
+                FROM memories
+                WHERE type = 'goal'
+                  AND metadata->>'title' = ANY($1::text[])
+                """,
+                titles,
+            )
+            assert {row["origin"] for row in origins} == {"derived"}
         finally:
             await tr.rollback()
 
 
-async def test_apply_inquiry_result_creates_semantic_memory(db_pool, ensure_embedding_service):
+async def test_apply_inquiry_result_creates_semantic_memory(
+    db_pool, ensure_embedding_service
+):
     async with db_pool.acquire() as conn:
         tr = conn.transaction()
         await tr.start()
@@ -108,7 +130,9 @@ async def test_apply_goal_changes_updates_priority(db_pool, ensure_embedding_ser
             await tr.rollback()
 
 
-async def test_apply_goal_changes_normalizes_new_priority_alias(db_pool, ensure_embedding_service):
+async def test_apply_goal_changes_normalizes_new_priority_alias(
+    db_pool, ensure_embedding_service
+):
     async with db_pool.acquire() as conn:
         tr = conn.transaction()
         await tr.start()
@@ -121,7 +145,11 @@ async def test_apply_goal_changes_normalizes_new_priority_alias(db_pool, ensure_
                 "queued",
             )
             changes = [
-                {"goal_id": str(goal_id), "new_priority": "high", "reason": "urgent audit"}
+                {
+                    "goal_id": str(goal_id),
+                    "new_priority": "high",
+                    "reason": "urgent audit",
+                }
             ]
             result = _coerce_json(
                 await conn.fetchval(
@@ -143,7 +171,9 @@ async def test_apply_goal_changes_normalizes_new_priority_alias(db_pool, ensure_
             await tr.rollback()
 
 
-async def test_apply_goal_changes_skips_invalid_priority_without_crashing(db_pool, ensure_embedding_service):
+async def test_apply_goal_changes_skips_invalid_priority_without_crashing(
+    db_pool, ensure_embedding_service
+):
     async with db_pool.acquire() as conn:
         tr = conn.transaction()
         await tr.start()
@@ -156,7 +186,11 @@ async def test_apply_goal_changes_skips_invalid_priority_without_crashing(db_poo
                 "queued",
             )
             changes = [
-                {"goal_id": str(goal_id), "new_priority": "impossibly-important", "reason": "bad label"}
+                {
+                    "goal_id": str(goal_id),
+                    "new_priority": "impossibly-important",
+                    "reason": "bad label",
+                }
             ]
             result = _coerce_json(
                 await conn.fetchval(
@@ -177,7 +211,9 @@ async def test_apply_goal_changes_skips_invalid_priority_without_crashing(db_poo
             await tr.rollback()
 
 
-async def test_execute_heartbeat_actions_batch_halts_on_external_call(db_pool, ensure_embedding_service):
+async def test_execute_heartbeat_actions_batch_halts_on_external_call(
+    db_pool, ensure_embedding_service
+):
     async with db_pool.acquire() as conn:
         tr = conn.transaction()
         await tr.start()

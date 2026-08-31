@@ -15,6 +15,7 @@ from core.memory_exchange import (
     export_hmx,
     import_hmx,
     resolve_export_sections,
+    verify_mind_continuity,
 )
 
 pytestmark = [pytest.mark.asyncio(loop_scope="session")]
@@ -502,7 +503,6 @@ class TestProtectedTargetPolicy:
                         "value_conflicts": [],
                     },
                 }
-
                 result = await import_hmx(conn, env)
                 assert result.inserted["identity"] == 1
                 assert result.inserted["memories"] == 3
@@ -557,6 +557,30 @@ class TestProtectedTargetPolicy:
                 assert child["parent_ref"] == parent["ref"]
                 assert len(child["blocked_by"]) == 1
                 assert child["blocked_by"][0].startswith(f"{exported['export_id']}:")
+                source_mind = exported
+                for section in (
+                    "narrative",
+                    "emotional_triggers",
+                    "drives",
+                    "goals",
+                    "worldview",
+                    "identity",
+                ):
+                    await conn.fetchval(
+                        "SELECT hmx_clear_protected_section($1)", section
+                    )
+                target_state = _json(
+                    await conn.fetchval("SELECT hexis_instance_is_empty()")
+                )
+                assert target_state["is_empty"] is True, target_state
+
+                await import_hmx(conn, source_mind)
+                continuity = await verify_mind_continuity(conn, source_mind)
+                assert continuity["verified"] is True, json.dumps(
+                    continuity,
+                    indent=2,
+                )
+                assert continuity["lineage"]["matches"] is True
             finally:
                 await tr.rollback()
 

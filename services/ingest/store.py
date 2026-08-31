@@ -26,7 +26,7 @@ from core.cognitive_memory_api import (
     RelationshipType,
 )
 
-from .config import Appraisal, Config, IngestionMetrics
+from .config import Config, IngestionMetrics
 
 # =========================================================================
 # STORAGE
@@ -301,15 +301,6 @@ class MemoryStore:
             document_id,
             original_hash,
         )
-
-    async def set_affective_state(self, appraisal: Appraisal) -> None:
-        if self.client is None:
-            await self.connect()
-        payload = json.dumps(appraisal.to_state_payload(source="ingest"))
-        try:
-            await self._fetchval("SELECT set_current_affective_state($1::jsonb)", payload)
-        except Exception:
-            pass
 
     async def create_encounter_memory(
         self,

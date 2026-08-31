@@ -8,17 +8,14 @@ import {
   EyeOff,
   Check,
   ExternalLink,
-  FileText,
-  Image as ImageIcon,
   Inbox,
-  Lock,
-  LockOpen,
   Mail,
   Paperclip,
   Plus,
   Send,
   Settings2,
   Trash2,
+  Volume2,
   Wrench,
   X,
   type LucideIcon,
@@ -33,23 +30,32 @@ import { Spinner } from "../components/ui/spinner";
 import { normalizeMessagePresentation } from "../../lib/message-presentation";
 import type { MessagePresentation } from "../../lib/message-presentation";
 import { isImageAttachmentFile, normalizeUploadFile } from "./attachment-helpers";
+import { AttachmentCard, type AttachmentKind } from "./attachment-card";
 import { MessagePresentationView } from "./message-presentation";
+import { VoiceRecorder } from "./voice-recorder";
+import { TalkMode } from "./talk-mode";
 
 type ChatMessage = {
   id: string;
   role: "user" | "assistant";
   content: string;
-  attachments?: ChatImageAttachment[];
+  attachments?: ChatAttachmentView[];
   presentation?: MessagePresentation;
   ui?: ChatUiArtifact[];
 };
 
-type ChatImageAttachment = {
+// What a message draws for the files that came with it. Images carry a data
+// URL and render inline; everything else draws as a card. A conversation
+// reloaded from the database has the descriptors but no data URLs, so both
+// forms have to stand on their own.
+type ChatAttachmentView = {
   id: string;
   name: string;
   mimeType: string;
-  dataUrl: string;
-  byteSize: number;
+  kind: AttachmentKind;
+  byteSize?: number;
+  dataUrl?: string;
+  note?: string;
 };
 
 type ChatVisualAttachmentPayload = {
@@ -57,6 +63,15 @@ type ChatVisualAttachmentPayload = {
   mime_type: string;
   data_url: string;
   byte_size: number;
+};
+
+// Travels with the turn so the stored message remembers what came with it.
+type ChatAttachmentPayload = {
+  name: string;
+  mime_type?: string;
+  byte_size?: number;
+  kind?: AttachmentKind;
+  artifact_id?: string;
 };
 
 type ConnectorSetupCapabilityOption = {
@@ -79,6 +94,13 @@ type ConnectorSetupAutonomyOption = {
   label: string;
   description?: string;
   heartbeat_digest_enabled?: boolean;
+};
+
+type ConnectorCredentialField = {
+  name: string;
+  label: string;
+  secret?: boolean;
+  example?: string;
 };
 
 type ConnectorSetupUi = {
@@ -105,17 +127,40 @@ type ConnectorSetupUi = {
   accepted_inputs?: string[];
   env_client_secret_available?: boolean;
   credential_step?: ConnectorCredentialStep;
+  credential_fields?: ConnectorCredentialField[];
   credential_step_label?: string;
   setup_steps?: string[];
   technical_next_step?: string;
   docs_url?: string;
   authorization_url?: string;
+  redirect_uri?: string;
   attempt_id?: string;
   completion_mode?: string;
   manual_completion_available?: boolean;
   connected_accounts?: Record<string, unknown>[];
   next_step?: string;
   safety_note?: string;
+};
+
+type AgentQuestionUi = {
+  kind: "question";
+  id: string;
+  prompt: string;
+  choices: string[];
+  allow_free_text: boolean;
+  status?: "pending" | "answered" | "timed_out" | "superseded";
+  answer?: string | null;
+  expires_at?: string | null;
+  timeout_seconds?: number;
+};
+
+type SpeechUi = {
+  kind: "speech";
+  id: string;
+  audio_url: string;
+  mime_type?: string;
+  provider?: string;
+  model?: string;
 };
 
 type ConnectorCredentialStep = {
@@ -132,7 +177,7 @@ type ConnectorCredentialMode = {
   description?: string;
 };
 
-type ChatUiArtifact = ConnectorSetupUi;
+type ChatUiArtifact = ConnectorSetupUi | AgentQuestionUi | SpeechUi;
 
 type IntegrationActionResult = {
   success?: boolean;
@@ -151,19 +196,28 @@ type PastedAttachment = {
   wordCount: number;
   // "private" keeps the ingested memories out of group-channel recall and
   // default HMX export (#92); toggled per-chip before sending.
-  sensitivity: "private" | null;
 };
 
-// A dropped/picked file; on send it uploads to POST /api/ingest/file, which
-// preserves the original bytes as a source artifact and runs the standard
-// ingestion pipeline in the background (PDF, DOCX, XLSX, ...).
+// A dropped/picked file. Attaching it preserves the original bytes and reads
+// its text right away (POST /api/attachments) so the agent can discuss the
+// file in the same turn; sending the message is what commits it to memory.
 type FileAttachment = {
   id: string;
   file: File;
   name: string;
   size: number;
   mimeType: string;
-  sensitivity: "private" | null;
+  status: "preparing" | "ready" | "error";
+  kind: AttachmentKind;
+  // Object URL for image previews in the composer; revoked when the chip goes.
+  previewUrl: string | null;
+  artifactId: string | null;
+  text: string;
+  textTruncated: boolean;
+  // Set when the text could not be read in time (audio, video, oversized,
+  // slow OCR): the agent is told plainly rather than left to guess.
+  unreadReason: string | null;
+  error: string | null;
 };
 
 type SearchConfigProvider = "tavily" | "brave" | "searxng" | "auto";
@@ -200,7 +254,8 @@ function formatBytes(size: number): string {
 
 // The agent's outbox is her always-available way to reach the user; the
 // channel worker tees every user-bound message into web_inbox (db/76), and
-// this page shows that feed plus resource requests awaiting a decision.
+// this page shows that feed plus resource requests and inert automation
+// suggestions awaiting a decision.
 type InboxMessage = {
   id: string;
   kind: string | null;
@@ -226,10 +281,50 @@ type PendingRequest = {
   requested_at: string;
 };
 
+type PendingAutomation = {
+  id: string;
+  source: "catalog" | "blueprint" | "usage" | "connector";
+  title: string;
+  rationale: string;
+  task_spec: {
+    schedule?: string;
+    schedule_kind?: string;
+    timezone?: string;
+    message?: string;
+  } & Record<string, unknown>;
+  status: "pending";
+  created_at: string;
+};
+
+type PendingContradiction = {
+  id: string;
+  code: string;
+  status: "pending";
+  tension: string;
+  confidence: number;
+  new_memory_id?: string | null;
+  memory_a: { id: string; content: string; trust_level: number; created_at: string };
+  memory_b: { id: string; content: string; trust_level: number; created_at: string };
+};
+
+type PendingNodePairing = {
+  id: string;
+  code: string;
+  node_id: string;
+  name: string;
+  capabilities: string[];
+  status: "pending";
+  requested_at: string;
+  expires_at: string;
+};
+
 type InboxData = {
   unread: number;
   messages: InboxMessage[];
   pending_requests: PendingRequest[];
+  pending_automations: PendingAutomation[];
+  pending_contradictions: PendingContradiction[];
+  pending_node_pairings: PendingNodePairing[];
 };
 
 // Pastes longer than this become attachments (matching the Claude/ChatGPT
@@ -254,13 +349,73 @@ function attachmentAddendum(attachment: PastedAttachment): string {
   const body = attachment.content.slice(0, ATTACHMENT_PROMPT_CHARS);
   return [
     `----- ATTACHED DOCUMENT: ${attachment.title} -----`,
-    "The user attached this document to their message. It is also being ingested into your durable memory (recall or open_memory can retrieve it later).",
+    "The user attached this to their message. Its text is below — you have read it, so answer from it directly.",
     "",
     body,
-    truncated
-      ? "\n[Document truncated here for the live turn — the full text is in memory via ingestion.]"
+    truncated ? "\n[Text truncated here; ask if you need a part that is not shown.]" : "",
+  ].join("\n");
+}
+
+// A file the user attached but whose text is not in hand this turn. The agent
+// is told exactly that, so it says so instead of guessing at the contents.
+function unreadFileNote(attachment: FileAttachment): string {
+  const reason = attachment.unreadReason;
+  if (reason === "audio" || reason === "video") {
+    const medium = reason === "audio" ? "audio" : "video";
+    return `The user attached this ${medium} file. You have not heard it — its transcript is not available in this turn. Say so plainly rather than guessing at its contents.`;
+  }
+  if (reason === "too_large" || reason === "timeout") {
+    return "The user attached this file, but it was too large to read within this turn. You have not read it — say so plainly rather than guessing at its contents.";
+  }
+  if (reason === "empty") {
+    return "The user attached this file, but no text could be pulled out of it (it may be scanned images with no text layer). Say so plainly rather than guessing at its contents.";
+  }
+  const detail = attachment.error ? ` (${attachment.error})` : "";
+  return `The user attached this file, but it could not be opened${detail}. You have not read it — say so plainly rather than guessing at its contents.`;
+}
+
+function fileAttachmentAddendum(attachment: FileAttachment): string {
+  if (!attachment.text) {
+    return [`----- ATTACHED FILE: ${attachment.name} -----`, unreadFileNote(attachment)].join("\n");
+  }
+  return [
+    `----- ATTACHED FILE: ${attachment.name} -----`,
+    "The user attached this file to their message. Its text is below — you have read it, so answer from it directly.",
+    "",
+    attachment.text,
+    attachment.textTruncated
+      ? "\n[Text truncated here; ask if you need a part that is not shown.]"
       : "",
   ].join("\n");
+}
+
+// What the chip says under the file name once it has been read. Silence means
+// "nothing to add" — the type label stands on its own.
+function composerAttachmentNote(attachment: FileAttachment): string | null {
+  if (attachment.status !== "ready") return null;
+  switch (attachment.unreadReason) {
+    case "audio":
+      return "Audio — not transcribed in this message";
+    case "video":
+      return "Video — not transcribed in this message";
+    case "too_large":
+    case "timeout":
+      return "Too large to read in this message";
+    case "empty":
+      return "No text found in this file";
+    case "error":
+      return attachment.error || "Could not be read";
+    default:
+      return null;
+  }
+}
+
+// A send with files and no words still needs a message: the file names, plainly.
+function attachmentOnlyMessage(attachments: { name: string }[]): string {
+  const names = attachments.map((attachment) => attachment.name).filter(Boolean);
+  if (names.length === 0) return "";
+  if (names.length === 1) return `Shared ${names[0]}.`;
+  return `Shared ${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}.`;
 }
 
 function imageAttachmentAddendum(attachment: FileAttachment, liveVisual: boolean): string {
@@ -268,9 +423,30 @@ function imageAttachmentAddendum(attachment: FileAttachment, liveVisual: boolean
     `----- ATTACHED IMAGE: ${attachment.name} -----`,
     liveVisual
       ? "The user attached this image to their message. You can inspect the image directly in this turn; do not reduce it to text extraction or assume it is only a text document."
-      : "The user attached this image to their message. It was too large to include as live visual context; the original file is preserved in the filing cabinet.",
-    "The original image is also preserved as a source artifact. Text extraction may run in the background when applicable, but the visual attachment is primary.",
+      : "The user attached this image to their message. It was too large to show you here, so you have not seen it — say so plainly rather than guessing at its contents.",
   ].join("\n");
+}
+
+// A local preview for image chips. jsdom (and any environment without the
+// object-URL API) simply gets the type icon instead.
+function objectUrlFor(file: File): string | null {
+  if (!isImageAttachmentFile(file)) return null;
+  if (typeof URL === "undefined" || typeof URL.createObjectURL !== "function") return null;
+  try {
+    return URL.createObjectURL(file);
+  } catch {
+    return null;
+  }
+}
+
+function releaseObjectUrl(url: string | null | undefined) {
+  if (!url) return;
+  if (typeof URL === "undefined" || typeof URL.revokeObjectURL !== "function") return;
+  try {
+    URL.revokeObjectURL(url);
+  } catch {
+    // Nothing to release.
+  }
 }
 
 async function fileToDataUrl(file: File): Promise<string> {
@@ -612,10 +788,25 @@ function normalizeConnectorSetupUi(value: unknown): ConnectorSetupUi | null {
         ? record.env_client_secret_available
         : undefined,
     credential_step: normalizeCredentialStep(record.credential_step),
+    credential_fields: Array.isArray(record.credential_fields)
+      ? record.credential_fields.flatMap((item): ConnectorCredentialField[] => {
+          const field = asRecord(item);
+          const name = asString(field.name);
+          const label = asString(field.label);
+          if (!name || !label) return [];
+          return [{
+            name,
+            label,
+            secret: typeof field.secret === "boolean" ? field.secret : undefined,
+            example: asString(field.example) || undefined,
+          }];
+        })
+      : [],
     setup_steps: stringArray(record.setup_steps),
     technical_next_step: asString(record.technical_next_step) || undefined,
     docs_url: asString(record.docs_url) || undefined,
     authorization_url: asString(record.authorization_url) || undefined,
+    redirect_uri: asString(record.redirect_uri) || undefined,
     attempt_id: asString(record.attempt_id) || undefined,
     completion_mode: asString(record.completion_mode) || undefined,
     manual_completion_available:
@@ -665,6 +856,48 @@ function connectorSetupUiFromPayload(payload: unknown): ConnectorSetupUi | null 
   return normalizeConnectorSetupUi(asRecord(asRecord(payload).output).ui);
 }
 
+function agentQuestionUiFromPayload(payload: unknown): AgentQuestionUi | null {
+  const record = asRecord(payload);
+  if (record.kind !== "question") return null;
+  const id = asString(record.id);
+  const prompt = asString(record.prompt);
+  if (!id || !prompt) return null;
+  const status = asString(record.status);
+  const normalizedStatus = ["pending", "answered", "timed_out", "superseded"].includes(
+    status
+  )
+    ? (status as AgentQuestionUi["status"])
+    : undefined;
+  return {
+    kind: "question",
+    id,
+    prompt,
+    choices: stringArray(record.choices).slice(0, 4),
+    allow_free_text: record.allow_free_text !== false,
+    status: normalizedStatus,
+    answer: typeof record.answer === "string" ? record.answer : null,
+    expires_at: typeof record.expires_at === "string" ? record.expires_at : null,
+    timeout_seconds:
+      typeof record.timeout_seconds === "number" ? record.timeout_seconds : undefined,
+  };
+}
+
+function speechUiFromPayload(payload: unknown): SpeechUi | null {
+  const record = asRecord(payload);
+  if (record.kind !== "speech") return null;
+  const id = asString(record.id);
+  const audioUrl = asString(record.audio_url);
+  if (!id || !audioUrl.startsWith("/api/voice/audio/")) return null;
+  return {
+    kind: "speech",
+    id,
+    audio_url: audioUrl,
+    mime_type: asString(record.mime_type) || undefined,
+    provider: asString(record.provider) || undefined,
+    model: asString(record.model) || undefined,
+  };
+}
+
 const NON_ACTIONABLE_CONNECTOR_SETUP_STATUSES = new Set(["connected", "complete", "verified"]);
 
 function connectorSetupNeedsUserAction(ui: ConnectorSetupUi | null): boolean {
@@ -675,7 +908,41 @@ function connectorSetupNeedsUserAction(ui: ConnectorSetupUi | null): boolean {
 
 function uiArtifactKey(ui: ChatUiArtifact): string {
   if (ui.id) return ui.id;
-  return `${ui.kind}:${ui.connector_id}:${ui.attempt_id || ui.status || "setup"}`;
+  if (ui.kind === "connector_setup") {
+    return `${ui.kind}:${ui.connector_id}:${ui.attempt_id || ui.status || "setup"}`;
+  }
+  if (ui.kind === "speech") return `${ui.kind}:${ui.id}`;
+  return `${ui.kind}:${ui.prompt}`;
+}
+
+function isAttachmentKind(value: unknown): value is AttachmentKind {
+  return value === "image" || value === "audio" || value === "video" || value === "document";
+}
+
+// Stored messages carry their attachments as descriptors, so a reloaded
+// conversation still shows what came with each message.
+function attachmentViewsFromMetadata(value: unknown): ChatAttachmentView[] | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const raw = (value as Record<string, unknown>).attachments;
+  if (!Array.isArray(raw)) return undefined;
+  const views: ChatAttachmentView[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const record = item as Record<string, unknown>;
+    const name = typeof record.name === "string" ? record.name.trim() : "";
+    if (!name) continue;
+    views.push({
+      id:
+        typeof record.artifact_id === "string" && record.artifact_id
+          ? record.artifact_id
+          : `${name}:${views.length}`,
+      name,
+      mimeType: typeof record.mime_type === "string" ? record.mime_type : "",
+      kind: isAttachmentKind(record.kind) ? record.kind : "document",
+      byteSize: typeof record.byte_size === "number" ? record.byte_size : undefined,
+    });
+  }
+  return views.length > 0 ? views : undefined;
 }
 
 function dbMessagesToChatMessages(value: unknown): ChatMessage[] | null {
@@ -691,6 +958,7 @@ function dbMessagesToChatMessages(value: unknown): ChatMessage[] | null {
         id: typeof record.message_id === "string" ? record.message_id : crypto.randomUUID(),
         role,
         content,
+        attachments: attachmentViewsFromMetadata(record.metadata),
       });
     }
   }
@@ -722,7 +990,14 @@ export default function ChatPage() {
   const [historyDraft, setHistoryDraft] = useState("");
   const [showInspector, setShowInspector] = useState(false);
   const [showInbox, setShowInbox] = useState(false);
-  const [inbox, setInbox] = useState<InboxData>({ unread: 0, messages: [], pending_requests: [] });
+  const [inbox, setInbox] = useState<InboxData>({
+    unread: 0,
+    messages: [],
+    pending_requests: [],
+    pending_automations: [],
+    pending_contradictions: [],
+    pending_node_pairings: [],
+  });
   const [decideBusy, setDecideBusy] = useState<string | null>(null);
   const [decideNotes, setDecideNotes] = useState<Record<string, string>>({});
   const [decideNotice, setDecideNotice] = useState<string | null>(null);
@@ -746,7 +1021,21 @@ export default function ChatPage() {
   const scrollRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
-  const inboxBadgeCount = inbox.unread + inbox.pending_requests.length;
+  const inboxBadgeCount =
+    inbox.unread +
+    inbox.pending_requests.length +
+    inbox.pending_automations.length +
+    inbox.pending_contradictions.length +
+    inbox.pending_node_pairings.length;
+  // Sending while a file is still being read would hand the agent a message
+  // about a document it cannot see; the composer waits the extra beat.
+  const attachmentsPreparing = fileAttachments.some((item) => item.status === "preparing");
+
+  const handleVoiceTranscript = useCallback((transcript: string) => {
+    if (historyIndex !== null) setHistoryIndex(null);
+    setInput((current) => current.trim() ? `${current.trim()}\n${transcript}` : transcript);
+    window.setTimeout(() => textareaRef.current?.focus(), 0);
+  }, [historyIndex]);
 
   const historyPayload = useMemo(
     () =>
@@ -790,7 +1079,23 @@ export default function ChatPage() {
   const loadInbox = useCallback(async () => {
     try {
       const res = await fetch("/api/outbox", { cache: "no-store" });
-      if (res.ok) setInbox(await res.json());
+      if (res.ok) {
+        const data = await res.json();
+        setInbox({
+          unread: Number(data?.unread || 0),
+          messages: Array.isArray(data?.messages) ? data.messages : [],
+          pending_requests: Array.isArray(data?.pending_requests) ? data.pending_requests : [],
+          pending_automations: Array.isArray(data?.pending_automations)
+            ? data.pending_automations
+            : [],
+          pending_contradictions: Array.isArray(data?.pending_contradictions)
+            ? data.pending_contradictions
+            : [],
+          pending_node_pairings: Array.isArray(data?.pending_node_pairings)
+            ? data.pending_node_pairings
+            : [],
+        });
+      }
     } catch {
       // The badge just stays stale until the next poll.
     }
@@ -957,6 +1262,110 @@ export default function ChatPage() {
     }
   };
 
+  const decideAutomation = async (
+    automation: PendingAutomation,
+    decision: "accept" | "dismiss"
+  ) => {
+    setDecideBusy(automation.id);
+    setDecideNotice(null);
+    try {
+      const res = await fetch("/api/automations/decide", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: automation.id, decision }),
+      });
+      const result = await res.json();
+      if (!res.ok) {
+        const recovery = result.next_step ? ` ${result.next_step}` : "";
+        setDecideNotice(
+          `${result.error || "The automation decision could not be recorded."}${recovery}`
+        );
+      } else if (decision === "accept") {
+        const schedule = result.schedule ? ` (${result.schedule})` : "";
+        setDecideNotice(`Accepted “${automation.title}”${schedule}. The scheduled task is active.`);
+        await loadInbox();
+      } else {
+        setDecideNotice(
+          `Marked “${automation.title}” Not for me. Hexis will not suggest that routine again.`
+        );
+        await loadInbox();
+      }
+    } catch (err: unknown) {
+      setDecideNotice(
+        err instanceof Error ? err.message : "The automation decision could not be recorded."
+      );
+    } finally {
+      setDecideBusy(null);
+    }
+  };
+
+  const decideContradiction = async (
+    contradiction: PendingContradiction,
+    outcome: "new_right" | "old_right" | "tension"
+  ) => {
+    setDecideBusy(contradiction.id);
+    setDecideNotice(null);
+    try {
+      const res = await fetch("/api/contradictions/decide", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: contradiction.id, outcome }),
+      });
+      const result = await res.json();
+      if (!res.ok) {
+        setDecideNotice(result.error || "The contradiction decision could not be recorded.");
+      } else {
+        setDecideNotice(
+          outcome === "tension"
+            ? `Case ${contradiction.code}: kept both memories as context-dependent.`
+            : `Case ${contradiction.code}: resolved and preserved the losing memory in history.`
+        );
+        await loadInbox();
+      }
+    } catch (err: unknown) {
+      setDecideNotice(
+        err instanceof Error ? err.message : "The contradiction decision could not be recorded."
+      );
+    } finally {
+      setDecideBusy(null);
+    }
+  };
+
+  const decideNodePairing = async (
+    pairing: PendingNodePairing,
+    decision: "approve" | "deny"
+  ) => {
+    setDecideBusy(pairing.id);
+    setDecideNotice(null);
+    try {
+      const res = await fetch("/api/nodes", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ request: pairing.id, decision }),
+      });
+      const result = await res.json();
+      if (!res.ok) {
+        setDecideNotice(
+          result.reason || result.error || "The node pairing decision could not be recorded."
+        );
+      } else if (decision === "approve") {
+        setDecideNotice(
+          `Approved the signed identity for “${pairing.name}”. A waiting node connects automatically.`
+        );
+        await loadInbox();
+      } else {
+        setDecideNotice(`Denied “${pairing.name}”. That node has no host access.`);
+        await loadInbox();
+      }
+    } catch (err: unknown) {
+      setDecideNotice(
+        err instanceof Error ? err.message : "The node pairing decision could not be recorded."
+      );
+    } finally {
+      setDecideBusy(null);
+    }
+  };
+
   // Save display cache on message change. This is not sent as authoritative
   // history once a DB chat session exists.
   useEffect(() => {
@@ -1053,9 +1462,7 @@ export default function ChatPage() {
         return {
           ...msg,
           ui: [
-            ...existing.filter(
-              (item) => item.kind !== ui.kind || item.connector_id !== ui.connector_id
-            ),
+            ...existing.filter((item) => uiArtifactKey(item) !== uiArtifactKey(ui)),
             ui,
           ],
         };
@@ -1074,8 +1481,8 @@ export default function ChatPage() {
         const existing = msg.ui || [];
         const kept = existing.filter(
           (item) =>
-            (item.kind !== previous.kind || item.connector_id !== previous.connector_id) &&
-            (item.kind !== next.kind || item.connector_id !== next.connector_id)
+            uiArtifactKey(item) !== uiArtifactKey(previous) &&
+            uiArtifactKey(item) !== uiArtifactKey(next)
         );
         return { ...msg, ui: [...kept, next] };
       })
@@ -1147,8 +1554,8 @@ export default function ChatPage() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          action: "gmail_setup_status",
-          arguments: {},
+          action: currentUi.connector_id === "gmail" ? "gmail_setup_status" : "setup_status",
+          arguments: currentUi.connector_id === "gmail" ? {} : { connector_id: currentUi.connector_id },
           source_session_id: currentSessionId,
         }),
       });
@@ -1346,8 +1753,7 @@ export default function ChatPage() {
           title: attachmentTitle(pasted),
           content: pasted,
           wordCount: pasted.split(/\s+/).filter(Boolean).length,
-          sensitivity: null,
-        },
+          },
       ]);
       handled = true;
     }
@@ -1359,14 +1765,60 @@ export default function ChatPage() {
     setAttachments((prev) => prev.filter((attachment) => attachment.id !== id));
   };
 
-  const toggleAttachmentPrivacy = (id: string) => {
-    setAttachments((prev) =>
-      prev.map((attachment) =>
-        attachment.id === id
-          ? { ...attachment, sensitivity: attachment.sensitivity === "private" ? null : "private" }
-          : attachment
-      )
-    );
+
+  // Attaching a file reads it immediately: the original is preserved and its
+  // text comes back before the message is even sent, so the agent can answer
+  // a question about the file in the same turn it arrives.
+  const prepareFileAttachment = async (attachment: FileAttachment) => {
+    const patch = (update: Partial<FileAttachment>) => {
+      setFileAttachments((prev) =>
+        prev.map((item) => (item.id === attachment.id ? { ...item, ...update } : item))
+      );
+    };
+    try {
+      const form = new FormData();
+      form.append("file", attachment.file, attachment.name);
+      const res = await fetch("/api/attachments", { method: "POST", body: form });
+      if (!res.ok) {
+        const detail = (await res.text()).slice(0, 200);
+        patch({ status: "error", error: `Upload failed (${res.status})` });
+        appendLog({
+          id: crypto.randomUUID(),
+          category: "error",
+          title: "Attachment error",
+          detail: `File "${attachment.name}" failed (${res.status}): ${detail}`,
+          ts: Date.now(),
+        });
+        return;
+      }
+      const payload = (await res.json()) as {
+        artifact_id?: string;
+        kind?: string;
+        text?: string;
+        truncated?: boolean;
+        reason?: string | null;
+        error?: string | null;
+      };
+      patch({
+        status: "ready",
+        artifactId: typeof payload.artifact_id === "string" ? payload.artifact_id : null,
+        kind: isAttachmentKind(payload.kind) ? payload.kind : attachment.kind,
+        text: typeof payload.text === "string" ? payload.text : "",
+        textTruncated: payload.truncated === true,
+        unreadReason: typeof payload.reason === "string" ? payload.reason : null,
+        error: typeof payload.error === "string" ? payload.error : null,
+      });
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      patch({ status: "error", error: "Could not reach the server" });
+      appendLog({
+        id: crypto.randomUUID(),
+        category: "error",
+        title: "Attachment error",
+        detail: `File "${attachment.name}": ${detail}`,
+        ts: Date.now(),
+      });
+    }
   };
 
   const addFiles = (files: FileList | File[] | null, source: "picker" | "drop" | "paste" = "picker") => {
@@ -1374,20 +1826,27 @@ export default function ChatPage() {
     const items = Array.from(files).filter((file) => file.size > 0);
     if (!items.length) return;
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-    setFileAttachments((prev) => [
-      ...prev,
-      ...items.map((file, index) => {
-        const uploadFile = normalizeUploadFile(file, `${source === "paste" ? "pasted-image" : "attachment"}-${timestamp}-${index + 1}`);
-        return {
-          id: crypto.randomUUID(),
-          file: uploadFile,
-          name: uploadFile.name,
-          size: uploadFile.size,
-          mimeType: uploadFile.type,
-          sensitivity: null as "private" | null,
-        };
-      }),
-    ]);
+    const added = items.map((file, index) => {
+      const uploadFile = normalizeUploadFile(file, `${source === "paste" ? "pasted-image" : "attachment"}-${timestamp}-${index + 1}`);
+      const attachment: FileAttachment = {
+        id: crypto.randomUUID(),
+        file: uploadFile,
+        name: uploadFile.name,
+        size: uploadFile.size,
+        mimeType: uploadFile.type,
+        status: "preparing",
+        kind: isImageAttachmentFile(uploadFile) ? "image" : "document",
+        previewUrl: objectUrlFor(uploadFile),
+        artifactId: null,
+        text: "",
+        textTruncated: false,
+        unreadReason: null,
+        error: null,
+      };
+      return attachment;
+    });
+    setFileAttachments((prev) => [...prev, ...added]);
+    for (const attachment of added) void prepareFileAttachment(attachment);
   };
 
   const handleComposerDrop = (event: React.DragEvent<HTMLDivElement>) => {
@@ -1397,122 +1856,127 @@ export default function ChatPage() {
   };
 
   const removeFileAttachment = (id: string) => {
-    setFileAttachments((prev) => prev.filter((attachment) => attachment.id !== id));
-  };
-
-  const toggleFileAttachmentPrivacy = (id: string) => {
     setFileAttachments((prev) =>
-      prev.map((attachment) =>
-        attachment.id === id
-          ? { ...attachment, sensitivity: attachment.sensitivity === "private" ? null : "private" }
-          : attachment
-      )
+      prev.filter((attachment) => {
+        if (attachment.id !== id) return true;
+        releaseObjectUrl(attachment.previewUrl);
+        return false;
+      })
     );
   };
 
-  const handleSend = async () => {
-    if ((!input.trim() && attachments.length === 0 && fileAttachments.length === 0) || sending) return;
 
-    // Attachments ingest as documents (durable) AND ride the turn's prompt
-    // addenda (immediate sight); the visible message carries only a note.
-    const toIngest = attachments;
-    setAttachments([]);
-    const filesToUpload = fileAttachments;
-    setFileAttachments([]);
+  const handleSend = async (messageOverride?: string): Promise<string | null> => {
+    const voiceOnly = typeof messageOverride === "string";
+    const overrideText = messageOverride?.trim() || "";
+    if ((!overrideText && !input.trim() && attachments.length === 0 && fileAttachments.length === 0) || sending) return null;
+    if (!voiceOnly && attachmentsPreparing) return null;
+
+    // Attached files were already preserved and read when they were attached;
+    // sending is what commits them to memory and hands their text to the turn.
+    const toIngest = voiceOnly ? [] : attachments;
+    if (!voiceOnly) setAttachments([]);
+    const filesToUpload = voiceOnly ? [] : fileAttachments;
+    if (!voiceOnly) setFileAttachments([]);
+    for (const attachment of filesToUpload) releaseObjectUrl(attachment.previewUrl);
     const attachmentAddenda = toIngest.map(attachmentAddendum);
-    const ingestNotes: string[] = [];
     const visualAttachments: ChatVisualAttachmentPayload[] = [];
-    const visibleImageAttachments: ChatImageAttachment[] = [];
+    const messageAttachments: ChatAttachmentView[] = [];
+    const attachmentPayload: ChatAttachmentPayload[] = [];
 
     for (const attachment of filesToUpload) {
-      if (!isImageAttachmentFile(attachment.file) || attachment.size > INLINE_IMAGE_MAX_BYTES) {
-        continue;
-      }
-      try {
-        const dataUrl = await fileToDataUrl(attachment.file);
-        visualAttachments.push({
-          name: attachment.name,
-          mime_type: attachment.mimeType || attachment.file.type || "image/png",
-          data_url: dataUrl,
-          byte_size: attachment.size,
-        });
-        visibleImageAttachments.push({
-          id: attachment.id,
-          name: attachment.name,
-          mimeType: attachment.mimeType || attachment.file.type || "image/png",
-          dataUrl,
-          byteSize: attachment.size,
-        });
-      } catch (err) {
-        appendLog({
-          id: crypto.randomUUID(),
-          category: "error",
-          title: "Image preview error",
-          detail: `Image "${attachment.name}" could not be prepared for the live turn: ${err instanceof Error ? err.message : String(err)}`,
-          ts: Date.now(),
-        });
-      }
-    }
-
-    // Dropped files upload as original bytes: preserved as source artifacts
-    // first, then ingested by a durable background job.
-    for (const attachment of filesToUpload) {
-      try {
-        const form = new FormData();
-        form.append("file", attachment.file, attachment.name);
-        form.append("mode", "fast");
-        if (attachment.sensitivity) form.append("sensitivity", attachment.sensitivity);
-        const res = await fetch("/api/ingest/file", { method: "POST", body: form });
-        if (res.ok) {
-          const isImage = isImageAttachmentFile(attachment.file);
-          const liveVisual = visualAttachments.some((item) => item.name === attachment.name);
-          ingestNotes.push(
-            isImage
-              ? `[Attached image "${attachment.name}" (${formatBytes(attachment.size)}) — ${
-                  liveVisual ? "visible in this turn; " : "too large for live visual context; "
-                }original preserved in the filing cabinet${
-                  attachment.sensitivity === "private" ? " as private (kept out of group conversations and exports)" : ""
-                }.]`
-              : `[Attached file "${attachment.name}" (${formatBytes(attachment.size)}) — original preserved, being ingested into memory${
-                  attachment.sensitivity === "private" ? " as private (kept out of group conversations and exports)" : ""
-                }. Search it later with search_documents / search_document_chunks.]`
-          );
-          attachmentAddenda.push(
-            isImage
-              ? imageAttachmentAddendum(attachment, liveVisual)
-              : [
-                  `----- ATTACHED FILE: ${attachment.name} -----`,
-                  "The user attached this file to their message. Its original bytes are preserved and it is being ingested in the background — the text is not inlined here.",
-                  "Once ingestion completes (usually under a minute), search_documents / search_document_chunks will find it and open_document can read the extracted content.",
-                ].join("\n")
-          );
-        } else {
-          const detail = await res.text();
-          ingestNotes.push(
-            `[Attached file "${attachment.name}" could not be uploaded: ${res.status}]`
-          );
+      const isImage = isImageAttachmentFile(attachment.file);
+      let dataUrl: string | null = null;
+      if (isImage && attachment.size <= INLINE_IMAGE_MAX_BYTES) {
+        try {
+          dataUrl = await fileToDataUrl(attachment.file);
+          visualAttachments.push({
+            name: attachment.name,
+            mime_type: attachment.mimeType || attachment.file.type || "image/png",
+            data_url: dataUrl,
+            byte_size: attachment.size,
+          });
+        } catch (err) {
+          dataUrl = null;
           appendLog({
             id: crypto.randomUUID(),
             category: "error",
-            title: "Upload error",
-            detail: `File "${attachment.name}" failed (${res.status}): ${detail.slice(0, 200)}`,
+            title: "Image preview error",
+            detail: `Image "${attachment.name}" could not be prepared for the live turn: ${err instanceof Error ? err.message : String(err)}`,
+            ts: Date.now(),
+          });
+        }
+      }
+
+      messageAttachments.push({
+        id: attachment.id,
+        name: attachment.name,
+        mimeType: attachment.mimeType || attachment.file.type || "",
+        kind: attachment.kind,
+        byteSize: attachment.size,
+        ...(dataUrl ? { dataUrl } : {}),
+      });
+      attachmentPayload.push({
+        name: attachment.name,
+        mime_type: attachment.mimeType || attachment.file.type || undefined,
+        byte_size: attachment.size,
+        kind: attachment.kind,
+        artifact_id: attachment.artifactId ?? undefined,
+      });
+      attachmentAddenda.push(
+        isImage
+          ? imageAttachmentAddendum(attachment, dataUrl !== null)
+          : fileAttachmentAddendum(attachment)
+      );
+    }
+
+    // Commit the preserved originals to durable memory now that the message is
+    // actually being sent. Failures are the agent's to report, never silent.
+    for (const attachment of filesToUpload) {
+      if (!attachment.artifactId) continue;
+      try {
+        const res = await fetch(`/api/attachments/${attachment.artifactId}/ingest`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            filename: attachment.name,
+            mode: "fast",
+          }),
+        });
+        if (!res.ok) {
+          const detail = await res.text();
+          appendLog({
+            id: crypto.randomUUID(),
+            category: "error",
+            title: "Attachment error",
+            detail: `File "${attachment.name}" was read but not filed (${res.status}): ${detail.slice(0, 200)}`,
             ts: Date.now(),
           });
         }
       } catch (err) {
-        ingestNotes.push(
-          `[Attached file "${attachment.name}" could not be uploaded: network error]`
-        );
         appendLog({
           id: crypto.randomUUID(),
           category: "error",
-          title: "Upload error",
-          detail: `File "${attachment.name}": ${err instanceof Error ? err.message : String(err)}`,
+          title: "Attachment error",
+          detail: `File "${attachment.name}" was read but not filed: ${err instanceof Error ? err.message : String(err)}`,
           ts: Date.now(),
         });
       }
     }
+
     for (const attachment of toIngest) {
+      attachmentPayload.push({
+        name: attachment.title,
+        mime_type: "text/plain",
+        kind: "document",
+      });
+      messageAttachments.push({
+        id: attachment.id,
+        name: attachment.title,
+        mimeType: "text/plain",
+        kind: "document",
+        note: `Pasted text · ${attachment.wordCount.toLocaleString()} words`,
+      });
       try {
         const res = await fetch("/api/ingest", {
           method: "POST",
@@ -1521,48 +1985,37 @@ export default function ChatPage() {
             content: attachment.content,
             title: attachment.title,
             mode: "fast",
-            sensitivity: attachment.sensitivity ?? undefined,
           }),
         });
-        if (res.ok) {
-          ingestNotes.push(
-            `[Attached document "${attachment.title}" (${attachment.wordCount} words) — being ingested into memory${
-              attachment.sensitivity === "private" ? " as private (kept out of group conversations and exports)" : ""
-            }]`
-          );
-        } else {
+        if (!res.ok) {
           const detail = await res.text();
-          ingestNotes.push(
-            `[Attached document "${attachment.title}" could not be ingested: ${res.status}]`
-          );
           appendLog({
             id: crypto.randomUUID(),
             category: "error",
-            title: "Ingest error",
-            detail: `Attachment "${attachment.title}" failed (${res.status}): ${detail.slice(0, 200)}`,
+            title: "Attachment error",
+            detail: `Pasted text "${attachment.title}" was not filed (${res.status}): ${detail.slice(0, 200)}`,
             ts: Date.now(),
           });
         }
       } catch (err) {
-        ingestNotes.push(
-          `[Attached document "${attachment.title}" could not be ingested: network error]`
-        );
         appendLog({
           id: crypto.randomUUID(),
           category: "error",
-          title: "Ingest error",
-          detail: `Attachment "${attachment.title}": ${err instanceof Error ? err.message : String(err)}`,
+          title: "Attachment error",
+          detail: `Pasted text "${attachment.title}" was not filed: ${err instanceof Error ? err.message : String(err)}`,
           ts: Date.now(),
         });
       }
     }
 
-    const messageText = [input.trim(), ...ingestNotes].filter(Boolean).join("\n\n");
+    // The message reads as the user wrote it. A send with files and no words
+    // still needs something to stand as the turn, so the file names do.
+    const messageText = overrideText || input.trim() || attachmentOnlyMessage(messageAttachments);
     const userMessage: ChatMessage = {
       id: crypto.randomUUID(),
       role: "user",
       content: messageText,
-      attachments: visibleImageAttachments,
+      attachments: messageAttachments.length > 0 ? messageAttachments : undefined,
     };
     const assistantMessage: ChatMessage = {
       id: crypto.randomUUID(),
@@ -1570,7 +2023,7 @@ export default function ChatPage() {
       content: "",
     };
     setMessages((prev) => [...prev, userMessage, assistantMessage]);
-    setInput("");
+    if (!voiceOnly) setInput("");
     setHistoryIndex(null);
     setHistoryDraft("");
     setSending(true);
@@ -1587,6 +2040,7 @@ export default function ChatPage() {
     setSessionNotice(null);
 
     let receivedDone = false;
+    let finalAssistantText: string | null = null;
 
     try {
       const currentSessionId = sessionId || loadSessionId();
@@ -1594,6 +2048,7 @@ export default function ChatPage() {
         message: string;
         prompt_addenda: string[];
         visual_attachments?: ChatVisualAttachmentPayload[];
+        attachments?: ChatAttachmentPayload[];
         session_id?: string | null;
         history?: { role: string; content: string }[];
       } = {
@@ -1603,6 +2058,9 @@ export default function ChatPage() {
       };
       if (visualAttachments.length > 0) {
         chatBody.visual_attachments = visualAttachments;
+      }
+      if (attachmentPayload.length > 0) {
+        chatBody.attachments = attachmentPayload;
       }
       if (!currentSessionId && historyPayload.length > 0) {
         chatBody.history = historyPayload;
@@ -1623,7 +2081,7 @@ export default function ChatPage() {
         });
         setSending(false);
         setStreamMeter((current) => ({ ...current, active: false }));
-        return;
+        return null;
       }
 
       const reader = res.body.getReader();
@@ -1757,10 +2215,12 @@ export default function ChatPage() {
 
           if (eventType === "ui") {
             const connectorUi = connectorSetupUiFromPayload(payload);
+            const speechUi = speechUiFromPayload(payload);
             const title =
               asString(payload.tool_name) ||
               connectorUi?.display_name ||
               connectorUi?.connector_id ||
+              (speechUi ? "Speech" : "") ||
               "Setup";
             appendLog({
               id: crypto.randomUUID(),
@@ -1768,6 +2228,8 @@ export default function ChatPage() {
               title,
               detail: connectorUi
                 ? `${connectorUi.display_name || connectorUi.connector_id} setup opened`
+                : speechUi
+                  ? "Local speech audio is ready"
                 : "Setup UI opened",
               raw: payload,
               ts: Date.now(),
@@ -1779,6 +2241,22 @@ export default function ChatPage() {
               setActiveConnectorSetup((current) =>
                 current?.ui.connector_id === connectorUi.connector_id ? null : current
               );
+            }
+            if (speechUi) upsertAssistantUi(assistantMessage.id, speechUi);
+          }
+
+          if (eventType === "question") {
+            const questionUi = agentQuestionUiFromPayload(payload);
+            if (questionUi) {
+              upsertAssistantUi(assistantMessage.id, questionUi);
+              appendLog({
+                id: crypto.randomUUID(),
+                category: "tool",
+                title: "Clarification requested",
+                detail: questionUi.prompt,
+                raw: payload,
+                ts: Date.now(),
+              });
             }
           }
 
@@ -1797,6 +2275,7 @@ export default function ChatPage() {
           }
           if (eventType === "done") {
             receivedDone = true;
+            finalAssistantText = asString(payload.assistant) || finalAssistantText;
             setAssistantPresentation(assistantMessage.id, payload.presentation);
             if (typeof payload.session_id === "string" && payload.session_id) {
               saveSessionId(payload.session_id);
@@ -1810,7 +2289,7 @@ export default function ChatPage() {
       }
     } catch (err: unknown) {
       if (receivedDone) {
-        return;
+        return finalAssistantText;
       }
       appendLog({
         id: crypto.randomUUID(),
@@ -1824,6 +2303,7 @@ export default function ChatPage() {
       setCurrentPhase(null);
       setStreamMeter((current) => ({ ...current, active: false }));
     }
+    return finalAssistantText;
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -1874,7 +2354,7 @@ export default function ChatPage() {
 
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
-      handleSend();
+      void handleSend();
     }
   };
 
@@ -2052,7 +2532,7 @@ export default function ChatPage() {
                   {message.role === "assistant" ? (
                     agentStatus.portrait_url ? <Image src={agentStatus.portrait_url} alt="" width={32} height={32} unoptimized className="mt-1 h-8 w-8 flex-none rounded-md object-cover" /> : <div className="mt-1 flex h-8 w-8 flex-none items-center justify-center rounded-md bg-[var(--surface-strong)] text-xs font-semibold">H</div>
                   ) : null}
-                  <div className={`max-w-[85%] text-sm leading-6 ${message.role === "user" ? "rounded-lg bg-[var(--foreground)] px-4 py-3 text-white" : "min-w-0 flex-1 py-1 text-[var(--foreground)]"}`}>
+                  <div className={`max-w-[85%] text-sm leading-6 ${message.role === "user" ? "flex flex-col items-end gap-2" : "min-w-0 flex-1 py-1 text-[var(--foreground)]"}`}>
                     {message.role === "assistant" ? (
                       <div className="space-y-3">
                         {message.presentation ? (
@@ -2063,35 +2543,52 @@ export default function ChatPage() {
                           <Spinner label="Thinking..." />
                         )}
                         {message.ui?.map((ui) => (
-                          <ConnectorSetupCard
-                            key={`${uiArtifactKey(ui)}:${ui.status || ""}`}
-                            ui={ui}
-                            assistantId={message.id}
-                            busy={connectorActionBusy}
-                            onAction={runConnectorSetupAction}
-                            onRefresh={refreshConnectorSetupStatus}
-                          />
+                          ui.kind === "connector_setup" ? (
+                            <ConnectorSetupCard
+                              key={`${uiArtifactKey(ui)}:${ui.status || ""}`}
+                              ui={ui}
+                              assistantId={message.id}
+                              busy={connectorActionBusy}
+                              onAction={runConnectorSetupAction}
+                              onRefresh={refreshConnectorSetupStatus}
+                            />
+                          ) : ui.kind === "question" ? (
+                            <AgentQuestionCard key={uiArtifactKey(ui)} question={ui} />
+                          ) : (
+                            <SpeechPlayer key={uiArtifactKey(ui)} speech={ui} />
+                          )
                         ))}
                       </div>
                     ) : (
-                      <div className="space-y-3">
-                        {message.attachments?.length ? (
-                          <div className="grid gap-2">
-                            {message.attachments.map((attachment) => (
-                              <Image
-                                key={attachment.id}
-                                src={attachment.dataUrl}
-                                alt={attachment.name}
-                                width={360}
-                                height={240}
-                                unoptimized
-                                className="max-h-72 w-full rounded-md object-contain"
-                              />
-                            ))}
+                      <>
+                        {message.attachments?.map((attachment) =>
+                          attachment.kind === "image" && attachment.dataUrl ? (
+                            <Image
+                              key={attachment.id}
+                              src={attachment.dataUrl}
+                              alt={attachment.name}
+                              width={360}
+                              height={240}
+                              unoptimized
+                              className="max-h-72 rounded-lg border border-[var(--outline)] object-contain"
+                            />
+                          ) : (
+                            <AttachmentCard
+                              key={attachment.id}
+                              name={attachment.name}
+                              mimeType={attachment.mimeType}
+                              kind={attachment.kind}
+                              note={attachment.note}
+                              detail={attachment.byteSize ? formatBytes(attachment.byteSize) : null}
+                            />
+                          )
+                        )}
+                        {message.content ? (
+                          <div className="rounded-lg bg-[var(--foreground)] px-4 py-3 text-white">
+                            <p className="whitespace-pre-wrap">{message.content}</p>
                           </div>
                         ) : null}
-                        {message.content ? <p className="whitespace-pre-wrap">{message.content}</p> : null}
-                      </div>
+                      </>
                     )}
                   </div>
                 </div>
@@ -2111,100 +2608,94 @@ export default function ChatPage() {
                   <span>
                     {agentStatus.agent_name || "The agent"} has{" "}
                     {inbox.unread > 0 ? `${inbox.unread} unread message${inbox.unread === 1 ? "" : "s"}` : ""}
-                    {inbox.unread > 0 && inbox.pending_requests.length > 0 ? " and " : ""}
+                    {inbox.unread > 0 &&
+                    (inbox.pending_requests.length > 0 ||
+                      inbox.pending_automations.length > 0 ||
+                      inbox.pending_contradictions.length > 0 ||
+                      inbox.pending_node_pairings.length > 0)
+                      ? " and "
+                      : ""}
                     {inbox.pending_requests.length > 0
                       ? `${inbox.pending_requests.length} request${inbox.pending_requests.length === 1 ? "" : "s"} awaiting your decision`
+                      : ""}
+                    {inbox.pending_requests.length > 0 &&
+                    (inbox.pending_automations.length > 0 ||
+                      inbox.pending_contradictions.length > 0 ||
+                      inbox.pending_node_pairings.length > 0)
+                      ? " and "
+                      : ""}
+                    {inbox.pending_automations.length > 0
+                      ? `${inbox.pending_automations.length} automation suggestion${inbox.pending_automations.length === 1 ? "" : "s"}`
+                      : ""}
+                    {inbox.pending_automations.length > 0 &&
+                    (inbox.pending_contradictions.length > 0 || inbox.pending_node_pairings.length > 0)
+                      ? " and "
+                      : ""}
+                    {inbox.pending_contradictions.length > 0
+                      ? `${inbox.pending_contradictions.length} memory contradiction${inbox.pending_contradictions.length === 1 ? "" : "s"}`
+                      : ""}
+                    {inbox.pending_contradictions.length > 0 && inbox.pending_node_pairings.length > 0
+                      ? " and "
+                      : ""}
+                    {inbox.pending_node_pairings.length > 0
+                      ? `${inbox.pending_node_pairings.length} node pairing${inbox.pending_node_pairings.length === 1 ? "" : "s"}`
                       : ""}
                     {" — open the inbox."}
                   </span>
                 </button>
               </div>
             ) : null}
-            {fileAttachments.length > 0 ? (
+            {fileAttachments.length > 0 || attachments.length > 0 ? (
               <div className="mx-auto mb-2 flex max-w-3xl flex-wrap gap-2">
                 {fileAttachments.map((attachment) => (
-                  <span key={attachment.id} className="flex items-center gap-2 rounded-md border border-[var(--outline)] bg-[#f5f7f5] px-2 py-1 text-xs">
-                    {isImageAttachmentFile(attachment.file) ? (
-                      <ImageIcon size={13} className="flex-none text-[var(--teal)]" />
-                    ) : (
-                      <Paperclip size={13} className="flex-none text-[var(--teal)]" />
-                    )}
-                    <span className="max-w-56 truncate font-medium">{attachment.name}</span>
-                    <span className="text-[var(--ink-soft)]">{formatBytes(attachment.size)}</span>
-                    <button
-                      type="button"
-                      aria-label={
-                        attachment.sensitivity === "private"
-                          ? `Make file ${attachment.name} shareable`
-                          : `Mark file ${attachment.name} private`
-                      }
-                      title={
-                        attachment.sensitivity === "private"
-                          ? "Private: kept out of group conversations and exports. Click to make shareable."
-                          : "Shareable. Click to keep out of group conversations and exports."
-                      }
-                      onClick={() => toggleFileAttachmentPrivacy(attachment.id)}
-                      className={`flex flex-none items-center gap-1 rounded p-0.5 ${
-                        attachment.sensitivity === "private"
-                          ? "text-[var(--teal)]"
-                          : "text-[var(--ink-soft)] hover:bg-[var(--outline)] hover:text-[var(--foreground)]"
-                      }`}
-                    >
-                      {attachment.sensitivity === "private" ? <Lock size={12} /> : <LockOpen size={12} />}
-                      {attachment.sensitivity === "private" ? <span className="font-medium">Private</span> : null}
-                    </button>
-                    <button
-                      type="button"
-                      aria-label={`Remove file ${attachment.name}`}
-                      title="Remove"
-                      onClick={() => removeFileAttachment(attachment.id)}
-                      className="flex-none rounded p-0.5 text-[var(--ink-soft)] hover:bg-[var(--outline)] hover:text-[var(--foreground)]"
-                    >
-                      <X size={12} />
-                    </button>
-                  </span>
+                  <AttachmentCard
+                    key={attachment.id}
+                    name={attachment.name}
+                    mimeType={attachment.mimeType}
+                    kind={attachment.kind}
+                    status={attachment.status}
+                    note={
+                      attachment.status === "error"
+                        ? attachment.error || "Could not be read"
+                        : composerAttachmentNote(attachment)
+                    }
+                    detail={formatBytes(attachment.size)}
+                    thumbnailUrl={attachment.previewUrl}
+                    actions={
+                      <>
+                        <button
+                          type="button"
+                          aria-label={`Remove file ${attachment.name}`}
+                          title="Remove"
+                          onClick={() => removeFileAttachment(attachment.id)}
+                          className="flex-none rounded p-1 text-[var(--ink-soft)] hover:bg-[var(--surface-strong)] hover:text-[var(--foreground)]"
+                        >
+                          <X size={14} />
+                        </button>
+                      </>
+                    }
+                  />
                 ))}
-              </div>
-            ) : null}
-            {attachments.length > 0 ? (
-              <div className="mx-auto mb-2 flex max-w-3xl flex-wrap gap-2">
                 {attachments.map((attachment) => (
-                  <span key={attachment.id} className="flex items-center gap-2 rounded-md border border-[var(--outline)] bg-[#f5f7f5] px-2 py-1 text-xs">
-                    <FileText size={13} className="flex-none text-[var(--teal)]" />
-                    <span className="max-w-56 truncate font-medium">{attachment.title}</span>
-                    <span className="text-[var(--ink-soft)]">{attachment.wordCount.toLocaleString()} words</span>
-                    <button
-                      type="button"
-                      aria-label={
-                        attachment.sensitivity === "private"
-                          ? `Make attachment ${attachment.title} shareable`
-                          : `Mark attachment ${attachment.title} private`
-                      }
-                      title={
-                        attachment.sensitivity === "private"
-                          ? "Private: kept out of group conversations and exports. Click to make shareable."
-                          : "Shareable. Click to keep out of group conversations and exports."
-                      }
-                      onClick={() => toggleAttachmentPrivacy(attachment.id)}
-                      className={`flex flex-none items-center gap-1 rounded p-0.5 ${
-                        attachment.sensitivity === "private"
-                          ? "text-[var(--teal)]"
-                          : "text-[var(--ink-soft)] hover:bg-[var(--outline)] hover:text-[var(--foreground)]"
-                      }`}
-                    >
-                      {attachment.sensitivity === "private" ? <Lock size={12} /> : <LockOpen size={12} />}
-                      {attachment.sensitivity === "private" ? <span className="font-medium">Private</span> : null}
-                    </button>
-                    <button
-                      type="button"
-                      aria-label={`Remove attachment ${attachment.title}`}
-                      title="Remove"
-                      onClick={() => removeAttachment(attachment.id)}
-                      className="flex-none rounded p-0.5 text-[var(--ink-soft)] hover:bg-[var(--outline)] hover:text-[var(--foreground)]"
-                    >
-                      <X size={12} />
-                    </button>
-                  </span>
+                  <AttachmentCard
+                    key={attachment.id}
+                    name={attachment.title}
+                    kind="document"
+                    note={`Pasted text · ${attachment.wordCount.toLocaleString()} words`}
+                    actions={
+                      <>
+                        <button
+                          type="button"
+                          aria-label={`Remove attachment ${attachment.title}`}
+                          title="Remove"
+                          onClick={() => removeAttachment(attachment.id)}
+                          className="flex-none rounded p-1 text-[var(--ink-soft)] hover:bg-[var(--surface-strong)] hover:text-[var(--foreground)]"
+                        >
+                          <X size={14} />
+                        </button>
+                      </>
+                    }
+                  />
                 ))}
               </div>
             ) : null}
@@ -2231,6 +2722,8 @@ export default function ChatPage() {
               >
                 <Paperclip size={17} />
               </button>
+              <VoiceRecorder disabled={sending || attachmentsPreparing} onTranscript={handleVoiceTranscript} />
+              <TalkMode disabled={sending || attachmentsPreparing || Boolean(input.trim()) || attachments.length > 0 || fileAttachments.length > 0} onUtterance={handleSend} />
               <textarea
                 ref={textareaRef}
                 aria-label={`Message ${agentStatus.agent_name || "Hexis"}`}
@@ -2242,7 +2735,7 @@ export default function ChatPage() {
                 onPaste={handlePaste}
                 rows={1}
               />
-              <button type="button" aria-label="Send message" title="Send" onClick={handleSend} disabled={sending || (!input.trim() && attachments.length === 0 && fileAttachments.length === 0)} className="flex h-10 w-10 flex-none items-center justify-center rounded-md bg-[var(--foreground)] text-white hover:bg-[var(--teal)] disabled:opacity-35">
+              <button type="button" aria-label="Send message" title={attachmentsPreparing ? "Reading the attached file..." : "Send"} onClick={() => { void handleSend(); }} disabled={sending || attachmentsPreparing || (!input.trim() && attachments.length === 0 && fileAttachments.length === 0)} className="flex h-10 w-10 flex-none items-center justify-center rounded-md bg-[var(--foreground)] text-white hover:bg-[var(--teal)] disabled:opacity-35">
                 <Send size={17} />
               </button>
             </div>
@@ -2265,10 +2758,125 @@ export default function ChatPage() {
                 <p className="rounded-md border border-[var(--outline)] bg-white px-3 py-2 text-xs">{decideNotice}</p>
               ) : null}
 
-              {inbox.pending_requests.length > 0 ? (
+              {inbox.pending_requests.length > 0 ||
+              inbox.pending_automations.length > 0 ||
+              inbox.pending_contradictions.length > 0 ||
+              inbox.pending_node_pairings.length > 0 ? (
                 <div>
                   <h3 className="text-xs font-semibold uppercase text-[var(--ink-soft)]">Awaiting your decision</h3>
                   <div className="mt-2 space-y-3">
+                    {inbox.pending_node_pairings.map((pairing) => (
+                      <div key={pairing.id} className="rounded-lg border border-amber-300 bg-white p-3">
+                        <div className="flex items-center justify-between gap-2">
+                          <Badge variant="accent">companion node</Badge>
+                          <span className="font-mono text-[10px] text-[var(--ink-soft)]">
+                            {pairing.code}
+                          </span>
+                        </div>
+                        <p className="mt-2 text-sm font-semibold">{pairing.name}</p>
+                        <p className="mt-1 break-all font-mono text-[10px] text-[var(--ink-soft)]">
+                          signed id {pairing.node_id}
+                        </p>
+                        <p className="mt-2 text-xs text-[var(--ink-soft)]">
+                          Requests: {pairing.capabilities.join(", ") || "no host capabilities"}
+                        </p>
+                        <p className="mt-1 text-xs leading-5 text-amber-800">
+                          Pairing trusts this exact identity. Every host action still needs approval,
+                          and commands remain limited by this device&apos;s local allowlist.
+                        </p>
+                        <div className="mt-3 flex gap-2">
+                          <button
+                            type="button"
+                            disabled={decideBusy === pairing.id}
+                            onClick={() => decideNodePairing(pairing, "approve")}
+                            className="flex flex-1 items-center justify-center gap-1.5 rounded-md bg-[var(--teal)] px-3 py-1.5 text-xs font-semibold text-white hover:opacity-90 disabled:opacity-40"
+                          >
+                            <Check size={13} /> Approve identity
+                          </button>
+                          <button
+                            type="button"
+                            disabled={decideBusy === pairing.id}
+                            onClick={() => decideNodePairing(pairing, "deny")}
+                            className="flex flex-1 items-center justify-center gap-1.5 rounded-md border border-[var(--outline)] px-3 py-1.5 text-xs font-semibold text-[var(--foreground)] hover:bg-[var(--surface-strong)] disabled:opacity-40"
+                          >
+                            <X size={13} /> Deny
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                    {inbox.pending_automations.map((automation) => (
+                      <div key={automation.id} className="rounded-lg border border-[var(--teal)]/40 bg-white p-3">
+                        <div className="flex items-center justify-between gap-2">
+                          <Badge variant="accent">{automation.source} automation</Badge>
+                          <span className="text-[10px] text-[var(--ink-soft)]">
+                            {String(automation.created_at).slice(0, 16).replace("T", " ")}
+                          </span>
+                        </div>
+                        <p className="mt-2 text-sm font-semibold">{automation.title}</p>
+                        <p className="mt-1 text-sm leading-6">{automation.rationale}</p>
+                        <p className="mt-2 text-xs text-[var(--ink-soft)]">
+                          Schedule: {String(automation.task_spec?.schedule || automation.task_spec?.schedule_kind || "proposed schedule")}
+                          {automation.task_spec?.timezone
+                            ? ` · ${automation.task_spec.timezone}`
+                            : " · your current timezone"}
+                        </p>
+                        <p className="mt-1 text-xs text-[var(--ink-soft)]">
+                          Nothing runs unless you accept.
+                        </p>
+                        <div className="mt-3 flex gap-2">
+                          <button
+                            type="button"
+                            disabled={decideBusy === automation.id}
+                            onClick={() => decideAutomation(automation, "accept")}
+                            className="flex flex-1 items-center justify-center gap-1.5 rounded-md bg-[var(--teal)] px-3 py-1.5 text-xs font-semibold text-white hover:opacity-90 disabled:opacity-40"
+                          >
+                            <Check size={13} /> Accept
+                          </button>
+                          <button
+                            type="button"
+                            disabled={decideBusy === automation.id}
+                            onClick={() => decideAutomation(automation, "dismiss")}
+                            className="flex flex-1 items-center justify-center gap-1.5 rounded-md border border-[var(--outline)] px-3 py-1.5 text-xs font-semibold text-[var(--foreground)] hover:bg-[var(--surface-strong)] disabled:opacity-40"
+                          >
+                            <X size={13} /> Not for me
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                    {inbox.pending_contradictions.map((contradiction) => {
+                      const newer = contradiction.new_memory_id === contradiction.memory_a.id
+                        ? contradiction.memory_a
+                        : contradiction.new_memory_id === contradiction.memory_b.id
+                          ? contradiction.memory_b
+                          : Date.parse(contradiction.memory_a.created_at) >= Date.parse(contradiction.memory_b.created_at)
+                            ? contradiction.memory_a
+                            : contradiction.memory_b;
+                      const older = newer.id === contradiction.memory_a.id
+                        ? contradiction.memory_b
+                        : contradiction.memory_a;
+                      return (
+                        <div key={contradiction.id} className="rounded-lg border border-amber-300 bg-white p-3">
+                          <div className="flex items-center justify-between gap-2">
+                            <Badge variant="accent">memory contradiction</Badge>
+                            <span className="font-mono text-[10px] text-[var(--ink-soft)]">{contradiction.code}</span>
+                          </div>
+                          <p className="mt-2 text-sm font-semibold leading-6">{contradiction.tension}</p>
+                          <div className="mt-2 space-y-2 text-xs leading-5">
+                            <p><span className="font-semibold">Newer:</span> {newer.content}</p>
+                            <p><span className="font-semibold">Older:</span> {older.content}</p>
+                          </div>
+                          <p className="mt-2 text-xs text-[var(--ink-soft)]">
+                            Neither memory changes until you choose. The losing version stays in point-in-time history.
+                          </p>
+                          <div className="mt-3 grid gap-2">
+                            <button type="button" disabled={decideBusy === contradiction.id} onClick={() => decideContradiction(contradiction, "new_right")} className="rounded-md bg-[var(--teal)] px-3 py-1.5 text-xs font-semibold text-white disabled:opacity-40">Newer is right</button>
+                            <button type="button" disabled={decideBusy === contradiction.id} onClick={() => decideContradiction(contradiction, "old_right")} className="rounded-md border border-[var(--outline)] px-3 py-1.5 text-xs font-semibold disabled:opacity-40">Older is right</button>
+                            <button type="button" disabled={decideBusy === contradiction.id} onClick={() => decideContradiction(contradiction, "tension")} className="rounded-md border border-[var(--outline)] px-3 py-1.5 text-xs font-semibold disabled:opacity-40">Both, by context</button>
+                          </div>
+                          <a href="/contradictions" className="mt-2 inline-block text-xs font-semibold text-[var(--teal)] underline">Open the ledger →</a>
+                        </div>
+                      );
+                    })}
                     {inbox.pending_requests.map((request) => (
                       <div key={request.id} className="rounded-lg border border-[var(--teal)]/40 bg-white p-3">
                         <div className="flex items-center justify-between gap-2">
@@ -2559,6 +3167,224 @@ function ConnectorSetupModal({
   );
 }
 
+function ConversationActionCard({
+  icon: Icon,
+  title,
+  summary,
+  status,
+  children,
+}: {
+  icon: LucideIcon;
+  title: string;
+  summary: ReactNode;
+  status: ReactNode;
+  children: ReactNode;
+}) {
+  return (
+    <div className="max-w-2xl rounded-lg border border-[var(--teal)]/35 bg-[#f8fbfa] p-4 shadow-sm">
+      <div className="flex items-start justify-between gap-3">
+        <div className="flex min-w-0 items-start gap-3">
+          <span className="mt-0.5 flex h-8 w-8 flex-none items-center justify-center rounded-md bg-[var(--teal)]/10 text-[var(--teal)]">
+            <Icon size={17} />
+          </span>
+          <div className="min-w-0">
+            <h3 className="text-sm font-semibold">{title}</h3>
+            <div className="mt-1 text-sm leading-6">{summary}</div>
+          </div>
+        </div>
+        {status}
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function AgentQuestionCard({ question }: { question: AgentQuestionUi }) {
+  const [status, setStatus] = useState<AgentQuestionUi["status"]>(
+    question.status || "pending"
+  );
+  const [answer, setAnswer] = useState<string | null>(question.answer || null);
+  const [otherOpen, setOtherOpen] = useState(question.choices.length === 0);
+  const [draft, setDraft] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (status !== "pending" || !question.expires_at) return;
+    const remaining = new Date(question.expires_at).getTime() - Date.now();
+    if (remaining <= 0) {
+      setStatus("timed_out");
+      return;
+    }
+    const timer = window.setTimeout(() => setStatus("timed_out"), remaining);
+    return () => window.clearTimeout(timer);
+  }, [question.expires_at, status]);
+
+  const submit = async (choiceIndex?: number, freeText?: string) => {
+    if (busy || status !== "pending") return;
+    const normalizedAnswer = freeText?.trim();
+    if (choiceIndex === undefined && !normalizedAnswer) {
+      setError("Type an answer before continuing.");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      const response = await fetch("/api/questions/answer", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          id: question.id,
+          choice_index: choiceIndex,
+          answer: choiceIndex === undefined ? normalizedAnswer : undefined,
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok || payload?.ok !== true) {
+        const nextStatus = asString(payload?.status);
+        if (["timed_out", "superseded"].includes(nextStatus)) {
+          setStatus(nextStatus as AgentQuestionUi["status"]);
+        }
+        setError(asString(payload?.message) || asString(payload?.error) || "The answer was not accepted.");
+        return;
+      }
+      setAnswer(asString(payload?.answer) || normalizedAnswer || null);
+      setStatus("answered");
+    } catch (submitError: unknown) {
+      setError(
+        submitError instanceof Error
+          ? submitError.message
+          : "The dashboard could not submit this answer."
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const settled = status !== "pending";
+  return (
+    <ConversationActionCard
+      icon={BrainCircuit}
+      title="I need your input"
+      summary={question.prompt}
+      status={
+        <Badge variant={status === "answered" ? "success" : status === "pending" ? "accent" : "muted"}>
+          {status === "answered" ? "answered" : status === "pending" ? "waiting" : status?.replace("_", " ")}
+        </Badge>
+      }
+    >
+      {status === "answered" ? (
+        <p className="mt-3 rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-800">
+          Answer sent{answer ? `: ${answer}` : ""}. Hexis is continuing this turn.
+        </p>
+      ) : settled ? (
+        <p className="mt-3 rounded-md border border-[var(--outline)] bg-white px-3 py-2 text-xs text-[var(--ink-soft)]">
+          This question is no longer waiting. Send a new chat message if you still want to answer it.
+        </p>
+      ) : (
+        <>
+          {question.choices.length > 0 ? (
+            <div className="mt-3 grid gap-2 sm:grid-cols-2">
+              {question.choices.map((choice, index) => (
+                <button
+                  key={`${question.id}:${index}`}
+                  type="button"
+                  disabled={busy}
+                  onClick={() => void submit(index + 1)}
+                  className="rounded-md border border-[var(--outline)] bg-white px-3 py-2 text-left text-xs hover:border-[var(--teal)] disabled:opacity-40"
+                >
+                  <span className="font-semibold">{choice}</span>
+                </button>
+              ))}
+              {question.allow_free_text ? (
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={() => setOtherOpen(true)}
+                  className="rounded-md border border-[var(--outline)] bg-white px-3 py-2 text-left text-xs hover:border-[var(--teal)] disabled:opacity-40"
+                >
+                  <span className="font-semibold">Other</span>
+                  <span className="mt-1 block text-[var(--ink-soft)]">Type your own answer</span>
+                </button>
+              ) : null}
+            </div>
+          ) : null}
+          {otherOpen && question.allow_free_text ? (
+            <form
+              className="mt-3"
+              onSubmit={(event) => {
+                event.preventDefault();
+                void submit(undefined, draft);
+              }}
+            >
+              <label htmlFor={`question-answer-${question.id}`} className="text-xs font-semibold">
+                Your answer
+              </label>
+              <textarea
+                id={`question-answer-${question.id}`}
+                autoFocus
+                rows={3}
+                value={draft}
+                disabled={busy}
+                onChange={(event) => setDraft(event.target.value)}
+                className="mt-1.5 w-full resize-y rounded-md border border-[var(--outline)] bg-white px-3 py-2 text-sm outline-none focus:border-[var(--teal)] disabled:opacity-50"
+              />
+              <div className="mt-2 flex justify-end gap-2">
+                {question.choices.length > 0 ? (
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => setOtherOpen(false)}
+                    className="rounded-md border border-[var(--outline)] px-3 py-1.5 text-xs font-medium disabled:opacity-40"
+                  >
+                    Back
+                  </button>
+                ) : null}
+                <button
+                  type="submit"
+                  disabled={busy || !draft.trim()}
+                  className="rounded-md bg-[var(--teal)] px-3 py-1.5 text-xs font-semibold text-white disabled:opacity-40"
+                >
+                  {busy ? "Sending…" : "Use this answer"}
+                </button>
+              </div>
+            </form>
+          ) : null}
+          {error ? <p className="mt-2 text-xs text-red-700">{error}</p> : null}
+        </>
+      )}
+    </ConversationActionCard>
+  );
+}
+
+function SpeechPlayer({ speech }: { speech: SpeechUi }) {
+  const [failed, setFailed] = useState(false);
+  return (
+    <ConversationActionCard
+      icon={Volume2}
+      title="Spoken response"
+      summary="Local speech audio is ready. The written response above remains the transcript."
+      status={<Badge variant={failed ? "warning" : "success"}>{failed ? "replay needed" : "ready"}</Badge>}
+    >
+      <audio
+        controls
+        autoPlay
+        preload="metadata"
+        aria-label="Spoken response audio"
+        className="mt-3 w-full"
+        onError={() => setFailed(true)}
+      >
+        <source src={speech.audio_url} type={speech.mime_type || "audio/wav"} />
+      </audio>
+      <p className="mt-2 text-xs text-[var(--ink-soft)]">
+        {failed
+          ? "This temporary audio expired or could not play. Ask Hexis to speak the response again."
+          : `${speech.model || "Configured local voice"} · temporary audio expires automatically.`}
+      </p>
+    </ConversationActionCard>
+  );
+}
+
 function ConnectorSetupCard({
   ui,
   assistantId,
@@ -2583,6 +3409,7 @@ function ConnectorSetupCard({
   const [clientSecretPath, setClientSecretPath] = useState("");
   const [useEnvSecret, setUseEnvSecret] = useState(false);
   const [authorizationResponse, setAuthorizationResponse] = useState("");
+  const [genericCredentialValues, setGenericCredentialValues] = useState<Record<string, string>>({});
   const [selectedCapabilityOption, setSelectedCapabilityOption] =
     useState<ConnectorSetupCapabilityOption | null>(null);
   const [selectedMemoryPolicy, setSelectedMemoryPolicy] = useState<string | null>(null);
@@ -2598,13 +3425,22 @@ function ConnectorSetupCard({
   const autonomyOptions = ui.autonomy_options || [];
   const connectedAccounts = ui.connected_accounts || [];
   const connected = ui.status === "connected" || connectedAccounts.length > 0;
-  const startBusy = busy === `${assistantId}:${ui.connector_id}:connect_gmail`;
-  const completeBusy = busy === `${assistantId}:${ui.connector_id}:complete_gmail`;
+  const lifeConnector = ["notion", "spotify", "home_assistant", "weather", "trello"].includes(ui.connector_id);
+  const startAction = ui.connector_id === "spotify" ? "connect_spotify" : ui.connector_id === "gmail" ? "connect_gmail" : "connect_life";
+  const completeAction = ui.connector_id === "spotify" ? "complete_spotify" : "complete_gmail";
+  const startBusy = busy === `${assistantId}:${ui.connector_id}:${startAction}`;
+  const completeBusy = busy === `${assistantId}:${ui.connector_id}:${completeAction}`;
   const needsCapabilityChoice =
     ui.status === "needs_capability_choice" && capabilityOptions.length > 0;
   const capabilities =
     selectedCapabilityOption?.capabilities ||
-    (ui.capabilities?.length ? ui.capabilities : needsCapabilityChoice ? [] : ["read", "search"]);
+    (ui.capabilities?.length
+      ? ui.capabilities
+      : needsCapabilityChoice
+        ? []
+        : ui.connector_id === "gmail"
+          ? ["read", "search"]
+          : []);
   const memoryPolicy = selectedMemoryPolicy || ui.memory_policy;
   const needsMemoryChoice =
     ui.status === "needs_memory_choice" || (Boolean(selectedCapabilityOption) && !selectedMemoryPolicy);
@@ -2617,7 +3453,7 @@ function ConnectorSetupCard({
     !needsCapabilityChoice &&
     !needsMemoryChoice &&
     !needsAutonomyChoice;
-  const canCompleteOAuth = ui.connector_id === "gmail" && !connected && Boolean(ui.authorization_url || ui.attempt_id);
+  const canCompleteOAuth = ["gmail", "spotify"].includes(ui.connector_id) && !connected && Boolean(ui.authorization_url || ui.attempt_id);
   const requiresClientSecret = canStartOAuth && !ui.client_secret_saved;
   const credentialModes = ui.credential_step?.modes || [];
   const hostedAvailable =
@@ -2631,7 +3467,7 @@ function ConnectorSetupCard({
   const setupSteps = ui.setup_steps?.length ? ui.setup_steps : GMAIL_SETUP_STEPS;
 
   useEffect(() => {
-    if (ui.connector_id !== "gmail" || !canCompleteOAuth || connected) return;
+    if (!["gmail", "spotify"].includes(ui.connector_id) || !canCompleteOAuth || connected) return;
     let stopped = false;
     const refresh = async () => {
       if (stopped || refreshInFlightRef.current) return;
@@ -2640,7 +3476,7 @@ function ConnectorSetupCard({
         const payload = await onRefresh(assistantId, ui);
         const nextUi = connectorSetupUiFromPayload(payload);
         if (nextUi?.status === "connected") {
-          setNotice("Gmail connected. You can return to the conversation.");
+          setNotice(`${connectorName} connected. You can return to the conversation.`);
         }
       } finally {
         refreshInFlightRef.current = false;
@@ -2654,7 +3490,7 @@ function ConnectorSetupCard({
       stopped = true;
       window.clearInterval(timer);
     };
-  }, [assistantId, canCompleteOAuth, connected, ui.attempt_id, ui.connector_id, ui.id, ui.status]);
+  }, [assistantId, canCompleteOAuth, connected, connectorName, onRefresh, ui]);
 
   const runSaveClientSecret = async (file: File | null | undefined) => {
     if (!file) return;
@@ -2719,10 +3555,10 @@ function ConnectorSetupCard({
     setError(null);
     const response = authorizationResponse.trim();
     if (!response) {
-      setError("Paste the Google callback URL or authorization code.");
+      setError(`Paste the ${connectorName} callback URL or authorization code.`);
       return;
     }
-    const payload = await onAction(assistantId, ui, "complete_gmail", {
+    const payload = await onAction(assistantId, ui, completeAction, {
       attempt_id: ui.attempt_id || undefined,
       authorization_response: response,
     });
@@ -2733,25 +3569,57 @@ function ConnectorSetupCard({
     }
   };
 
+  const credentialFields = ui.credential_fields || [];
+  const genericConfigured =
+    ui.connector_id === "spotify"
+      ? Boolean(
+          genericCredentialValues.client_id?.trim() ||
+            genericCredentialValues.client_id_env?.trim()
+        )
+      : credentialFields.every((field) =>
+          Boolean(genericCredentialValues[field.name]?.trim())
+        );
+
+  const runGenericConnect = async () => {
+    setNotice(null);
+    setError(null);
+    const argumentsPayload: Record<string, unknown> = {
+      capabilities,
+    };
+    if (ui.connector_id !== "spotify") {
+      argumentsPayload.connector_id = ui.connector_id;
+    }
+    for (const [name, value] of Object.entries(genericCredentialValues)) {
+      if (value.trim()) argumentsPayload[name] = value.trim();
+    }
+    const payload = await onAction(
+      assistantId,
+      ui,
+      startAction,
+      argumentsPayload
+    );
+    if (payload.error || payload.detail || payload.success === false) {
+      setError(integrationActionError(payload, 400));
+    } else {
+      setNotice(integrationActionNotice(payload, 200));
+    }
+  };
+
   return (
-    <div className="max-w-2xl rounded-lg border border-[var(--teal)]/35 bg-[#f8fbfa] p-4 shadow-sm">
-      <div className="flex items-start justify-between gap-3">
-        <div className="flex min-w-0 items-start gap-3">
-          <span className="mt-0.5 flex h-8 w-8 flex-none items-center justify-center rounded-md bg-[var(--teal)]/10 text-[var(--teal)]">
-            <Mail size={17} />
-          </span>
-          <div className="min-w-0">
-            <h3 className="text-sm font-semibold">{ui.title || `Connect ${connectorName}`}</h3>
-            <p className="mt-1 text-xs leading-5 text-[var(--ink-soft)]">
-              {ui.summary || `Set up ${connectorName} access.`}
-            </p>
-          </div>
-        </div>
+    <ConversationActionCard
+      icon={Mail}
+      title={ui.title || `Connect ${connectorName}`}
+      summary={
+        <span className="text-xs leading-5 text-[var(--ink-soft)]">
+          {ui.summary || `Set up ${connectorName} access.`}
+        </span>
+      }
+      status={
         <Badge variant={connected ? "success" : ui.status === "needs_client_secret" ? "warning" : "muted"}>
           {connectorSetupStatusLabel(ui)}
         </Badge>
-      </div>
-
+      }
+    >
       <div className="mt-3 flex flex-wrap gap-1.5">
         {capabilities.map((capability) => (
           <Badge key={capability} variant="muted">
@@ -2916,6 +3784,68 @@ function ConnectorSetupCard({
         </div>
       ) : null}
 
+      {lifeConnector && !connected && !ui.authorization_url ? (
+        <div className="mt-4 space-y-3 rounded-md border border-[var(--outline)] bg-white p-3">
+          <div>
+            <p className="text-sm font-medium">{connectorName} setup</p>
+            <p className="mt-1 text-xs leading-5 text-[var(--ink-soft)]">
+              {ui.next_step || `Configure and verify ${connectorName}.`}
+            </p>
+          </div>
+          {ui.redirect_uri ? (
+            <div className="rounded-md bg-[var(--surface-strong)] px-3 py-2 text-xs">
+              <span className="font-semibold">Exact redirect URI</span>
+              <span className="mt-1 block break-all font-mono">{ui.redirect_uri}</span>
+            </div>
+          ) : null}
+          <div className="grid gap-2 sm:grid-cols-2">
+            {credentialFields.map((field) => {
+              const isEnvironmentReference = field.name.endsWith("_env");
+              return (
+                <label key={field.name} className="text-xs font-semibold">
+                  {field.label}
+                  <input
+                    type="text"
+                    value={genericCredentialValues[field.name] || ""}
+                    onChange={(event) =>
+                      setGenericCredentialValues((current) => ({
+                        ...current,
+                        [field.name]: event.target.value,
+                      }))
+                    }
+                    placeholder={field.example || (isEnvironmentReference ? "ENVIRONMENT_VARIABLE_NAME" : "")}
+                    autoComplete="off"
+                    className="mt-1.5 w-full rounded-md border border-[var(--outline)] bg-white px-3 py-2 text-sm outline-none focus:border-[var(--teal)] focus:ring-2 focus:ring-[var(--teal)]/10"
+                  />
+                  {isEnvironmentReference ? (
+                    <span className="mt-1 block font-normal text-[var(--ink-soft)]">
+                      Environment variable name only — never paste the secret value.
+                    </span>
+                  ) : null}
+                </label>
+              );
+            })}
+          </div>
+          {ui.connector_id === "spotify" ? (
+            <p className="text-xs text-[var(--ink-soft)]">
+              Choose one client-ID field. The client ID is non-secret; Hexis never asks for a Spotify client secret in this desktop PKCE flow.
+            </p>
+          ) : null}
+          <button
+            type="button"
+            onClick={() => void runGenericConnect()}
+            disabled={Boolean(busy) || !genericConfigured || capabilities.length === 0}
+            className="rounded-md bg-[var(--foreground)] px-3 py-2 text-xs font-semibold text-white hover:bg-[var(--teal)] disabled:opacity-40"
+          >
+            {startBusy
+              ? "Starting..."
+              : ui.connector_id === "spotify"
+                ? "Start Spotify sign-in"
+                : `Verify ${connectorName}`}
+          </button>
+        </div>
+      ) : null}
+
       {canStartOAuth ? (
         <div className="mt-4 space-y-3 rounded-md border border-[var(--outline)] bg-white p-3">
           <div className="flex items-start justify-between gap-3">
@@ -3045,13 +3975,13 @@ function ConnectorSetupCard({
             rel="noreferrer"
             className="inline-flex items-center gap-1 text-xs font-semibold text-[var(--teal)] underline"
           >
-            Open Google sign-in <ExternalLink size={12} />
+            Open {connectorName} sign-in <ExternalLink size={12} />
           </a>
           <p className="mt-1 break-all font-mono text-[11px] leading-5 text-[var(--ink-soft)]">
             {ui.authorization_url}
           </p>
           <p className="mt-2 text-xs leading-5 text-[var(--ink-soft)]">
-            After you approve access, Google returns to Hexis and this panel checks for completion automatically.
+            After you approve access, {connectorName} returns to Hexis and this panel checks for completion automatically.
           </p>
         </div>
       ) : null}
@@ -3059,14 +3989,14 @@ function ConnectorSetupCard({
       {canCompleteOAuth ? (
         <details className="mt-3 rounded-md border border-[var(--outline)] bg-white p-3 text-xs">
           <summary className="cursor-pointer font-semibold text-[var(--teal)]">
-            Google did not return automatically
+            {connectorName} did not return automatically
           </summary>
           <div className="mt-3 grid gap-2 sm:grid-cols-[1fr_auto]">
             <input
               type="text"
               value={authorizationResponse}
               onChange={(event) => setAuthorizationResponse(event.target.value)}
-              placeholder="Paste Google callback URL or authorization code"
+              placeholder={`Paste ${connectorName} callback URL or authorization code`}
               className="w-full rounded-md border border-[var(--outline)] bg-white px-3 py-2 text-sm outline-none focus:border-[var(--teal)] focus:ring-2 focus:ring-[var(--teal)]/10"
             />
             <button
@@ -3099,7 +4029,7 @@ function ConnectorSetupCard({
       </a>
       {notice ? <p className="mt-3 rounded-md border border-[var(--teal)]/35 bg-white px-3 py-2 text-xs">{notice}</p> : null}
       {error ? <p className="mt-3 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">{error}</p> : null}
-    </div>
+    </ConversationActionCard>
   );
 }
 
@@ -3133,24 +4063,39 @@ function ActivityInspector({
     [events],
   );
   const recallEvents = useMemo(() => events.filter(isMemoryRecallEvent), [events]);
+  const latestTool = toolEvents.length > 0 ? toolEvents[toolEvents.length - 1] : null;
+  const [activityNow, setActivityNow] = useState<number | null>(null);
+
+  useEffect(() => {
+    const initial = window.setTimeout(() => setActivityNow(Date.now()), 0);
+    const remaining = latestTool
+      ? Math.max(0, 15000 - (Date.now() - latestTool.ts))
+      : 0;
+    const expiration = latestTool && remaining > 0
+      ? window.setTimeout(() => setActivityNow(Date.now()), remaining + 10)
+      : null;
+    return () => {
+      window.clearTimeout(initial);
+      if (expiration !== null) window.clearTimeout(expiration);
+    };
+  }, [latestTool]);
 
   const currentEmotion = emotionHistory.length > 0
     ? emotionHistory[emotionHistory.length - 1]
     : {
         id: "current-emotion",
-        ts: Date.now(),
+        ts: 0,
         label: agentStatus.mood || "neutral",
         valence: typeof agentStatus.valence === "number" ? agentStatus.valence : null,
         detail: agentStatus.mood || "No emotional state reported yet.",
       };
   const latestThought = thoughtPairs.length > 0 ? thoughtPairs[thoughtPairs.length - 1] : null;
-  const latestTool = toolEvents.length > 0 ? toolEvents[toolEvents.length - 1] : null;
   const latestRecall = recallEvents.length > 0 ? recallEvents[recallEvents.length - 1] : null;
   const latestMemories = latestRecall ? memoryPreviewsFromEvent(latestRecall) : [];
   const latestMemory = latestMemories.length > 0 ? latestMemories[0] : null;
   const workLabel = sending
     ? streamLabel(currentPhase || "stream")
-    : latestTool && Date.now() - latestTool.ts < 15000
+    : latestTool && activityNow !== null && activityNow - latestTool.ts < 15000
       ? latestTool.title
       : "Idle";
 
@@ -3766,7 +4711,7 @@ function connectorSetupNotice(ui: ConnectorSetupUi): string {
     case "client_secret_saved":
       return `${connector} setup file saved. Start Google sign-in from the setup panel.`;
     case "pending_authorization":
-      return `${connector} sign-in started. Open Google; Hexis will complete the connection when Google returns.`;
+      return `${connector} sign-in started. Open the provider authorization page; Hexis will complete the connection when it returns.`;
     case "connected":
       return `${connector} is connected.`;
     default:

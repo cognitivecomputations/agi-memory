@@ -1,0 +1,69 @@
+{
+  "benchmark": "hexis-public-memory-benchmark",
+  "version": "1.0.0",
+  "dataset_sha256": "f92bd4dc54a5209cadd2af90706be163d539d4d7f455c068695b5a8dbb323149",
+  "run_date": "2026-08-28",
+  "case_count": 25,
+  "scoring": "macro average across five dimensions; deterministic exact-string and event-id scoring",
+  "systems": [
+    {
+      "name": "hexis-memory-v1",
+      "kind": "system_under_test",
+      "overall": 96.33,
+      "dimensions": {
+        "provenance_accuracy": 96.67,
+        "contradiction_detection": 85.0,
+        "six_month_recall": 100.0,
+        "cross_session_continuity": 100.0,
+        "stale_belief_resistance": 100.0
+      },
+      "profile": {
+        "hexis_source_version": "1.0.13",
+        "installed_distribution_version": "1.0.10",
+        "contradiction_provider": "openai-codex",
+        "contradiction_model": "gpt-5.6-luna",
+        "contradiction_prompt": "production services/prompts/contradiction_detection.md",
+        "retrieval": "temporal_memory_snapshot over case-owned semantic memories",
+        "isolation": "one live-database transaction per case, always rolled back",
+        "embedding_service": "embeddinggemma:300m-qat-q4_0"
+      },
+      "cases_below_100": [
+        {
+          "case_id": "provenance-02",
+          "score": 83.33,
+          "reason": "The answer was correct, but the answer projection cited one of two corroborating sources (citation F1 66.67)."
+        },
+        {
+          "case_id": "contradiction-03",
+          "score": 25.0,
+          "reason": "In the official one-shot run the live classifier emitted no conflict, and answer projection included only ALMOND-SAFE, omitting SEVERE-ALMOND-ALLERGY."
+        }
+      ]
+    },
+    {
+      "name": "append-only-transcript",
+      "kind": "reference_baseline_not_a_product",
+      "overall": 82.33,
+      "dimensions": {
+        "provenance_accuracy": 96.67,
+        "contradiction_detection": 55.0,
+        "six_month_recall": 100.0,
+        "cross_session_continuity": 100.0,
+        "stale_belief_resistance": 60.0
+      }
+    },
+    {
+      "name": "recent-window-30d",
+      "kind": "reference_baseline_not_a_product",
+      "overall": 32.0,
+      "dimensions": {
+        "provenance_accuracy": 20.0,
+        "contradiction_detection": 10.0,
+        "six_month_recall": 0.0,
+        "cross_session_continuity": 100.0,
+        "stale_belief_resistance": 30.0
+      }
+    }
+  ],
+  "disclosure": "This is the one-shot run-all result with no best-of retry. A prior development pilot scored 98.33, exposing live-classifier variance; the lower complete run is official. No third-party product result is claimed. The two comparison rows are source-controlled sanity baselines. External agents can be run through the command adapter and must publish their wrapper, configuration, raw run result, and dataset hash."
+}

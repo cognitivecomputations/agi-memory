@@ -5,10 +5,19 @@ category: system
 requires:
   tools: [safe_shell, execute_code]
 contexts: [heartbeat, chat]
+aliases: [code, script, compute, calculate, run, python]
 bound_tools: [safe_shell, execute_code, run_script, read_file, write_file, list_directory, glob, grep, edit_file, shell, browser]
 ---
 
 # Code Execution
+
+All four tools use the operator-selected execution profile. Do not ask for or
+invent a backend argument—the public tool schemas stay stable. If a result says
+the selected SSH or remote-Docker profile is unavailable, report its exact
+recovery step; never retry by assuming local placement. `run_script` requires
+the same workspace-relative file to exist on the remote target. Remote
+`execute_code` persists picklable session variables, reports unpicklable names,
+and cannot call the local `tool_use` bridge; call that tool directly instead.
 
 Use this skill to actually run things: compile a program, execute a script,
 test code someone shares with you, check what a command outputs, or work with

@@ -185,6 +185,21 @@ class ChannelAdapter(ABC):
         """
         return None
 
+    async def download_attachment(
+        self,
+        attachment: Attachment,
+        *,
+        max_size: int,
+    ) -> Attachment:
+        """Materialize one inbound attachment for a service such as STT.
+
+        Adapters with authenticated or platform-id media override this. The
+        portable fallback keeps SSRF and response-size checks in one place.
+        """
+        from .media import download_attachment
+
+        return await download_attachment(attachment, max_size=max_size)
+
     async def send_presentation(
         self,
         channel_id: str,
@@ -219,6 +234,7 @@ def parse_allowlist(value: Any) -> set[str] | None:
         return None
     if isinstance(value, str):
         import json
+
         try:
             value = json.loads(value)
         except Exception:
@@ -226,6 +242,29 @@ def parse_allowlist(value: Any) -> set[str] | None:
     if isinstance(value, list):
         return {str(v) for v in value}
     return None
+
+
+def resolve_forward_all(
+    config: dict[str, Any],
+    override: bool | None = None,
+) -> bool:
+    """Resolve the transport-only mode used by inbound disposition.
+
+    The explicit constructor flag is useful to isolated adapter tests. In
+    production the channel worker supplies ``config["forward_all"]`` so a
+    runtime feature-flag change needs no adapter restart. The manager uses
+    each message's legacy gate hint while the DB-owned layer is disabled.
+    """
+    if override is not None:
+        return bool(override)
+    value = config.get("forward_all")
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return False
 
 
 def resolve_channel_token(

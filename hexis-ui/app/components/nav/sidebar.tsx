@@ -9,11 +9,16 @@ import {
   Layers,
   LayoutDashboard,
   MessageCircle,
+  Send,
   Plug,
   Settings,
   Target,
   UserRound,
   X,
+  GitCompareArrows,
+  History,
+  BookCheck,
+  ArchiveRestore,
 } from "lucide-react";
 import Link from "next/link";
 import Image from "next/image";
@@ -27,6 +32,7 @@ type StatusData = {
   portrait_url?: string | null;
   energy?: number;
   max_energy?: number;
+  energy_capacity?: number;
   mood?: string;
   heartbeat_active?: boolean;
   heartbeat_paused?: boolean;
@@ -37,7 +43,12 @@ const navItems = [
   { href: "/chat", label: "Conversation", icon: MessageCircle },
   { href: "/goals", label: "Goals", icon: Target },
   { href: "/responsibilities", label: "Responsibilities", icon: BellRing },
+  { href: "/outbound", label: "Outbound", icon: Send },
   { href: "/memories", label: "Memory", icon: Brain },
+  { href: "/memory-history", label: "Memory history", icon: History },
+  { href: "/contradictions", label: "Contradictions", icon: GitCompareArrows },
+  { href: "/learning-review", label: "Learning review", icon: BookCheck },
+  { href: "/forgetting", label: "Forgetting", icon: ArchiveRestore },
   { href: "/user-model", label: "User Model", icon: UserRound },
   { href: "/documents", label: "Documents", icon: FolderOpen },
   { href: "/desk", label: "Desk", icon: Layers },
@@ -147,7 +158,7 @@ export function Sidebar({
         {status.energy !== undefined ? (
           <ProgressBar
             value={status.energy}
-            max={status.max_energy || 20}
+            max={status.energy_capacity || status.max_energy || 20}
             label="Energy"
             color="teal"
           />

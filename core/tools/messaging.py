@@ -18,6 +18,7 @@ from core.integration_reliability import (
 )
 
 from .base import (
+    OutboundSpec,
     ToolCategory,
     ToolContext,
     ToolErrorType,
@@ -42,7 +43,9 @@ def _integration_tool_error_type(exc: IntegrationHttpError) -> ToolErrorType:
     return ToolErrorType.HTTP_ERROR
 
 
-def _integration_error_result(provider_label: str, exc: IntegrationHttpError) -> ToolResult:
+def _integration_error_result(
+    provider_label: str, exc: IntegrationHttpError
+) -> ToolResult:
     return ToolResult.error_result(
         format_provider_error(provider_label, exc),
         _integration_tool_error_type(exc),
@@ -64,7 +67,9 @@ async def _load_db_channel_config(
             loaded = await _load_channel_config(conn, channel_type)
         return loaded if isinstance(loaded, dict) else {}
     except Exception:
-        logger.debug("Failed to load %s channel config from DB", channel_type, exc_info=True)
+        logger.debug(
+            "Failed to load %s channel config from DB", channel_type, exc_info=True
+        )
         return {}
 
 
@@ -133,6 +138,12 @@ class DiscordSendHandler(ToolHandler):
             is_read_only=False,
             requires_approval=True,
             optional=True,
+            outbound=OutboundSpec(
+                recipient_arg="channel_id",
+                body_arg="message",
+                channel="discord",
+                fixed_recipient="configured_webhook",
+            ),
             allowed_contexts={ToolContext.HEARTBEAT, ToolContext.CHAT},
         )
 
@@ -306,6 +317,13 @@ class SlackSendHandler(ToolHandler):
             is_read_only=False,
             requires_approval=True,
             optional=True,
+            outbound=OutboundSpec(
+                recipient_arg="channel",
+                body_arg="message",
+                channel="slack",
+                thread_arg="thread_ts",
+                fixed_recipient="configured_webhook",
+            ),
             allowed_contexts={ToolContext.HEARTBEAT, ToolContext.CHAT},
         )
 
@@ -328,9 +346,14 @@ class SlackSendHandler(ToolHandler):
         try:
             from channels.slack_adapter import _resolve_token as _resolve_slack_token
 
-            bot_token = _resolve_slack_token(config, "bot_token", "SLACK_BOT_TOKEN") or bot_token
+            bot_token = (
+                _resolve_slack_token(config, "bot_token", "SLACK_BOT_TOKEN")
+                or bot_token
+            )
         except Exception:
-            logger.debug("Slack token resolution via channel adapter failed", exc_info=True)
+            logger.debug(
+                "Slack token resolution via channel adapter failed", exc_info=True
+            )
 
         # Prefer webhook if available
         if webhook_url:
@@ -510,6 +533,13 @@ class TelegramSendHandler(ToolHandler):
             is_read_only=False,
             requires_approval=True,
             optional=True,
+            outbound=OutboundSpec(
+                recipient_arg="chat_id",
+                body_arg="message",
+                channel="telegram",
+                thread_arg="reply_to_message_id",
+                fixed_recipient="configured_default_chat",
+            ),
             allowed_contexts={ToolContext.HEARTBEAT, ToolContext.CHAT},
         )
 
@@ -525,11 +555,15 @@ class TelegramSendHandler(ToolHandler):
 
         bot_token = config.get("bot_token")
         try:
-            from channels.telegram_adapter import _resolve_token as _resolve_telegram_token
+            from channels.telegram_adapter import (
+                _resolve_token as _resolve_telegram_token,
+            )
 
             bot_token = _resolve_telegram_token(config) or bot_token
         except Exception:
-            logger.debug("Telegram token resolution via channel adapter failed", exc_info=True)
+            logger.debug(
+                "Telegram token resolution via channel adapter failed", exc_info=True
+            )
         if not bot_token:
             return ToolResult(
                 success=False,
@@ -655,6 +689,11 @@ class SignalSendHandler(ToolHandler):
             is_read_only=False,
             requires_approval=True,
             optional=True,
+            outbound=OutboundSpec(
+                recipient_arg="recipient",
+                body_arg="message",
+                channel="signal",
+            ),
             allowed_contexts={ToolContext.HEARTBEAT, ToolContext.CHAT},
         )
 
@@ -671,9 +710,13 @@ class SignalSendHandler(ToolHandler):
         recipient = str(arguments.get("recipient") or "").strip()
         message = str(arguments.get("message") or "")
         if not recipient:
-            return ToolResult.error_result("recipient is required.", ToolErrorType.INVALID_PARAMS)
+            return ToolResult.error_result(
+                "recipient is required.", ToolErrorType.INVALID_PARAMS
+            )
         if not message.strip():
-            return ToolResult.error_result("message is required.", ToolErrorType.INVALID_PARAMS)
+            return ToolResult.error_result(
+                "message is required.", ToolErrorType.INVALID_PARAMS
+            )
         if not _target_allowed(config, "allowed_numbers", recipient):
             return ToolResult.error_result(
                 f"Signal recipient {recipient} is not in channel.signal.allowed_numbers.",
@@ -681,14 +724,33 @@ class SignalSendHandler(ToolHandler):
             )
 
         try:
-            from channels.signal_adapter import DEFAULT_API_URL, _resolve_token as _resolve_signal_phone
+            from channels.signal_adapter import (
+                DEFAULT_API_URL,
+                _resolve_token as _resolve_signal_phone,
+            )
 
-            sender_number = str(arguments.get("phone_number") or "").strip() or _resolve_signal_phone(config)
-            api_url = str(arguments.get("api_url") or config.get("api_url") or os.getenv("SIGNAL_API_URL") or DEFAULT_API_URL).rstrip("/")
+            sender_number = str(
+                arguments.get("phone_number") or ""
+            ).strip() or _resolve_signal_phone(config)
+            api_url = str(
+                arguments.get("api_url")
+                or config.get("api_url")
+                or os.getenv("SIGNAL_API_URL")
+                or DEFAULT_API_URL
+            ).rstrip("/")
         except Exception:
-            logger.debug("Signal config resolution via channel adapter failed", exc_info=True)
-            sender_number = str(arguments.get("phone_number") or config.get("phone_number") or "").strip()
-            api_url = str(arguments.get("api_url") or config.get("api_url") or os.getenv("SIGNAL_API_URL") or "http://localhost:8080").rstrip("/")
+            logger.debug(
+                "Signal config resolution via channel adapter failed", exc_info=True
+            )
+            sender_number = str(
+                arguments.get("phone_number") or config.get("phone_number") or ""
+            ).strip()
+            api_url = str(
+                arguments.get("api_url")
+                or config.get("api_url")
+                or os.getenv("SIGNAL_API_URL")
+                or "http://localhost:8080"
+            ).rstrip("/")
 
         if not sender_number:
             return ToolResult.error_result(
@@ -718,7 +780,9 @@ class SignalSendHandler(ToolHandler):
                 {
                     "sent": True,
                     "recipient": recipient,
-                    "timestamp": data.get("timestamp") if isinstance(data, dict) else None,
+                    "timestamp": data.get("timestamp")
+                    if isinstance(data, dict)
+                    else None,
                     "response": data,
                 },
                 display_output=f"Signal message sent to {recipient}",

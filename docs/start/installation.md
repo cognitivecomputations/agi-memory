@@ -96,11 +96,28 @@ Note that `hexis` is then only on PATH while that virtualenv is active.
 
 For development or contributing:
 
+### With Mise
+
+The repository's [`mise.toml`](../../mise.toml) provides Python, uv, Bun, the Docker CLI, and Docker Compose. Install [Mise](https://mise.jdx.dev/getting-started.html), then run:
+
 ```bash
 git clone https://github.com/QuixiAI/Hexis.git && cd Hexis
-uv venv && source .venv/bin/activate
-uv pip install -e .
-cp .env.local .env   # edit with your settings
+mise install
+mise run setup
+mise run docker:check
+```
+
+`mise run setup` links the Mise-managed Compose binary into Docker's user plugin directory only when `docker compose` is otherwise unavailable; it never replaces an existing plugin. `docker:check` then verifies Compose through the standard `docker compose` command and uses whichever Docker daemon is active.
+
+On macOS 13 or newer without Docker Desktop, install and start the optional VZ/VirtioFS Colima runtime with `mise run docker:colima`, then rerun the check. On older macOS releases, use Docker Desktop or configure a compatible Docker daemon manually.
+
+### Without Mise
+
+```bash
+git clone https://github.com/QuixiAI/Hexis.git && cd Hexis
+uv sync --locked --inexact
+source .venv/bin/activate
+cp .env.example .env   # edit with your settings; never commit .env
 ```
 
 No uv? A plain virtualenv works too: `python3 -m venv .venv && source .venv/bin/activate && pip install -e .`
@@ -113,36 +130,54 @@ pip install -e . --no-build-isolation
 
 ## Environment Configuration
 
-Create a `.env` file (automatically created by `hexis init` for packaged installs):
+Copy the tracked template, then edit only the settings you need. The resulting
+`.env` is ignored by Git:
 
 ```bash
-POSTGRES_DB=hexis_memory
-POSTGRES_USER=hexis_user
-POSTGRES_PASSWORD=hexis_password
-POSTGRES_HOST=localhost
-POSTGRES_PORT=43815
-HEXIS_BIND_ADDRESS=127.0.0.1    # Set to 0.0.0.0 to expose services
+cp .env.example .env
 ```
 
 If port `43815` is already in use, set `POSTGRES_PORT` to any free port.
 
-For LLM API keys (if using API-key providers):
+For a custom OpenAI-compatible server, set its base URL and key in `.env`:
+
+```dotenv
+OPENAI_BASE_URL=https://your-inference-server.example/v1
+OPENAI_API_KEY=replace-with-your-key
+```
+
+Then initialize with the model ID exposed by that server. `--api-key-env` tells
+Hexis which variable to read without putting the secret in shell history:
 
 ```bash
-OPENAI_API_KEY=sk-...           # OpenAI Platform
-ANTHROPIC_API_KEY=sk-ant-...    # Anthropic
+hexis init --provider openai_compatible --model your-model-id --character hexis \
+  --api-key-env OPENAI_API_KEY
 ```
+
+If the server does not authenticate, use a non-secret placeholder such as
+`OPENAI_API_KEY=not-needed`; the OpenAI client still requires a value. Hexis
+stores the endpoint and the environment variable's **name** in PostgreSQL, not
+the key itself.
 
 See [Environment Variables](../operations/environment-variables.md) for the complete reference.
 
 ## Start the Stack
 
 ```bash
-hexis up         # starts PostgreSQL, RabbitMQ, heartbeat worker, and maintenance worker
+hexis up         # starts the brain, workers, API, dashboard, and delivery relay
 hexis doctor     # verify everything is healthy
 ```
 
 The CLI auto-detects whether you're running from source or a packaged install and uses the appropriate Docker Compose file.
+It starts cached or published images by default; a source checkout only builds
+images when you explicitly run `hexis up --build` or enter watch mode with
+`hexis dev`.
+
+The dashboard stays available on loopback at `http://127.0.0.1:3477`. To install
+it on a phone, keep that loopback bind and run `hexis tunnel start`; the private
+[Tailscale HTTPS runbook](../operations/secure-remote-access.md) covers device
+approval and verification. Plain LAN HTTP cannot provide the service worker, push,
+or microphone.
 
 ## Verify It Worked
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from uuid import uuid4
 
 import pytest
 
@@ -14,8 +15,7 @@ def _coerce_json(value):
 
 
 async def _stub_get_embedding(conn):
-    await conn.execute(
-        """
+    await conn.execute("""
         CREATE OR REPLACE FUNCTION get_embedding(text_contents TEXT[])
         RETURNS vector[] AS $$
             SELECT COALESCE(
@@ -28,8 +28,7 @@ async def _stub_get_embedding(conn):
             )
             FROM unnest(text_contents)
         $$ LANGUAGE sql;
-        """
-    )
+        """)
 
 
 async def test_execute_goals_tool_create_and_list(db_pool):
@@ -41,16 +40,75 @@ async def test_execute_goals_tool_create_and_list(db_pool):
             created = _coerce_json(
                 await conn.fetchval(
                     "SELECT execute_goals_tool($1::jsonb)",
-                    json.dumps({"action": "create", "title": "DB-native goal", "priority": "queued"}),
+                    json.dumps(
+                        {
+                            "action": "create",
+                            "title": "DB-native goal",
+                            "priority": "queued",
+                        }
+                    ),
                 )
             )
             listed = _coerce_json(
-                await conn.fetchval("SELECT execute_goals_tool('{\"action\":\"list\"}'::jsonb)")
+                await conn.fetchval(
+                    'SELECT execute_goals_tool(\'{"action":"list"}\'::jsonb)'
+                )
             )
 
             assert created["success"] is True
             assert created["output"]["title"] == "DB-native goal"
+            assert created["output"]["origin"] == "derived"
             assert listed["success"] is True
+        finally:
+            await tr.rollback()
+
+
+async def test_execute_goals_tool_uses_trusted_origin_not_source_text(db_pool):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            await _stub_get_embedding(conn)
+            payload = _coerce_json(
+                await conn.fetchval(
+                    "SELECT execute_goals_tool($1::jsonb, 'external'::goal_source)",
+                    json.dumps(
+                        {
+                            "action": "create",
+                            "title": "Trusted-origin DB goal",
+                            "source": "user_request",
+                        }
+                    ),
+                )
+            )
+            assert payload["success"] is True
+            assert payload["output"]["origin"] == "external"
+            assert (
+                await conn.fetchval(
+                    "SELECT goal_origin::text FROM memories WHERE id = $1::uuid",
+                    payload["output"]["goal_id"],
+                )
+                == "external"
+            )
+        finally:
+            await tr.rollback()
+
+
+async def test_raw_goal_insert_cannot_infer_authority_from_metadata(db_pool):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            origin = await conn.fetchval("""
+                INSERT INTO memories (type, content, metadata)
+                VALUES (
+                    'goal',
+                    'Raw goal origin probe',
+                    '{"source": "user_request", "priority": "queued"}'::jsonb
+                )
+                RETURNING goal_origin::text
+                """)
+            assert origin == "derived"
         finally:
             await tr.rollback()
 
@@ -63,7 +121,13 @@ async def test_execute_backlog_tool_create_status_and_get(db_pool):
             created = _coerce_json(
                 await conn.fetchval(
                     "SELECT execute_backlog_tool($1::jsonb, $2::jsonb)",
-                    json.dumps({"action": "create", "title": "DB-native backlog", "priority": "high"}),
+                    json.dumps(
+                        {
+                            "action": "create",
+                            "title": "DB-native backlog",
+                            "priority": "high",
+                        }
+                    ),
                     json.dumps({"tool_context": "heartbeat"}),
                 )
             )
@@ -71,7 +135,13 @@ async def test_execute_backlog_tool_create_status_and_get(db_pool):
             status = _coerce_json(
                 await conn.fetchval(
                     "SELECT execute_backlog_tool($1::jsonb, $2::jsonb)",
-                    json.dumps({"action": "set_status", "item_id": item_id, "status": "in_progress"}),
+                    json.dumps(
+                        {
+                            "action": "set_status",
+                            "item_id": item_id,
+                            "status": "in_progress",
+                        }
+                    ),
                     json.dumps({"tool_context": "heartbeat"}),
                 )
             )
@@ -98,7 +168,13 @@ async def test_execute_contact_tool_create_search_get_update(db_pool):
             created = _coerce_json(
                 await conn.fetchval(
                     "SELECT execute_contact_tool('create_contact', $1::jsonb)",
-                    json.dumps({"name": "Ada Lovelace", "email": "ada@example.com", "company": "Analytical"}),
+                    json.dumps(
+                        {
+                            "name": "Ada Lovelace",
+                            "email": "ada@example.com",
+                            "company": "Analytical",
+                        }
+                    ),
                 )
             )
             contact_id = created["output"]["id"]
@@ -138,7 +214,13 @@ async def test_execute_memory_tool_remember_sense_and_recall(db_pool):
             remembered = _coerce_json(
                 await conn.fetchval(
                     "SELECT execute_memory_tool('remember', $1::jsonb)",
-                    json.dumps({"content": "DB-native memory likes plums", "type": "semantic", "importance": 0.8}),
+                    json.dumps(
+                        {
+                            "content": "DB-native memory likes plums",
+                            "type": "semantic",
+                            "importance": 0.8,
+                        }
+                    ),
                 )
             )
             recalled = _coerce_json(
@@ -169,15 +251,25 @@ async def test_remember_semantic_records_confidence_and_sources(db_pool):
             result = _coerce_json(
                 await conn.fetchval(
                     "SELECT execute_memory_tool('remember', $1::jsonb)",
-                    json.dumps({
-                        "content": "Eric is the inventor of Hexis (dispatch test)",
-                        "type": "semantic",
-                        "confidence": 0.8,
-                        "sources": [
-                            {"kind": "user_testimony", "ref": "conversation:test", "trust": 0.75},
-                            {"kind": "user_testimony", "ref": "conversation:test", "trust": 0.75},
-                        ],
-                    }),
+                    json.dumps(
+                        {
+                            "content": "Eric is the inventor of Hexis (dispatch test)",
+                            "type": "semantic",
+                            "confidence": 0.8,
+                            "sources": [
+                                {
+                                    "kind": "user_testimony",
+                                    "ref": "conversation:test",
+                                    "trust": 0.75,
+                                },
+                                {
+                                    "kind": "user_testimony",
+                                    "ref": "conversation:test",
+                                    "trust": 0.75,
+                                },
+                            ],
+                        }
+                    ),
                 )
             )
             assert result["success"] is True
@@ -187,7 +279,8 @@ async def test_remember_semantic_records_confidence_and_sources(db_pool):
             assert out["trust_level"] is not None
             meta = _coerce_json(
                 await conn.fetchval(
-                    "SELECT metadata FROM memories WHERE id = $1::uuid", out["memory_id"]
+                    "SELECT metadata FROM memories WHERE id = $1::uuid",
+                    out["memory_id"],
                 )
             )
             # Duplicate source entries are deduped on the way in.
@@ -206,11 +299,13 @@ async def test_remember_episodic_takes_first_source_as_attribution(db_pool):
             result = _coerce_json(
                 await conn.fetchval(
                     "SELECT execute_memory_tool('remember', $1::jsonb)",
-                    json.dumps({
-                        "content": "Met Eric today (dispatch test)",
-                        "type": "episodic",
-                        "sources": [{"kind": "conversation", "ref": "session:abc"}],
-                    }),
+                    json.dumps(
+                        {
+                            "content": "Met Eric today (dispatch test)",
+                            "type": "episodic",
+                            "sources": [{"kind": "conversation", "ref": "session:abc"}],
+                        }
+                    ),
                 )
             )
             assert result["success"] is True
@@ -227,30 +322,98 @@ async def test_remember_episodic_takes_first_source_as_attribution(db_pool):
             await tr.rollback()
 
 
+async def test_remember_reuses_equivalent_session_write_with_conversation_provenance(
+    db_pool,
+):
+    session_id = str(uuid4())
+    marker = uuid4().hex
+    args = {
+        "content": f"Eric and I agreed to preserve the lighthouse thread {marker}",
+        "type": "semantic",
+        "confidence": 0.7,
+        "_execution_context": {
+            "session_id": session_id,
+            "call_id": "remember-first",
+            "tool_context": "chat",
+        },
+    }
+
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            await _stub_get_embedding(conn)
+            first = _coerce_json(
+                await conn.fetchval(
+                    "SELECT execute_memory_tool('remember', $1::jsonb)",
+                    json.dumps(args),
+                )
+            )
+            args["_execution_context"]["call_id"] = "remember-retry"
+            args["content"] = (
+                f"Eric and I agreed to preserve the lighthouse thread: {marker}."
+            )
+            second = _coerce_json(
+                await conn.fetchval(
+                    "SELECT execute_memory_tool('remember', $1::jsonb)",
+                    json.dumps(args),
+                )
+            )
+
+            assert first["success"] is True, first
+            assert first["output"]["reused"] is False
+            assert second["success"] is True, second
+            assert second["output"]["reused"] is True
+            assert second["output"]["memory_id"] == first["output"]["memory_id"]
+
+            row = await conn.fetchrow(
+                """
+                SELECT source_attribution, trust_level, metadata
+                FROM memories
+                WHERE id = $1::uuid
+                """,
+                first["output"]["memory_id"],
+            )
+            count = await conn.fetchval(
+                "SELECT count(*) FROM memories WHERE content LIKE $1",
+                f"%{marker}%",
+            )
+            assert count == 1
+            attribution = _coerce_json(row["source_attribution"])
+            metadata = _coerce_json(row["metadata"])
+            assert attribution["ref"] == f"chat_session:{session_id}"
+            assert row["trust_level"] > 0.15
+            assert metadata["tool_write"]["session_id"] == session_id
+        finally:
+            await tr.rollback()
+
+
 async def test_add_evidence_dispatch_happy_path_and_validation(db_pool):
     async with db_pool.acquire() as conn:
         tr = conn.transaction()
         await tr.start()
         try:
             await _stub_get_embedding(conn)
-            mid = str(
-                await conn.fetchval(
-                    """
+            mid = str(await conn.fetchval("""
                     INSERT INTO memories (type, content, embedding, importance, trust_level, status, metadata)
                     VALUES ('semantic', 'dispatch belief', array_fill(0.1, ARRAY[embedding_dimension()])::vector,
                             0.8, 0.3, 'active', '{"confidence": 0.5}'::jsonb)
                     RETURNING id
-                    """
-                )
-            )
+                    """))
             result = _coerce_json(
                 await conn.fetchval(
                     "SELECT execute_memory_tool('add_evidence', $1::jsonb)",
-                    json.dumps({
-                        "memory_id": mid,
-                        "stance": "supports",
-                        "source": {"kind": "repository_document", "ref": "README.md", "trust": 0.8},
-                    }),
+                    json.dumps(
+                        {
+                            "memory_id": mid,
+                            "stance": "supports",
+                            "source": {
+                                "kind": "repository_document",
+                                "ref": "README.md",
+                                "trust": 0.8,
+                            },
+                        }
+                    ),
                 )
             )
             assert result["success"] is True
@@ -262,8 +425,13 @@ async def test_add_evidence_dispatch_happy_path_and_validation(db_pool):
             bad_uuid = _coerce_json(
                 await conn.fetchval(
                     "SELECT execute_memory_tool('add_evidence', $1::jsonb)",
-                    json.dumps({"memory_id": "not-a-uuid", "stance": "supports",
-                                "source": {"ref": "x"}}),
+                    json.dumps(
+                        {
+                            "memory_id": "not-a-uuid",
+                            "stance": "supports",
+                            "source": {"ref": "x"},
+                        }
+                    ),
                 )
             )
             assert bad_uuid["success"] is False
@@ -272,7 +440,9 @@ async def test_add_evidence_dispatch_happy_path_and_validation(db_pool):
             bad_stance = _coerce_json(
                 await conn.fetchval(
                     "SELECT execute_memory_tool('add_evidence', $1::jsonb)",
-                    json.dumps({"memory_id": mid, "stance": "maybe", "source": {"ref": "x"}}),
+                    json.dumps(
+                        {"memory_id": mid, "stance": "maybe", "source": {"ref": "x"}}
+                    ),
                 )
             )
             assert bad_stance["success"] is False
@@ -297,30 +467,38 @@ async def test_recall_surfaces_trust_and_confidence(db_pool):
             created = _coerce_json(
                 await conn.fetchval(
                     "SELECT execute_memory_tool('remember', $1::jsonb)",
-                    json.dumps({
-                        "content": "Recall projection test fact",
-                        "type": "semantic",
-                        "confidence": 0.7,
-                        "sources": [{"kind": "test", "ref": "recall-projection"}],
-                    }),
+                    json.dumps(
+                        {
+                            "content": "Recall projection test fact",
+                            "type": "semantic",
+                            "confidence": 0.7,
+                            "sources": [{"kind": "test", "ref": "recall-projection"}],
+                        }
+                    ),
                 )
             )
             assert created["success"] is True
 
             for args in (
-                {"query": "Recall projection test fact"},                      # hybrid
-                {"query": "Recall projection test fact",
-                 "memory_types": ["semantic"]},                                 # structured
+                {"query": "Recall projection test fact"},  # hybrid
+                {
+                    "query": "Recall projection test fact",
+                    "memory_types": ["semantic"],
+                },  # structured
             ):
                 recalled = _coerce_json(
                     await conn.fetchval(
-                        "SELECT execute_memory_tool('recall', $1::jsonb)", json.dumps(args)
+                        "SELECT execute_memory_tool('recall', $1::jsonb)",
+                        json.dumps(args),
                     )
                 )
                 assert recalled["success"] is True
                 match = next(
-                    (m for m in recalled["output"]["memories"]
-                     if m["memory_id"] == created["output"]["memory_id"]),
+                    (
+                        m
+                        for m in recalled["output"]["memories"]
+                        if m["memory_id"] == created["output"]["memory_id"]
+                    ),
                     None,
                 )
                 assert match is not None, f"memory not recalled with args {args}"
@@ -344,7 +522,9 @@ async def test_recall_limit_is_config_driven_budget(db_pool):
             for i in range(4):
                 await conn.fetchval(
                     "SELECT execute_memory_tool('remember', $1::jsonb)",
-                    json.dumps({"content": f"budget test fact number {i}", "type": "semantic"}),
+                    json.dumps(
+                        {"content": f"budget test fact number {i}", "type": "semantic"}
+                    ),
                 )
             # Default budget honored.
             await conn.execute(
@@ -382,7 +562,9 @@ async def test_recall_min_score_is_a_relevance_floor(db_pool):
             created = _coerce_json(
                 await conn.fetchval(
                     "SELECT execute_memory_tool('remember', $1::jsonb)",
-                    json.dumps({"content": "relevance floor target fact", "type": "semantic"}),
+                    json.dumps(
+                        {"content": "relevance floor target fact", "type": "semantic"}
+                    ),
                 )
             )
             assert created["success"] is True
@@ -390,8 +572,13 @@ async def test_recall_min_score_is_a_relevance_floor(db_pool):
             recalled = _coerce_json(
                 await conn.fetchval(
                     "SELECT execute_memory_tool('recall', $1::jsonb)",
-                    json.dumps({"query": "relevance floor target fact", "min_score": 0.999999,
-                                "limit": 10}),
+                    json.dumps(
+                        {
+                            "query": "relevance floor target fact",
+                            "min_score": 0.999999,
+                            "limit": 10,
+                        }
+                    ),
                 )
             )
             assert recalled["success"] is True
@@ -400,8 +587,13 @@ async def test_recall_min_score_is_a_relevance_floor(db_pool):
             recalled = _coerce_json(
                 await conn.fetchval(
                     "SELECT execute_memory_tool('recall', $1::jsonb)",
-                    json.dumps({"query": "relevance floor target fact", "min_score": 0.0,
-                                "limit": 10}),
+                    json.dumps(
+                        {
+                            "query": "relevance floor target fact",
+                            "min_score": 0.0,
+                            "limit": 10,
+                        }
+                    ),
                 )
             )
             contents = [m["content"] for m in recalled["output"]["memories"]]
@@ -418,28 +610,29 @@ async def test_get_procedures_and_strategies_dispatch(db_pool):
         await tr.start()
         try:
             await _stub_get_embedding(conn)
-            await conn.execute(
-                """
+            await conn.execute("""
                 INSERT INTO memories (type, content, embedding, importance, trust_level, status)
                 VALUES ('procedural', 'How to deploy: build, test, ship',
                         array_fill(0.1, ARRAY[embedding_dimension()])::vector, 0.8, 0.9, 'active'),
                        ('strategic', 'Ship small reversible changes',
                         array_fill(0.1, ARRAY[embedding_dimension()])::vector, 0.8, 0.9, 'active')
-                """
+                """)
+            procedures = json.loads(
+                await conn.fetchval(
+                    "SELECT execute_memory_tool('get_procedures', '{\"task\": \"deploy\"}'::jsonb)"
+                )
             )
-            procedures = json.loads(await conn.fetchval(
-                "SELECT execute_memory_tool('get_procedures', '{\"task\": \"deploy\"}'::jsonb)"
-            ))
-            strategies = json.loads(await conn.fetchval(
-                "SELECT execute_memory_tool('get_strategies', '{\"situation\": \"shipping\"}'::jsonb)"
-            ))
+            strategies = json.loads(
+                await conn.fetchval(
+                    "SELECT execute_memory_tool('get_strategies', '{\"situation\": \"shipping\"}'::jsonb)"
+                )
+            )
         finally:
             await tr.rollback()
 
     assert procedures["success"] is True
     assert all(
-        "deploy" in p["content"] or True
-        for p in procedures["output"]["procedures"]
+        "deploy" in p["content"] or True for p in procedures["output"]["procedures"]
     )
     assert procedures["output"]["task"] == "deploy"
     assert strategies["success"] is True
@@ -448,12 +641,16 @@ async def test_get_procedures_and_strategies_dispatch(db_pool):
 
 async def test_explore_concept_dispatch_validates_and_shapes(db_pool):
     async with db_pool.acquire() as conn:
-        missing = json.loads(await conn.fetchval(
-            "SELECT execute_memory_tool('explore_concept', '{}'::jsonb)"
-        ))
-        empty = json.loads(await conn.fetchval(
-            "SELECT execute_memory_tool('explore_concept', '{\"concept\": \"nonexistent-concept-xyz\"}'::jsonb)"
-        ))
+        missing = json.loads(
+            await conn.fetchval(
+                "SELECT execute_memory_tool('explore_concept', '{}'::jsonb)"
+            )
+        )
+        empty = json.loads(
+            await conn.fetchval(
+                "SELECT execute_memory_tool('explore_concept', '{\"concept\": \"nonexistent-concept-xyz\"}'::jsonb)"
+            )
+        )
 
     assert missing["success"] is False
     assert missing["error_type"] == "invalid_params"
@@ -464,12 +661,16 @@ async def test_explore_concept_dispatch_validates_and_shapes(db_pool):
 
 async def test_explore_subgraph_dispatch_requires_seed_or_query(db_pool):
     async with db_pool.acquire() as conn:
-        missing = json.loads(await conn.fetchval(
-            "SELECT execute_memory_tool('explore_subgraph', '{}'::jsonb)"
-        ))
-        bad_seed = json.loads(await conn.fetchval(
-            "SELECT execute_memory_tool('explore_subgraph', '{\"seeds\": [\"not-a-uuid\"]}'::jsonb)"
-        ))
+        missing = json.loads(
+            await conn.fetchval(
+                "SELECT execute_memory_tool('explore_subgraph', '{}'::jsonb)"
+            )
+        )
+        bad_seed = json.loads(
+            await conn.fetchval(
+                "SELECT execute_memory_tool('explore_subgraph', '{\"seeds\": [\"not-a-uuid\"]}'::jsonb)"
+            )
+        )
 
     assert missing["success"] is False
     assert "query" in missing["error"]

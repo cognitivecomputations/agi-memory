@@ -12,6 +12,15 @@ describe("normalizeMessagePresentation", () => {
           { type: "text", text: "Ready" },
           { type: "divider" },
           { type: "context", text: "Live evidence" },
+          {
+            type: "citation",
+            citation_id: "mem-123",
+            label: "A memory",
+            href: "/memories?memory=123",
+            trust_level: 0.42,
+            low_trust: true,
+            locator: { page_start: 2 },
+          },
         ],
       })
     ).toEqual({
@@ -21,6 +30,15 @@ describe("normalizeMessagePresentation", () => {
         { type: "text", text: "Ready" },
         { type: "divider" },
         { type: "context", text: "Live evidence" },
+        {
+          type: "citation",
+          citation_id: "mem-123",
+          label: "A memory",
+          href: "/memories?memory=123",
+          trust_level: 0.42,
+          low_trust: true,
+          locator: { page_start: 2 },
+        },
       ],
     });
   });
@@ -43,5 +61,19 @@ describe("normalizeMessagePresentation", () => {
         blocks: [{ type: "text", text: "Visible" }],
       })?.tone
     ).toBe("neutral");
+  });
+
+  it("rejects citation links outside the local memory surfaces", () => {
+    expect(
+      normalizeMessagePresentation({
+        blocks: [{
+          type: "citation",
+          citation_id: "source-1",
+          label: "Unsafe",
+          href: "javascript:alert(1)",
+          trust_level: 1,
+        }],
+      })
+    ).toBeUndefined();
   });
 });

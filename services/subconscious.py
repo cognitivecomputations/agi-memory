@@ -7,7 +7,7 @@ from typing import Any
 from core.llm_config import load_llm_config
 from core.llm_json import chat_json
 from core.subconscious import get_subconscious_context
-from services.prompt_resources import load_subconscious_prompt
+from services.prompt_resources import load_subconscious_maintenance_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +87,7 @@ async def run_subconscious_decider(conn) -> dict[str, Any]:
         doc, raw = await chat_json(
             llm_config=llm_config,
             messages=[
-                {"role": "system", "content": load_subconscious_prompt().strip()},
+                {"role": "system", "content": load_subconscious_maintenance_prompt().strip()},
                 {"role": "user", "content": user_prompt},
             ],
             max_tokens=1800,

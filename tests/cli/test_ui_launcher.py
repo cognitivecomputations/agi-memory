@@ -145,7 +145,7 @@ def test_handle_ui_runs_locked_local_next_without_telemetry(monkeypatch, tmp_pat
     assert calls[0][1]["NEXT_TELEMETRY_DISABLED"] == "1"
 
 
-def test_handle_ui_rejects_running_dashboard(monkeypatch, tmp_path):
+def test_handle_ui_opens_running_dashboard(monkeypatch, tmp_path):
     from apps import hexis_cli
 
     stack_root = _prepare_ui_tree(tmp_path)
@@ -183,8 +183,8 @@ def test_handle_ui_rejects_running_dashboard(monkeypatch, tmp_path):
         ),
     )
 
-    assert hexis_cli._handle_ui(stack_root, 3477, no_open=False) == 1
-    assert opened == []
+    assert hexis_cli._handle_ui(stack_root, 3477, no_open=False) == 0
+    assert opened == ["http://localhost:3477/chat"]
 
 
 def test_handle_ui_reports_occupied_non_dashboard_port(monkeypatch, tmp_path):
@@ -256,6 +256,15 @@ def test_handle_ui_container_runs_foreground_and_stops_owned_services(
     )
 
     assert rc == 0
-    assert calls[0] == ["up", "api", "ui"]
+    # The always-on loops come up first, detached, and are never stopped:
+    # closing the dashboard must not stop the agent from thinking.
+    assert calls[0] == ["up", "-d", "heartbeat_worker", "maintenance_worker"]
+    assert calls[1] == ["up", "api", "ui"]
     assert calls[-1] == ["stop", "ui", "api"]
-    assert all("-d" not in call for call in calls)
+    assert not any(
+        "heartbeat_worker" in call or "maintenance_worker" in call
+        for call in calls
+        if call and call[0] == "stop"
+    )
+    # The dashboard itself still runs in the foreground.
+    assert "-d" not in calls[1]

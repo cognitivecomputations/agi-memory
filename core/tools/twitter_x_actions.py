@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from .base import (
+    OutboundSpec,
     ToolCategory,
     ToolContext,
     ToolErrorType,
@@ -24,7 +25,10 @@ class TwitterXPostHandler(ToolHandler):
             parameters={
                 "type": "object",
                 "properties": {
-                    "account_key": {"type": "string", "description": "Optional connected Twitter/X account key."},
+                    "account_key": {
+                        "type": "string",
+                        "description": "Optional connected Twitter/X account key.",
+                    },
                     "text": {"type": "string", "description": "Post text."},
                 },
                 "required": ["text"],
@@ -34,10 +38,19 @@ class TwitterXPostHandler(ToolHandler):
             is_read_only=False,
             requires_approval=True,
             supports_parallel=False,
+            outbound=OutboundSpec(
+                recipient_arg=None,
+                body_arg="text",
+                channel="twitter_x",
+                fixed_recipient="public",
+                public_recipient=True,
+            ),
             allowed_contexts={ToolContext.CHAT, ToolContext.HEARTBEAT, ToolContext.MCP},
         )
 
-    async def execute(self, arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
+    async def execute(
+        self, arguments: dict[str, Any], context: ToolExecutionContext
+    ) -> ToolResult:
         from core.auth.twitter_x import TwitterXOAuthError
         from services.twitter_x import TwitterXProviderError, post_twitter_x
 
@@ -63,8 +76,14 @@ class TwitterXReplyHandler(ToolHandler):
             parameters={
                 "type": "object",
                 "properties": {
-                    "account_key": {"type": "string", "description": "Optional connected Twitter/X account key."},
-                    "reply_to_tweet_id": {"type": "string", "description": "Tweet/Post ID to reply to."},
+                    "account_key": {
+                        "type": "string",
+                        "description": "Optional connected Twitter/X account key.",
+                    },
+                    "reply_to_tweet_id": {
+                        "type": "string",
+                        "description": "Tweet/Post ID to reply to.",
+                    },
                     "text": {"type": "string", "description": "Reply text."},
                 },
                 "required": ["reply_to_tweet_id", "text"],
@@ -74,10 +93,20 @@ class TwitterXReplyHandler(ToolHandler):
             is_read_only=False,
             requires_approval=True,
             supports_parallel=False,
+            outbound=OutboundSpec(
+                recipient_arg=None,
+                body_arg="text",
+                channel="twitter_x",
+                thread_arg="reply_to_tweet_id",
+                fixed_recipient="public",
+                public_recipient=True,
+            ),
             allowed_contexts={ToolContext.CHAT, ToolContext.HEARTBEAT, ToolContext.MCP},
         )
 
-    async def execute(self, arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
+    async def execute(
+        self, arguments: dict[str, Any], context: ToolExecutionContext
+    ) -> ToolResult:
         from core.auth.twitter_x import TwitterXOAuthError
         from services.twitter_x import TwitterXProviderError, reply_twitter_x
 
@@ -104,8 +133,14 @@ class TwitterXDMSendHandler(ToolHandler):
             parameters={
                 "type": "object",
                 "properties": {
-                    "account_key": {"type": "string", "description": "Optional connected Twitter/X account key."},
-                    "participant_id": {"type": "string", "description": "Twitter/X user ID to receive the DM."},
+                    "account_key": {
+                        "type": "string",
+                        "description": "Optional connected Twitter/X account key.",
+                    },
+                    "participant_id": {
+                        "type": "string",
+                        "description": "Twitter/X user ID to receive the DM.",
+                    },
                     "text": {"type": "string", "description": "Direct Message text."},
                 },
                 "required": ["participant_id", "text"],
@@ -115,10 +150,17 @@ class TwitterXDMSendHandler(ToolHandler):
             is_read_only=False,
             requires_approval=True,
             supports_parallel=False,
+            outbound=OutboundSpec(
+                recipient_arg="participant_id",
+                body_arg="text",
+                channel="twitter_x_dm",
+            ),
             allowed_contexts={ToolContext.CHAT, ToolContext.HEARTBEAT, ToolContext.MCP},
         )
 
-    async def execute(self, arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
+    async def execute(
+        self, arguments: dict[str, Any], context: ToolExecutionContext
+    ) -> ToolResult:
         from core.auth.twitter_x import TwitterXOAuthError
         from services.twitter_x import TwitterXProviderError, send_twitter_x_dm
 

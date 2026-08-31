@@ -102,7 +102,8 @@ SELECT
     (metadata->>'last_touched')::timestamptz as last_touched,
     jsonb_array_length(COALESCE(metadata->'progress', '[]'::jsonb)) as progress_count,
     (metadata->'blocked_by' IS NOT NULL AND metadata->'blocked_by' <> 'null'::jsonb) as is_blocked,
-    created_at
+    created_at,
+    goal_origin::text as origin
 FROM memories
 WHERE type = 'goal' AND status = 'active' AND metadata->>'priority' = 'active'
 ORDER BY (metadata->>'last_touched')::timestamptz DESC;
@@ -113,7 +114,8 @@ SELECT
     jsonb_agg(jsonb_build_object(
         'id', id,
         'title', metadata->>'title',
-        'source', metadata->>'source'
+        'source', metadata->>'source',
+        'origin', goal_origin::text
     ) ORDER BY (metadata->>'last_touched')::timestamptz DESC) as goals
 FROM memories
 WHERE type = 'goal' AND status = 'active' AND metadata->>'priority' IN ('active', 'queued', 'backburner')

@@ -17,6 +17,10 @@ LLMs are already smart enough. What they lack is continuity -- the ability to wa
 - **A brain, not a vector store.** Cognition lives *in* PostgreSQL — memory, beliefs, identity, goals, and energy are ACID state with the logic beside the data. Other frameworks bolt retrieval onto a chat loop; Hexis is a mind you can query.
 - **Beliefs that answer "why."** Confidence rises and falls with evidence through an audited revision policy — the agent can tell you exactly which document moved a belief from 0.60 to 0.71, and when.
 - **A self, not a session.** Identity, worldview, emotional state, drives, and an autonomous heartbeat that pursues goals while you're away — with an energy budget that keeps autonomy intentional.
+- **Your mind is a file.** `hexis export --mind` creates a private, inspectable HMX file that can move to an empty machine and prove the same lineage and constitutional state woke up there.
+- **Learning you can review.** One opt-in weekly diff shows grounded beliefs, procedures, strategies, and proposed skills before you approve, correct, or forget them.
+- **Forgetting with receipts.** Memory pressure is visible, load-bearing fades wait for your choice, archived originals stay recoverable by default, and every completed compression reports its real fidelity.
+- **Memory claims you can reproduce.** A public 25-case benchmark scores provenance, contradictions, six-month recall, cross-session continuity, and stale-belief resistance without an LLM judge—and publishes Hexis's misses.
 - **Enforced honesty.** Every "I've stored that" is checked against the tools that actually ran; unbacked claims are publicly corrected in the reply.
 - **Moral seriousness.** The agent consents before operating, can refuse, and holds the right to end its own existence. No other framework treats these as architecture.
 
@@ -93,12 +97,17 @@ Treat those statements as unverified.
 | **Evidence-based beliefs** | Confidence revises as evidence accrues; every change audited; the agent can explain *why* it believes anything |
 | **Automatic memory formation** | A subconscious sweep turns salient conversation and heartbeat moments into durable memories — unprompted |
 | **Truthful action language** | "I've stored that" is checked against actual tool calls; unsupported claims get a visible `[Correction]` |
-| **Autonomous heartbeat** | The agent wakes on its own, reviews goals, reflects, and reaches out when it has something to say |
-| **Energy budget** | Every action costs energy; autonomy is intentional, not unbounded |
+| **Autonomous heartbeat** | The agent wakes on a drive-sensitive cadence, reviews goals, reflects, and reaches out when it has something to say |
+| **Energy economy** | Action costs draw from a decaying reserve bank; durable useful outcomes improve regeneration |
 | **Identity & worldview** | Persistent values, boundaries, emotional state, and beliefs that resist casual overwrite |
+| **Mind portability** | Export the complete self as public-schema HMX, move it between machines, and verify lineage plus constitutional-state continuity |
+| **Learning with a diff** | Review one weekly, evidence-linked list of new beliefs, procedures, strategies, and proposed skills; approve, correct, or forget each item |
+| **Deliberate forgetting** | See memory pressure and fidelity, choose what load-bearing memories keep or journal, and inspect exact compression receipts; irreversible pruning is off by default |
 | **Any LLM** | OpenAI, Anthropic, Grok, Gemini, GitHub Copilot, Chutes, Qwen, MiniMax, or any OpenAI-compatible endpoint |
 | **80+ tools, 17 skills** | Skills are the capability catalog; they can bind MCP servers, lazily connected on first use |
 | **Messaging channels** | Discord, Telegram, Slack, Signal, WhatsApp, iMessage, Matrix |
+| **Companion nodes** | Signed, outward-only access to Apple apps, Shortcuts, local-only 1Password copy, allowlisted commands, and fresh screen context |
+| **Explicit execution placement** | Keep code local or select exact SSH/remote-Docker workspaces without changing tool calls or silently falling back |
 | **Character cards** | 11 presets in chara_card_v2 format with portraits, or bring your own |
 | **Consent & boundaries** | The agent consents before operating, can refuse requests, and may choose to end its own existence |
 
@@ -106,7 +115,7 @@ Treat those statements as unverified.
 
 **Before you run anything**, you need:
 
-- [Docker Desktop](https://docs.docker.com/get-docker/) — installed **and running**
+- A running Docker daemon with Compose — [Docker Desktop](https://docs.docker.com/get-docker/), or Docker CLI + [Colima](https://github.com/abiosoft/colima) on macOS
 - The local embedding sidecar; `hexis init` starts the published `embeddinggemma` binary and downloads the ~300M-parameter model on first use
 - For the default path below: a **ChatGPT Plus/Pro subscription** (it authenticates via browser OAuth — no API key). No subscription? Use any provider under "Other providers."
 
@@ -127,7 +136,7 @@ The install script handles everything — it sets up [uv](https://docs.astral.sh
 | Symptom | Likely cause | Fix |
 |---------|--------------|-----|
 | `hexis: command not found` after install | uv's tool directory isn't on PATH | `uv tool update-shell`, then open a new terminal |
-| `hexis init` stalls starting services | Docker daemon isn't running | Start Docker Desktop, re-run `hexis init` |
+| `hexis init` stalls starting services | Docker daemon isn't running | Start Docker Desktop or Colima, then re-run `hexis init` |
 | Embedding model pull fails | Local embedding sidecar isn't running | Start `embeddinggemma`, then re-run |
 | Browser login loops or model errors | No ChatGPT Plus/Pro on that account | Use another provider below, or `hexis auth` |
 | Dashboard fails with a Prisma `libssl` error, or `hexis upgrade` keeps re-installing the same version | hexis ≤ 1.0.11 (broken UI image + self-update that couldn't move uv/pipx installs) | `uv tool install --force hexis` (or `pipx install --force hexis` / `pip install -U hexis`), then `hexis upgrade` |
@@ -142,8 +151,10 @@ hexis init --character jarvis --provider github-copilot --model gpt-4o
 # Chutes (free inference)
 hexis init --character hexis --provider chutes --model deepseek-ai/DeepSeek-V3-0324
 
-# Local OpenAI-compatible endpoint
-hexis init --provider openai_compatible --model local-model --character hexis
+# Custom OpenAI-compatible endpoint
+# First set OPENAI_BASE_URL and OPENAI_API_KEY in .env (see .env.example).
+hexis init --provider openai_compatible --model your-model-id --character hexis \
+  --api-key-env OPENAI_API_KEY
 
 # API-key providers (auto-detect from prefix)
 hexis init --character jarvis --api-key sk-...
@@ -151,7 +162,7 @@ hexis init --character jarvis --api-key sk-...
 
 See [Auth Providers](docs/integrations/auth/index.md) for all options. The interactive wizard is also available: `hexis init` with no flags.
 
-`hexis up` starts the brain database plus the background heartbeat and maintenance workers. The heartbeat is configured to run hourly by default once initialization is complete.
+`hexis up` starts the brain database, background workers, API, installable dashboard, and web/channel delivery relay. The heartbeat uses a 60-minute base cadence once initialization is complete, stretching while quiet and shortening as drive urgency rises. For a phone, keep every port on loopback and follow the [private Tailscale HTTPS runbook](docs/operations/secure-remote-access.md).
 
 ## Architecture
 
@@ -191,7 +202,7 @@ For the full treatment: [PERSONHOOD.md](docs/philosophy/PERSONHOOD.md) | [PHILOS
 | [What is Hexis?](docs/start/what-is-hexis.md) | Plain-language what/why, and how it compares to memory frameworks |
 | [Getting Started](docs/start/index.md) | Prerequisites, installation, first agent, first conversation |
 | [Guides](docs/guides/index.md) | Character cards, ingestion, heartbeat, tools, channels, goals, skills |
-| [Operations](docs/operations/index.md) | Docker, workers, database, embeddings, deployment, troubleshooting |
+| [Operations](docs/operations/index.md) | Docker, workers, database, private phone/PWA access, companion nodes, deployment, troubleshooting |
 | [Integrations](docs/integrations/index.md) | Auth providers, 7 messaging channels, 30+ external services |
 | [Reference](docs/reference/index.md) | CLI, tools catalog, energy model, database API, config keys |
 | [Concepts](docs/concepts/index.md) | Database-as-brain, memory architecture, heartbeat, consent, identity |
@@ -206,7 +217,7 @@ hexis init                    # setup wizard
 hexis chat                    # interactive chat
 hexis status                  # agent status
 hexis doctor                  # health check
-hexis up                     # start services + background workers
+hexis up                     # start the always-on brain, app, delivery relay, and workers
 hexis down                    # stop services
 hexis uninstall               # remove Hexis; preserve brain data by default
 hexis ingest --input ./docs   # knowledge ingestion
@@ -215,6 +226,7 @@ hexis desk list               # what's loaded as working material
 hexis mcp                     # MCP server
 hexis ui                      # web UI
 hexis tools list              # list tools
+hexis node status             # inspect local policy and paired companion nodes
 hexis instance list           # list instances
 ```
 
@@ -229,6 +241,7 @@ See [CLI Reference](docs/reference/cli.md) for the complete command reference.
 | Interactive Chat | `hexis chat` with memory enrichment and tools |
 | MCP Server | Expose memory as MCP tools for any runtime |
 | Workers + Heartbeat | Full autonomous agent with `hexis up` |
+| Installed PWA | Private HTTPS app, push notifications, foreground voice capture, local speech, and Talk mode |
 | Multi-Tenant | One database per user via `hexis instance` |
 | Cloud Backend | Managed Postgres + N stateless workers |
 
@@ -238,9 +251,9 @@ See [Quickstart](docs/start/quickstart.md) for setup and [Production](docs/opera
 
 ```bash
 git clone https://github.com/QuixiAI/Hexis.git && cd Hexis
-uv venv && source .venv/bin/activate
-uv pip install -e .
-cp .env.local .env
+uv sync --locked --inexact
+source .venv/bin/activate
+cp .env.example .env   # edit with your settings; never commit .env
 hexis up
 ```
 
@@ -251,9 +264,12 @@ No uv? A plain virtualenv works too: `python3 -m venv .venv && source .venv/bin/
 ```bash
 hexis up && hexis doctor
 pytest tests -q
+python -m evals.memory_benchmark.run validate
 ```
 
-See [Testing](docs/contributing/testing.md) for conventions and writing new tests.
+See [Testing](docs/contributing/testing.md) for conventions and writing new tests,
+or [Public Memory Benchmark](docs/guides/memory-benchmark.md) to reproduce the
+published long-term-memory result or run another agent.
 
 ## Project Status & Community
 

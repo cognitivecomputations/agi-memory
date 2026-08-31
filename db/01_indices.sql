@@ -23,10 +23,33 @@ CREATE INDEX idx_memories_content ON memories USING GIN (content gin_trgm_ops);
 CREATE INDEX idx_memories_content_fts ON memories USING GIN (to_tsvector('english', content));
 CREATE INDEX idx_memories_importance ON memories (importance DESC) WHERE status = 'active';
 CREATE INDEX idx_memories_created ON memories (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_memories_tool_write_session_created
+    ON memories ((metadata#>>'{tool_write,session_id}'), created_at DESC)
+    WHERE status = 'active' AND metadata ? 'tool_write';
 CREATE INDEX idx_memories_last_accessed ON memories (last_accessed DESC NULLS LAST);
 CREATE INDEX idx_memories_updated ON memories (updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_memory_reinforcement_events_memory_created
     ON memory_reinforcement_events (memory_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_memory_supersessions_superseded
+    ON memory_supersessions (superseded_memory_id, superseded_at DESC);
+CREATE INDEX IF NOT EXISTS idx_memory_supersessions_replacement
+    ON memory_supersessions (replacement_memory_id, superseded_at DESC)
+    WHERE replacement_memory_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_memory_supersessions_active_per_memory
+    ON memory_supersessions (superseded_memory_id)
+    WHERE status = 'active';
+CREATE INDEX IF NOT EXISTS idx_belief_update_log_recent
+    ON belief_update_log (fired_at DESC, log_id DESC);
+CREATE INDEX IF NOT EXISTS idx_belief_update_log_memory
+    ON belief_update_log (memory_id, fired_at DESC);
+CREATE INDEX IF NOT EXISTS idx_belief_update_log_kind
+    ON belief_update_log (change_kind, fired_at DESC);
+CREATE INDEX IF NOT EXISTS idx_belief_update_deliveries_subscriber
+    ON belief_update_deliveries (subscriber, received_at DESC);
+CREATE INDEX IF NOT EXISTS idx_operator_policy_corrections_policy_created
+    ON operator_policy_corrections (policy_key, created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_operator_policy_corrections_action_created
+    ON operator_policy_corrections (action, created_at DESC, id DESC);
 CREATE INDEX idx_memories_activation_boost ON memories (((metadata->>'activation_boost')::float))
     WHERE metadata ? 'activation_boost';
 CREATE INDEX idx_memories_metadata ON memories USING GIN (metadata);

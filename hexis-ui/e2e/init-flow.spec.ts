@@ -179,7 +179,7 @@ test("completes the initialization ritual and persists data", async ({ page }) =
   const statusRows = await prisma.$queryRaw<{ status: unknown }[]>`
     SELECT get_init_status() as status
   `;
-  const status = normalizeJsonValue(statusRows[0]?.status) as any;
+  const status = normalizeJsonValue(statusRows[0]?.status) as { stage?: string } | null;
   expect(status?.stage).toBe("complete");
 
   const configuredRows = await prisma.$queryRaw<{ configured: unknown }[]>`
@@ -191,7 +191,18 @@ test("completes the initialization ritual and persists data", async ({ page }) =
   const profileRows = await prisma.$queryRaw<{ profile: unknown }[]>`
     SELECT get_config('agent.init_profile') as profile
   `;
-  const profile = normalizeJsonValue(profileRows[0]?.profile) as any;
+  const profile = normalizeJsonValue(profileRows[0]?.profile) as {
+    agent?: { name?: string; tools?: string[] };
+    user?: { name?: string };
+    heartbeat?: {
+      interval_minutes?: number;
+      decision_max_tokens?: number;
+      base_regeneration?: number;
+      max_energy?: number;
+      allowed_actions?: string[];
+      action_costs?: Record<string, number>;
+    };
+  } | null;
   expect(profile?.agent?.name).toBe("Astra");
   expect(profile?.user?.name).toBe("Erin");
   expect(profile?.heartbeat?.interval_minutes).toBe(45);

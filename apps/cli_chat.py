@@ -70,6 +70,61 @@ async def _approve_tool(tool_name: str, arguments: dict[str, Any]) -> bool:
     return approved
 
 
+async def _answer_cli_question(pool: Any, payload: dict[str, Any]) -> None:
+    """Render ask_user with the native arrow-key picker and persist the answer."""
+    from apps.cli_prompts import select_index, text
+    from services.agent_questions import answer_agent_question
+
+    question_id = str(payload.get("id") or "")
+    prompt = str(payload.get("prompt") or "I need your input.").strip()
+    choices = [
+        str(item).strip()
+        for item in payload.get("choices", [])
+        if str(item).strip()
+    ][:4]
+    allow_free_text = payload.get("allow_free_text") is not False
+    if not question_id:
+        err_console.print("[fail]The clarification question has no durable id.[/fail]")
+        return
+
+    while True:
+        choice_index: int | None = None
+        free_text: str | None = None
+        if choices:
+            options = list(choices)
+            if allow_free_text:
+                options.append("Other (type your answer)")
+            selected = await select_index(prompt, options)
+            if selected <= len(choices):
+                choice_index = selected
+            else:
+                free_text = (await text("Your answer")).strip()
+                if not free_text:
+                    err_console.print("[warn]An answer is required.[/warn]")
+                    continue
+        else:
+            free_text = (await text(prompt)).strip()
+            if not free_text:
+                err_console.print("[warn]An answer is required.[/warn]")
+                continue
+
+        result = await answer_agent_question(
+            pool,
+            question_id,
+            answer=free_text,
+            choice_index=choice_index,
+            channel="cli",
+            actor="local-user",
+        )
+        if result.get("ok"):
+            return
+        err_console.print(
+            f"[warn]{result.get('message') or 'That answer was not accepted.'}[/warn]"
+        )
+        if result.get("status") != "pending":
+            return
+
+
 def _fmt_json(obj: Any, max_len: int = 400) -> str:
     """Format an object as compact JSON, truncating if needed."""
     try:
@@ -254,7 +309,7 @@ async def _run_chat(dsn: str, *, verbose: bool = False, debug: bool = False,
     from core.agent_loop import AgentEvent
     from core.cognitive_memory_api import CognitiveMemory
     from core.llm_config import load_llm_config
-    from core.tools import ToolContext, create_default_registry
+    from core.tools import ToolContext, create_full_registry
     from services.chat import _build_system_prompt, _hydrate_chat_history, stream_chat_events
     from rich.table import Table
 
@@ -276,7 +331,7 @@ async def _run_chat(dsn: str, *, verbose: bool = False, debug: bool = False,
         async with pool.acquire() as conn:
             llm_config = await load_llm_config(conn, "llm.chat", fallback_key="llm")
 
-        registry = create_default_registry(pool)
+        registry = await create_full_registry(pool)
         agent_profile = await get_agent_profile_context(dsn)
         system_prompt = await _build_system_prompt(agent_profile, registry)
 
@@ -459,6 +514,7 @@ async def _run_chat(dsn: str, *, verbose: bool = False, debug: bool = False,
                     dsn=dsn,
                     pool=pool,
                     on_approval=_approve_tool,
+                    surface="cli",
                 ):
                     if event.event == AgentEvent.PHASE_CHANGE:
                         phase = event.data.get("phase", "")
@@ -524,6 +580,10 @@ async def _run_chat(dsn: str, *, verbose: bool = False, debug: bool = False,
                         ui = _connector_setup_ui(event.data)
                         if ui and _connector_setup_requires_action(ui):
                             _print_connector_setup_ui(ui)
+
+                    elif event.event == AgentEvent.QUESTION:
+                        console.print()
+                        await _answer_cli_question(pool, dict(event.data))
 
                     elif event.event == AgentEvent.LOOP_START:
                         if debug:

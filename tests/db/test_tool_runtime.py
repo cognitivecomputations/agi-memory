@@ -13,6 +13,30 @@ def _coerce_json(value):
     return value
 
 
+async def test_agent_tools_default_names_are_all_registered(db_pool):
+    """#108: agent.tools (rendered into the heartbeat's advertised "Tools:"
+    block) named 9 tool names that were never registered -- recall_recent,
+    recall_episode, explore_cluster, list_recent_episodes, create_goal,
+    schedule_task, list_scheduled_tasks, update_scheduled_task,
+    delete_scheduled_task -- causing live "Unknown tool" heartbeat failures.
+    Every name in the default must resolve to a real handler."""
+    from core.tools.registry import create_default_registry
+
+    async with db_pool.acquire() as conn:
+        raw = await conn.fetchval(
+            "SELECT value FROM config_defaults WHERE key = 'agent.tools'"
+        )
+    names = _coerce_json(raw)
+    assert isinstance(names, list) and names
+
+    registry = create_default_registry(pool=None)
+    registered = set(registry.list_names())
+    unregistered = [n for n in names if n not in registered]
+    assert not unregistered, (
+        f"agent.tools default advertises unregistered tool(s): {unregistered}"
+    )
+
+
 async def test_tool_catalog_specs_and_policy_are_db_owned(db_pool):
     async with db_pool.acquire() as conn:
         tr = conn.transaction()
@@ -53,6 +77,63 @@ async def test_tool_catalog_specs_and_policy_are_db_owned(db_pool):
             assert decision["energy_cost"] == 2
             assert denied["allowed"] is False
             assert denied["error_type"] == "insufficient_energy"
+        finally:
+            await tr.rollback()
+
+
+async def test_stale_tool_definitions_flags_old_unsynced_rows(db_pool):
+    """#115: sync_tool_definitions only upserts, so a renamed/removed tool
+    would advertise forever with nothing noticing. stale_tool_definitions()
+    is the read-only, never-auto-deleting advisory hexis doctor surfaces
+    instead."""
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            await conn.execute(
+                "SELECT upsert_tool_definition('stale_check_fresh', 'external')"
+            )
+            await conn.execute(
+                "SELECT upsert_tool_definition('stale_check_old', 'external')"
+            )
+            await conn.execute(
+                "UPDATE tool_definitions SET updated_at = CURRENT_TIMESTAMP - INTERVAL '30 days' "
+                "WHERE name = 'stale_check_old'"
+            )
+
+            stale = _coerce_json(await conn.fetchval("SELECT stale_tool_definitions()"))
+            names = {item["name"]: item for item in stale}
+
+            assert "stale_check_fresh" not in names
+            assert "stale_check_old" in names
+            assert names["stale_check_old"]["age_days"] >= 29
+        finally:
+            await tr.rollback()
+
+
+async def test_stale_tool_definitions_respects_config_threshold(db_pool):
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            await conn.execute(
+                "SELECT upsert_tool_definition('stale_check_recent', 'external')"
+            )
+            await conn.execute(
+                "UPDATE tool_definitions SET updated_at = CURRENT_TIMESTAMP - INTERVAL '2 days' "
+                "WHERE name = 'stale_check_recent'"
+            )
+
+            # Under the default 14-day threshold, 2 days old is not stale.
+            default_stale = _coerce_json(await conn.fetchval("SELECT stale_tool_definitions()"))
+            assert "stale_check_recent" not in {i["name"] for i in default_stale}
+
+            await conn.execute(
+                "INSERT INTO config (key, value) VALUES ('tools.definition_stale_days', '1'::jsonb) "
+                "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"
+            )
+            tightened = _coerce_json(await conn.fetchval("SELECT stale_tool_definitions()"))
+            assert "stale_check_recent" in {i["name"] for i in tightened}
         finally:
             await tr.rollback()
 

@@ -25,7 +25,7 @@ Connect your Hexis agent to iMessage via BlueBubbles. **macOS only.**
 
 ```bash
 hexis channels setup imessage
-hexis up --profile active
+hexis up
 hexis channels status
 ```
 
@@ -36,6 +36,7 @@ hexis channels status
 | `channel.imessage.api_url` | text | BlueBubbles server URL (default: `http://localhost:1234`) |
 | `channel.imessage.password` | text | BlueBubbles password or env var name |
 | `channel.imessage.allowed_handles` | array | JSON array of phone/email handles or `"*"` (all) |
+| `channel.imessage.operator_recipient` | text | Your phone/email for unanswered Slack approval escalation |
 
 Environment variable: `IMESSAGE_PASSWORD`
 
@@ -55,6 +56,9 @@ Environment variable: `IMESSAGE_PASSWORD`
 ## How It Works
 
 - Connects to the BlueBubbles REST API running on the same Mac (or accessible over the network)
+- The configured operator recipient may answer approval prompts even when the
+  ordinary conversation allowlist excludes that handle; replies still require
+  the eight-character request code when multiple actions are pending.
 - **Polling**: Queries `/api/v1/message` every 2 seconds with a timestamp cursor to fetch new messages
 - **Cursor tracking**: Maintains `_last_timestamp` to avoid processing duplicates
 - Skips messages with `isFromMe` flag to avoid echo loops

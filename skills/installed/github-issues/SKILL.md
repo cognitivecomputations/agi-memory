@@ -37,6 +37,10 @@ unlocks the bound tools for this turn.
 
 ## If activation reports needs_setup
 
-Relay the exact `next_step` to the user (usually: set `GITHUB_PERSONAL_ACCESS_TOKEN`
-in the service environment). Do not claim GitHub capability is missing — it is
-installed and one step away.
+Relay the exact `next_step` to the user (#102). It will point them to run
+`hexis auth github setup-token` in a terminal — never ask for or accept a
+token pasted into chat; the tool activation path already checks Hexis's own
+stored credential automatically on retry. Explain, if useful, why a public
+repo still needs this: reading it is public, but creating or commenting on
+an issue as a specific account is not. Do not claim GitHub capability is
+missing — it is installed and one step away.

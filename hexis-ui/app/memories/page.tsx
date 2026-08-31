@@ -105,6 +105,32 @@ export default function MemoriesPage() {
   }, [fetchGraph]);
 
   useEffect(() => {
+    const memoryId = new URLSearchParams(window.location.search).get("memory");
+    if (!memoryId) return;
+    let cancelled = false;
+    setView("list");
+    setDetailLoading(true);
+    void fetch(`/api/memories/${encodeURIComponent(memoryId)}`, { cache: "no-store" })
+      .then(async (response) => {
+        if (!response.ok) throw new Error(`Failed to open cited memory (${response.status})`);
+        const memory = await response.json() as Memory;
+        if (!cancelled) {
+          setSelected(memory);
+          setDetailData(memory);
+        }
+      })
+      .catch((requestError: unknown) => {
+        if (!cancelled) {
+          setError(requestError instanceof Error ? requestError.message : "Failed to open cited memory.");
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setDetailLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
     setFocusId(null);
   }, [query, typeFilter, sort]);
 

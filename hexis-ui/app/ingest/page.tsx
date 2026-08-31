@@ -8,8 +8,6 @@ import {
   FilePlus2,
   Globe,
   Loader2,
-  Lock,
-  LockOpen,
   UploadCloud,
   X,
 } from "lucide-react";
@@ -21,6 +19,7 @@ import {
   isActiveIngestJob,
   mergeIngestJobs,
   normalizeIngestJob,
+  retainActiveTrackedJobIds,
 } from "./jobs";
 
 type PendingFileState = "queued" | "uploading" | "accepted" | "failed";
@@ -30,7 +29,6 @@ type PendingFile = {
   file: File;
   name: string;
   size: number;
-  sensitivity: "private" | null;
   state: PendingFileState;
   detail?: string;
   jobId?: string;
@@ -51,7 +49,6 @@ export default function IngestPage() {
   const [dragActive, setDragActive] = useState(false);
   const [pasteText, setPasteText] = useState("");
   const [pasteTitle, setPasteTitle] = useState("");
-  const [pastePrivate, setPastePrivate] = useState(false);
   const [pasteBusy, setPasteBusy] = useState(false);
   const [url, setUrl] = useState("");
   const [urlBusy, setUrlBusy] = useState(false);
@@ -61,7 +58,13 @@ export default function IngestPage() {
   const [trackedJobIds, setTrackedJobIds] = useState<string[]>([]);
   const [jobsLoading, setJobsLoading] = useState(true);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const trackedJobIdsRef = useRef(trackedJobIds);
+  const jobsFetchInFlightRef = useRef(false);
   const hasActiveJobs = trackedJobIds.length > 0 || jobs.some(isActiveIngestJob);
+
+  useEffect(() => {
+    trackedJobIdsRef.current = trackedJobIds;
+  }, [trackedJobIds]);
 
   const trackAcceptedJob = useCallback((job: IngestJob) => {
     setJobs((prev) => mergeIngestJobs(prev, [job]));
@@ -71,64 +74,70 @@ export default function IngestPage() {
   }, []);
 
   const fetchJobs = useCallback(async () => {
+    if (jobsFetchInFlightRef.current) return;
+    jobsFetchInFlightRef.current = true;
+    const trackedIds = trackedJobIdsRef.current;
     const recentJobs: IngestJob[] = [];
     try {
-      const res = await fetch("/api/ingest/jobs?limit=25", { cache: "no-store" });
-      if (res.ok) {
-        const data = await res.json();
-        for (const item of Array.isArray(data.jobs) ? data.jobs : []) {
-          const job = normalizeIngestJob(item);
-          if (job) recentJobs.push(job);
-        }
-      }
-    } catch {
-      // Keep polling tracked jobs even when the recent-list proxy is unavailable.
-    }
-
-    const exactJobs: IngestJob[] = [];
-    const missingIds = new Set<string>();
-    await Promise.all(
-      trackedJobIds.map(async (id) => {
-        try {
-          const exact = await fetch(`/api/ingest/jobs/${encodeURIComponent(id)}`, {
-            cache: "no-store",
-          });
-          if (exact.status === 404) {
-            missingIds.add(id);
-            return;
+      try {
+        const res = await fetch("/api/ingest/jobs?limit=25", { cache: "no-store" });
+        if (res.ok) {
+          const data = await res.json();
+          for (const item of Array.isArray(data.jobs) ? data.jobs : []) {
+            const job = normalizeIngestJob(item);
+            if (job) recentJobs.push(job);
           }
-          if (!exact.ok) return;
-          const job = normalizeIngestJob(await exact.json());
-          if (job) exactJobs.push(job);
-        } catch {
-          // Keep the job tracked and visible; the next poll may succeed.
         }
-      })
-    );
+      } catch {
+        // Keep polling tracked jobs even when the recent-list proxy is unavailable.
+      }
 
-    const exactById = new Map(exactJobs.map((job) => [job.id, job]));
-    setTrackedJobIds((prev) =>
-      prev.filter((id) => {
-        if (missingIds.has(id)) return false;
-        const job = exactById.get(id);
-        return job ? isActiveIngestJob(job) : true;
-      })
-    );
-    setJobs((prev) => {
-      const unresolvedTracked = prev.filter(
-        (job) =>
-          trackedJobIds.includes(job.id) &&
-          !missingIds.has(job.id) &&
-          !exactById.has(job.id)
+      const exactJobs: IngestJob[] = [];
+      const missingIds = new Set<string>();
+      await Promise.all(
+        trackedIds.map(async (id) => {
+          try {
+            const exact = await fetch(`/api/ingest/jobs/${encodeURIComponent(id)}`, {
+              cache: "no-store",
+            });
+            if (exact.status === 404) {
+              missingIds.add(id);
+              return;
+            }
+            if (!exact.ok) return;
+            const job = normalizeIngestJob(await exact.json());
+            if (job) exactJobs.push(job);
+          } catch {
+            // Keep the job tracked and visible; the next poll may succeed.
+          }
+        })
       );
-      return mergeIngestJobs([...recentJobs, ...unresolvedTracked], exactJobs);
-    });
-    setJobsLoading(false);
-  }, [trackedJobIds]);
+
+      const exactById = new Map(exactJobs.map((job) => [job.id, job]));
+      setTrackedJobIds((prev) => retainActiveTrackedJobIds(prev, missingIds, exactById));
+      setJobs((prev) => {
+        const unresolvedTracked = prev.filter(
+          (job) =>
+            trackedIds.includes(job.id) &&
+            !missingIds.has(job.id) &&
+            !exactById.has(job.id)
+        );
+        return mergeIngestJobs([...recentJobs, ...unresolvedTracked], exactJobs);
+      });
+    } finally {
+      setJobsLoading(false);
+      jobsFetchInFlightRef.current = false;
+    }
+  }, []);
 
   useEffect(() => {
-    fetchJobs();
-    const timer = window.setInterval(fetchJobs, hasActiveJobs ? 3000 : 15000);
+    void fetchJobs();
+  }, [fetchJobs]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      void fetchJobs();
+    }, hasActiveJobs ? 3000 : 15000);
     return () => window.clearInterval(timer);
   }, [fetchJobs, hasActiveJobs]);
 
@@ -143,7 +152,6 @@ export default function IngestPage() {
         file,
         name: file.name,
         size: file.size,
-        sensitivity: null as "private" | null,
         state: "queued" as const,
       })),
     ]);
@@ -162,7 +170,6 @@ export default function IngestPage() {
         const form = new FormData();
         form.append("file", item.file, item.name);
         form.append("mode", mode);
-        if (item.sensitivity) form.append("sensitivity", item.sensitivity);
         const res = await fetch("/api/ingest/file", { method: "POST", body: form });
         if (res.ok) {
           const body = await res.json();
@@ -231,7 +238,6 @@ export default function IngestPage() {
           content,
           title: pasteTitle.trim() || undefined,
           mode,
-          sensitivity: pastePrivate ? "private" : undefined,
         }),
       });
       if (!res.ok) {
@@ -240,7 +246,6 @@ export default function IngestPage() {
       }
       setPasteText("");
       setPasteTitle("");
-      setPastePrivate(false);
       const body = await res.json();
       const job = normalizeIngestJob({
         id: body.job_id,
@@ -428,35 +433,6 @@ export default function IngestPage() {
                   </span>
                   <button
                     type="button"
-                    aria-label={
-                      item.sensitivity === "private"
-                        ? `Make ${item.name} shareable`
-                        : `Mark ${item.name} private`
-                    }
-                    title={
-                      item.sensitivity === "private"
-                        ? "Private: kept out of group conversations and exports."
-                        : "Shareable. Click to mark private."
-                    }
-                    onClick={() =>
-                      setPending((prev) =>
-                        prev.map((p) =>
-                          p.id === item.id
-                            ? { ...p, sensitivity: p.sensitivity === "private" ? null : "private" }
-                            : p
-                        )
-                      )
-                    }
-                    className={`flex-none rounded p-0.5 ${
-                      item.sensitivity === "private"
-                        ? "text-[var(--teal)]"
-                        : "text-[var(--ink-soft)] hover:text-[var(--foreground)]"
-                    }`}
-                  >
-                    {item.sensitivity === "private" ? <Lock size={12} /> : <LockOpen size={12} />}
-                  </button>
-                  <button
-                    type="button"
                     aria-label={`Remove ${item.name}`}
                     title="Remove"
                     onClick={() => setPending((prev) => prev.filter((p) => p.id !== item.id))}
@@ -506,14 +482,6 @@ export default function IngestPage() {
               >
                 {pasteBusy ? "Submitting…" : "Ingest text"}
               </button>
-              <label className="flex items-center gap-1.5 text-xs text-[var(--ink-soft)]">
-                <input
-                  type="checkbox"
-                  checked={pastePrivate}
-                  onChange={(event) => setPastePrivate(event.target.checked)}
-                />
-                Private (kept out of group conversations and exports)
-              </label>
             </div>
           </Card>
 

@@ -125,12 +125,12 @@ class ChatScreen(Screen):
                 energy = await conn.fetchval(
                     "SELECT current_energy FROM heartbeat_state WHERE id = 1"
                 )
-                max_energy = await conn.fetchval(
-                    "SELECT get_config_int('heartbeat.max_energy')"
+                energy_capacity = await conn.fetchval(
+                    "SELECT heartbeat_bank_capacity()"
                 )
             if energy is not None:
                 self.query_one(StatusBar).update_state(
-                    energy=int(energy), max_energy=int(max_energy or 20)
+                    energy=int(energy), max_energy=int(energy_capacity or 20)
                 )
         except Exception:
             pass  # energy meter is ambient; never block chat on it
@@ -219,9 +219,10 @@ class ChatScreen(Screen):
                 if payload.get("mood"):
                     tr.write_info(f"Mood: {payload.get('mood')}")
                 energy = payload.get("energy")
-                max_e = payload.get("max_energy")
+                max_e = payload.get("energy_capacity", payload.get("max_energy"))
+                reserve = payload.get("energy_reserve", payload.get("max_energy"))
                 if energy is not None:
-                    tr.write_info(f"Energy: {energy}/{max_e}")
+                    tr.write_info(f"Energy: {energy}/{max_e} (reserve {reserve})")
                 consent = payload.get("consent", {})
                 if isinstance(consent, dict) and consent.get("status"):
                     tr.write_info(f"Consent: {consent.get('status')}")
@@ -469,7 +470,7 @@ class HexisChatApp(App):
         import asyncpg
         from core.agent_api import db_dsn_from_env, get_agent_profile_context
         from core.llm_config import load_llm_config
-        from core.tools import create_default_registry
+        from core.tools import create_full_registry
 
         dsn = None
         i = 0
@@ -502,7 +503,7 @@ class HexisChatApp(App):
                     configured = True  # never block chat on this probe
                 llm_config = await load_llm_config(conn, "llm.chat", fallback_key="llm")
             self.model_name = llm_config.get("model", "") if isinstance(llm_config, dict) else ""
-            self.registry = create_default_registry(self.pool)
+            self.registry = await create_full_registry(self.pool)
             agent_profile = await get_agent_profile_context(self.dsn)
             if isinstance(agent_profile, dict):
                 self.agent_name = agent_profile.get("name", "Hexis")

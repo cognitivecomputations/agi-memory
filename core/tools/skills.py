@@ -39,6 +39,38 @@ _AGENT_SKILL_MANAGER = "author_skill"
 _LEGACY_AGENT_PROVENANCE = "- Authored by Hexis via `author_skill`."
 
 
+def _resolve_stored_mcp_credential(env_var: str) -> str | None:
+    """Bridge an MCP server's required env var to a credential Hexis already
+    manages in its own secret store (#102), instead of requiring the whole
+    service process to carry it. The caller injects the result only into
+    that one server's own subprocess env (MCPServerConfig.env) -- never into
+    os.environ globally, and it is never read from ambient credentials like
+    `gh auth token` (see core/auth/github_pat.py's module docstring)."""
+    if env_var == "GITHUB_PERSONAL_ACCESS_TOKEN":
+        from core.auth.github_pat import resolve_github_token
+
+        token, _login = resolve_github_token()
+        return token
+    return None
+
+
+def _mcp_setup_next_step(missing_env: list[str]) -> str:
+    """A missing-credential next_step that explains itself instead of
+    dead-ending into a bare env-var name (#102)."""
+    if "GITHUB_PERSONAL_ACCESS_TOKEN" in missing_env:
+        return (
+            "GitHub needs a connected account before this can search, create, "
+            "or comment on issues -- a public repo being readable doesn't mean "
+            "acting on it as you is. Run `hexis auth github setup-token` in a "
+            "terminal (never paste the token into chat), then call use_skill "
+            "again."
+        )
+    return (
+        f"Set {', '.join(missing_env)} in the service environment and "
+        "call use_skill again."
+    )
+
+
 class ListSkillsHandler(ToolHandler):
     """List skills available in the current context."""
 
@@ -160,20 +192,35 @@ class UseSkillHandler(ToolHandler):
         from core.tools.config import MCPServerConfig
 
         binding = skill.mcp_binding
-        missing_env = [v for v in binding.env_requires if not os.environ.get(v)]
+        # A required env var absent from the service's own process environment
+        # is not necessarily unresolvable (#102): check whether Hexis already
+        # holds a credential for it in its own secret store first, and inject
+        # that into only this server's own subprocess env (never os.environ
+        # globally) rather than dead-ending into "set X in the service
+        # environment" for something the user already connected.
+        resolved_env: dict[str, str] = {}
+        missing_env: list[str] = []
+        for var in binding.env_requires:
+            if os.environ.get(var):
+                continue
+            stored = _resolve_stored_mcp_credential(var)
+            if stored:
+                resolved_env[var] = stored
+                continue
+            missing_env.append(var)
         if missing_env:
             return {
                 "status": "needs_setup",
                 "missing": [f"missing env var: {v}" for v in missing_env],
-                "next_step": (
-                    f"Set {', '.join(missing_env)} in the service environment and "
-                    "call use_skill again."
-                ),
+                "next_step": _mcp_setup_next_step(missing_env),
             }
 
         if binding.command:
             server_config = MCPServerConfig(
-                name=binding.server, command=binding.command, args=list(binding.args)
+                name=binding.server,
+                command=binding.command,
+                args=list(binding.args),
+                env=resolved_env,
             )
         else:
             config = await context.registry.get_config()

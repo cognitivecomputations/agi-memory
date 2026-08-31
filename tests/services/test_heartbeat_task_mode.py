@@ -55,6 +55,11 @@ def _mock_conn(prompt: str = "[heartbeat decision prompt]") -> AsyncMock:
     conn = AsyncMock()
 
     async def fetchval(query, *args):
+        if "attach_answered_agent_questions" in query:
+            ctx = json.loads(args[0]) if args and isinstance(args[0], str) else {}
+            return {**ctx, "answered_questions": []}
+        if "render_answered_agent_questions" in query:
+            return ""
         if "heartbeat_agentic_plan" in query:
             ctx = json.loads(args[0]) if args and isinstance(args[0], str) else {}
             backlog = ctx.get("backlog") or {}
@@ -85,6 +90,19 @@ def _mock_conn(prompt: str = "[heartbeat decision prompt]") -> AsyncMock:
                 "allow_shell": has_tasks,
                 "allow_file_write": has_tasks,
                 "prompt_suffix": "\n\n".join(parts) or None,
+            }
+        if "enforce_heartbeat_plan_energy" in query:
+            plan = json.loads(args[0]) if args and isinstance(args[0], str) else {}
+            energy = (plan.get("context", {}).get("energy") or {})
+            available = float(energy.get("current", 0))
+            reserve = float(energy.get("max", 20))
+            limit = reserve * (2 if plan.get("has_backlog_tasks") else 1)
+            return {
+                **plan,
+                "energy_budget": min(available, limit),
+                "energy_available": available,
+                "energy_reserve": reserve,
+                "energy_bank_capacity": reserve * 3,
             }
         return prompt
 
@@ -229,7 +247,7 @@ class TestBuildSystemPromptBacklog:
 
 class TestRunAgenticHeartbeatScaling:
     @patch("services.heartbeat_agentic.run_agent")
-    async def test_backlog_doubles_energy(self, mock_run_agent):
+    async def test_backlog_can_draw_up_to_double_reserve(self, mock_run_agent):
         mock_run_agent.return_value = MagicMock(
             text="Done.", tool_calls_made=[], iterations=1,
             energy_spent=0, timed_out=False, stopped_reason="completed",
@@ -239,7 +257,7 @@ class TestRunAgenticHeartbeatScaling:
             "counts": {"todo": 1},
             "actionable": [{"title": "Task", "status": "todo"}],
         })
-        ctx["energy"]["current"] = 10
+        ctx["energy"]["current"] = 50
 
         result = await run_agentic_heartbeat(
             _mock_conn(), pool=MagicMock(), registry=_mock_registry(),
@@ -247,7 +265,7 @@ class TestRunAgenticHeartbeatScaling:
         )
 
         call_kwargs = mock_run_agent.call_args[1]
-        assert call_kwargs["energy_budget"] == 20  # 10 * 2
+        assert call_kwargs["energy_budget"] == 40  # two 20-point reserves
         assert result["has_backlog_tasks"] is True
 
     @patch("services.heartbeat_agentic.run_agent")

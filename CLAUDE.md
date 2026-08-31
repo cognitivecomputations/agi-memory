@@ -106,7 +106,7 @@ hexis/
 - `clusters` - Thematic groupings with centroid embeddings
 - `memory_neighborhoods` - Precomputed associative neighbors (hot-path optimization)
 - `memories` (type=`worldview`, `goal`) - Beliefs, boundaries, and goals stored as memories
-- `external_calls` - Queue for LLM/embedding requests
+- `external_driver_calls` - Queue for LLM/embedding requests (LLM calls also route through `gateway_events`)
 - `memory_graph` (Apache AGE) - Graph nodes/edges for multi-hop reasoning
 
 ### Key Database Functions
@@ -127,9 +127,14 @@ hexis migrate            # or `hexis upgrade` to also refresh images/code
 
 # Dev loop: watch mode — code + migration edits apply to the running stack
 # automatically (sync + restart; Ctrl+C stops watching, stack keeps running).
-# `hexis up` in a source checkout also rebuilds by default, so containers
-# always match the code on disk after any `up`.
+# `hexis up` uses cached/published images by default, including in a source
+# checkout. Use `hexis up --build` for a deliberate build or `hexis dev` while editing.
 hexis dev
+
+# Python runtime image dependencies are resolved only from the committed uv.lock.
+# After changing pyproject.toml, refresh and verify it before building.
+uv lock
+uv lock --check
 
 # Wipe the DB volume — deliberate clean slate only (loses all data)
 docker compose down -v && docker compose up -d
@@ -179,6 +184,21 @@ hexis mcp                 # Start MCP server
 ## Configuration & Safety Notes
 
 - **Secrets**: Store API keys in environment variables (`.env`), not in Postgres; DB config stores env var *names* only
+- **`core/auth/gmail-credentials.json` is intentional — do not "fix" it.** Hexis ships
+  as a **desktop application**, and that file is an OAuth client for an *installed
+  application*. Google's own documentation states the client secret for an installed
+  app is not treated as confidential, and RFC 8252 ("OAuth 2.0 for Native Apps") says
+  the same: a native client cannot keep a secret, so the security model does not rely
+  on it. Packaging it via `pyproject.toml` `package-data` is the documented path. Code
+  audits repeatedly flag this by applying a web-server threat model to a desktop
+  client — **it has been reviewed and blessed. Do not rotate it, remove it from
+  `package-data`, or rewrite git history over it.**
+- **OSS has no authentication layer, and is not getting one.** API-key auth
+  (`HEXIS_API_KEY`) is a **Hexis Pro** feature. OSS Hexis is a desktop application
+  bound to `127.0.0.1`; "the dashboard has no auth" is the design, not a gap. Audits
+  flag this by assuming a server product. The consequence that *does* matter: OSS
+  remote access must be secured at the network layer only — a tailnet, or a reverse
+  proxy supplying its own auth — never by exposing the dashboard directly.
 - **Heartbeat gating**: Heartbeat is blocked until `agent.is_configured=true` (set via `hexis init`)
 - **Consent flow**: Agent signs consent before first LLM use; consent is final and only ends via self-termination
 - **Pause/terminate**: Heartbeat pauses must include a detailed reason queued to the outbox; self-termination must queue a last will to the outbox

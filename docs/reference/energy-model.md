@@ -27,11 +27,32 @@ Energy does **not** represent compute cost, latency, API pricing, or system reso
 
 ## Core Mechanics
 
-- Energy regenerates at +10/hour, max 20
-- Unused energy carries forward up to the cap
-- Actions consume energy at execution time
-- The agent may rest to preserve energy
-- Budget is global per heartbeat (no separate pools)
+- Energy regenerates from elapsed wall time when a heartbeat starts. The base rate is 10/hour.
+- `heartbeat.max_energy` is the normal reserve (20 by default), not a hard storage cap.
+- Unused energy banks up to three times the reserve by default. Surplus above the reserve decays with a 12-hour half-life.
+- Ordinary heartbeats may spend the normal reserve. A heartbeat with actionable backlog may draw up to two reserves, bounded by what is actually banked.
+- Actions consume energy at execution time. Agentic tool spend is deducted once when the beat finalizes.
+- The agent may rest to preserve energy. The budget remains global (no separate pools).
+
+### Outcome Gradient
+
+The prior completed beat changes the next regeneration rate. A beat with no
+durable result gets the configured floor multiplier (0.75 by default). Durable
+memories, resolved contradictions, advanced goals, and explicit thanks from a
+verified operator increase its outcome score; the multiplier is capped at 1.5.
+Tool receipts and outcome signals are stored in Postgres, so a model-written
+summary cannot award itself credit.
+
+Operator thanks only credit a recent heartbeat that actually made proactive
+contact. Untrusted channel participants and vague positive language do not affect
+the economy.
+
+### Adaptive Cadence
+
+The next heartbeat is scheduled from the live maximum drive-urgency ratio. With
+the defaults, a quiet agent waits 90 minutes; increasing urgency shortens that
+toward a 15-minute floor. `should_run_heartbeat()` honors the resulting
+`next_heartbeat_at`, so the worker remains a stateless poller.
 
 ### Base Cost Dimensions
 
@@ -120,7 +141,8 @@ Proposals are arguments, not instructions. Constraints:
 2. Costs do not change automatically
 3. Public or destructive actions are never cheap (hard floor)
 4. Heartbeat autonomy is more restricted than chat
-5. Energy remains a single, shared budget (no fragmentation)
+5. Energy remains a single, shared bank and budget (no fragmentation)
+6. Outcome credit comes from durable receipts or verified operator feedback, never self-report
 
 ## Related
 

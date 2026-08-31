@@ -3,7 +3,8 @@ name: humanizer
 description: Detect and remove AI writing patterns to produce natural, human-sounding prose
 category: creative
 contexts: [heartbeat, chat]
-bound_tools: [humanize_text]
+aliases: [humanize, natural, rewrite, prose, tone, polish]
+bound_tools: [humanize_text, post_process_output]
 ---
 
 # AI Writing Pattern Detection and Removal

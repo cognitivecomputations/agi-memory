@@ -34,13 +34,13 @@ async def build_heartbeat_system_prompt(
     Compatibility wrapper — delegates to services.agent.build_system_prompt().
     """
     from services.agent import build_system_prompt as _build
-    from core.tools.registry import ToolRegistry as _TR
 
     if registry is None:
         # Create a minimal mock for the prompt builder
         class _NoopRegistry:
             async def get_specs(self, ctx):
                 return []
+
         registry = _NoopRegistry()  # type: ignore[assignment]
     return await _build(
         "heartbeat",
@@ -69,6 +69,17 @@ async def run_agentic_heartbeat(
     - stopped_reason: str
     - has_backlog_tasks: bool
     """
+    # Answers to asynchronous ask_user calls are claimed exactly once before
+    # the DB builds this beat's plan. The original beat ended cleanly; this beat
+    # receives the answer as explicit user input and can resume or reassess.
+    answered_raw = await conn.fetchval(
+        "SELECT attach_answered_agent_questions($1::jsonb)",
+        json.dumps(context, default=str),
+    )
+    context = (
+        json.loads(answered_raw) if isinstance(answered_raw, str) else answered_raw
+    ) or context
+
     # The DB owns the whole plan (db/68 heartbeat_agentic_plan): context
     # enrichment, the backlog gate, resource scaling, the shell/file-write
     # permission grant, and the protected-decision prompt fragments.
@@ -76,12 +87,35 @@ async def run_agentic_heartbeat(
         "SELECT heartbeat_agentic_plan($1::jsonb)", json.dumps(context, default=str)
     )
     plan = json.loads(plan_raw) if isinstance(plan_raw, str) else (plan_raw or {})
+    bounded_plan_raw = await conn.fetchval(
+        "SELECT enforce_heartbeat_plan_energy($1::jsonb)",
+        json.dumps(plan, default=str),
+    )
+    plan = (
+        json.loads(bounded_plan_raw)
+        if isinstance(bounded_plan_raw, str)
+        else (bounded_plan_raw or plan)
+    )
     context = plan.get("context") or context
     has_tasks = bool(plan.get("has_backlog_tasks"))
     if has_tasks:
-        logger.info("Backlog has actionable items — scaling resources + granting permissions")
+        logger.info(
+            "Backlog has actionable items — scaling resources + granting permissions"
+        )
 
     user_message = await render_heartbeat_decision_prompt_db(conn, context)
+    belief_updates_prompt = await conn.fetchval(
+        "SELECT render_belief_updates($1::jsonb)",
+        json.dumps(context.get("belief_updates_recent") or []),
+    )
+    if belief_updates_prompt:
+        user_message += "\n\n" + str(belief_updates_prompt)
+    answered_prompt = await conn.fetchval(
+        "SELECT render_answered_agent_questions($1::jsonb)",
+        json.dumps(context.get("answered_questions") or []),
+    )
+    if answered_prompt:
+        user_message += "\n\n" + str(answered_prompt)
     if plan.get("prompt_suffix"):
         user_message += "\n\n" + plan["prompt_suffix"]
 
@@ -96,10 +130,14 @@ async def run_agentic_heartbeat(
         has_backlog_tasks=has_tasks,
         timeout_seconds=float(plan.get("timeout_seconds", 120.0)),
         max_tokens=int(plan.get("max_tokens", 2048)),
-        context_overrides=ContextOverrides(
-            allow_shell=True,
-            allow_file_write=True,
-        ) if plan.get("allow_shell") else None,
+        context_overrides=(
+            ContextOverrides(
+                allow_shell=True,
+                allow_file_write=True,
+            )
+            if plan.get("allow_shell")
+            else None
+        ),
         on_event=on_event,
     )
 
@@ -136,7 +174,10 @@ async def finalize_heartbeat(
 
     # Build a summary of what happened
     tool_names = [tc.get("name", "?") for tc in tool_calls]
-    summary = text or f"Heartbeat completed: {len(tool_calls)} tool calls, {energy_spent} energy spent."
+    summary = (
+        text
+        or f"Heartbeat completed: {len(tool_calls)} tool calls, {energy_spent} energy spent."
+    )
     if tool_names:
         summary += f" Tools used: {', '.join(tool_names)}."
     if has_tasks:
@@ -146,6 +187,22 @@ async def finalize_heartbeat(
     # episodic memory + heartbeat_state bump + auto-checkpoint of interrupted
     # in-progress backlog items — previously three inline SQL blocks here.
     memory_id = None
+    economy: dict[str, Any] = {}
+    try:
+        economy_raw = await conn.fetchval(
+            "SELECT finalize_heartbeat_economy($1::uuid, $2::float, $3::text)",
+            heartbeat_id,
+            float(energy_spent or 0),
+            stopped_reason,
+        )
+        economy = (
+            json.loads(economy_raw)
+            if isinstance(economy_raw, str)
+            else (economy_raw or {})
+        )
+    except Exception:
+        logger.warning("Failed to finalize heartbeat economy", exc_info=True)
+
     try:
         raw = await conn.fetchval(
             "SELECT finalize_agentic_heartbeat($1::text, $2::text, $3::int, $4::int, $5::text, $6::boolean)",
@@ -159,7 +216,7 @@ async def finalize_heartbeat(
         payload = json.loads(raw) if isinstance(raw, str) else (raw or {})
         memory_id = payload.get("memory_id")
     except Exception:
-        logger.debug("Failed to finalize heartbeat", exc_info=True)
+        logger.warning("Failed to finalize heartbeat recap", exc_info=True)
         # finalize_agentic_heartbeat releases the claim itself; only the
         # failure path needs an explicit guarded release.
         await conn.fetchval("SELECT release_active_heartbeat($1)", heartbeat_id)
@@ -168,6 +225,7 @@ async def finalize_heartbeat(
         "completed": True,
         "memory_id": memory_id,
         "energy_spent": energy_spent,
+        "economy": economy,
         "outbox_messages": [],
         "has_backlog_tasks": has_tasks,
     }

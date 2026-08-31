@@ -1815,10 +1815,8 @@ CREATE OR REPLACE FUNCTION search_similar_memories(
 ) AS $$
 DECLARE
     query_embedding vector;
-    zero_vec vector;
 BEGIN
     query_embedding := (get_embedding(ARRAY[ensure_embedding_prefix(p_query_text, 'search_query')]))[1];
-    zero_vec := array_fill(0.0::float, ARRAY[embedding_dimension()])::vector;
     
     RETURN QUERY
     WITH candidates AS MATERIALIZED (
@@ -1826,8 +1824,8 @@ BEGIN
         FROM memories m
         WHERE m.status = 'active'
           AND (m.valid_until IS NULL OR m.valid_until > CURRENT_TIMESTAMP)
+          AND m.embedding_status = 'embedded'
           AND m.embedding IS NOT NULL
-          AND m.embedding <> zero_vec
           AND (p_memory_types IS NULL OR m.type = ANY(p_memory_types))
           AND m.importance >= p_min_importance
     )
@@ -1854,8 +1852,10 @@ DECLARE
     zero_vec vector := array_fill(0.0::float, ARRAY[embedding_dimension()])::vector;
 BEGIN
     SELECT embedding INTO memory_embedding
-    FROM memories WHERE id = p_memory_id;
-    IF memory_embedding IS NULL OR memory_embedding = zero_vec THEN
+    FROM memories
+    WHERE id = p_memory_id
+      AND embedding_status = 'embedded';
+    IF memory_embedding IS NULL THEN
         RETURN;
     END IF;
 
@@ -1927,17 +1927,11 @@ DECLARE
     min_contradict FLOAT;
     sim FLOAT;
     w RECORD;
-    zero_vec vector;
 BEGIN
     IF NEW.type <> 'semantic' THEN
         RETURN NEW;
     END IF;
-    IF NEW.embedding IS NULL THEN
-        RETURN NEW;
-    END IF;
-
-    zero_vec := array_fill(0.0::float, ARRAY[embedding_dimension()])::vector;
-    IF NEW.embedding = zero_vec THEN
+    IF NEW.embedding IS NULL OR NEW.embedding_status <> 'embedded' THEN
         RETURN NEW;
     END IF;
 
@@ -1950,8 +1944,8 @@ BEGIN
             FROM memories
             WHERE type = 'worldview'
               AND status = 'active'
+              AND embedding_status = 'embedded'
               AND embedding IS NOT NULL
-              AND embedding <> zero_vec
             ORDER BY embedding <=> NEW.embedding
             LIMIT 10
         LOOP

@@ -28,6 +28,25 @@ All providers can be used for any LLM slot (`llm.chat`, `llm.heartbeat`, `llm.su
 
 API-key providers (`openai`, `anthropic`, `grok`, `gemini`) can also use traditional environment variables (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, etc.) instead of OAuth.
 
+For a custom OpenAI-compatible endpoint, put the endpoint and key in the
+project's ignored `.env` file:
+
+```dotenv
+OPENAI_BASE_URL=https://your-inference-server.example/v1
+OPENAI_API_KEY=replace-with-your-key
+```
+
+Then configure Hexis without exposing the key in shell history:
+
+```bash
+hexis init --provider openai_compatible --model your-model-id --character hexis \
+  --api-key-env OPENAI_API_KEY
+```
+
+The endpoint and environment variable name are stored in the brain; the key
+itself remains in `.env`. Use `OPENAI_API_KEY=not-needed` for an unauthenticated
+server because the OpenAI client still requires a value.
+
 ---
 
 ## OpenAI Codex (ChatGPT Subscription)

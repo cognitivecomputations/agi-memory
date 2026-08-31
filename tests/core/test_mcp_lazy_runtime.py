@@ -201,3 +201,59 @@ async def test_use_skill_needs_setup_is_not_a_dead_end(
     assert result.output["instructions"]
     # No server started, no tools unlocked.
     assert not any(n.startswith("mcp_") for n in registry.list_names())
+
+
+async def test_use_skill_resolves_stored_github_credential_instead_of_dead_ending(
+    tmp_path, stub_server_config, fresh_singleton, monkeypatch
+):
+    """#102: a required env var missing from the process environment isn't
+    necessarily unresolvable -- Hexis's own stored GitHub credential should
+    be injected into just this server's subprocess env instead of dead-
+    ending into "set X in the service environment"."""
+    monkeypatch.delenv("GITHUB_PERSONAL_ACCESS_TOKEN", raising=False)
+    monkeypatch.setattr(
+        "core.auth.github_pat.resolve_github_token",
+        lambda: ("github_pat_fake123", "octocat"),
+    )
+    script = Path(stub_server_config.args[0])
+    skills_root = _skill_dir_with_manifest(
+        tmp_path, script, env_requires="GITHUB_PERSONAL_ACCESS_TOKEN"
+    )
+    registry = _registry_for_skills(skills_root)
+    context = ToolExecutionContext(
+        tool_context=ToolContext.CHAT, call_id="t3", registry=registry
+    )
+
+    result = await UseSkillHandler().execute({"name": "stub-echo"}, context)
+    assert result.success
+    assert result.output["status"] == "activated"
+    assert "mcp_stub_echo" in result.output["bound_tools"]
+
+    await MCPRuntime.instance().shutdown()
+
+
+async def test_use_skill_github_needs_setup_points_to_setup_token_command(
+    tmp_path, stub_server_config, fresh_singleton, monkeypatch
+):
+    """#102: with nothing stored and no env var, the next_step must explain
+    itself and point at `hexis auth github setup-token` -- never the raw
+    "set GITHUB_PERSONAL_ACCESS_TOKEN in the service environment" dead end,
+    and never a request to paste the token into chat."""
+    monkeypatch.delenv("GITHUB_PERSONAL_ACCESS_TOKEN", raising=False)
+    monkeypatch.setattr(
+        "core.auth.github_pat.resolve_github_token", lambda: (None, "")
+    )
+    script = Path(stub_server_config.args[0])
+    skills_root = _skill_dir_with_manifest(
+        tmp_path, script, env_requires="GITHUB_PERSONAL_ACCESS_TOKEN"
+    )
+    registry = _registry_for_skills(skills_root)
+    context = ToolExecutionContext(
+        tool_context=ToolContext.CHAT, call_id="t4", registry=registry
+    )
+
+    result = await UseSkillHandler().execute({"name": "stub-echo"}, context)
+    assert result.output["status"] == "needs_setup"
+    assert "hexis auth github setup-token" in result.output["next_step"]
+    assert "GITHUB_PERSONAL_ACCESS_TOKEN" not in result.output["next_step"]
+    assert not any(n.startswith("mcp_") for n in registry.list_names())

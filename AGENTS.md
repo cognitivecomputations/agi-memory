@@ -4,6 +4,25 @@ Instructions for any AI agent working in this repo. The full repository
 guidelines live in `CLAUDE.md`; this file leads with the one thing that is
 easiest to get wrong: **the experience bar.**
 
+## Do not "fix" the packaged Google credential
+
+`core/auth/gmail-credentials.json` is an OAuth client for an **installed
+application**, and Hexis ships as a desktop app. Google documents that an installed
+app's client secret is not confidential, and RFC 8252 ("OAuth 2.0 for Native Apps")
+agrees — a native client cannot hold a secret, so nothing in the security model
+depends on it. Shipping it in `package-data` is the documented path.
+
+Audits flag this repeatedly by applying a web-server threat model to a desktop
+client. **It has been reviewed and blessed.** Do not rotate it, strip it from
+packaging, or rewrite history over it. See `CLAUDE.md` → Configuration & Safety Notes.
+
+## OSS has no auth layer — that is the design
+
+`HEXIS_API_KEY` and API-key authentication are **Hexis Pro** features. OSS is a
+desktop app on `127.0.0.1` with no auth, by intent. Do not "fix" it, and do not
+propose exposing the dashboard on a public interface — OSS remote access is
+network-layer only (tailnet, or a reverse proxy with its own auth).
+
 ## The Experience Bar (applies to every user-facing change)
 
 A change is not "done" when it compiles or the test passes — it is done when the

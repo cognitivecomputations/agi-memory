@@ -23,7 +23,55 @@ All workers are **stateless** -- they can be killed and restarted without losing
 
 ## Starting and Stopping
 
-### Via Docker Compose (Recommended)
+### Host user services (recommended)
+
+Keep PostgreSQL and RabbitMQ in Docker while launchd on macOS or the systemd
+user manager on Linux owns the stateless Python workers:
+
+```bash
+hexis up
+hexis service install --replace-docker-workers
+hexis service status
+```
+
+The migration command installs and enables the host units before stopping the
+matching Docker workers, then starts the host copies. If host startup fails,
+Hexis stops the attempted host copies and restores the previous Docker workers.
+It refuses to proceed when it cannot determine whether Docker workers are
+running. This ensures each worker has one owner.
+
+The CLI selects the same `.env` file as the stack. You can make that choice
+explicit without copying its values into service definitions:
+
+```bash
+hexis service install --env-file /path/to/.env --replace-docker-workers
+```
+
+Service lifecycle commands are:
+
+```bash
+hexis service status [--json]
+hexis service start [heartbeat maintenance channels]
+hexis service stop [heartbeat maintenance channels]
+hexis service restart [heartbeat maintenance channels]
+hexis service logs [-f] [heartbeat maintenance channels]
+hexis service uninstall [--yes]
+```
+
+The channel worker remains opt-in for host ownership; add `--channels` during
+installation to migrate it too. On Linux, `--enable-linger` explicitly allows
+the systemd user manager to survive logout. Without it, Hexis reports the live
+linger status and leaves that system setting under your control. On macOS the
+units live in `~/Library/LaunchAgents`; on Linux they live in
+`~/.config/systemd/user`. `hexis service uninstall` preserves worker logs.
+
+Once installed, `hexis up`, `down`, `start`, `stop`, `reset`, and `upgrade`
+coordinate host workers and omit their Docker copies. `hexis upgrade` restarts
+them onto the updated Python package after migrations. `hexis uninstall`
+removes managed units before removing the CLI. Source watch mode deliberately
+refuses to start while host workers are active because it owns Docker workers.
+
+### Docker Compose alternative
 
 ```bash
 # Start the default background stack
@@ -47,8 +95,8 @@ hexis start    # start workers manually if they were stopped
 hexis stop     # stop workers
 ```
 
-Channel workers are opt-in because they open live external connections. Start
-them with `hexis up --profile active` after configuring a channel.
+Without host units, these commands retain the Docker-only behavior. The channel
+delivery relay is part of the default stack.
 
 ### Running Locally
 
@@ -75,10 +123,10 @@ hexis-worker --mode maintenance
 The heartbeat worker drives the agent's conscious cognitive loop:
 
 1. Checks `should_run_heartbeat()` on a polling interval
-2. Calls `run_heartbeat()` which gathers context and returns external call payloads
-3. Executes LLM calls and feeds results back
-4. Calls `execute_heartbeat_actions_batch()` to apply decisions
-5. Calls `complete_heartbeat()` to finalize
+2. Opens a beat in Postgres, which regenerates/decays energy and gathers context
+3. Runs the energy-bounded agent loop and its tool calls
+4. Derives useful outcomes from durable tool receipts
+5. Deducts exact spend, records the episode, and stores the urgency-adjusted next due time
 
 ### Prerequisites
 
@@ -144,7 +192,9 @@ RabbitMQ details:
 
 ```bash
 hexis status                          # heartbeat number, energy, last run
-hexis logs -f                         # tail all logs
+hexis service status                  # launchd/systemd process state
+hexis service logs -f                 # launchd/systemd worker logs
+hexis logs -f                         # Docker logs
 docker compose logs heartbeat_worker -f
 docker compose logs maintenance_worker -f
 ```

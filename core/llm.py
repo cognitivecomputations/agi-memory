@@ -4,6 +4,7 @@ import base64
 import json
 import logging
 import os
+import re
 from typing import Any, AsyncIterator
 
 import httpx
@@ -585,6 +586,55 @@ def _extract_responses_result(response: Any) -> dict[str, Any]:
     return {"content": content, "tool_calls": tool_calls, "raw": response}
 
 
+_REASONING_PATTERNS = [
+    # DeepSeek/Qwen-style reasoning tags, if they surface inline in `content`.
+    re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE),
+    # Gemma 4 native reasoning channel — <|channel>thought ... <channel|>.
+    # A well-behaved Gemma 4 emits these special tokens; llama.cpp does not
+    # parse them, so they leak into `content`.
+    re.compile(r"<\|?channel\|?>\s*thought\b.*?<\|?channel\|?>", re.DOTALL | re.IGNORECASE),
+    # Markdown-fenced reasoning block — ```thought ... ``` — the form actually
+    # observed in production: an abliterated Gemma 4 merge degrades special-token
+    # adherence and approximates its thought channel as a plaintext fence.
+    re.compile(r"```(?:thought|thinking|reasoning)\b.*?```", re.DOTALL | re.IGNORECASE),
+]
+
+
+def strip_reasoning(content: str) -> str:
+    """
+    Remove leaked chain-of-thought from model output.
+
+    Some models — abliterated community merges in particular — emit their
+    reasoning trace as visible content instead of through a separate reasoning
+    channel: either ``<think>...</think>`` tags or a ```thought fenced block.
+    Hexis never wants that text in a user-facing reply.
+
+    Model-agnostic and a no-op when the content is already clean, so it is safe
+    to apply unconditionally regardless of which model/provider is configured.
+    """
+    if not content:
+        return content
+    lowered = content.lower()
+    if "```" not in content and "<think>" not in lowered and "channel" not in lowered:
+        return content
+    cleaned = content
+    for pat in _REASONING_PATTERNS:
+        cleaned = pat.sub("", cleaned)
+    cleaned = cleaned.strip()
+    if cleaned == content:
+        return content
+    if not cleaned:
+        logger.warning(
+            "strip_reasoning: model output was entirely reasoning trace, "
+            "nothing left after strip (%d chars removed)", len(content),
+        )
+        return ""
+    logger.info(
+        "strip_reasoning: removed %d chars of leaked reasoning", len(content) - len(cleaned),
+    )
+    return cleaned
+
+
 _PROVIDER_ALIASES: dict[str, str] = {
     "openai_chat_completions_endpoint": "openai-chat-completions-endpoint",
     "openai_codex": "openai-codex",
@@ -673,14 +723,49 @@ def normalize_llm_config(config: dict[str, Any] | None, *, default_model: str = 
 
 
 def _extract_system_prompt(messages: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
+    parts, rest = _extract_system_parts(messages)
+    return "\n\n".join(parts), rest
+
+
+def _extract_system_parts(messages: list[dict[str, Any]]) -> tuple[list[str], list[dict[str, Any]]]:
+    """System messages kept as separate parts, in order.
+
+    Callers assemble the prompt so that everything stable comes first and
+    everything per-turn comes last (see services.agent.SystemPrompt). Providers
+    that can cache a prefix need that boundary preserved rather than flattened,
+    so the parts stay split until the last moment.
+    """
     system_parts: list[str] = []
     rest: list[dict[str, Any]] = []
     for msg in messages:
         if msg.get("role") == "system":
-            system_parts.append(_content_text(msg.get("content")))
+            text = _content_text(msg.get("content"))
+            if text.strip():
+                system_parts.append(text)
         else:
             rest.append(msg)
-    return "\n\n".join([p for p in system_parts if p.strip()]), rest
+    return system_parts, rest
+
+
+def _anthropic_system_blocks(parts: list[str]) -> list[dict[str, Any]] | None:
+    """Anthropic `system` as content blocks, with a cache breakpoint.
+
+    Everything except the final part is the stable prefix, so the breakpoint
+    goes on the last stable block: Anthropic caches up to and including the
+    marked block and re-reads only what follows. With a single part there is
+    nothing to cache against, so it is sent plain.
+    """
+    if not parts:
+        return None
+    if len(parts) == 1:
+        return [{"type": "text", "text": parts[0]}]
+    blocks: list[dict[str, Any]] = []
+    for index, part in enumerate(parts):
+        block: dict[str, Any] = {"type": "text", "text": part}
+        if index == len(parts) - 2:
+            block["cache_control"] = {"type": "ephemeral"}
+        blocks.append(block)
+    return blocks
 
 
 def _content_text(content: Any) -> str:
@@ -1166,6 +1251,9 @@ async def chat_completion(
             raise RuntimeError("Gemini API key is required. Set GEMINI_API_KEY or configure api_key_env.")
 
         client = genai.Client(api_key=api_key)
+        # Gemini 2.5+ implicitly caches repeated prefixes. SystemPrompt emits
+        # the stable half first and the volatile half second; keep that order
+        # intact when flattening the API's single system instruction.
         system_prompt, rest = _extract_system_prompt(messages)
         contents = _messages_to_gemini_contents(rest)
         gemini_tools = _gemini_tools(tools)
@@ -1243,7 +1331,7 @@ async def chat_completion(
         async def _do_chat_completion():
             response = await client.chat.completions.create(**payload)
             message = response.choices[0].message
-            content = message.content or ""
+            content = strip_reasoning(message.content or "")
             tool_calls = _openai_tool_calls(message.tool_calls or [])
             return {"content": content, "tool_calls": tool_calls, "raw": response}
 
@@ -1281,14 +1369,15 @@ async def chat_completion(
         if anthropic is None:
             raise RuntimeError("anthropic package is required for Anthropic provider.")
         client = anthropic.AsyncAnthropic(api_key=api_key)
-        system_prompt, rest = _extract_system_prompt(messages)
+        system_parts, rest = _extract_system_parts(messages)
+        system_blocks = _anthropic_system_blocks(system_parts)
         rest = _messages_to_anthropic_messages(rest)
         anthropic_tools = _anthropic_tools(tools)
 
         async def _do_anthropic_completion():
             response = await client.messages.create(
                 model=model,
-                system=system_prompt or None,
+                system=system_blocks,
                 messages=rest,
                 tools=anthropic_tools or None,
                 max_tokens=max_tokens,
@@ -1333,7 +1422,6 @@ async def chat_completion(
             messages=messages,
             tools=tools,
             is_antigravity=(provider == "google-antigravity"),
-            system_prompt=_extract_system_prompt(messages)[0] or None,
         )
 
     raise ValueError(f"Unsupported provider: {provider}")
@@ -1372,6 +1460,8 @@ async def stream_chat_completion(
             raise RuntimeError("Gemini API key is required. Set GEMINI_API_KEY or configure api_key_env.")
 
         client = genai.Client(api_key=api_key)
+        # Preserve the stable-prefix/volatile-tail order for Gemini's implicit
+        # caching. The complete instruction still reaches the model.
         system_prompt, rest = _extract_system_prompt(messages)
         contents = _messages_to_gemini_contents(rest)
         gemini_tools = _gemini_tools(tools)
@@ -1396,12 +1486,14 @@ async def stream_chat_completion(
             # Track emitted text so we can compute deltas if the stream is cumulative.
             emitted: str = ""
             calls_by_id: dict[str, dict[str, Any]] = {}
+            last_chunk: Any | None = None
 
             async for chunk in client.aio.models.generate_content_stream(
                 model=model,
                 contents=contents,
                 config=config,
             ):
+                last_chunk = chunk
                 text = getattr(chunk, "text", "") or ""
                 if text:
                     if text.startswith(emitted):
@@ -1426,7 +1518,9 @@ async def stream_chat_completion(
                     }
 
             tool_calls = [v for k, v in calls_by_id.items() if k]
-            return {"content": emitted, "tool_calls": tool_calls, "raw": None}
+            # Gemini reports cached_content_token_count on the final streamed
+            # chunk. Preserve it so record_llm_usage can prove cache hits.
+            return {"content": emitted, "tool_calls": tool_calls, "raw": last_chunk}
 
         return await _retry_on_transient(_do_gemini_stream)
 
@@ -1510,7 +1604,11 @@ async def stream_chat_completion(
                     logger.debug("Failed to parse tool arguments: %r", raw_args[:200])
                     args = {}
                 tool_calls.append({"id": tc["id"], "name": tc["name"], "arguments": args})
-            return {"content": "".join(content_parts), "tool_calls": tool_calls, "raw": None}
+            return {
+                "content": strip_reasoning("".join(content_parts)),
+                "tool_calls": tool_calls,
+                "raw": None,
+            }
 
         return await _retry_on_transient(_do_stream_completion)
 
@@ -1637,7 +1735,6 @@ async def stream_chat_completion(
         _api_key_data = json.loads(api_key) if api_key else {}
         access_token = _api_key_data.get("token", api_key or "")
         project_id = _api_key_data.get("projectId", "")
-        system_prompt = _extract_system_prompt(messages)[0] or None
         return await stream_google_code_assist_completion(
             endpoint=endpoint or "https://cloudcode-pa.googleapis.com",
             access_token=access_token,
@@ -1646,7 +1743,6 @@ async def stream_chat_completion(
             messages=messages,
             tools=tools,
             is_antigravity=(provider == "google-antigravity"),
-            system_prompt=system_prompt,
             on_text_delta=on_text_delta,
         )
 
@@ -1699,6 +1795,8 @@ async def stream_text_completion(
             raise RuntimeError("Gemini API key is required. Set GEMINI_API_KEY or configure api_key_env.")
 
         client = genai.Client(api_key=api_key)
+        # Preserve the stable-prefix/volatile-tail order for Gemini's implicit
+        # caching. The complete instruction still reaches the model.
         system_prompt, rest = _extract_system_prompt(messages)
         contents = _messages_to_gemini_contents(rest)
         config = gemini_types.GenerateContentConfig(
@@ -1820,7 +1918,6 @@ async def stream_text_completion(
         _api_key_data = json.loads(api_key) if api_key else {}
         access_token = _api_key_data.get("token", api_key or "")
         project_id = _api_key_data.get("projectId", "")
-        system_prompt = _extract_system_prompt(messages)[0] or None
         result = await stream_google_code_assist_completion(
             endpoint=endpoint or "https://cloudcode-pa.googleapis.com",
             access_token=access_token,
@@ -1829,7 +1926,6 @@ async def stream_text_completion(
             messages=messages,
             tools=None,
             is_antigravity=(provider == "google-antigravity"),
-            system_prompt=system_prompt,
         )
         if result["content"]:
             yield result["content"]

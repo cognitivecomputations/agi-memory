@@ -7,6 +7,7 @@ requires:
   config: [google_calendar]
   env: [GOOGLE_CREDENTIALS_JSON]
 contexts: [heartbeat, chat]
+aliases: [meeting, prep, brief, agenda, attendees, before]
 bound_tools: [calendar_events, meeting_prep, search_contacts, recall]
 ---
 

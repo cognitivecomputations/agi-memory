@@ -22,10 +22,15 @@ export async function POST(req: NextRequest) {
     );
 
     return NextResponse.json({ ok: true, key, enabled: enabled !== false });
-  } catch (error: any) {
+  } catch (error: unknown) {
     console.error("Tool toggle error:", error);
     return NextResponse.json(
-      { error: error?.message || "Failed to update tool" },
+      {
+        error:
+          error instanceof Error && error.message
+            ? error.message
+            : "Failed to update tool",
+      },
       { status: 500 }
     );
   }

@@ -482,15 +482,13 @@ class TestIngestConfigKeys:
             )
             assert result == 3.0
 
-    async def test_allowed_actions_include_ingest(self, db_pool):
+    async def test_retired_ingest_actions_are_not_heartbeat_actions(self, db_pool):
         async with db_pool.acquire() as conn:
             result = await conn.fetchval(
                 "SELECT get_config('heartbeat.allowed_actions')"
             )
             actions = json.loads(result) if isinstance(result, str) else result
-            assert "fast_ingest" in actions
-            assert "slow_ingest" in actions
-            assert "hybrid_ingest" in actions
+            assert {"fast_ingest", "slow_ingest", "hybrid_ingest"}.isdisjoint(actions)
 
 
 # ---------------------------------------------------------------------------

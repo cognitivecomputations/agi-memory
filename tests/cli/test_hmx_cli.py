@@ -19,6 +19,8 @@ from apps.cli_exchange import _print_import_result
 from core.digest import content_hash_v1, protected_section_digest_v1
 from core.memory_exchange import (
     HmxAuthoritativeResult,
+    HmxImportResult,
+    PROTECTED_SECTIONS,
     build_envelope,
     resolve_export_sections,
 )
@@ -98,6 +100,122 @@ async def test_import_help_exposes_explicit_failed_work_retry():
     assert "--retry-failed-work" in result.stdout
     assert "--force-replace" in result.stdout
     assert "--operator-signature" in result.stdout
+    assert "--mind" in result.stdout
+
+
+async def test_mind_export_creates_a_private_complete_port_file(db_pool, tmp_path):
+    hexis_home = tmp_path / "hexis-home"
+
+    exported = _run_with_env(
+        {"HEXIS_HOME": str(hexis_home)},
+        "export",
+        "--mind",
+        "--wait-seconds",
+        "60",
+    )
+
+    assert exported.returncode == 0, exported.stderr
+    files = list((hexis_home / "exports").glob("*.hmx.json"))
+    assert len(files) == 1
+    output = files[0]
+    document = json.loads(output.read_text(encoding="utf-8"))
+    assert document["export_intent"] == "port"
+    assert set(document["export_scope"]["include_protected"]) == set(
+        PROTECTED_SECTIONS
+    )
+    assert document["export_scope"]["include_in_flight_work"] is True
+    assert document["export_scope"]["include_audit_records"] is True
+    assert stat.S_IMODE(output.stat().st_mode) == 0o600
+    human_output = " ".join(exported.stdout.split())
+    assert f"hexis import {output.name} --mind --dry-run --json" in human_output
+    assert f"hexis import {output.name} --mind --confirm-intent port" in human_output
+
+
+async def test_mind_export_refuses_conflicting_or_partial_policy():
+    conflicting = _run("export", "--mind", "--intent", "telepathy")
+    partial = _run("export", "--mind", "--types", "semantic")
+
+    assert conflicting.returncode != 0
+    assert "cannot be combined with another intent" in conflicting.stderr
+    assert partial.returncode != 0
+    assert "mind export must be complete" in partial.stderr
+
+
+async def test_mind_import_refuses_non_port_and_non_additive_files(tmp_path):
+    telepathy_path = tmp_path / "telepathy.hmx.json"
+    telepathy_path.write_text(
+        json.dumps(_single_memory_document("telepathy", "A shared observation")),
+        encoding="utf-8",
+    )
+    non_port = _run("import", str(telepathy_path), "--mind", "--dry-run")
+
+    port_path = tmp_path / "mind.hmx.json"
+    port_path.write_text(
+        json.dumps(
+            build_envelope(
+                intent="port",
+                plan=resolve_export_sections("port"),
+                instance_id="cli-test-source",
+                schema_version="0009_hmx_deliberative_analysis",
+                embedding_model="embeddinggemma:300m",
+                embedding_dimension=768,
+                lineage_id=str(uuid.uuid4()),
+                relationship_edge_types=["SUPPORTS"],
+            )
+        ),
+        encoding="utf-8",
+    )
+    non_additive = _run(
+        "import",
+        str(port_path),
+        "--mind",
+        "--strategy",
+        "authoritative",
+        "--dry-run",
+    )
+
+    assert non_port.returncode != 0
+    assert "accepts only a port-intent HMX file" in non_port.stderr
+    assert non_additive.returncode != 0
+    assert "empty-target additive path" in non_additive.stderr
+
+
+async def test_mind_import_result_reports_continuity_in_human_and_json(capsys):
+    result = HmxImportResult(
+        export_id="mind-continuity-output",
+        intent="port",
+        strategy="additive",
+        target_state={},
+        inserted={},
+        duplicate_refs=(),
+        ref_map={},
+        conflicts=(),
+        warnings=(),
+    )
+    continuity = {
+        "verified": True,
+        "lineage": {"matches": True},
+        "protected_sections": {},
+    }
+
+    _print_import_result(
+        result,
+        as_json=False,
+        skipped=[],
+        continuity=continuity,
+    )
+    human_output = " ".join(capsys.readouterr().out.split())
+    assert "Mind continuity verified" in human_output
+    assert "constitutional section projections match" in human_output
+
+    _print_import_result(
+        result,
+        as_json=True,
+        skipped=[],
+        continuity=continuity,
+    )
+    json_output = json.loads(capsys.readouterr().out)
+    assert json_output["continuity"] == continuity
 
 
 async def test_export_jsonl_and_database_aware_dry_run(db_pool, tmp_path):

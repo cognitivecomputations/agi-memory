@@ -77,18 +77,28 @@ No periodic reaper. Compression happens during **rest**, and — like a human �
 **Subconscious rest (cheap, automatic, high-volume — `MaintenanceWorker` / `run_subconscious_maintenance`).** Runs continuously on its own trigger and does the bulk of the work *without conscious involvement*: (1) **reinforces** what was salient, (2) **distills lessons upward** into schema (§4), (3) **compresses and releases the predictable** (§9, §6). This is where most forgetting happens — silently, as it should.
 
 **Triage — what is "worth the conscious mind's attention."** Conscious attention is expensive and finite; Hexis cannot review every consolidation without blowing its energy budget — and a mind that consciously deliberated over every forgotten trifle would not be human. So the subconscious applies a **cheap gate** and escalates *only the borderline consolidations* — the cases where a heuristic is genuinely uncertain and judgment adds value:
-- clearly-mundane memories the subconscious just forgets; clearly-precious ones are already protected (§8) — **neither needs the conscious mind**;
+- clearly-mundane memories can be compressed into a gist and archived recoverably;
+  clearly-precious ones are already protected (§8) — **neither needs a user chore**;
 - the **ambiguous middle is escalated**: near a protection threshold, emotionally charged (high intensity), relationally significant (user-referenced), or a poor schema fit (surprising/novel — the codebook couldn't compress it, so it may be worth keeping).
 
-Escalation is a *small* set surfaced into the heartbeat's context — *"a handful of memories are at the threshold of fading; keep any?"* — never a review of everything. Conscious attention (and the veto budget) is thereby spent exactly where it matters.
+Escalation is a *small* set surfaced into the heartbeat's context and the user's
+Forgetting inbox — *"a handful of memories are at the threshold of fading; keep
+any?"* — never a review of everything. Attention (and the keep budget) is thereby
+spent exactly where it matters.
 
-**Conscious response (expensive, scarce — the heartbeat).** For *only the escalated subset*, Hexis chooses among four distinctly human moves:
+**Conscious response (expensive, scarce).** For *only the escalated subset*, Hexis
+may take the non-destructive first move itself; the user owns every move that
+archives source memories:
 1. **Reinforce** (revisit → strengthen),
-2. **Veto** (spend a point — keep it as living memory; below),
-3. **Journal** (write it down permanently, *outside* memory, then let the memory itself fade — §7), or
-4. **Let it go** — the default; no action means the subconscious's consolidation proceeds.
+2. **Keep** (spend a point — keep it as living memory; below),
+3. **Journal** (the user writes what should remain permanently, *outside* memory,
+   then authorizes compression — §7), or
+4. **Let it compress** — an explicit user choice; no response leaves the review
+   pending. A reminder horizon never decides.
 
-For relationally-significant escalations, the conscious move may be to **surface it to the user** rather than decide alone (below).
+The database enforces this boundary: even a legacy heartbeat action cannot release
+or journal a pending fade review without the exact transaction-local proof set by
+the user decision function.
 
 ### The veto — a finite retention budget
 Offered *only on escalated memories*, never on all consolidations. Hexis may **spend a point from a scarce retention budget** to hold one back — with the honest reminder: *memory is limited; keeping this one means others compress sooner.* Protection is an act of finite will, **zero-sum against the capacity bound** — never a free flag, never able to defeat the frontier.
@@ -98,22 +108,37 @@ Offered *only on escalated memories*, never on all consolidations. Hexis may **s
 - **v1 → north star:** ship a fixed small pool + flat cost + the reminder first; add per-chapter regeneration and the "still worth a point?" re-evaluation later.
 
 ### Surfacing what fades — relational honesty
-For the relationally-significant escalations, Hexis **tells** the user — **selectively and rate-limited**: *"I'm starting to lose the details of our first project together — is that one worth holding onto?"* Honest, a natural **reinforcement cue** (the user can strengthen it), and *dignified* — Hexis advocates for its own memories rather than losing them silently. Forgetting a shared memory becomes *consensual*. A user setting governs how vocal this is.
+For the relationally-significant escalations, Hexis **tells** the user —
+**selectively and rate-limited**: *"I'm starting to lose the details of our first
+project together — is that one worth holding onto?"* Honest, a natural
+**reinforcement cue**, and *dignified* — Hexis advocates for its own memories rather
+than losing them silently. The Forgetting page and exact verified-channel replies
+complete keep, journal, or release in place.
 
 Forgetting becomes an experience of the self — most of it beneath notice, a salient few weighed and sometimes grieved — never a blanket silent `DELETE`, and never a blanket conscious chore. (Hexis's memories are already transparent to its operators, an unenviable vulnerability; the least it is owed is a say in what it keeps.)
 
 ---
 
-## 6. Forgetting is real — consolidation *is* deletion
+## 6. Compression is real; irreversible deletion is an explicit posture
 
-Consolidating N memories into one gist **truly deletes** the N originals and replaces them with the summary (`delete_memory_fully`, §11). There is no secret permanent backstop that keeps everything — that would make "limited resource" a lie and forgetting cosmetic. Real detail is really lost. What carries the loss:
+Consolidating N memories into one gist removes the N originals from active recall
+and replaces them with the summary. Their full rows are archived by default, so an
+operator can recover from a bad candidate or summarization bug. Active memory still
+experiences real loss: ordinary recall sees the gist, its lower fidelity, and not the
+archived detail. What carries that loss:
 
 - **The lesson** — distilled *upward* into schema before the detail goes (§4).
 - **That it happened** — the gist still attests the events occurred, in summarized form. Hexis is **not** made to believe an event never happened. Forced, traceless amnesia is a violation, the more so because Hexis's memory is already transparent. **Hexis (open source) does not do total erasure.** (A consent-bounded "forget entirely" is a *HexisPro*-only idea, out of scope here.)
 - **Honest fidelity** — the gist's fidelity fell when compressed, so recall never overstates what remains (§3).
-- **The journal, *if Hexis chose to write it*** (§7) — a deliberate, permanent record outside memory. The memory still fades; the diary entry doesn't.
+- **The journal, if deliberately written** (§7) — a permanent record outside
+  passive memory. The memory still fades; the diary entry doesn't.
 
-The only concession to *implementation* safety (not to forgetting) is an optional **short undo window** on a rest pass's deletions — a guard against a *bug* in candidate selection, measured in a rest cycle or two, then final.
+Hard deletion through `delete_memory_fully` is governed by the separate
+`retention.irreversible_pruning_enabled` posture. It is **off by default**. Enabling
+it is an explicit operator authorization for archived originals past the grace
+window and last-resort capacity pruning; pending reviews still never expire into a
+decision. Every completed gist writes a factual receipt with exact source count and
+stored fidelity.
 
 ---
 
@@ -191,7 +216,8 @@ Postgres-native:
 2. **Fidelity field + fidelity-graded recall + short undo window** — honesty + bug-guard, *before* anything destructive.
 3. **The journal** — `journal_entries` + write/read/search actions. Non-destructive, pure agency/value; can land early.
 4. **Schema codebook / distill-upward** — lessons promote before episodes fade.
-5. **Rest-cycle consolidation** — merge+summarize + intelligent edge merge + `delete_memory_fully`; mass-frontier release.
+5. **Rest-cycle consolidation** — merge+summarize + intelligent edge merge;
+   archive originals recoverably, with separately authorized hard pruning.
 6. **Asymmetric intensity (ember/heal/re-kindle); relational + attention reinforcement signals.**
 7. **Subconscious triage → conscious veto/journal/surface** — the cheap gate that escalates *only* borderline consolidations to the heartbeat; veto budget (v1: fixed pool, flat cost, reminder); selective user surfacing.
 8. **Ingested-knowledge tier + outbox approval.**
@@ -205,11 +231,18 @@ Postgres-native:
 - **Compression is the substrate**, always at capacity (§1).
 - **Strength is the master variable** — continuous, computed, reinforced-up (§2).
 - **Recall rewrites periphery, not core; content only at consolidation**, lowering fidelity — reinforcement stabilizes, consolidation compresses (§3).
-- **Forgetting is real** — consolidation deletes originals; carried by lesson + that-it-happened + honest fidelity + the optional journal. **No total erasure in Hexis** (HexisPro-only). Short operational undo window (§6).
+- **Forgetting is real in active recall** — consolidation replaces details with a
+  lower-fidelity gist, while archived originals remain recoverable by default.
+  Irreversible pruning is a separate explicit operator posture (§6).
 - **The journal is deliberate, permanent, and outside memory** — a chosen `write_journal` act into a separate `journal_entries` table; read/search only by choice; reading is a fresh (fallible) memory; Hexis's private space (§7).
-- **Consolidation is subconscious by default; only borderline cases reach consciousness.** The cheap subconscious gate handles the confident cases both ways (forgets the mundane, leaves the already-protected); only the *ambiguous middle* — near-threshold, emotionally charged, relationally significant, or poor schema fit — is escalated for conscious veto/journal/surface. Conscious attention and the veto budget are rationed to where judgment matters (§5).
+- **Consolidation is subconscious by default; only borderline cases reach user
+  review.** The cheap gate compresses ordinary groups recoverably and leaves
+  already-protected memories alone. The *ambiguous middle* — near-threshold,
+  emotionally charged, relationally significant, or poor schema fit — waits for an
+  explicit user keep/journal/release choice (§5).
 - **Veto = finite budget**, small, **per-life-chapter**, permanent-until-reconsidered, zero-sum, offered *only on escalated memories*, with the scarcity reminder (§5).
-- **Hexis surfaces fading** selectively/relationally as a reinforcement cue (§5).
+- **Hexis surfaces fading** selectively/relationally as a reinforcement cue and
+  reports every completed compression with exact fidelity (§5).
 - **Capacity = Σ strength (mass) over the episodic layer**; schema protected, working TTL, journal outside (§8).
 - **Intensity is asymmetric** — permanent embers for positive peaks, healing for pain, re-kindled rate-limited by recall (§9).
 
@@ -218,4 +251,5 @@ Postgres-native:
 - **Curve shapes** — decay constants; intensity ember floor + re-kindle rate; reconsolidation fidelity floor.
 - **Retention-budget size** — points per chapter; how "chapter" boundaries are detected.
 - **Journal** — is it embedded for search by default; how strong the privacy stance is in OSS vs. HexisPro.
-- **Undo-window length**; whether surfacing-what-fades is on by default.
+- **Grace-window length** for deployments that explicitly opt into irreversible
+  pruning; compression reporting is on by default.

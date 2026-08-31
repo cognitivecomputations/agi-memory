@@ -407,3 +407,40 @@ BEGIN
     );
 END;
 $$ LANGUAGE plpgsql;
+
+-- Code/schema version skew (#113): a long-running worker keeps talking to a
+-- schema that has moved on without it -- migrations auto-apply on startup,
+-- but nothing previously checked or surfaced that the *running* worker code
+-- predates the migrations it's now sharing a database with. Each worker
+-- records the highest migration version bundled in its OWN db/migrations/
+-- at registration time (metadata.bundled_latest_migration); this compares
+-- that against the schema's actual latest applied version for every
+-- non-stale worker still running.
+CREATE OR REPLACE FUNCTION worker_code_schema_skew_report()
+RETURNS JSONB
+LANGUAGE sql STABLE
+AS $$
+    WITH latest AS (
+        SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1
+    ),
+    skewed AS (
+        SELECT
+            w.id AS worker_id,
+            w.mode,
+            w.instance_name,
+            w.build_id,
+            NULLIF(w.metadata->>'bundled_latest_migration', '') AS bundled_latest_migration,
+            (SELECT version FROM latest) AS db_latest_migration
+        FROM worker_runtime_status w
+        WHERE NOT w.is_stale
+          AND w.status IN ('starting', 'running', 'stopping')
+          AND NULLIF(w.metadata->>'bundled_latest_migration', '') IS NOT NULL
+          AND (SELECT version FROM latest) IS NOT NULL
+          AND NULLIF(w.metadata->>'bundled_latest_migration', '') < (SELECT version FROM latest)
+    )
+    SELECT jsonb_build_object(
+        'db_latest_migration', (SELECT version FROM latest),
+        'skewed_workers', COALESCE(jsonb_agg(to_jsonb(skewed)), '[]'::jsonb)
+    )
+    FROM skewed;
+$$;

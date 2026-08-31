@@ -2,6 +2,17 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { normalizeJsonValue } from "@/lib/db";
 
+type GoalRow = {
+  id: string;
+  content: string;
+  metadata: unknown;
+  created_at: unknown;
+};
+
+function errorMessage(error: unknown, fallback: string): string {
+  return error instanceof Error && error.message ? error.message : fallback;
+}
+
 export async function GET(
   _req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
@@ -9,7 +20,7 @@ export async function GET(
   try {
     const { id } = await params;
 
-    const rows: any[] = await prisma.$queryRawUnsafe(
+    const rows = await prisma.$queryRawUnsafe<GoalRow[]>(
       `SELECT id, type, content, importance, metadata, created_at, last_accessed
        FROM memories
        WHERE id = $1::uuid AND type = 'goal'`,
@@ -21,7 +32,10 @@ export async function GET(
     }
 
     const g = rows[0];
-    const meta = normalizeJsonValue(g.metadata) || {};
+    const normalizedMeta = normalizeJsonValue(g.metadata);
+    const meta = normalizedMeta && typeof normalizedMeta === "object" && !Array.isArray(normalizedMeta)
+      ? normalizedMeta as Record<string, unknown>
+      : {};
 
     return NextResponse.json({
       id: g.id,
@@ -33,10 +47,10 @@ export async function GET(
       last_touched: meta.last_touched,
       created_at: g.created_at,
     });
-  } catch (error: any) {
+  } catch (error: unknown) {
     console.error("Goal detail error:", error);
     return NextResponse.json(
-      { error: error?.message || "Failed to fetch goal" },
+      { error: errorMessage(error, "Failed to fetch goal") },
       { status: 500 }
     );
   }
@@ -48,7 +62,7 @@ export async function PATCH(
 ) {
   try {
     const { id } = await params;
-    const body = await req.json();
+    const body = await req.json() as Record<string, unknown>;
 
     if (body.priority) {
       await prisma.$queryRawUnsafe(
@@ -68,10 +82,10 @@ export async function PATCH(
     }
 
     return NextResponse.json({ ok: true });
-  } catch (error: any) {
+  } catch (error: unknown) {
     console.error("Update goal error:", error);
     return NextResponse.json(
-      { error: error?.message || "Failed to update goal" },
+      { error: errorMessage(error, "Failed to update goal") },
       { status: 500 }
     );
   }
