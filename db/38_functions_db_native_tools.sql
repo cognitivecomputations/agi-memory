@@ -37,7 +37,8 @@ AS $$
 $$;
 
 CREATE OR REPLACE FUNCTION execute_goals_tool(
-    p_args JSONB
+    p_args JSONB,
+    p_goal_origin goal_source
 ) RETURNS JSONB
 LANGUAGE plpgsql
 AS $$
@@ -66,9 +67,22 @@ BEGIN
         IF source_value NOT IN ('curiosity', 'user_request', 'identity', 'derived', 'external') THEN
             source_value := 'curiosity';
         END IF;
-        goal_id := create_goal(title, p_args->>'description', source_value::goal_source, priority::goal_priority);
+        goal_id := create_goal(
+            title,
+            p_args->>'description',
+            source_value::goal_source,
+            priority::goal_priority,
+            NULL,
+            NULL,
+            COALESCE(p_goal_origin, 'derived'::goal_source)
+        );
         RETURN tool_success(
-            jsonb_build_object('goal_id', goal_id::text, 'title', title, 'priority', priority),
+            jsonb_build_object(
+                'goal_id', goal_id::text,
+                'title', title,
+                'priority', priority,
+                'origin', COALESCE(p_goal_origin, 'derived'::goal_source)::text
+            ),
             format('Created goal: %s (%s)', title, priority)
         );
     ELSIF action = 'update_priority' THEN
@@ -113,6 +127,18 @@ BEGIN
 EXCEPTION WHEN OTHERS THEN
     RETURN tool_error(SQLERRM);
 END;
+$$;
+
+-- Direct database compatibility path. Without trusted execution context the
+-- conservative origin is derived, regardless of model-authored source text.
+CREATE OR REPLACE FUNCTION execute_goals_tool(p_args JSONB)
+RETURNS JSONB
+LANGUAGE sql
+AS $$
+    SELECT execute_goals_tool(
+        p_args,
+        'derived'::goal_source
+    );
 $$;
 
 CREATE OR REPLACE FUNCTION record_backlog_user_change(
@@ -365,7 +391,180 @@ EXCEPTION WHEN OTHERS THEN
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION execute_memory_tool(
+INSERT INTO config_defaults (key, value, description) VALUES
+    ('memory.remember_duplicate_similarity', '0.9'::jsonb,
+     'Trigram similarity that makes a recent remember write equivalent within one chat session'),
+    ('memory.remember_duplicate_window_minutes', '120'::jsonb,
+     'How long remember reuses an equivalent tool-created memory within one chat session')
+ON CONFLICT (key) DO NOTHING;
+
+CREATE OR REPLACE FUNCTION execute_remember_tool(
+    p_args JSONB
+) RETURNS JSONB
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    remember_content TEXT := NULLIF(btrim(COALESCE(p_args->>'content', '')), '');
+    memory_type_value TEXT := COALESCE(NULLIF(p_args->>'type', ''), 'episodic');
+    importance_value FLOAT;
+    memory_id UUID;
+    existing_id UUID;
+    existing_content TEXT;
+    session_uuid UUID := _db_brain_try_uuid(p_args#>>'{_execution_context,session_id}');
+    call_id TEXT := NULLIF(p_args#>>'{_execution_context,call_id}', '');
+    source_references JSONB := NULL;
+    source_attribution JSONB := NULL;
+    source_trust FLOAT := NULL;
+    derived_conversation_source BOOLEAN := FALSE;
+    canonical_content TEXT;
+    duplicate_similarity FLOAT := LEAST(1.0, GREATEST(0.0, COALESCE(
+        get_config_float('memory.remember_duplicate_similarity'), 0.9)));
+    duplicate_window_minutes INT := GREATEST(1, COALESCE(
+        get_config_int('memory.remember_duplicate_window_minutes'), 120));
+    tool_write JSONB;
+    result JSONB;
+BEGIN
+    IF remember_content IS NULL THEN
+        RETURN tool_error('content is required', 'invalid_params');
+    END IF;
+    IF memory_type_value NOT IN ('episodic', 'semantic', 'procedural', 'strategic') THEN
+        RETURN tool_error(format('Invalid memory type: %s', memory_type_value), 'invalid_params');
+    END IF;
+    importance_value := LEAST(1.0, GREATEST(0.0, COALESCE(
+        NULLIF(p_args->>'importance', '')::float, 0.5)));
+    canonical_content := lower(btrim(regexp_replace(remember_content, '[^[:alnum:]]+', ' ', 'g')));
+    tool_write := jsonb_strip_nulls(jsonb_build_object(
+        'source', 'remember_tool',
+        'session_id', CASE WHEN session_uuid IS NULL THEN NULL ELSE session_uuid::text END,
+        'call_id', call_id,
+        'recorded_at', CURRENT_TIMESTAMP
+    ));
+
+    IF jsonb_typeof(p_args->'sources') = 'array'
+       AND jsonb_array_length(p_args->'sources') > 0 THEN
+        source_references := p_args->'sources';
+        source_attribution := source_references->0;
+    ELSIF session_uuid IS NOT NULL THEN
+        source_trust := COALESCE(get_config_float('memory.conversation_turn_trust'), 0.8);
+        source_attribution := jsonb_build_object(
+            'kind', 'conversation',
+            'ref', 'chat_session:' || session_uuid::text,
+            'label', 'current chat session',
+            'observed_at', CURRENT_TIMESTAMP,
+            'trust', source_trust
+        );
+        source_references := jsonb_build_array(source_attribution);
+        derived_conversation_source := TRUE;
+    END IF;
+
+    -- Serialize equivalent writes for one session so parallel/retried calls
+    -- cannot both observe absence and create duplicates.
+    IF session_uuid IS NOT NULL THEN
+        PERFORM pg_advisory_xact_lock(hashtext(session_uuid::text), hashtext(canonical_content));
+        SELECT m.id, m.content
+        INTO existing_id, existing_content
+        FROM memories m
+        WHERE m.type = memory_type_value::memory_type
+          AND m.status = 'active'
+          AND m.created_at >= CURRENT_TIMESTAMP - make_interval(mins => duplicate_window_minutes)
+          AND m.metadata#>>'{tool_write,session_id}' = session_uuid::text
+          AND (
+              lower(btrim(regexp_replace(m.content, '[^[:alnum:]]+', ' ', 'g'))) = canonical_content
+              OR similarity(
+                    lower(btrim(regexp_replace(m.content, '[^[:alnum:]]+', ' ', 'g'))),
+                    canonical_content
+                 ) >= duplicate_similarity
+          )
+        ORDER BY
+            (lower(btrim(regexp_replace(m.content, '[^[:alnum:]]+', ' ', 'g'))) = canonical_content) DESC,
+            similarity(lower(m.content), lower(remember_content)) DESC,
+            m.created_at DESC
+        LIMIT 1
+        FOR UPDATE;
+    END IF;
+
+    IF existing_id IS NOT NULL THEN
+        IF memory_type_value = 'semantic'
+           AND jsonb_typeof(source_references) = 'array' THEN
+            PERFORM add_semantic_source_reference(existing_id, source.value)
+            FROM jsonb_array_elements(source_references) source(value);
+            PERFORM sync_memory_trust(existing_id);
+        END IF;
+        IF jsonb_typeof(COALESCE(p_args->'concepts', '[]'::jsonb)) = 'array' THEN
+            PERFORM link_memory_to_concept(existing_id, value)
+            FROM jsonb_array_elements_text(p_args->'concepts') concept(value);
+        END IF;
+        UPDATE memories
+        SET importance = GREATEST(importance, importance_value),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = existing_id;
+        SELECT jsonb_strip_nulls(jsonb_build_object(
+            'memory_id', m.id::text,
+            'type', m.type::text,
+            'content', left(m.content, 100),
+            'confidence', NULLIF(m.metadata->>'confidence', '')::float,
+            'trust_level', m.trust_level,
+            'reused', TRUE
+        ))
+        INTO result
+        FROM memories m
+        WHERE m.id = existing_id;
+        RETURN tool_success(
+            result,
+            format('Already stored; reused %s memory: %s...', memory_type_value, left(existing_content, 50))
+        );
+    END IF;
+
+    IF memory_type_value = 'semantic' THEN
+        memory_id := create_semantic_memory(
+            remember_content,
+            LEAST(1.0, GREATEST(0.0, COALESCE(NULLIF(p_args->>'confidence', '')::float, 0.5))),
+            NULL,
+            NULL,
+            source_references,
+            importance_value,
+            source_attribution
+        );
+    ELSE
+        memory_id := create_memory(
+            memory_type_value::memory_type,
+            remember_content,
+            importance_value,
+            source_attribution,
+            CASE WHEN derived_conversation_source THEN source_trust ELSE NULL END,
+            jsonb_build_object('tool_write', tool_write)
+        );
+    END IF;
+    UPDATE memories
+    SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{tool_write}', tool_write, TRUE)
+    WHERE id = memory_id;
+    IF jsonb_typeof(COALESCE(p_args->'concepts', '[]'::jsonb)) = 'array' THEN
+        PERFORM link_memory_to_concept(memory_id, value)
+        FROM jsonb_array_elements_text(p_args->'concepts') concept(value);
+    END IF;
+    SELECT jsonb_strip_nulls(jsonb_build_object(
+        'memory_id', m.id::text,
+        'type', m.type::text,
+        'content', left(m.content, 100),
+        'confidence', NULLIF(m.metadata->>'confidence', '')::float,
+        'trust_level', m.trust_level,
+        'reused', FALSE
+    ))
+    INTO result
+    FROM memories m
+    WHERE m.id = memory_id;
+    RETURN tool_success(
+        result,
+        format('Stored %s memory: %s...', memory_type_value, left(remember_content, 50))
+    );
+EXCEPTION WHEN OTHERS THEN
+    RETURN tool_error(SQLERRM);
+END;
+$$;
+
+-- The wrapper below owns remember idempotency while this function retains the
+-- established dispatch for every other memory tool.
+CREATE OR REPLACE FUNCTION _execute_memory_tool_dispatch(
     p_tool_name TEXT,
     p_args JSONB
 ) RETURNS JSONB
@@ -398,6 +597,8 @@ DECLARE
     history_browse BOOLEAN;
     oldest_ts TIMESTAMPTZ;
     type_filter_uuids UUID[];
+    candidates_json JSONB;
+    candidate_lines TEXT;
 BEGIN
     IF p_tool_name = 'remember' THEN
         content := NULLIF(btrim(COALESCE(p_args->>'content', '')), '');
@@ -456,7 +657,46 @@ BEGIN
         IF revision->>'reason' = 'not_found' THEN
             RETURN tool_error(format('memory not found: %s', target_id), 'invalid_params');
         ELSIF revision->>'reason' = 'not_semantic' THEN
-            RETURN tool_error('add_evidence targets semantic memories; this memory is another type. Episodic records are the immutable audit trail — recall with memory_types=[''semantic''] to find the revisable belief that was built on this episode, and attach the evidence there.', 'invalid_params');
+            -- #101: don't leave the caller at a dead end -- surface concrete
+            -- semantic candidates to retry against (graph-linked first, else
+            -- nearest by embedding) instead of only pointing at recall.
+            SELECT jsonb_agg(jsonb_build_object(
+                       'memory_id', c.memory_id::text,
+                       'content', left(c.content, 150),
+                       'confidence', c.confidence,
+                       'trust_level', c.trust_level,
+                       'match_reason', c.match_reason
+                   )),
+                   string_agg(
+                       format('- %s: "%s" (confidence %s, %s match)',
+                              c.memory_id, left(c.content, 100),
+                              COALESCE(round(c.confidence::numeric, 2)::text, 'n/a'),
+                              c.match_reason),
+                       E'\n' ORDER BY c.match_reason, c.memory_id
+                   )
+            INTO candidates_json, candidate_lines
+            FROM find_semantic_evidence_targets(target_id, 5) c;
+
+            RETURN jsonb_build_object(
+                'success', false,
+                'error', CASE
+                    WHEN candidates_json IS NOT NULL THEN
+                        format(
+                            'add_evidence targets semantic memories; this memory is another type. '
+                            || 'Found %s related semantic belief(s) -- call add_evidence again with '
+                            || 'one of these memory_id values instead:%s%s',
+                            jsonb_array_length(candidates_json), E'\n', candidate_lines
+                        )
+                    ELSE
+                        'add_evidence targets semantic memories; this memory is another type, and no '
+                        || 'linked or similar semantic belief was found. Episodic records are the '
+                        || 'immutable audit trail -- recall with memory_types=[''semantic''] to find '
+                        || 'the revisable belief that was built on this episode, and attach the '
+                        || 'evidence there.'
+                END,
+                'error_type', 'invalid_params',
+                'candidates', COALESCE(candidates_json, '[]'::jsonb)
+            );
         END IF;
         display := CASE
             WHEN COALESCE((revision->>'applied')::boolean, FALSE) THEN
@@ -826,5 +1066,19 @@ BEGIN
     RETURN tool_error(format('Unsupported memory tool: %s', p_tool_name), 'invalid_params');
 EXCEPTION WHEN OTHERS THEN
     RETURN tool_error(SQLERRM);
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION execute_memory_tool(
+    p_tool_name TEXT,
+    p_args JSONB
+) RETURNS JSONB
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF p_tool_name = 'remember' THEN
+        RETURN execute_remember_tool(p_args);
+    END IF;
+    RETURN _execute_memory_tool_dispatch(p_tool_name, p_args);
 END;
 $$;

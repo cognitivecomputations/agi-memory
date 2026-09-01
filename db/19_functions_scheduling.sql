@@ -654,7 +654,13 @@ BEGIN
                     COALESCE(NULLIF(action_payload->>'source', ''), 'user_request')::goal_source,
                     COALESCE(NULLIF(action_payload->>'priority', ''), 'queued')::goal_priority,
                     NULLIF(action_payload->>'parent_id', '')::uuid,
-                    COALESCE(NULLIF(action_payload->>'due_at', '')::timestamptz, task.next_run_at)
+                    COALESCE(NULLIF(action_payload->>'due_at', '')::timestamptz, task.next_run_at),
+                    CASE
+                        WHEN action_payload->>'origin' IN (
+                            'curiosity', 'user_request', 'identity', 'derived', 'external'
+                        ) THEN (action_payload->>'origin')::goal_source
+                        ELSE 'derived'::goal_source
+                    END
                 );
                 IF COALESCE((action_payload->>'notify')::boolean, false) THEN
                     outbox_messages := outbox_messages || jsonb_build_array(

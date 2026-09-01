@@ -10,6 +10,7 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -161,12 +162,19 @@ async def test_tool_specs_are_complete_and_conservative():
         )
 
 
-async def test_registry_and_memory_exchange_skill_bind_all_tools(db_pool):
+async def test_registry_and_memory_exchange_skill_bind_all_tools(db_pool, monkeypatch):
     from core.tools import create_default_registry
+    import services.skill_runtime as skill_runtime
     from services.skill_runtime import (
         get_skill_by_name,
         select_skills,
         skill_bound_tools,
+    )
+
+    monkeypatch.setattr(
+        skill_runtime,
+        "_semantic_selection_enabled",
+        AsyncMock(return_value=False),
     )
 
     registry = create_default_registry(db_pool)

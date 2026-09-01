@@ -21,6 +21,7 @@ import uuid
 from typing import Any
 
 from dotenv import load_dotenv
+from rich.markup import escape
 
 from apps.cli_theme import console, err_console
 
@@ -68,6 +69,61 @@ async def _approve_tool(tool_name: str, arguments: dict[str, Any]) -> bool:
     approved = answer in ("y", "yes")
     console.print("[ok]Allowed.[/ok]" if approved else "[muted]Denied.[/muted]")
     return approved
+
+
+async def _answer_cli_question(pool: Any, payload: dict[str, Any]) -> None:
+    """Render ask_user with the native arrow-key picker and persist the answer."""
+    from apps.cli_prompts import select_index, text
+    from services.agent_questions import answer_agent_question
+
+    question_id = str(payload.get("id") or "")
+    prompt = str(payload.get("prompt") or "I need your input.").strip()
+    choices = [
+        str(item).strip()
+        for item in payload.get("choices", [])
+        if str(item).strip()
+    ][:4]
+    allow_free_text = payload.get("allow_free_text") is not False
+    if not question_id:
+        err_console.print("[fail]The clarification question has no durable id.[/fail]")
+        return
+
+    while True:
+        choice_index: int | None = None
+        free_text: str | None = None
+        if choices:
+            options = list(choices)
+            if allow_free_text:
+                options.append("Other (type your answer)")
+            selected = await select_index(prompt, options)
+            if selected <= len(choices):
+                choice_index = selected
+            else:
+                free_text = (await text("Your answer")).strip()
+                if not free_text:
+                    err_console.print("[warn]An answer is required.[/warn]")
+                    continue
+        else:
+            free_text = (await text(prompt)).strip()
+            if not free_text:
+                err_console.print("[warn]An answer is required.[/warn]")
+                continue
+
+        result = await answer_agent_question(
+            pool,
+            question_id,
+            answer=free_text,
+            choice_index=choice_index,
+            channel="cli",
+            actor="local-user",
+        )
+        if result.get("ok"):
+            return
+        err_console.print(
+            f"[warn]{result.get('message') or 'That answer was not accepted.'}[/warn]"
+        )
+        if result.get("status") != "pending":
+            return
 
 
 def _fmt_json(obj: Any, max_len: int = 400) -> str:
@@ -254,7 +310,7 @@ async def _run_chat(dsn: str, *, verbose: bool = False, debug: bool = False,
     from core.agent_loop import AgentEvent
     from core.cognitive_memory_api import CognitiveMemory
     from core.llm_config import load_llm_config
-    from core.tools import ToolContext, create_default_registry
+    from core.tools import ToolContext, create_full_registry
     from services.chat import _build_system_prompt, _hydrate_chat_history, stream_chat_events
     from rich.table import Table
 
@@ -276,7 +332,7 @@ async def _run_chat(dsn: str, *, verbose: bool = False, debug: bool = False,
         async with pool.acquire() as conn:
             llm_config = await load_llm_config(conn, "llm.chat", fallback_key="llm")
 
-        registry = create_default_registry(pool)
+        registry = await create_full_registry(pool)
         agent_profile = await get_agent_profile_context(dsn)
         system_prompt = await _build_system_prompt(agent_profile, registry)
 
@@ -437,7 +493,17 @@ async def _run_chat(dsn: str, *, verbose: bool = False, debug: bool = False,
                 raw_buf = ""   # full raw model output
                 shown = ""     # what we've actually printed (scaffolding-stripped)
                 turn_timed_out = False
+                turn_error: str | None = None
+                reasoning_active = False
+                reasoning_chunks = 0
                 tool_calls_log: list[dict[str, Any]] = []
+
+                def _end_reasoning_activity() -> None:
+                    nonlocal reasoning_active
+                    if reasoning_active:
+                        sys.stdout.write("\n")
+                        sys.stdout.flush()
+                        reasoning_active = False
 
                 # Debug: show conversation history being sent
                 if debug and history:
@@ -459,6 +525,7 @@ async def _run_chat(dsn: str, *, verbose: bool = False, debug: bool = False,
                     dsn=dsn,
                     pool=pool,
                     on_approval=_approve_tool,
+                    surface="cli",
                 ):
                     if event.event == AgentEvent.PHASE_CHANGE:
                         phase = event.data.get("phase", "")
@@ -477,6 +544,7 @@ async def _run_chat(dsn: str, *, verbose: bool = False, debug: bool = False,
                     elif event.event == AgentEvent.TEXT_DELTA:
                         text = event.data.get("text", "")
                         if text:
+                            _end_reasoning_activity()
                             raw_buf += text
                             # Strip leaked <think>/tool-call scaffolding from what the
                             # user SEES, not just from what we persist. Streaming-safe:
@@ -491,7 +559,21 @@ async def _run_chat(dsn: str, *, verbose: bool = False, debug: bool = False,
                             else:
                                 shown = visible
 
+                    elif event.event == AgentEvent.REASONING_DELTA:
+                        # The provider is actively thinking even though no
+                        # user-visible answer token exists yet. Show truthful
+                        # progress without leaking reasoning into the reply,
+                        # history, or memory.
+                        reasoning_chunks += 1
+                        if not reasoning_active:
+                            console.print("\n  [muted]thinking[/muted]", end="")
+                            reasoning_active = True
+                        elif reasoning_chunks % 24 == 0:
+                            sys.stdout.write("·")
+                            sys.stdout.flush()
+
                     elif event.event == AgentEvent.TOOL_START:
+                        _end_reasoning_activity()
                         tool_name = event.data.get("tool_name", "tool")
                         arguments = event.data.get("arguments", {})
                         tool_calls_log.append({"tool": tool_name, "args": arguments})
@@ -516,7 +598,10 @@ async def _run_chat(dsn: str, *, verbose: bool = False, debug: bool = False,
                                     console.print(f"    [dim]{_fmt_json(display, 500)}[/dim]")
                         else:
                             error_msg = event.data.get("error", "")
-                            console.print(f" [fail]failed[/fail][dim]{dur_str}[/dim] [muted]{error_msg[:120]}[/muted]")
+                            console.print(
+                                f" [fail]failed[/fail][dim]{dur_str}[/dim] "
+                                f"[muted]{escape(error_msg[:120])}[/muted]"
+                            )
                             if ui and _connector_setup_requires_action(ui):
                                 _print_connector_setup_ui(ui)
 
@@ -524,6 +609,10 @@ async def _run_chat(dsn: str, *, verbose: bool = False, debug: bool = False,
                         ui = _connector_setup_ui(event.data)
                         if ui and _connector_setup_requires_action(ui):
                             _print_connector_setup_ui(ui)
+
+                    elif event.event == AgentEvent.QUESTION:
+                        console.print()
+                        await _answer_cli_question(pool, dict(event.data))
 
                     elif event.event == AgentEvent.LOOP_START:
                         if debug:
@@ -533,6 +622,9 @@ async def _run_chat(dsn: str, *, verbose: bool = False, debug: bool = False,
 
                     elif event.event == AgentEvent.LOOP_END:
                         turn_timed_out = bool(event.data.get("timed_out", False))
+                        reason = str(event.data.get("stopped_reason") or "")
+                        if reason == "error" and not turn_error:
+                            turn_error = "Agent loop ended with an error."
                         if debug:
                             reason = event.data.get("stopped_reason", "?")
                             iters = event.data.get("iterations", 0)
@@ -543,10 +635,19 @@ async def _run_chat(dsn: str, *, verbose: bool = False, debug: bool = False,
                             )
 
                     elif event.event == AgentEvent.ERROR:
-                        error_msg = event.data.get("error", "Unknown error")
-                        console.print(f"\n[fail]Error: {error_msg}[/fail]")
+                        _end_reasoning_activity()
+                        error_msg = str(
+                            event.data.get("error")
+                            or event.data.get("error_type")
+                            or "Unknown error"
+                        )
+                        turn_error = error_msg
+                        console.print(
+                            f"\n[fail]Error: {escape(error_msg)}[/fail]"
+                        )
 
                 # End the streaming line
+                _end_reasoning_activity()
                 sys.stdout.write("\n")
 
                 # Debug: post-turn summary
@@ -561,6 +662,16 @@ async def _run_chat(dsn: str, *, verbose: bool = False, debug: bool = False,
 
                 if turn_timed_out:
                     console.print("[warn](response timed out — the reply above may be incomplete)[/warn]")
+
+                if turn_error:
+                    console.print(
+                        "[warn](response incomplete — your conversation was not updated)[/warn]"
+                    )
+                    console.print(
+                        "[muted]Try again, or run `hexis doctor --llm` if it "
+                        "keeps happening.[/muted]\n"
+                    )
+                    continue
 
                 # Empty response — say so, don't poison history with a blank turn.
                 if not clean_text:

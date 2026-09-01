@@ -23,12 +23,12 @@ function isSensitiveFieldName(name: string): boolean {
   return false;
 }
 
-function redactDeep(value: any): any {
+function redactDeep(value: unknown): unknown {
   if (Array.isArray(value)) {
     return value.map((v) => redactDeep(v));
   }
   if (value && typeof value === "object") {
-    const out: Record<string, any> = {};
+    const out: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(value)) {
       out[k] = isSensitiveFieldName(k) ? "***" : redactDeep(v);
     }
@@ -37,7 +37,7 @@ function redactDeep(value: any): any {
   return value;
 }
 
-function redactValue(key: string, value: any): any {
+function redactValue(key: string, value: unknown): unknown {
   if (!isSensitiveConfigKey(key)) {
     // Still deep-redact common secret-shaped fields to prevent accidental leaks.
     return redactDeep(value);
@@ -50,12 +50,12 @@ function redactValue(key: string, value: any): any {
 
 export async function GET() {
   try {
-    const rows: any[] = await prisma.$queryRawUnsafe(
+    const rows = await prisma.$queryRawUnsafe<Array<{ key: string; value: unknown }>>(
       `SELECT key, value FROM config ORDER BY key`
     );
 
     // Group by prefix
-    const groups: Record<string, Record<string, any>> = {};
+    const groups: Record<string, Record<string, unknown>> = {};
     for (const row of rows) {
       const val = redactValue(String(row.key || ""), normalizeJsonValue(row.value));
       const prefix = row.key.split(".")[0] || "other";
@@ -76,10 +76,15 @@ export async function GET() {
       agent,
       tools,
     });
-  } catch (error: any) {
+  } catch (error: unknown) {
     console.error("Settings API error:", error);
     return NextResponse.json(
-      { error: error?.message || "Failed to fetch settings" },
+      {
+        error:
+          error instanceof Error && error.message
+            ? error.message
+            : "Failed to fetch settings",
+      },
       { status: 500 }
     );
   }

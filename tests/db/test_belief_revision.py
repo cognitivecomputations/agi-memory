@@ -291,3 +291,182 @@ async def test_non_semantic_target_is_rejected(db_pool):
             assert r["reason"] == "not_semantic"
         finally:
             await tr.rollback()
+
+
+async def _onehot(conn, position: int):
+    """A vector with 1.0 at `position` and 0.0 elsewhere: identical positions
+    give cosine similarity 1.0, distinct positions give exactly 0.0 --
+    deterministic near/far fixtures for similarity-threshold tests."""
+    return await conn.fetchval(
+        """
+        SELECT (
+            array_fill(0.0::float, ARRAY[$1::int])
+            || ARRAY[1.0::float]
+            || array_fill(0.0::float, ARRAY[(embedding_dimension() - $1 - 1)::int])
+        )::vector
+        """,
+        position,
+    )
+
+
+async def test_add_evidence_tool_surfaces_linked_candidate_on_non_semantic_target(
+    db_pool,
+):
+    """#101: add_evidence no longer dead-ends on an episodic memory_id -- a
+    semantic belief already graph-linked to it (e.g. DERIVED_FROM) is
+    surfaced by name, and retrying against it succeeds outright."""
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            v = await _onehot(conn, 0)
+            episodic_id = await conn.fetchval(
+                """
+                INSERT INTO memories (type, content, embedding, importance, trust_level, status)
+                VALUES ('episodic', 'Eric described a mini-heartbeat trigger', $1::vector,
+                        0.5, 0.9, 'active')
+                RETURNING id
+                """,
+                v,
+            )
+            belief_id = await conn.fetchval(
+                """
+                INSERT INTO memories (type, content, embedding, importance, trust_level, status, metadata)
+                VALUES ('semantic', 'Mini-heartbeats should trigger on crash alerts',
+                        $1::vector, 0.6, 0.8, 'active', '{"confidence": 0.6}'::jsonb)
+                RETURNING id
+                """,
+                v,
+            )
+            await conn.execute(
+                "SELECT create_memory_relationship($1::uuid, $2::uuid, 'DERIVED_FROM'::graph_edge_type, '{}'::jsonb)",
+                belief_id,
+                episodic_id,
+            )
+
+            blocked = _coerce_json(
+                await conn.fetchval(
+                    "SELECT execute_memory_tool('add_evidence', $1::jsonb)",
+                    json.dumps(
+                        {
+                            "memory_id": str(episodic_id),
+                            "stance": "supports",
+                            "source": {"ref": "test-101"},
+                        }
+                    ),
+                )
+            )
+            assert blocked["success"] is False
+            assert str(belief_id) in blocked["error"]
+            assert "call add_evidence again" in blocked["error"]
+            assert blocked["candidates"][0]["memory_id"] == str(belief_id)
+            assert blocked["candidates"][0]["match_reason"] == "linked"
+
+            retried = _coerce_json(
+                await conn.fetchval(
+                    "SELECT execute_memory_tool('add_evidence', $1::jsonb)",
+                    json.dumps(
+                        {
+                            "memory_id": str(belief_id),
+                            "stance": "supports",
+                            "source": {"ref": "test-101"},
+                        }
+                    ),
+                )
+            )
+            assert retried["success"] is True
+        finally:
+            await tr.rollback()
+
+
+async def test_add_evidence_tool_falls_back_to_similar_candidate_above_threshold(
+    db_pool,
+):
+    """#101: with no graph edge at all, a semantic memory close enough in
+    embedding space is still surfaced (as a 'similar' match), but an
+    unrelated one (orthogonal embedding) never is."""
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            near = await _onehot(conn, 1)
+            far = await _onehot(conn, 7)
+            episodic_id = await conn.fetchval(
+                """
+                INSERT INTO memories (type, content, embedding, importance, trust_level, status)
+                VALUES ('episodic', 'an unlinked observation', $1::vector, 0.5, 0.9, 'active')
+                RETURNING id
+                """,
+                near,
+            )
+            related_id = await conn.fetchval(
+                """
+                INSERT INTO memories (type, content, embedding, importance, trust_level, status, metadata)
+                VALUES ('semantic', 'a closely related belief', $1::vector,
+                        0.6, 0.8, 'active', '{"confidence": 0.55}'::jsonb)
+                RETURNING id
+                """,
+                near,
+            )
+            await conn.execute(
+                """
+                INSERT INTO memories (type, content, embedding, importance, trust_level, status, metadata)
+                VALUES ('semantic', 'a totally unrelated belief', $1::vector,
+                        0.6, 0.8, 'active', '{}'::jsonb)
+                """,
+                far,
+            )
+
+            result = _coerce_json(
+                await conn.fetchval(
+                    "SELECT execute_memory_tool('add_evidence', $1::jsonb)",
+                    json.dumps(
+                        {
+                            "memory_id": str(episodic_id),
+                            "stance": "supports",
+                            "source": {"ref": "test-101b"},
+                        }
+                    ),
+                )
+            )
+            assert result["success"] is False
+            ids = [c["memory_id"] for c in result["candidates"]]
+            assert ids == [str(related_id)]
+            assert result["candidates"][0]["match_reason"] == "similar"
+        finally:
+            await tr.rollback()
+
+
+async def test_add_evidence_tool_no_candidates_still_names_recovery_step(db_pool):
+    """#101: with nothing linked or similar enough, the caller still gets an
+    explicit next step (recall by type) rather than a bare rejection."""
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            v = await _onehot(conn, 2)
+            episodic_id = await conn.fetchval(
+                """
+                INSERT INTO memories (type, content, embedding, importance, trust_level, status)
+                VALUES ('episodic', 'a lone unrelated event', $1::vector, 0.5, 0.9, 'active')
+                RETURNING id
+                """,
+                v,
+            )
+            result = _coerce_json(
+                await conn.fetchval(
+                    "SELECT execute_memory_tool('add_evidence', $1::jsonb)",
+                    json.dumps(
+                        {
+                            "memory_id": str(episodic_id),
+                            "stance": "supports",
+                            "source": {"ref": "test-101c"},
+                        }
+                    ),
+                )
+            )
+            assert result["success"] is False
+            assert result["candidates"] == []
+            assert "memory_types=['semantic']" in result["error"]
+        finally:
+            await tr.rollback()

@@ -3,7 +3,6 @@ from uuid import uuid4
 
 import pytest
 
-
 pytestmark = [pytest.mark.asyncio(loop_scope="session"), pytest.mark.db]
 
 
@@ -12,8 +11,7 @@ def _json(value):
 
 
 async def _stub_get_embedding(conn):
-    await conn.execute(
-        """
+    await conn.execute("""
         CREATE OR REPLACE FUNCTION get_embedding(text_contents TEXT[])
         RETURNS vector[] AS $$
             SELECT COALESCE(
@@ -25,8 +23,7 @@ async def _stub_get_embedding(conn):
             )
             FROM unnest(text_contents)
         $$ LANGUAGE sql;
-        """
-    )
+        """)
 
 
 async def test_record_chat_turn_memory_always_uses_recmem(db_pool):
@@ -63,18 +60,22 @@ async def test_record_chat_turn_memory_derives_source_identity(db_pool):
     async with db_pool.acquire() as conn:
         await _stub_get_embedding(conn)
 
-        first = _json(await conn.fetchval(
-            "SELECT record_chat_turn_memory($1, $2, $3, NULL, '{}'::jsonb)",
-            "identity derivation turn one",
-            "first reply",
-            session_id,
-        ))
-        second = _json(await conn.fetchval(
-            "SELECT record_chat_turn_memory($1, $2, $3, NULL, '{}'::jsonb)",
-            "identity derivation turn two",
-            "second reply",
-            session_id,
-        ))
+        first = _json(
+            await conn.fetchval(
+                "SELECT record_chat_turn_memory($1, $2, $3, NULL, '{}'::jsonb)",
+                "identity derivation turn one",
+                "first reply",
+                session_id,
+            )
+        )
+        second = _json(
+            await conn.fetchval(
+                "SELECT record_chat_turn_memory($1, $2, $3, NULL, '{}'::jsonb)",
+                "identity derivation turn two",
+                "second reply",
+                session_id,
+            )
+        )
         identities = [
             await conn.fetchval(
                 "SELECT source_identity FROM subconscious_units WHERE id = $1::uuid",
@@ -94,13 +95,15 @@ async def test_record_chat_turn_memory_keeps_caller_identity(db_pool):
     async with db_pool.acquire() as conn:
         await _stub_get_embedding(conn)
         explicit = f"channel:telegram:{uuid4()}"
-        result = _json(await conn.fetchval(
-            "SELECT record_chat_turn_memory($1, $2, $3, $4, '{}'::jsonb)",
-            "caller identity wins",
-            "kept verbatim",
-            str(uuid4()),
-            explicit,
-        ))
+        result = _json(
+            await conn.fetchval(
+                "SELECT record_chat_turn_memory($1, $2, $3, $4, '{}'::jsonb)",
+                "caller identity wins",
+                "kept verbatim",
+                str(uuid4()),
+                explicit,
+            )
+        )
         stored = await conn.fetchval(
             "SELECT source_identity FROM subconscious_units WHERE id = $1::uuid",
             result["raw_unit_id"],
@@ -133,14 +136,16 @@ async def test_prepare_and_finalize_channel_turn_db_lifecycle(db_pool):
         sender_id = f"sender-{uuid4()}"
         prepared_raw = await conn.fetchval(
             "SELECT prepare_channel_turn($1::jsonb)",
-            json.dumps({
-                "channel_type": "unit",
-                "channel_id": channel_id,
-                "sender_id": sender_id,
-                "sender_name": "Tester",
-                "content": "hello",
-                "message_id": "m1",
-            }),
+            json.dumps(
+                {
+                    "channel_type": "unit",
+                    "channel_id": channel_id,
+                    "sender_id": sender_id,
+                    "sender_name": "Tester",
+                    "content": "hello",
+                    "message_id": "m1",
+                }
+            ),
         )
         prepared = _json(prepared_raw)
         assert prepared["allowed"] is True
@@ -177,11 +182,12 @@ async def test_turn_write_stamps_appraisal_affect(db_pool):
             await _stub_get_embedding(conn)
             await conn.fetchval(
                 """SELECT record_chat_turn_memory('kiss turn', 'warm reply', $1, NULL,
-                    '{"emotional_state": {"valence": 0.66, "arousal": 0.53, "intensity": 0.62, "primary_emotion": "affection"}}'::jsonb)""",
+                    '{"emotional_state": {"valence": 0.66, "arousal": 0.53, "intensity": 0.62, "primary_emotion": "affection", "family": "connection"}}'::jsonb)""",
                 str(uuid4()),
             )
             stamped = await conn.fetchrow(
                 """SELECT metadata #>> '{emotional_context,primary_emotion}' AS emotion,
+                          metadata #>> '{emotional_context,family}' AS family,
                           (metadata #>> '{emotional_context,valence}')::float AS valence,
                           metadata #>> '{emotional_context,source}' AS source
                    FROM subconscious_units WHERE user_text = 'kiss turn'"""
@@ -197,6 +203,7 @@ async def test_turn_write_stamps_appraisal_affect(db_pool):
             await tr.rollback()
 
     assert stamped["emotion"] == "affection"
+    assert stamped["family"] == "connection"
     assert abs(stamped["valence"] - 0.66) < 1e-9
     assert stamped["source"] == "appraisal"
     assert fallback == "state_snapshot"
@@ -212,8 +219,7 @@ async def test_extraction_carries_turn_affect_not_sweep_mood(db_pool):
         await tr.start()
         try:
             await _stub_get_embedding(conn)
-            unit_id = await conn.fetchval(
-                """
+            unit_id = await conn.fetchval("""
                 INSERT INTO subconscious_units (
                     content, user_text, assistant_text, embedding, embedding_status,
                     route_status, importance, idempotency_key, metadata
@@ -223,18 +229,23 @@ async def test_extraction_carries_turn_affect_not_sweep_mood(db_pool):
                     'raw_only', 0.7, gen_random_uuid()::text,
                     '{"emotional_context": {"valence": 0.66, "arousal": 0.53, "intensity": 0.62, "primary_emotion": "affection", "source": "appraisal"}}'::jsonb
                 ) RETURNING id
-                """
+                """)
+            result = json.loads(
+                await conn.fetchval(
+                    "SELECT apply_conscious_extraction(ARRAY[$1::uuid], $2::jsonb)",
+                    unit_id,
+                    json.dumps(
+                        [
+                            {
+                                "content": "Affect-carry check: Eric adores this project.",
+                                "kind": "user_testimony",
+                                "confidence": 0.8,
+                                "unit_id": str(unit_id),
+                            }
+                        ]
+                    ),
+                )
             )
-            result = json.loads(await conn.fetchval(
-                "SELECT apply_conscious_extraction(ARRAY[$1::uuid], $2::jsonb)",
-                unit_id,
-                json.dumps([{
-                    "content": "Affect-carry check: Eric adores this project.",
-                    "kind": "user_testimony",
-                    "confidence": 0.8,
-                    "unit_id": str(unit_id),
-                }]),
-            ))
             assert result["created"] == 1
             row = await conn.fetchrow(
                 """SELECT (metadata #>> '{emotional_context,valence}')::float AS valence,

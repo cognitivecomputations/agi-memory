@@ -19,8 +19,8 @@ WHERE id = 'slack';
 INSERT INTO config_defaults (key, value, description) VALUES
     ('connector.user_model_synthesis_enabled', 'true'::jsonb,
      'Distill connector source items into evidence-backed user-model claims'),
-    ('connector.user_model_synthesis_mode', '"hybrid"'::jsonb,
-     'User-model synthesis mode: rules, llm, or hybrid'),
+    ('connector.user_model_synthesis_mode', '"llm"'::jsonb,
+     'User-model synthesis mode; llm is authoritative, while rules is retained only as an explicit LLM-disabled fallback'),
     ('connector.user_model_review_required', 'true'::jsonb,
      'Derived user-model claims enter a review queue before being treated as operator-approved'),
     ('connector.user_model_llm_enabled', 'true'::jsonb,
@@ -40,6 +40,23 @@ INSERT INTO config_defaults (key, value, description) VALUES
     ('connector.importance_notify_threshold', '0.85'::jsonb,
      'Importance score at or above which a connector item queues a web-inbox notification')
 ON CONFLICT (key) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS connector_cognition_cache (
+    task TEXT NOT NULL CHECK (task IN ('user_model_claims', 'item_importance')),
+    content_hash TEXT NOT NULL,
+    detector_version TEXT NOT NULL,
+    result JSONB NOT NULL,
+    provenance TEXT NOT NULL DEFAULT 'llm' CHECK (provenance = 'llm'),
+    provider TEXT,
+    model TEXT,
+    hit_count BIGINT NOT NULL DEFAULT 0 CHECK (hit_count >= 0),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_used_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (task, content_hash, detector_version)
+);
+
+CREATE INDEX IF NOT EXISTS idx_connector_cognition_cache_last_used
+    ON connector_cognition_cache (last_used_at DESC);
 
 CREATE TABLE IF NOT EXISTS user_model_source_progress (
     source_item_id UUID PRIMARY KEY REFERENCES connector_source_items(id) ON DELETE CASCADE,
@@ -185,6 +202,7 @@ BEGIN
             'provider_item_id', csi.provider_item_id,
             'provider_thread_id', csi.provider_thread_id,
             'source_document_id', d.id::text,
+            'content_hash', csi.content_hash,
             'title', d.title,
             'path', d.path,
             'content', d.content,
@@ -727,6 +745,7 @@ BEGIN
             'account_key', csi.account_key,
             'provider_item_id', csi.provider_item_id,
             'source_document_id', d.id::text,
+            'content_hash', csi.content_hash,
             'title', d.title,
             'path', d.path,
             'content', d.content,

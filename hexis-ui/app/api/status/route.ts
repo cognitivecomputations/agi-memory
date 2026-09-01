@@ -25,6 +25,7 @@ export async function GET() {
       memHealthRows,
       configuredRows,
       profileRows,
+      economyRows,
     ] = await Promise.all([
       prisma.$queryRawUnsafe<DbRow[]>("SELECT * FROM cognitive_health LIMIT 1"),
       prisma.$queryRawUnsafe<DbRow[]>("SELECT * FROM heartbeat_state LIMIT 1"),
@@ -36,6 +37,7 @@ export async function GET() {
       prisma.$queryRawUnsafe<DbRow[]>("SELECT * FROM memory_health"),
       prisma.$queryRawUnsafe<DbRow[]>("SELECT is_agent_configured() AS configured"),
       prisma.$queryRawUnsafe<DbRow[]>("SELECT get_init_profile() AS profile"),
+      prisma.$queryRawUnsafe<DbRow[]>("SELECT heartbeat_economy_status() AS economy"),
     ]);
 
     const cogHealth = normalize(cogHealthRows);
@@ -44,6 +46,7 @@ export async function GET() {
     const profile = normalizeJsonValue(profileRows[0]?.profile);
     const profileRecord = asRecord(profile);
     const profileAgent = asRecord(profileRecord.agent);
+    const economy = asRecord(normalizeJsonValue(economyRows[0]?.economy));
 
     const agentName =
       stringValue(profileAgent.name) ||
@@ -59,8 +62,11 @@ export async function GET() {
       configured: configuredRows[0]?.configured ?? false,
 
       // Energy
-      energy: toNum(cogHealth.current_energy ?? heartbeat.current_energy),
-      max_energy: toNum(cogHealth.max_energy ?? 20),
+      energy: toNum(heartbeat.current_energy ?? cogHealth.energy),
+      max_energy: toNum(economy.reserve_energy ?? cogHealth.max_energy ?? 20),
+      energy_reserve: toNum(economy.reserve_energy ?? cogHealth.max_energy ?? 20),
+      energy_capacity: toNum(economy.bank_capacity ?? cogHealth.max_energy ?? 20),
+      next_regen_multiplier: toNum(economy.next_regen_multiplier ?? 1),
 
       // Heartbeat
       heartbeat_active: !!heartbeat.active_heartbeat_id,

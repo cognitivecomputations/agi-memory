@@ -19,13 +19,13 @@ Connect your Hexis agent to Slack workspaces.
 
 - A Slack app with Bot token (`xoxb-...`) from the [Slack API](https://api.slack.com/apps)
 - App token (`xapp-...`) for Socket Mode (recommended)
-- Required scopes: `chat:write`, `channels:history`, `im:history`
+- Required scopes: `chat:write`, `channels:history`, `im:history`, `im:write`
 
 ## Quick Start
 
 ```bash
 hexis channels setup slack
-hexis up --profile active
+hexis up
 hexis channels status
 ```
 
@@ -35,9 +35,11 @@ hexis channels status
 |------------|------|-------------|
 | `channel.slack.bot_token` | text | Env var name for `xoxb-...` bot token |
 | `channel.slack.app_token` | text | Env var name for `xapp-...` app token (Socket Mode) |
+| `channel.slack.signing_secret` | text | Env var name for Slack's signing secret (HTTP interactivity only) |
+| `channel.slack.operator_user_id` | text | Your Slack `U...` user ID for private approval DMs |
 | `channel.slack.allowed_channels` | array | JSON array of channel IDs or `"*"` (all) |
 
-Environment variables: `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`
+Environment variables: `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, and optionally `SLACK_SIGNING_SECRET`
 
 ## Connection Modes
 
@@ -47,6 +49,13 @@ Environment variables: `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`
 | **HTTP Events** (fallback) | Bot token + webhook URL | Requires external accessibility; used if `app_token` is missing |
 
 Socket Mode is strongly recommended -- it works behind NAT and firewalls without any webhook configuration.
+
+Approve/Deny buttons are received over Socket Mode automatically. If you use
+HTTP interactivity instead, set Slack's Interactivity Request URL to
+`https://your-secure-endpoint/api/slack/interactivity`, configure
+`channel.slack.signing_secret`, and expose only that signed route through a
+tightly scoped reverse proxy rather than exposing the dashboard. Hexis verifies
+Slack's signature and five-minute replay window.
 
 ## Features
 
@@ -59,6 +68,7 @@ Socket Mode is strongly recommended -- it works behind NAT and firewalls without
 | Media (files, images) | Yes | Uses `files_upload_v2()` |
 | Typing indicator | No | Slack API does not support bot typing indicators (silently skipped) |
 | Edit messages | Yes | Via message timestamp |
+| Protected-tool approvals | Yes | Identity-checked, one-shot Approve/Deny buttons in a private DM |
 | Max message length | 4,000 chars | |
 
 ## How It Works
@@ -70,12 +80,19 @@ Socket Mode is strongly recommended -- it works behind NAT and firewalls without
 - **Thread support**: Uses Slack's `thread_ts` (timestamp) for threaded conversations
 - **Channel filtering**: Responds to allowlisted channels; always responds when mentioned in non-allowed channels
 - **File attachments**: Extracts `url_private_download` or `url_private` from file metadata
+- **Approvals**: A protected tool call opens a private Slack DM. The exact
+  arguments are shown with secrets redacted; the resulting proof is consumed
+  once and only for those arguments. If iMessage escalation is configured and
+  Slack is unanswered for five minutes, Hexis sends a coded approve/deny prompt
+  there instead.
+- **Plain replies**: The configured operator can also reply `approve CODE` or
+  `deny CODE`. The code is optional only when exactly one request is pending.
 
 ## Troubleshooting
 
 - **Bot not responding**: Verify both `SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` are set
 - **Socket Mode errors**: Ensure Socket Mode is enabled in your Slack app settings (Settings > Socket Mode)
-- **Missing permissions**: Add `chat:write`, `channels:history`, `im:history` scopes to your bot token
+- **Missing permissions**: Add `chat:write`, `channels:history`, `im:history`, and `im:write` scopes to your bot token
 - **No typing indicator**: This is expected -- the Slack bot API does not support typing indicators
 - **HTTP fallback warning**: If you see "Using HTTP fallback" in logs, set the `SLACK_APP_TOKEN` to enable Socket Mode
 

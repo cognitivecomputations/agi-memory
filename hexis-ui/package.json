@@ -24,7 +24,7 @@
     "react": "19.2.3",
     "react-dom": "19.2.3",
     "three": "^0.185.1",
-    "zod": "^4.3.5"
+    "zod": "^3.25.76"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",

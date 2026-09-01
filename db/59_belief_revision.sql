@@ -40,7 +40,9 @@ INSERT INTO config_defaults (key, value, description) VALUES
     ('belief.confidence_floor', '0.05'::jsonb,
      'Confidence never drops below this: beliefs are eroded, never silently zeroed'),
     ('belief.confidence_ceiling', '0.99'::jsonb,
-     'Confidence never reaches certainty regardless of evidence volume')
+     'Confidence never reaches certainty regardless of evidence volume'),
+    ('belief.evidence_candidate_min_similarity', '0.5'::jsonb,
+     'Minimum raw cosine similarity for a semantic memory to be suggested as an add_evidence retry target (#101)')
 ON CONFLICT (key) DO NOTHING;
 
 -- The dedupe identity of a source, matching dedupe_source_references (db/05):
@@ -255,3 +257,67 @@ BEGIN
     ));
 END;
 $$ LANGUAGE plpgsql;
+
+-- #101: add_evidence dead-ends when handed a non-semantic (typically episodic)
+-- memory_id -- the caller is told to go recall the right belief, with nothing
+-- to recover with. This surfaces concrete candidate semantic memories to
+-- retry against: memories already graph-linked to the given memory (the
+-- belief this episode/observation fed into), falling back to the nearest
+-- semantic memories by embedding similarity when no edge exists yet. Reuses
+-- the target's own stored embedding rather than re-embedding, so this never
+-- needs a live embedding-service call.
+CREATE OR REPLACE FUNCTION find_semantic_evidence_targets(
+    p_memory_id UUID,
+    p_limit INT DEFAULT 5
+) RETURNS TABLE (
+    memory_id UUID,
+    content TEXT,
+    confidence FLOAT,
+    trust_level FLOAT,
+    match_reason TEXT
+) LANGUAGE sql STABLE AS $$
+    WITH target AS (
+        SELECT id, embedding FROM memories WHERE id = p_memory_id
+    ),
+    via_edges AS (
+        SELECT DISTINCT
+            m.id AS memory_id,
+            m.content,
+            NULLIF(m.metadata->>'confidence', '')::float AS confidence,
+            m.trust_level,
+            'linked'::text AS match_reason
+        FROM memory_edges e
+        JOIN target t ON TRUE
+        JOIN memories m ON m.type = 'semantic' AND m.status = 'active'
+        WHERE e.src_type = 'memory' AND e.dst_type = 'memory'
+          AND (
+                (e.src_id = t.id::text AND m.id::text = e.dst_id)
+             OR (e.dst_id = t.id::text AND m.id::text = e.src_id)
+          )
+    ),
+    via_similarity AS (
+        -- A floor on raw cosine similarity: topically-adjacent noise is worse
+        -- than no candidate at all (it reads as a confident suggestion).
+        SELECT
+            m.id AS memory_id,
+            m.content,
+            NULLIF(m.metadata->>'confidence', '')::float AS confidence,
+            m.trust_level,
+            'similar'::text AS match_reason
+        FROM memories m, target t
+        WHERE m.type = 'semantic' AND m.status = 'active'
+          AND m.embedding IS NOT NULL AND t.embedding IS NOT NULL
+          AND (1 - (m.embedding <=> t.embedding)) >= COALESCE(
+              get_config_float('belief.evidence_candidate_min_similarity'), 0.5)
+        ORDER BY m.embedding <=> t.embedding
+        LIMIT p_limit
+    )
+    SELECT memory_id, content, confidence, trust_level, match_reason FROM (
+        SELECT *, 0 AS rank FROM via_edges
+        UNION ALL
+        SELECT vs.*, 1 AS rank FROM via_similarity vs
+        WHERE NOT EXISTS (SELECT 1 FROM via_edges ve WHERE ve.memory_id = vs.memory_id)
+    ) combined
+    ORDER BY rank, memory_id
+    LIMIT p_limit;
+$$;

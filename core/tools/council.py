@@ -11,15 +11,13 @@ F.3 - Signal Aggregation Tool (AggregateSignalsHandler)
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
-from datetime import datetime, timezone
+import uuid
 from typing import Any, TYPE_CHECKING
 
 from .base import (
     ToolCategory,
-    ToolContext,
     ToolErrorType,
     ToolExecutionContext,
     ToolHandler,
@@ -37,7 +35,9 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-async def load_council_personas(context: "ToolExecutionContext") -> dict[str, dict[str, str]]:
+async def load_council_personas(
+    context: "ToolExecutionContext",
+) -> dict[str, dict[str, str]]:
     """Fetch the persona catalog from get_council_personas() (db/33)."""
     pool = context.registry.pool if context.registry else None
     if pool is None:
@@ -46,7 +46,9 @@ async def load_council_personas(context: "ToolExecutionContext") -> dict[str, di
         raw = await conn.fetchval("SELECT get_council_personas()")
     personas = json.loads(raw) if isinstance(raw, str) else (raw or {})
     if not personas:
-        raise RuntimeError("No council personas are seeded (prompt_modules council.persona.*)")
+        raise RuntimeError(
+            "No council personas are seeded (prompt_modules council.persona.*)"
+        )
     return personas
 
 
@@ -142,14 +144,26 @@ class RunCouncilHandler(ToolHandler):
                     },
                     "signal_limit": {
                         "type": "integer",
-                        "description": "Maximum number of compacted signals to include (default 10, max 30).",
+                        "description": (
+                            "Maximum number of compacted signals to include. "
+                            "Defaults to the live deliberation configuration."
+                        ),
+                    },
+                    "stakes": {
+                        "type": "string",
+                        "enum": ["routine", "material", "high"],
+                        "description": (
+                            "How consequential the decision is. This labels the "
+                            "record and does not authorize or gate any action."
+                        ),
                     },
                 },
                 "required": ["topic"],
             },
             category=ToolCategory.MEMORY,
             energy_cost=5,
-            is_read_only=True,
+            is_read_only=False,
+            supports_parallel=False,
             optional=True,
             requires_approval=False,
         )
@@ -168,7 +182,37 @@ class RunCouncilHandler(ToolHandler):
 
         requested_personas: list[str] | None = arguments.get("personas")
         extra_context: str = arguments.get("context", "")
-        signal_limit: int = max(1, min(int(arguments.get("signal_limit", 10) or 10), 30))
+        stakes = str(arguments.get("stakes") or "material").strip().lower()
+        if stakes not in {"routine", "material", "high"}:
+            return ToolResult.error_result(
+                "Parameter 'stakes' must be routine, material, or high.",
+                ToolErrorType.INVALID_PARAMS,
+            )
+
+        pool: asyncpg.Pool | None = context.registry.pool if context.registry else None
+        if pool is None:
+            return ToolResult.error_result(
+                "Council deliberation requires a database-backed registry.",
+                ToolErrorType.MISSING_CONFIG,
+            )
+
+        from services.deliberation import (
+            DeliberationUnavailable,
+            load_deliberation_config,
+            run_adversarial_deliberation,
+        )
+
+        try:
+            policy = await load_deliberation_config(pool)
+        except DeliberationUnavailable as exc:
+            return ToolResult.error_result(str(exc), ToolErrorType.MISSING_CONFIG)
+        configured_signal_limit = int(policy["signal_limit"])
+        raw_signal_limit = arguments.get("signal_limit")
+        signal_limit = (
+            configured_signal_limit
+            if raw_signal_limit is None
+            else max(0, min(int(raw_signal_limit), 30))
+        )
 
         # Resolve persona keys against the DB catalog
         try:
@@ -183,75 +227,65 @@ class RunCouncilHandler(ToolHandler):
                     f"Valid keys: {', '.join(sorted(personas.keys()))}",
                     ToolErrorType.INVALID_PARAMS,
                 )
+            max_personas = int(policy["max_personas"])
+            if len(requested_personas) > max_personas:
+                return ToolResult.error_result(
+                    "Requested "
+                    f"{len(requested_personas)} personas, but the live maximum is "
+                    f"{max_personas}. Choose a smaller council.",
+                    ToolErrorType.INVALID_PARAMS,
+                )
             selected_keys = requested_personas
         else:
-            selected_keys = list(personas.keys())
+            selected_keys = list(personas.keys())[: int(policy["max_personas"])]
 
-        signals = await self._collect_signals(context, limit=signal_limit)
-
-        # Build the council configuration
-        council_analyses: list[dict[str, str]] = []
-        for key in selected_keys:
-            persona = personas[key]
-            prompt_parts = [persona["system_prompt"]]
-            if signals:
-                prompt_parts.append(
-                    "\nCompacted signals:\n" + "\n".join(f"- {s}" for s in signals)
-                )
-            if extra_context:
-                prompt_parts.append(f"\nAdditional context:\n{extra_context}")
-            prompt_parts.append(f"\nTopic for analysis:\n{topic}")
-            full_prompt = "\n".join(prompt_parts)
-
-            council_analyses.append({
-                "persona_key": key,
-                "persona_name": persona["name"],
-                "system_prompt": persona["system_prompt"],
-                "full_prompt": full_prompt,
-            })
-
-        analyses = await self._run_parallel_analyses(
-            context=context,
-            topic=topic,
-            council_entries=council_analyses,
+        signals, evidence_memory_ids, collection_warning = await self._collect_signals(
+            context, limit=signal_limit
         )
-        for entry in council_analyses:
-            entry["analysis"] = analyses.get(entry["persona_key"], "")
-
-        moderator_report = await self._run_moderator_pass(
-            context=context,
-            topic=topic,
-            council_entries=council_analyses,
-        )
-
-        return ToolResult(
-            success=True,
-            output={
-                "topic": topic,
-                "persona_count": len(council_analyses),
-                "personas_included": [a["persona_key"] for a in council_analyses],
-                "signals": signals,
-                "council": council_analyses,
-                "moderator_report": moderator_report,
-                "instructions": (
-                    "Council analyses were run in parallel and reconciled via a "
-                    "moderator pass. Use moderator_report as the synthesis."
+        try:
+            output = await run_adversarial_deliberation(
+                pool,
+                topic=topic,
+                personas=personas,
+                selected_keys=selected_keys,
+                extra_context=extra_context,
+                signals=signals,
+                stakes=stakes,
+                source_context=context.tool_context.value,
+                source_session_id=context.session_id,
+                heartbeat_id=context.heartbeat_id,
+                call_id=context.call_id,
+                evidence_memory_ids=evidence_memory_ids,
+                collection_warnings=(
+                    [collection_warning] if collection_warning else None
                 ),
-            },
-            energy_spent=5,
-        )
+            )
+        except ValueError as exc:
+            return ToolResult.error_result(str(exc), ToolErrorType.INVALID_PARAMS)
+        except DeliberationUnavailable as exc:
+            return ToolResult.error_result(str(exc), ToolErrorType.MISSING_CONFIG)
+        except Exception as exc:
+            logger.exception("Council deliberation failed")
+            return ToolResult.error_result(
+                "Council deliberation failed. The partial record was preserved as "
+                f"failed so it can be inspected. Cause: {exc}",
+                ToolErrorType.EXECUTION_FAILED,
+            )
+
+        return ToolResult(success=True, output=output, energy_spent=5)
 
     async def _collect_signals(
         self,
         context: ToolExecutionContext,
         *,
         limit: int,
-    ) -> list[str]:
+    ) -> tuple[list[str], list[str], str | None]:
         pool: asyncpg.Pool | None = context.registry.pool if context.registry else None
-        if not pool:
-            return []
+        if not pool or limit <= 0:
+            return [], [], None
 
-        signals: list[str] = []
+        entries: list[tuple[str, str | None]] = []
+        category_limit = max(1, (limit + 2) // 3)
         try:
             async with pool.acquire() as conn:
                 event_rows = await conn.fetch(
@@ -261,7 +295,7 @@ class RunCouncilHandler(ToolHandler):
                     ORDER BY created_at DESC
                     LIMIT $1
                     """,
-                    limit,
+                    category_limit,
                 )
                 for row in event_rows:
                     src = row["source"]
@@ -273,175 +307,185 @@ class RunCouncilHandler(ToolHandler):
                             payload = {}
                     if isinstance(payload, dict):
                         keys = ", ".join(sorted(payload.keys())[:4])
-                        signals.append(f"Event[{src}]: payload keys ({keys or 'none'})")
+                        entries.append(
+                            (f"Event[{src}]: payload keys ({keys or 'none'})", None)
+                        )
                     else:
-                        signals.append(f"Event[{src}]")
+                        entries.append((f"Event[{src}]", None))
 
                 mem_rows = await conn.fetch(
                     """
-                    SELECT content
+                    SELECT id, content
                     FROM memories
                     WHERE type = 'episodic' AND status = 'active'
                     ORDER BY created_at DESC
                     LIMIT $1
                     """,
-                    limit,
+                    category_limit,
                 )
                 for row in mem_rows:
                     content = (row["content"] or "").strip().replace("\n", " ")
                     if content:
-                        signals.append(f"Memory: {content[:180]}")
+                        entries.append((f"Memory: {content[:180]}", str(row["id"])))
 
                 goal_rows = await conn.fetch(
                     """
-                    SELECT content
+                    SELECT id, content
                     FROM memories
                     WHERE type = 'goal' AND status = 'active'
                     ORDER BY importance DESC NULLS LAST, created_at DESC
                     LIMIT $1
                     """,
-                    max(1, limit // 2),
+                    category_limit,
                 )
                 for row in goal_rows:
                     content = (row["content"] or "").strip().replace("\n", " ")
                     if content:
-                        signals.append(f"Goal: {content[:180]}")
+                        entries.append((f"Goal: {content[:180]}", str(row["id"])))
         except Exception as exc:
-            logger.debug("Council signal collection failed: %s", exc)
-            return []
-
-        return signals[:limit]
-
-    async def _run_parallel_analyses(
-        self,
-        *,
-        context: ToolExecutionContext,
-        topic: str,
-        council_entries: list[dict[str, str]],
-    ) -> dict[str, str]:
-        async def _run_one(entry: dict[str, str]) -> tuple[str, str]:
-            analysis = await self._analyze_with_persona(
-                context=context,
-                topic=topic,
-                persona_name=entry["persona_name"],
-                system_prompt=entry["system_prompt"],
-                full_prompt=entry["full_prompt"],
+            cause = " ".join(str(exc).split())[:300] or type(exc).__name__
+            warning = (
+                "Recent evidence signals could not be collected; the council ran "
+                f"without that context. Cause: {cause}"
             )
-            return entry["persona_key"], analysis
+            logger.warning("Council signal collection failed: %s", cause)
+            return [], [], warning
 
-        pairs = await asyncio.gather(*[_run_one(entry) for entry in council_entries])
-        return {k: v for k, v in pairs}
+        included = entries[:limit]
+        evidence_ids = list(
+            dict.fromkeys(memory_id for _, memory_id in included if memory_id)
+        )
+        return [text for text, _ in included], evidence_ids, None
 
-    async def _analyze_with_persona(
-        self,
-        *,
-        context: ToolExecutionContext,
-        topic: str,
-        persona_name: str,
-        system_prompt: str,
-        full_prompt: str,
-    ) -> str:
-        llm_cfg = await self._load_llm_config(context)
-        if llm_cfg is None:
-            return f"{persona_name} perspective on '{topic}': {full_prompt[:260]}"
 
-        from core.llm import chat_completion
+# ---------------------------------------------------------------------------
+# F.2a -- Durable deliberation review
+# ---------------------------------------------------------------------------
 
-        try:
-            response = await chat_completion(
-                provider=llm_cfg["provider"],
-                model=llm_cfg["model"],
-                endpoint=llm_cfg.get("endpoint"),
-                api_key=llm_cfg.get("api_key"),
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": full_prompt},
-                ],
-                temperature=0.4,
-                max_tokens=700,
-                tools=None,
-                auth_mode=llm_cfg.get("auth_mode"),
-            )
-            text = (response or {}).get("content") or ""
-            return text.strip() or f"{persona_name} produced no content."
-        except Exception as exc:
-            logger.debug("Council persona analysis failed for %s: %s", persona_name, exc)
-            return f"{persona_name} analysis unavailable ({exc})."
 
-    async def _run_moderator_pass(
-        self,
-        *,
-        context: ToolExecutionContext,
-        topic: str,
-        council_entries: list[dict[str, str]],
-    ) -> str:
-        llm_cfg = await self._load_llm_config(context)
-        if llm_cfg is None:
-            return self._heuristic_moderator_summary(council_entries)
+class ListDeliberationsHandler(ToolHandler):
+    """List recent advisory council runs and their lifecycle status."""
 
-        from core.llm import chat_completion
-
-        payload = [
-            {"persona": e["persona_name"], "analysis": e.get("analysis", "")}
-            for e in council_entries
-        ]
-        moderator_prompt = (
-            f"Topic: {topic}\n\n"
-            "Persona analyses (JSON):\n"
-            f"{json.dumps(payload, ensure_ascii=True)}\n\n"
-            "Produce a reconciled report with:\n"
-            "1) Agreements\n2) Key disagreements\n3) Risks\n4) Recommended actions."
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name="list_deliberations",
+            description=(
+                "List recent durable council deliberations, including completed "
+                "and failed runs."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum rows to return (default 20, max 100).",
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": ["running", "completed", "failed"],
+                        "description": "Optional lifecycle status filter.",
+                    },
+                },
+            },
+            category=ToolCategory.MEMORY,
+            energy_cost=0,
+            is_read_only=True,
+            requires_approval=False,
         )
 
-        try:
-            response = await chat_completion(
-                provider=llm_cfg["provider"],
-                model=llm_cfg["model"],
-                endpoint=llm_cfg.get("endpoint"),
-                api_key=llm_cfg.get("api_key"),
-                messages=[
-                    {"role": "system", "content": "You are a neutral moderator that reconciles expert perspectives."},
-                    {"role": "user", "content": moderator_prompt},
-                ],
-                temperature=0.3,
-                max_tokens=900,
-                tools=None,
-                auth_mode=llm_cfg.get("auth_mode"),
-            )
-            text = (response or {}).get("content") or ""
-            return text.strip() or self._heuristic_moderator_summary(council_entries)
-        except Exception as exc:
-            logger.debug("Council moderator pass failed: %s", exc)
-            return self._heuristic_moderator_summary(council_entries)
-
-    async def _load_llm_config(
+    async def execute(
         self,
+        arguments: dict[str, Any],
         context: ToolExecutionContext,
-    ) -> dict[str, Any] | None:
-        pool: asyncpg.Pool | None = context.registry.pool if context.registry else None
-        if not pool:
-            return None
+    ) -> ToolResult:
+        pool = context.registry.pool if context.registry else None
+        if pool is None:
+            return ToolResult.error_result(
+                "Deliberation history requires a database-backed registry.",
+                ToolErrorType.MISSING_CONFIG,
+            )
+        status = str(arguments.get("status") or "").strip().lower() or None
+        if status not in {None, "running", "completed", "failed"}:
+            return ToolResult.error_result(
+                "Parameter 'status' must be running, completed, or failed.",
+                ToolErrorType.INVALID_PARAMS,
+            )
+        limit = max(1, min(int(arguments.get("limit", 20) or 20), 100))
         try:
-            from core.llm_config import resolve_llm_config
-            return await resolve_llm_config(pool, "llm.chat", fallback_key="llm")
-        except Exception:
-            return None
+            from services.deliberation import list_deliberations
 
-    @staticmethod
-    def _heuristic_moderator_summary(council_entries: list[dict[str, str]]) -> str:
-        lines = [
-            "Moderator synthesis (fallback mode):",
-            "Agreements: Council members provided perspectives on growth, risk, and customer impact.",
-            "Disagreements: Trade-offs center on speed vs. risk and expansion vs. margin discipline.",
-            "Risks: Execution complexity, cost overruns, and potential customer confusion.",
-            "Recommended actions: Run a limited pilot, measure outcomes, and iterate before full rollout.",
-            "",
-            "Persona notes:",
-        ]
-        for entry in council_entries:
-            snippet = (entry.get("analysis") or "").strip().replace("\n", " ")
-            lines.append(f"- {entry['persona_name']}: {snippet[:180]}")
-        return "\n".join(lines)
+            payload = await list_deliberations(pool, limit=limit, status=status)
+            return ToolResult.success_result(payload)
+        except Exception as exc:
+            return ToolResult.error_result(
+                f"Could not list deliberations: {exc}",
+                ToolErrorType.EXECUTION_FAILED,
+            )
+
+
+class InspectDeliberationHandler(ToolHandler):
+    """Inspect one council run with all perspectives, challenges, and verdict."""
+
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name="inspect_deliberation",
+            description=(
+                "Inspect one durable council deliberation, including its input, "
+                "perspectives, challenges, dissent, and invalidation conditions."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "deliberation_id": {
+                        "type": "string",
+                        "description": "UUID returned by run_council.",
+                    }
+                },
+                "required": ["deliberation_id"],
+            },
+            category=ToolCategory.MEMORY,
+            energy_cost=0,
+            is_read_only=True,
+            requires_approval=False,
+        )
+
+    async def execute(
+        self,
+        arguments: dict[str, Any],
+        context: ToolExecutionContext,
+    ) -> ToolResult:
+        try:
+            deliberation_id = str(
+                uuid.UUID(str(arguments.get("deliberation_id") or ""))
+            )
+        except (ValueError, TypeError, AttributeError):
+            return ToolResult.error_result(
+                "Parameter 'deliberation_id' must be a UUID returned by run_council.",
+                ToolErrorType.INVALID_PARAMS,
+            )
+        pool = context.registry.pool if context.registry else None
+        if pool is None:
+            return ToolResult.error_result(
+                "Deliberation history requires a database-backed registry.",
+                ToolErrorType.MISSING_CONFIG,
+            )
+        try:
+            from services.deliberation import inspect_deliberation
+
+            payload = await inspect_deliberation(pool, deliberation_id)
+            if not payload.get("found"):
+                return ToolResult.error_result(
+                    f"Deliberation {deliberation_id} was not found.",
+                    ToolErrorType.FILE_NOT_FOUND,
+                )
+            return ToolResult.success_result(payload)
+        except Exception as exc:
+            return ToolResult.error_result(
+                f"Could not inspect deliberation: {exc}",
+                ToolErrorType.EXECUTION_FAILED,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -497,9 +541,7 @@ class AggregateSignalsHandler(ToolHandler):
         arguments: dict[str, Any],
         context: ToolExecutionContext,
     ) -> ToolResult:
-        pool: asyncpg.Pool | None = (
-            context.registry.pool if context.registry else None
-        )
+        pool: asyncpg.Pool | None = context.registry.pool if context.registry else None
         if not pool:
             return ToolResult.error_result(
                 "Database pool not available.",
@@ -522,7 +564,8 @@ class AggregateSignalsHandler(ToolHandler):
                     ToolErrorType.EXECUTION_FAILED,
                 )
             return ToolResult.error_result(
-                "Signal aggregation failed: unexpected payload", ToolErrorType.EXECUTION_FAILED
+                "Signal aggregation failed: unexpected payload",
+                ToolErrorType.EXECUTION_FAILED,
             )
         except Exception as exc:
             logger.exception("Signal aggregation failed")
@@ -541,5 +584,7 @@ def create_council_tools() -> list[ToolHandler]:
     return [
         ListCouncilPersonasHandler(),
         RunCouncilHandler(),
+        ListDeliberationsHandler(),
+        InspectDeliberationHandler(),
         AggregateSignalsHandler(),
     ]

@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/QuixiAI/Hexis/evals/memory_benchmark/prediction.schema.v1.json",
+  "title": "Hexis Public Memory Benchmark v1 prediction",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["case_id", "answer", "citations", "contradictions", "abstained"],
+  "properties": {
+    "case_id": {"type": "string", "minLength": 1},
+    "answer": {"type": "string"},
+    "citations": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "contradictions": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "abstained": {"type": "boolean"},
+    "metadata": {"type": "object"}
+  }
+}

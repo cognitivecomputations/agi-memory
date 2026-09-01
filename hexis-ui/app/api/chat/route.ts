@@ -1,5 +1,6 @@
 import {
   errorMessage,
+  hexisApiHeaders,
   resolveHexisApiUrl,
   sseError,
   sseProxyResponse,
@@ -29,10 +30,10 @@ export async function POST(request: Request): Promise<Response> {
   try {
     upstream = await fetch(url, {
       method: "POST",
-      headers: {
+      headers: hexisApiHeaders({
         "Content-Type": request.headers.get("content-type") || "application/json",
         Accept: "text/event-stream",
-      },
+      }),
       body: bodyText,
       signal: request.signal,
     });

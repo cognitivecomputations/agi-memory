@@ -18,31 +18,34 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
+import hmac
 import html
 import json
 import logging
 import os
 import time
 import uuid
+import urllib.parse
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Literal
 
 import asyncpg
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket
 from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from channels.presentation import presentation_from_text
+from channels.presentation import citations_from_tool_output, presentation_from_text
 from core.agent_api import db_dsn_from_env, pool_sizes_from_env
-from core.agent_loop import AgentEvent, AgentEventData
+from core.agent_loop import AgentEvent, AgentEventData, describe_exception
 from core.auth.ui_flow import AuthFlowError, auth_flow_coordinator
 from core.cli_api import status_payload_rich
 from core.gateway import EventSource, Gateway
 from core.rabbitmq_bridge import RabbitMQBridge
-from core.tools import create_default_registry
+from core.tools import create_default_registry, create_full_registry
 from services.chat import resolve_prompt_addenda, stream_chat_events
 
 logger = logging.getLogger(__name__)
@@ -65,17 +68,22 @@ async def lifespan(app: FastAPI):
     # Bring the schema up to date on startup (advisory-locked, idempotent, no data loss).
     try:
         from core.agent_api import apply_migrations
+
         applied = await apply_migrations(dsn)
         if applied:
-            logger.info("Applied %d schema migration(s) on startup: %s", len(applied), applied)
+            logger.info(
+                "Applied %d schema migration(s) on startup: %s", len(applied), applied
+            )
     except Exception as exc:
         logger.warning("Startup migration check failed (continuing): %s", exc)
     _min, _max = pool_sizes_from_env(2, 10)
     _pool = await asyncpg.create_pool(dsn, min_size=_min, max_size=_max)
     from core.usage import set_usage_pool
+
     set_usage_pool(_pool)
     try:
         from core.agent_api import record_build_change
+
         async with _pool.acquire() as conn:
             await record_build_change(conn, "api")
     except Exception:
@@ -87,6 +95,7 @@ async def lifespan(app: FastAPI):
         await auth_flow_coordinator.close()
         try:
             from core.tools.mcp_runtime import MCPRuntime
+
             await MCPRuntime.instance().shutdown()
         except Exception:
             logger.debug("MCP runtime shutdown failed", exc_info=True)
@@ -98,7 +107,9 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Hexis API", lifespan=lifespan)
 
 # CORS — allow Next.js dev server and configurable origins
-_cors_origins = os.getenv("HEXIS_CORS_ORIGINS", "http://localhost:3477,http://localhost:3000").split(",")
+_cors_origins = os.getenv(
+    "HEXIS_CORS_ORIGINS", "http://localhost:3477,http://localhost:3000"
+).split(",")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[o.strip() for o in _cors_origins if o.strip()],
@@ -113,10 +124,14 @@ _API_KEY = (os.getenv("HEXIS_API_KEY") or "").strip() or None
 
 class _BearerAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        gmail_callback = request.url.path == "/api/integrations/gmail/callback" or (
-            request.url.path == "/" and ("code" in request.query_params or "error" in request.query_params)
+        oauth_callback = request.url.path in {
+            "/api/integrations/gmail/callback",
+            "/api/integrations/spotify/callback",
+        } or (
+            request.url.path == "/"
+            and ("code" in request.query_params or "error" in request.query_params)
         )
-        if _API_KEY and request.url.path != "/health" and not gmail_callback:
+        if _API_KEY and request.url.path != "/health" and not oauth_callback:
             auth = request.headers.get("authorization", "")
             if not auth.startswith("Bearer ") or auth[7:] != _API_KEY:
                 return JSONResponse({"error": "Unauthorized"}, status_code=401)
@@ -131,6 +146,7 @@ if _API_KEY:
 # Request / Response models
 # ---------------------------------------------------------------------------
 
+
 class ChatVisualAttachment(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -140,6 +156,25 @@ class ChatVisualAttachment(BaseModel):
     byte_size: int | None = Field(default=None, ge=0)
 
 
+class ChatAttachment(BaseModel):
+    """A file the user attached to this message.
+
+    Descriptive only — the file's text rides the turn as a prompt addendum
+    and its bytes are already preserved. This travels with the turn so the
+    stored message remembers what came with it, and the chat can redraw the
+    attachment when the conversation is reloaded.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    mime_type: str | None = None
+    byte_size: int | None = Field(default=None, ge=0)
+    kind: str | None = None
+    artifact_id: str | None = None
+    sensitivity: str | None = None
+
+
 class ChatRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -147,6 +182,7 @@ class ChatRequest(BaseModel):
     history: list[dict[str, Any]] | None = None
     prompt_addenda: list[str] | None = None
     visual_attachments: list[ChatVisualAttachment] | None = None
+    attachments: list[ChatAttachment] | None = None
     # Client-held session identity (#71): pass the session_id from a prior
     # turn's `done` event to keep one conversation as one session; omit and
     # the server mints one (returned in `done`).
@@ -158,6 +194,55 @@ class InboxReplyRequest(BaseModel):
 
     message_id: uuid.UUID
     reply: str = Field(min_length=1, max_length=20_000)
+
+
+class AttachmentIngestRequest(BaseModel):
+    """Start ingestion for a file already preserved by POST /api/attachments."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    filename: str | None = None
+    title: str | None = None
+    mode: str = "fast"
+    sensitivity: str | None = None
+
+
+class SpeechSynthesisRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    text: str = Field(min_length=1, max_length=20_000)
+
+
+class WebPushKeys(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    p256dh: str = Field(min_length=1, max_length=1024)
+    auth: str = Field(min_length=1, max_length=1024)
+
+
+class WebPushSubscriptionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    endpoint: str = Field(min_length=1, max_length=4096)
+    expirationTime: int | None = Field(default=None, ge=0)
+    keys: WebPushKeys
+    installed: bool = False
+    display_mode: str | None = Field(default=None, max_length=80)
+
+
+class WebPushRevokeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    endpoint: str = Field(min_length=1, max_length=4096)
+
+
+class PwaPresenceRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    device_id: str = Field(min_length=1, max_length=200)
+    presence: Literal["online", "offline", "idle"]
+    display_mode: str | None = Field(default=None, max_length=80)
+    visibility: Literal["visible", "hidden"] | None = None
 
 
 class IngestTextRequest(BaseModel):
@@ -190,6 +275,31 @@ class ResponsibilityActionRequest(BaseModel):
     action: str
     arguments: dict[str, Any] = Field(default_factory=dict)
     source_session_id: str | None = None
+
+
+class OutboundControlRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    action: Literal[
+        "suspend_global", "resume_global", "suspend_entity", "resume_entity"
+    ]
+    entity: str | None = None
+    reason: str | None = None
+
+
+class NodePairingDecisionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    request: str = Field(min_length=1, max_length=100)
+    decision: Literal["approve", "deny"]
+    note: str | None = Field(default=None, max_length=1000)
+
+
+class NodeRevokeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    node_id: str = Field(min_length=1, max_length=128)
+    reason: str | None = Field(default=None, max_length=1000)
 
 
 class UserModelReviewRequest(BaseModel):
@@ -253,12 +363,17 @@ class InitAuthCompleteRequest(BaseModel):
 # SSE helpers
 # ---------------------------------------------------------------------------
 
+
 def _sse_event(event: str, payload: dict[str, Any]) -> str:
     return f"event: {event}\ndata: {json.dumps(payload)}\n\n"
 
 
 def _openai_sse_data(payload: dict[str, Any] | str) -> str:
-    encoded = payload if isinstance(payload, str) else json.dumps(payload, separators=(",", ":"))
+    encoded = (
+        payload
+        if isinstance(payload, str)
+        else json.dumps(payload, separators=(",", ":"))
+    )
     return f"data: {encoded}\n\n"
 
 
@@ -425,7 +540,9 @@ def _prepare_openai_chat(
     history: list[dict[str, Any]] = []
     for index, message in enumerate(req.messages):
         if message.role not in allowed_roles:
-            raise ValueError(f"messages[{index}].role {message.role!r} is not supported")
+            raise ValueError(
+                f"messages[{index}].role {message.role!r} is not supported"
+            )
         if message.tool_calls or message.tool_call_id:
             raise ValueError("client-supplied tool call history is not supported")
         if message.model_extra:
@@ -512,7 +629,9 @@ async def init_auth_session(session_id: str):
 async def init_auth_complete(req: InitAuthCompleteRequest):
     """Complete an authorization-code flow from a pasted code or redirect URL."""
     try:
-        return await auth_flow_coordinator.complete(req.session_id, req.authorization_input)
+        return await auth_flow_coordinator.complete(
+            req.session_id, req.authorization_input
+        )
     except AuthFlowError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -530,8 +649,7 @@ async def init_openai_codex_models():
     except Exception as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)
 
-    rows = await pool.fetch(
-        """
+    rows = await pool.fetch("""
         SELECT DISTINCT model
         FROM api_usage
         WHERE provider = 'openai-codex'
@@ -539,8 +657,7 @@ async def init_openai_codex_models():
           AND operation = 'consent_response'
           AND created_at > now() - interval '24 hours'
           AND metadata #>> '{response,error}' ILIKE '%Model not found%'
-        """
-    )
+        """)
     unavailable = {str(row["model"]) for row in rows}
     return {
         "models": [model for model in models if model not in unavailable],
@@ -581,6 +698,7 @@ def _gmail_callback_page(
     message: str,
     status: str,
     status_code: int = 200,
+    connector_label: str = "Gmail",
 ) -> HTMLResponse:
     return_url = _ui_return_url()
     status_class = "ok" if status == "connected" else "error"
@@ -658,7 +776,7 @@ def _gmail_callback_page(
       <span class="label {status_class}">{html.escape(status)}</span>
       <h1>{html.escape(title)}</h1>
       <p>{html.escape(message)}</p>
-      <p>You can return to Hexis now. The Gmail setup panel will show the updated status.</p>
+      <p>You can return to Hexis now. The {html.escape(connector_label)} setup panel will show the updated status.</p>
       <a href="{html.escape(return_url)}">Return to Hexis</a>
     </main>
   </body>
@@ -668,7 +786,10 @@ def _gmail_callback_page(
 
 async def _handle_gmail_oauth_callback(request: Request) -> HTMLResponse:
     if request.query_params.get("error"):
-        detail = request.query_params.get("error_description") or request.query_params["error"]
+        detail = (
+            request.query_params.get("error_description")
+            or request.query_params["error"]
+        )
         return _gmail_callback_page(
             title="Gmail was not connected",
             message=f"Google returned: {detail}",
@@ -696,7 +817,9 @@ async def _handle_gmail_oauth_callback(request: Request) -> HTMLResponse:
     try:
         from core.auth.google_gmail import GmailOAuthError, complete_gmail_oauth
 
-        completed = await complete_gmail_oauth(pool, authorization_response=str(request.url))
+        completed = await complete_gmail_oauth(
+            pool, authorization_response=str(request.url)
+        )
     except GmailOAuthError as exc:
         return _gmail_callback_page(
             title="Gmail was not connected",
@@ -733,6 +856,71 @@ async def gmail_oauth_callback(request: Request):
     return await _handle_gmail_oauth_callback(request)
 
 
+async def _handle_spotify_oauth_callback(request: Request) -> HTMLResponse:
+    if request.query_params.get("error"):
+        return _gmail_callback_page(
+            title="Spotify was not connected",
+            message=f"Spotify returned: {request.query_params['error']}",
+            status="authorization failed",
+            status_code=400,
+            connector_label="Spotify",
+        )
+    if not request.query_params.get("code"):
+        return _gmail_callback_page(
+            title="Spotify connection is incomplete",
+            message="Spotify did not include an authorization code in this callback.",
+            status="incomplete",
+            status_code=400,
+            connector_label="Spotify",
+        )
+    pool = _pool
+    if pool is None:
+        return _gmail_callback_page(
+            title="Hexis is still starting",
+            message="The local Hexis API is not ready. Return to Hexis and start Spotify sign-in again.",
+            status="not ready",
+            status_code=503,
+            connector_label="Spotify",
+        )
+    try:
+        from core.auth.spotify import SpotifyOAuthError, complete_spotify_oauth
+
+        completed = await complete_spotify_oauth(
+            pool, authorization_response=str(request.url)
+        )
+    except SpotifyOAuthError as exc:
+        return _gmail_callback_page(
+            title="Spotify was not connected",
+            message=str(exc),
+            status="setup failed",
+            status_code=400,
+            connector_label="Spotify",
+        )
+    except Exception as exc:
+        logger.exception("Spotify OAuth callback failed")
+        return _gmail_callback_page(
+            title="Spotify was not connected",
+            message=str(exc),
+            status="setup failed",
+            status_code=500,
+            connector_label="Spotify",
+        )
+    return _gmail_callback_page(
+        title="Spotify connected",
+        message=(
+            f"{completed.display_name or completed.account_key} is connected to Hexis "
+            "with the Spotify permissions you approved."
+        ),
+        status="connected",
+        connector_label="Spotify",
+    )
+
+
+@app.get("/api/integrations/spotify/callback", response_class=HTMLResponse)
+async def spotify_oauth_callback(request: Request):
+    return await _handle_spotify_oauth_callback(request)
+
+
 @app.get("/api/status")
 async def status():
     try:
@@ -757,7 +945,7 @@ async def reply_to_web_inbox(req: InboxReplyRequest):
     async with pool.acquire() as conn:
         source = await conn.fetchrow(
             """
-            SELECT id, outbox_msg_id, kind, intent, message
+            SELECT id, outbox_msg_id, kind, intent, message, payload
             FROM web_inbox
             WHERE id = $1
             """,
@@ -765,6 +953,55 @@ async def reply_to_web_inbox(req: InboxReplyRequest):
         )
     if source is None:
         raise HTTPException(status_code=404, detail="Outbox message not found")
+
+    source_payload = source["payload"]
+    if isinstance(source_payload, str):
+        try:
+            source_payload = json.loads(source_payload)
+        except Exception:
+            source_payload = {}
+    delivery = (
+        source_payload.get("delivery")
+        if isinstance(source_payload, dict)
+        and isinstance(source_payload.get("delivery"), dict)
+        else {}
+    )
+    question_id = delivery.get("question_id") if isinstance(delivery, dict) else None
+    if question_id:
+        try:
+            parsed_question_id = str(uuid.UUID(str(question_id)))
+        except (ValueError, TypeError, AttributeError):
+            raise HTTPException(
+                status_code=409,
+                detail="This inbox question has an invalid correlation id. Send a new chat message with your answer.",
+            )
+        choice_index = int(reply) if reply.isdigit() else None
+        async with pool.acquire() as conn:
+            raw = await conn.fetchval(
+                "SELECT answer_agent_question($1::uuid, $2, $3, 'web_inbox', 'dashboard')",
+                parsed_question_id,
+                None if choice_index is not None else reply,
+                choice_index,
+            )
+            result = json.loads(raw) if isinstance(raw, str) else (raw or {})
+            if result.get("ok"):
+                await conn.fetchval(
+                    "SELECT mark_web_inbox_read(ARRAY[$1::uuid])", req.message_id
+                )
+        if not result.get("ok"):
+            raise HTTPException(
+                status_code=409,
+                detail=result.get("message")
+                or "That question is no longer waiting for an answer.",
+            )
+        return JSONResponse(
+            {
+                "queued": False,
+                "answered": True,
+                "question_id": parsed_question_id,
+                "status": result.get("status"),
+            }
+        )
 
     inbox_message_id = uuid.uuid4()
     content = (
@@ -824,12 +1061,20 @@ async def _integration_status_payload(
     connector_id: str | None = None,
 ) -> dict[str, Any]:
     normalized_id = str(connector_id or "").strip().lower().replace("-", "_") or None
-    channel_filter = normalized_id if normalized_id in {"slack", "telegram", "signal"} else None
+    channel_filter = (
+        normalized_id if normalized_id in {"slack", "telegram", "signal"} else None
+    )
     include_gmail_config = normalized_id in {None, "gmail"}
     async with pool.acquire() as conn:
-        integration_raw = await conn.fetchval("SELECT integration_status($1)", normalized_id)
-        runtime_raw = await conn.fetchval("SELECT list_channel_adapter_status($1)", channel_filter)
-        backfill_raw = await conn.fetchval("SELECT get_connector_backfill_status($1, NULL)", normalized_id)
+        integration_raw = await conn.fetchval(
+            "SELECT integration_status($1)", normalized_id
+        )
+        runtime_raw = await conn.fetchval(
+            "SELECT list_channel_adapter_status($1)", channel_filter
+        )
+        backfill_raw = await conn.fetchval(
+            "SELECT get_connector_backfill_status($1, NULL)", normalized_id
+        )
         gmail_memory_policy = (
             await conn.fetchval(
                 "SELECT COALESCE(get_config_text('integrations.gmail.memory_policy'), 'ask')"
@@ -869,8 +1114,14 @@ async def _integration_status_payload(
     payload["channel_runtime"] = _json_value(runtime_raw) or []
     payload["backfill"] = {
         "jobs": backfill.get("jobs") if isinstance(backfill.get("jobs"), list) else [],
-        "cursors": backfill.get("cursors") if isinstance(backfill.get("cursors"), list) else [],
-        "item_counts": backfill.get("item_counts") if isinstance(backfill.get("item_counts"), list) else [],
+        "cursors": (
+            backfill.get("cursors") if isinstance(backfill.get("cursors"), list) else []
+        ),
+        "item_counts": (
+            backfill.get("item_counts")
+            if isinstance(backfill.get("item_counts"), list)
+            else []
+        ),
     }
     payload["generated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     return payload
@@ -882,13 +1133,16 @@ async def integration_status(connector_id: str | None = None):
     if pool is None:
         return JSONResponse({"error": "Server not ready (no DB pool)"}, status_code=503)
     try:
-        return JSONResponse(jsonable_encoder(await _integration_status_payload(pool, connector_id)))
+        return JSONResponse(
+            jsonable_encoder(await _integration_status_payload(pool, connector_id))
+        )
     except Exception as exc:
         logger.error("Integration status failed: %s", exc)
         return JSONResponse({"error": str(exc)}, status_code=500)
 
 
 _INTEGRATION_ACTION_TO_TOOL = {
+    "setup_status": "integration_setup_status",
     "start_setup": "start_integration_setup",
     "configure_channel": "configure_channel_integration",
     "connect_gmail": "connect_gmail",
@@ -903,6 +1157,10 @@ _INTEGRATION_ACTION_TO_TOOL = {
     "start_connector_backfill": "start_connector_backfill",
     "control_connector_backfill": "control_connector_backfill",
     "verify_channel": "verify_channel_integration",
+    "connect_life": "connect_life_integration",
+    "connect_spotify": "connect_spotify",
+    "complete_spotify": "complete_spotify_connection",
+    "revoke_life": "revoke_life_integration",
 }
 
 
@@ -928,10 +1186,42 @@ def _integration_action_arguments(
                 detail=f"{action} supports {', '.join(sorted(allowed))}.",
             )
         args["connector_id"] = connector_id
-    if action in {"start_setup", "connect_gmail", "connect_twitter_x", "start_gmail_backfill", "start_connector_backfill"}:
+    if action in {"connect_life", "revoke_life", "setup_status"}:
+        connector_id = (
+            str(args.get("connector_id") or "").strip().lower().replace("-", "_")
+        )
+        allowed = {"notion", "spotify", "home_assistant", "weather", "trello"}
+        if connector_id not in allowed:
+            raise HTTPException(
+                status_code=422,
+                detail=f"{action} supports {', '.join(sorted(allowed))}.",
+            )
+        if action == "connect_life" and connector_id == "spotify":
+            raise HTTPException(
+                status_code=422, detail="Use connect_spotify for Spotify setup."
+            )
+        args["connector_id"] = connector_id
+    if action in {
+        "start_setup",
+        "connect_gmail",
+        "connect_twitter_x",
+        "start_gmail_backfill",
+        "start_connector_backfill",
+        "connect_life",
+        "connect_spotify",
+    }:
         args.setdefault("source_channel", "web")
     if (
-        action in {"start_setup", "connect_gmail", "connect_twitter_x", "start_gmail_backfill", "start_connector_backfill"}
+        action
+        in {
+            "start_setup",
+            "connect_gmail",
+            "connect_twitter_x",
+            "start_gmail_backfill",
+            "start_connector_backfill",
+            "connect_life",
+            "connect_spotify",
+        }
         and source_session_id
     ):
         args.setdefault("source_session_id", source_session_id)
@@ -966,7 +1256,10 @@ async def _tee_outbox_to_web_inbox(pool: asyncpg.Pool, messages: list[Any]) -> i
                 continue
             payload = msg.get("payload") if isinstance(msg.get("payload"), dict) else {}
             delivery_info = payload.get("delivery") or msg.get("delivery")
-            if isinstance(delivery_info, dict) and delivery_info.get("mode") == "silent":
+            if (
+                isinstance(delivery_info, dict)
+                and delivery_info.get("mode") == "silent"
+            ):
                 continue
             body = {
                 "id": msg.get("message_id") or msg.get("id"),
@@ -1009,7 +1302,10 @@ async def integration_action(req: IntegrationActionRequest):
 
     if action == "revoke_connection":
         connector_id = (
-            str(action_arguments.get("connector_id") or "").strip().lower().replace("-", "_")
+            str(action_arguments.get("connector_id") or "")
+            .strip()
+            .lower()
+            .replace("-", "_")
         )
         if not connector_id:
             raise HTTPException(status_code=422, detail="connector_id is required")
@@ -1034,7 +1330,10 @@ async def integration_action(req: IntegrationActionRequest):
         )
 
     if action == "save_gmail_client_secret":
-        from core.auth.google_gmail import GmailOAuthError, save_gmail_client_secret_payload
+        from core.auth.google_gmail import (
+            GmailOAuthError,
+            save_gmail_client_secret_payload,
+        )
         from core.tools.base import ToolContext, ToolExecutionContext
 
         secret_payload = action_arguments.get("client_secret_json")
@@ -1053,7 +1352,9 @@ async def integration_action(req: IntegrationActionRequest):
             )
 
         try:
-            saved = save_gmail_client_secret_payload(secret_payload, source="web_upload")
+            saved = save_gmail_client_secret_payload(
+                secret_payload, source="web_upload"
+            )
         except GmailOAuthError as exc:
             return JSONResponse(
                 {
@@ -1078,7 +1379,11 @@ async def integration_action(req: IntegrationActionRequest):
         )
         status_result = await registry.execute("gmail_setup_status", {}, context)
         status_payload = _tool_result_payload(status_result)
-        output = status_payload.get("output") if isinstance(status_payload.get("output"), dict) else {}
+        output = (
+            status_payload.get("output")
+            if isinstance(status_payload.get("output"), dict)
+            else {}
+        )
         merged_output = {**output, **saved}
         ui = merged_output.get("ui")
         if isinstance(ui, dict):
@@ -1102,12 +1407,16 @@ async def integration_action(req: IntegrationActionRequest):
 
     tool_name = _INTEGRATION_ACTION_TO_TOOL.get(action)
     if not tool_name:
-        raise HTTPException(status_code=422, detail=f"unknown integration action: {action}")
+        raise HTTPException(
+            status_code=422, detail=f"unknown integration action: {action}"
+        )
 
     from core.tools.base import ToolContext, ToolExecutionContext
 
     registry = create_default_registry(pool)
-    args = _integration_action_arguments(action, action_arguments, req.source_session_id)
+    args = _integration_action_arguments(
+        action, action_arguments, req.source_session_id
+    )
     context = ToolExecutionContext(
         tool_context=ToolContext.CHAT,
         call_id=f"web-integration:{uuid.uuid4()}",
@@ -1116,7 +1425,126 @@ async def integration_action(req: IntegrationActionRequest):
     )
     result = await registry.execute(tool_name, args, context)
     status_code = 200 if result.success else 400
-    return JSONResponse(jsonable_encoder(_tool_result_payload(result)), status_code=status_code)
+    return JSONResponse(
+        jsonable_encoder(_tool_result_payload(result)), status_code=status_code
+    )
+
+
+@app.get("/api/outbound")
+async def outbound_ledger(limit: int = 100, entity: str | None = None):
+    """Inspectable purpose/cost/delivery ledger and its kill-switch state."""
+    pool = _pool
+    if pool is None:
+        return JSONResponse({"error": "Server not ready (no DB pool)"}, status_code=503)
+    bounded_limit = max(1, min(int(limit or 100), 500))
+    async with pool.acquire() as conn:
+        raw = await conn.fetchval(
+            "SELECT get_outbound_ledger($1::int, $2::text)", bounded_limit, entity
+        )
+    return JSONResponse(jsonable_encoder(_json_value(raw) or {}))
+
+
+@app.post("/api/outbound/control")
+async def outbound_control(req: OutboundControlRequest):
+    """Operator controls can pause sends; they never erase a recipient STOP."""
+    pool = _pool
+    if pool is None:
+        return JSONResponse({"error": "Server not ready (no DB pool)"}, status_code=503)
+    if (
+        req.action in {"suspend_entity", "resume_entity"}
+        and not str(req.entity or "").strip()
+    ):
+        raise HTTPException(status_code=422, detail="entity is required")
+
+    async with pool.acquire() as conn:
+        if req.action in {"suspend_global", "resume_global"}:
+            raw = await conn.fetchval(
+                "SELECT set_outbound_global_suspension($1)",
+                req.action == "suspend_global",
+            )
+        else:
+            raw = await conn.fetchval(
+                "SELECT set_outbound_entity_suspension($1, $2, $3)",
+                str(req.entity).strip(),
+                req.action == "suspend_entity",
+                req.reason,
+            )
+        ledger_raw = await conn.fetchval("SELECT get_outbound_ledger(100, NULL)")
+    return JSONResponse(
+        jsonable_encoder(
+            {
+                "control": _json_value(raw) or {},
+                "ledger": _json_value(ledger_raw) or {},
+            }
+        )
+    )
+
+
+@app.websocket("/api/nodes/connect")
+async def node_connect(websocket: WebSocket):
+    """Outward-only signed node transport; unknown identities can only request pairing."""
+    pool = _pool
+    if pool is None:
+        await websocket.close(code=1013, reason="Server database is not ready")
+        return
+    from services.node_gateway import handle_node_websocket
+
+    await handle_node_websocket(websocket, pool)
+
+
+@app.get("/api/nodes")
+async def nodes_status():
+    """Approved nodes plus pending pairing decisions for the operator surface."""
+    pool = _pool
+    if pool is None:
+        return JSONResponse({"error": "Server not ready (no DB pool)"}, status_code=503)
+    async with pool.acquire() as conn:
+        nodes_raw = await conn.fetchval("SELECT list_hexis_nodes()")
+        pending_raw = await conn.fetchval(
+            "SELECT list_node_pairing_requests('pending', 50)"
+        )
+    return JSONResponse(
+        jsonable_encoder(
+            {
+                "nodes": _json_value(nodes_raw) or [],
+                "pending_pairings": _json_value(pending_raw) or [],
+            }
+        )
+    )
+
+
+@app.post("/api/nodes/pairing")
+async def node_pairing_decision(req: NodePairingDecisionRequest):
+    pool = _pool
+    if pool is None:
+        return JSONResponse({"error": "Server not ready (no DB pool)"}, status_code=503)
+    async with pool.acquire() as conn:
+        raw = await conn.fetchval(
+            "SELECT decide_node_pairing($1, $2, 'dashboard', $3)",
+            req.request,
+            req.decision,
+            req.note,
+        )
+    result = _json_value(raw) or {}
+    status_code = (
+        200 if result.get("status") not in {"not_found", "invalid_decision"} else 404
+    )
+    return JSONResponse(jsonable_encoder(result), status_code=status_code)
+
+
+@app.post("/api/nodes/revoke")
+async def node_revoke(req: NodeRevokeRequest):
+    pool = _pool
+    if pool is None:
+        return JSONResponse({"error": "Server not ready (no DB pool)"}, status_code=503)
+    async with pool.acquire() as conn:
+        raw = await conn.fetchval(
+            "SELECT revoke_hexis_node($1, 'dashboard', $2)", req.node_id, req.reason
+        )
+    result = _json_value(raw) or {}
+    return JSONResponse(
+        jsonable_encoder(result), status_code=200 if result.get("revoked") else 404
+    )
 
 
 @app.get("/api/responsibilities")
@@ -1128,14 +1556,20 @@ async def responsibilities(status: str | None = None, limit: int = 50):
     async with pool.acquire() as conn:
         await conn.fetchval("SELECT refresh_ambient_responsibility_blockers()")
         status_raw = await conn.fetchval("SELECT ambient_responsibility_status()")
-        rows_raw = await conn.fetchval("SELECT list_ambient_responsibilities($1, $2::int)", status, limit)
+        rows_raw = await conn.fetchval(
+            "SELECT list_ambient_responsibilities($1, $2::int)", status, limit
+        )
     status_payload = _json_value(status_raw) or {}
     rows = _json_value(rows_raw) or []
-    return JSONResponse(jsonable_encoder({
-        "status": status_payload,
-        "responsibilities": rows if isinstance(rows, list) else [],
-        "limit": limit,
-    }))
+    return JSONResponse(
+        jsonable_encoder(
+            {
+                "status": status_payload,
+                "responsibilities": rows if isinstance(rows, list) else [],
+                "limit": limit,
+            }
+        )
+    )
 
 
 @app.get("/api/responsibilities/{responsibility_id}")
@@ -1146,10 +1580,14 @@ async def responsibility_detail(responsibility_id: str):
     try:
         parsed = uuid.UUID(responsibility_id)
     except ValueError:
-        raise HTTPException(status_code=422, detail="responsibility_id must be a valid UUID")
+        raise HTTPException(
+            status_code=422, detail="responsibility_id must be a valid UUID"
+        )
     async with pool.acquire() as conn:
         await conn.fetchval("SELECT refresh_ambient_responsibility_blockers()")
-        raw = await conn.fetchval("SELECT ambient_responsibility_detail($1::uuid)", str(parsed))
+        raw = await conn.fetchval(
+            "SELECT ambient_responsibility_detail($1::uuid)", str(parsed)
+        )
     payload = _json_value(raw) or {}
     if not payload.get("success"):
         return JSONResponse(jsonable_encoder(payload), status_code=404)
@@ -1188,13 +1626,21 @@ async def responsibility_action(req: ResponsibilityActionRequest):
     payload = _tool_result_payload(result)
 
     output = payload.get("output") if isinstance(payload.get("output"), dict) else {}
-    evaluation = output.get("evaluation") if isinstance(output.get("evaluation"), dict) else {}
-    outbox_messages = evaluation.get("outbox_messages") if isinstance(evaluation.get("outbox_messages"), list) else []
+    evaluation = (
+        output.get("evaluation") if isinstance(output.get("evaluation"), dict) else {}
+    )
+    outbox_messages = (
+        evaluation.get("outbox_messages")
+        if isinstance(evaluation.get("outbox_messages"), list)
+        else []
+    )
     if outbox_messages:
         delivered = await _tee_outbox_to_web_inbox(pool, outbox_messages)
         evaluation["web_inbox_delivered"] = delivered
 
-    return JSONResponse(jsonable_encoder(payload), status_code=200 if result.success else 400)
+    return JSONResponse(
+        jsonable_encoder(payload), status_code=200 if result.success else 400
+    )
 
 
 @app.get("/api/user-model/claims")
@@ -1294,7 +1740,11 @@ async def connector_importance(
     total = int(items[0].get("total") or 0) if items else 0
     for item in items:
         item.pop("total", None)
-    return JSONResponse(jsonable_encoder({"items": items, "total": total, "limit": limit, "offset": offset}))
+    return JSONResponse(
+        jsonable_encoder(
+            {"items": items, "total": total, "limit": limit, "offset": offset}
+        )
+    )
 
 
 @app.post("/api/webhook/{source}")
@@ -1316,10 +1766,121 @@ async def webhook(source: str, request: Request):
             f"webhook:{source}",
             payload,
         )
-        return JSONResponse({"status": "accepted", "event_id": event_id}, status_code=202)
+        return JSONResponse(
+            {"status": "accepted", "event_id": event_id}, status_code=202
+        )
     except Exception as e:
         logger.error("Webhook submit failed: %s", e)
         return JSONResponse({"error": str(e)}, status_code=500)
+
+
+def _verify_slack_signature(
+    raw_body: bytes,
+    timestamp: str | None,
+    signature: str | None,
+    signing_secret: str,
+) -> bool:
+    """Verify Slack's v0 HMAC and reject requests older than five minutes."""
+    if not timestamp or not signature or not signing_secret:
+        return False
+    try:
+        sent_at = int(timestamp)
+    except (TypeError, ValueError):
+        return False
+    if abs(time.time() - sent_at) > 300:
+        return False
+    base = b"v0:" + timestamp.encode("utf-8") + b":" + raw_body
+    digest = hmac.new(signing_secret.encode("utf-8"), base, hashlib.sha256).hexdigest()
+    return hmac.compare_digest("v0=" + digest, signature)
+
+
+@app.post("/api/slack/interactivity")
+async def slack_interactivity(request: Request):
+    """Receive signed Block Kit decisions when Slack is not using Socket Mode."""
+    pool = _pool
+    if pool is None:
+        return JSONResponse({"error": "Server not ready"}, status_code=503)
+    raw_body = await request.body()
+    try:
+        from channels.slack_adapter import _resolve_token
+
+        async with pool.acquire() as conn:
+            secret_ref = await conn.fetchval(
+                "SELECT get_config_text('channel.slack.signing_secret')"
+            )
+        signing_secret = _resolve_token(
+            {"signing_secret": secret_ref},
+            "signing_secret",
+            "SLACK_SIGNING_SECRET",
+        )
+    except Exception:
+        logger.warning("Slack signing-secret lookup failed", exc_info=True)
+        signing_secret = None
+    if not signing_secret:
+        return JSONResponse(
+            {
+                "error": "Slack signing secret is not configured",
+                "next_step": (
+                    "Set SLACK_SIGNING_SECRET and store that env-var name in "
+                    "channel.slack.signing_secret, or use Socket Mode."
+                ),
+            },
+            status_code=401,
+        )
+    if not _verify_slack_signature(
+        raw_body,
+        request.headers.get("X-Slack-Request-Timestamp"),
+        request.headers.get("X-Slack-Signature"),
+        signing_secret,
+    ):
+        return JSONResponse({"error": "invalid Slack signature"}, status_code=401)
+
+    try:
+        form = urllib.parse.parse_qs(raw_body.decode("utf-8"))
+        payload_raw = (form.get("payload") or [""])[0]
+        payload = json.loads(payload_raw) if payload_raw else {}
+    except Exception:
+        logger.warning("Slack interactivity payload was malformed", exc_info=True)
+        return Response(status_code=200)
+    if payload.get("type") != "block_actions":
+        return Response(status_code=200)
+
+    actor = str(((payload.get("user") or {}).get("id")) or "")
+    actions = payload.get("actions") or []
+    try:
+        async with pool.acquire() as conn:
+            for action in actions if isinstance(actions, list) else []:
+                if not isinstance(action, dict):
+                    continue
+                action_id = str(action.get("action_id") or "")
+                if action_id not in {
+                    "operator_approval_approve",
+                    "operator_approval_deny",
+                }:
+                    continue
+                try:
+                    value = json.loads(str(action.get("value") or "{}"))
+                except json.JSONDecodeError:
+                    continue
+                request_id = str(value.get("approval_request_id") or "")
+                decision = str(value.get("decision") or "")
+                if not request_id or decision not in {"approve", "deny"}:
+                    continue
+                await conn.fetchval(
+                    """
+                    SELECT record_operator_tool_approval_decision(
+                        $1::uuid, $2, 'slack', $3, NULL
+                    )
+                    """,
+                    request_id,
+                    decision,
+                    actor,
+                )
+    except Exception:
+        # Slack retries non-2xx responses. The decision is idempotent, but a
+        # retry storm helps nobody; log the durable failure and acknowledge.
+        logger.warning("Slack approval action dispatch failed", exc_info=True)
+    return Response(status_code=200)
 
 
 @app.get("/api/events/stream")
@@ -1362,8 +1923,7 @@ async def _stream_manual_heartbeat(pool: asyncpg.Pool) -> AsyncIterator[str]:
     from services.worker_service import _extract_heartbeat_context
 
     async with pool.acquire() as conn:
-        state = await conn.fetchrow(
-            """
+        state = await conn.fetchrow("""
             SELECT is_agent_configured() AS configured,
                    is_init_complete() AS initialized,
                    is_agent_terminated() AS terminated,
@@ -1371,16 +1931,24 @@ async def _stream_manual_heartbeat(pool: asyncpg.Pool) -> AsyncIterator[str]:
                    active_heartbeat_id
             FROM heartbeat_state
             WHERE id = 1
-            """
-        )
+            """)
         if not state or not state["configured"] or not state["initialized"]:
-            yield _sse_event("error", {"message": "Complete initialization before running a heartbeat."})
+            yield _sse_event(
+                "error",
+                {"message": "Complete initialization before running a heartbeat."},
+            )
             return
         if state["terminated"]:
-            yield _sse_event("error", {"message": "The agent is terminated and cannot run a heartbeat."})
+            yield _sse_event(
+                "error",
+                {"message": "The agent is terminated and cannot run a heartbeat."},
+            )
             return
         if state["is_paused"]:
-            yield _sse_event("error", {"message": "Heartbeat is paused. Resume it before running one now."})
+            yield _sse_event(
+                "error",
+                {"message": "Heartbeat is paused. Resume it before running one now."},
+            )
             return
         if state["active_heartbeat_id"]:
             yield _sse_event("error", {"message": "A heartbeat is already running."})
@@ -1390,7 +1958,9 @@ async def _stream_manual_heartbeat(pool: asyncpg.Pool) -> AsyncIterator[str]:
         payload = (
             raw_payload
             if isinstance(raw_payload, dict)
-            else json.loads(raw_payload) if isinstance(raw_payload, str) else {}
+            else json.loads(raw_payload)
+            if isinstance(raw_payload, str)
+            else {}
         )
         heartbeat_id = str(payload.get("heartbeat_id") or "")
         if not heartbeat_id:
@@ -1398,17 +1968,20 @@ async def _stream_manual_heartbeat(pool: asyncpg.Pool) -> AsyncIterator[str]:
             return
 
         heartbeat_number = payload.get("heartbeat_number")
-        yield _sse_event("heartbeat_start", {
-            "heartbeat_id": heartbeat_id,
-            "heartbeat_number": heartbeat_number,
-        })
+        yield _sse_event(
+            "heartbeat_start",
+            {
+                "heartbeat_id": heartbeat_id,
+                "heartbeat_number": heartbeat_number,
+            },
+        )
 
         queue: asyncio.Queue[AgentEventData] = asyncio.Queue()
 
         async def on_event(event: AgentEventData) -> None:
             await queue.put(event)
 
-        registry = create_default_registry(pool)
+        registry = await create_full_registry(pool)
         context = _extract_heartbeat_context(payload)
         task = asyncio.create_task(
             run_agentic_heartbeat(
@@ -1435,15 +2008,18 @@ async def _stream_manual_heartbeat(pool: asyncpg.Pool) -> AsyncIterator[str]:
                 heartbeat_id=heartbeat_id,
                 result=result,
             )
-            yield _sse_event("heartbeat_done", {
-                "heartbeat_id": heartbeat_id,
-                "heartbeat_number": heartbeat_number,
-                "text": result.get("text") or "",
-                "tool_calls": result.get("tool_calls_made") or [],
-                "energy_spent": result.get("energy_spent") or 0,
-                "stopped_reason": result.get("stopped_reason") or "completed",
-                "memory_id": finalized.get("memory_id"),
-            })
+            yield _sse_event(
+                "heartbeat_done",
+                {
+                    "heartbeat_id": heartbeat_id,
+                    "heartbeat_number": heartbeat_number,
+                    "text": result.get("text") or "",
+                    "tool_calls": result.get("tool_calls_made") or [],
+                    "energy_spent": result.get("energy_spent") or 0,
+                    "stopped_reason": result.get("stopped_reason") or "completed",
+                    "memory_id": finalized.get("memory_id"),
+                },
+            )
         except Exception as exc:
             logger.exception("Manual heartbeat failed")
             await conn.fetchval("SELECT release_active_heartbeat($1)", heartbeat_id)
@@ -1463,8 +2039,12 @@ def _heartbeat_agent_sse(event: AgentEventData) -> str:
         return _sse_event("tool", {"status": "end", **event.data})
     if event.event == AgentEvent.TEXT_DELTA:
         return _sse_event("text", event.data)
+    if event.event == AgentEvent.REASONING_DELTA:
+        return _sse_event("phase", {"phase": "reasoning", "status": "progress"})
     if event.event == AgentEvent.ERROR:
-        return _sse_event("error", {"message": event.data.get("error", "Heartbeat failed")})
+        return _sse_event(
+            "error", {"message": event.data.get("error", "Heartbeat failed")}
+        )
     return _sse_event("agent_event", {"event": event.event.value, **event.data})
 
 
@@ -1510,7 +2090,9 @@ async def _sse_event_stream(pool: asyncpg.Pool) -> AsyncIterator[str]:
                         "status": row["status"],
                         "session_key": row["session_key"],
                         "correlation_id": str(row["correlation_id"]),
-                        "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+                        "created_at": (
+                            row["created_at"].isoformat() if row["created_at"] else None
+                        ),
                     }
                     yield _sse_event("gateway_event", event_data)
             except Exception:
@@ -1551,17 +2133,21 @@ async def ingest_text(req: IngestTextRequest):
         raise HTTPException(status_code=422, detail="content is required")
     mode_value = (req.mode or "fast").lower()
     if mode_value not in ("fast", "slow", "hybrid"):
-        raise HTTPException(status_code=422, detail="mode must be fast, slow, or hybrid")
+        raise HTTPException(
+            status_code=422, detail="mode must be fast, slow, or hybrid"
+        )
     sensitivity = (req.sensitivity or "").strip().lower() or None
     if sensitivity not in (None, "private"):
-        raise HTTPException(status_code=422, detail="sensitivity must be omitted or 'private'")
+        raise HTTPException(
+            status_code=422, detail="sensitivity must be omitted or 'private'"
+        )
     if _pool is None:
         raise HTTPException(status_code=503, detail="database not ready")
 
     title = (req.title or "").strip()
     if not title:
         first_line = next((ln.strip() for ln in content.splitlines() if ln.strip()), "")
-        title = (first_line[:80] or "Pasted text")
+        title = first_line[:80] or "Pasted text"
 
     # Durable job (#87): survives restarts, retries with backoff, resumes
     # partial documents via receipts. The maintenance worker is the consumer.
@@ -1571,13 +2157,15 @@ async def ingest_text(req: IngestTextRequest):
     async with _pool.acquire() as conn:
         job_id = await conn.fetchval(
             "SELECT enqueue_ingestion_job('text', $1::jsonb, $2, $3)",
-            json.dumps({
-                "title": title,
-                "mode": mode_value,
-                "source_type": "pasted_text",
-                "sensitivity": sensitivity,
-                "acquisition": "user",
-            }),
+            json.dumps(
+                {
+                    "title": title,
+                    "mode": mode_value,
+                    "source_type": "pasted_text",
+                    "sensitivity": sensitivity,
+                    "acquisition": "user",
+                }
+            ),
             content,
             content_hash,
         )
@@ -1603,27 +2191,144 @@ async def ingest_url_enqueue(req: IngestUrlRequest):
         raise HTTPException(status_code=503, detail="database not ready")
     target = (req.url or "").strip()
     if not target.lower().startswith(("http://", "https://")):
-        raise HTTPException(status_code=422, detail="url must start with http:// or https://")
+        raise HTTPException(
+            status_code=422, detail="url must start with http:// or https://"
+        )
     mode_value = (req.mode or "fast").lower()
     if mode_value not in ("fast", "slow", "hybrid"):
-        raise HTTPException(status_code=422, detail="mode must be fast, slow, or hybrid")
+        raise HTTPException(
+            status_code=422, detail="mode must be fast, slow, or hybrid"
+        )
     sensitivity = (req.sensitivity or "").strip().lower() or None
     if sensitivity not in (None, "private"):
-        raise HTTPException(status_code=422, detail="sensitivity must be omitted or 'private'")
+        raise HTTPException(
+            status_code=422, detail="sensitivity must be omitted or 'private'"
+        )
 
     async with _pool.acquire() as conn:
         job_id = await conn.fetchval(
             "SELECT enqueue_ingestion_job('url', $1::jsonb, NULL, $2)",
-            json.dumps({
-                "url": target,
-                "title": (req.title or "").strip() or None,
-                "mode": mode_value,
-                "sensitivity": sensitivity,
-                "acquisition": "user",
-            }),
+            json.dumps(
+                {
+                    "url": target,
+                    "title": (req.title or "").strip() or None,
+                    "mode": mode_value,
+                    "sensitivity": sensitivity,
+                    "acquisition": "user",
+                }
+            ),
             f"url:{_hashlib.sha256(target.encode('utf-8')).hexdigest()}",
         )
     return {"accepted": True, "job_id": str(job_id), "url": target, "mode": mode_value}
+
+
+def _normalized_ingest_mode(mode: str | None) -> str:
+    value = (mode or "fast").lower()
+    if value not in ("fast", "slow", "hybrid"):
+        raise HTTPException(
+            status_code=422, detail="mode must be fast, slow, or hybrid"
+        )
+    return value
+
+
+def _normalized_sensitivity(sensitivity: str | None) -> str | None:
+    value = (sensitivity or "").strip().lower() or None
+    if value not in (None, "private"):
+        raise HTTPException(
+            status_code=422, detail="sensitivity must be omitted or 'private'"
+        )
+    return value
+
+
+async def _preserve_upload_artifact(
+    conn,
+    data: bytes,
+    *,
+    filename: str | None,
+    mime_type: str | None,
+    uploaded_via: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Preserve original bytes as a source artifact (dedup by sha256).
+
+    Upload once: everything downstream — the ingestion job, a re-read for the
+    live turn — works from the preserved artifact rather than another copy of
+    the bytes on the wire.
+    """
+    from services.ingest.artifacts import default_artifact_dir, prepare_artifact_info
+
+    upload_cap = int(
+        await conn.fetchval(
+            "SELECT COALESCE(get_config_int('ingest.upload_max_bytes'), 104857600)"
+        )
+    )
+    if len(data) > upload_cap:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"file is {len(data)} bytes; the upload cap is {upload_cap}. "
+                "Use the CLI for oversized files: hexis ingest --file <path>"
+            ),
+        )
+    max_db_bytes = int(
+        await conn.fetchval(
+            "SELECT COALESCE(get_config_int('ingest.artifact_max_db_bytes'), 26214400)"
+        )
+    )
+    info = prepare_artifact_info(
+        data,
+        original_filename=filename,
+        mime_type=mime_type,
+        metadata={"uploaded_via": uploaded_via},
+        max_db_bytes=max_db_bytes,
+        artifact_dir=default_artifact_dir(),
+    )
+    artifact_raw = await conn.fetchval(
+        """
+        SELECT upsert_source_artifact(
+            $1::text, $2::text, $3::bytea, $4::text, NULL,
+            $5::text, $6::text, $7::bigint, $8::jsonb
+        )
+        """,
+        info["sha256"],
+        info["storage_kind"],
+        info.get("bytes"),
+        info.get("storage_ref"),
+        info.get("original_filename"),
+        info.get("mime_type"),
+        info.get("byte_size"),
+        json.dumps(info.get("metadata") or {}),
+    )
+    artifact = (
+        json.loads(artifact_raw) if isinstance(artifact_raw, str) else artifact_raw
+    )
+    return info, artifact
+
+
+async def _enqueue_artifact_ingestion(
+    conn,
+    *,
+    artifact_id: str,
+    sha256: str,
+    filename: str | None,
+    title: str | None,
+    mode: str,
+    sensitivity: str | None,
+) -> str:
+    job_id = await conn.fetchval(
+        "SELECT enqueue_ingestion_job('artifact', $1::jsonb, NULL, $2)",
+        json.dumps(
+            {
+                "artifact_id": artifact_id,
+                "filename": filename,
+                "title": (title or "").strip() or None,
+                "mode": mode,
+                "sensitivity": sensitivity,
+                "acquisition": "user",
+            }
+        ),
+        f"artifact:{sha256}",
+    )
+    return str(job_id)
 
 
 @app.post("/api/ingest/file")
@@ -1633,86 +2338,424 @@ async def ingest_file_upload(
     sensitivity: str | None = Form(None),
     title: str | None = Form(None),
 ):
-    """Ingest an uploaded file (chat drops, the UI Ingest page).
+    """Ingest an uploaded file (the UI Ingest page, API clients).
 
     The original bytes are preserved as a source artifact FIRST, then a
     durable `artifact` job re-reads them through the standard pipeline —
     upload once, survive restarts, inspect failures.
     """
-    from services.ingest.artifacts import default_artifact_dir, prepare_artifact_info
-
     if _pool is None:
         raise HTTPException(status_code=503, detail="database not ready")
-    mode_value = (mode or "fast").lower()
-    if mode_value not in ("fast", "slow", "hybrid"):
-        raise HTTPException(status_code=422, detail="mode must be fast, slow, or hybrid")
-    sensitivity_value = (sensitivity or "").strip().lower() or None
-    if sensitivity_value not in (None, "private"):
-        raise HTTPException(status_code=422, detail="sensitivity must be omitted or 'private'")
+    mode_value = _normalized_ingest_mode(mode)
+    sensitivity_value = _normalized_sensitivity(sensitivity)
 
     data = await file.read()
     if not data:
         raise HTTPException(status_code=422, detail="uploaded file is empty")
 
     async with _pool.acquire() as conn:
-        upload_cap = int(await conn.fetchval(
-            "SELECT COALESCE(get_config_int('ingest.upload_max_bytes'), 104857600)"
-        ))
-        if len(data) > upload_cap:
-            raise HTTPException(
-                status_code=413,
-                detail=(
-                    f"file is {len(data)} bytes; the upload cap is {upload_cap}. "
-                    "Use the CLI for oversized files: hexis ingest --file <path>"
-                ),
-            )
-        max_db_bytes = int(await conn.fetchval(
-            "SELECT COALESCE(get_config_int('ingest.artifact_max_db_bytes'), 26214400)"
-        ))
-        info = prepare_artifact_info(
+        info, artifact = await _preserve_upload_artifact(
+            conn,
             data,
-            original_filename=file.filename,
+            filename=file.filename,
             mime_type=file.content_type,
-            metadata={"uploaded_via": "api"},
-            max_db_bytes=max_db_bytes,
-            artifact_dir=default_artifact_dir(),
+            uploaded_via="api",
         )
-        artifact_raw = await conn.fetchval(
-            """
-            SELECT upsert_source_artifact(
-                $1::text, $2::text, $3::bytea, $4::text, NULL,
-                $5::text, $6::text, $7::bigint, $8::jsonb
-            )
-            """,
-            info["sha256"],
-            info["storage_kind"],
-            info.get("bytes"),
-            info.get("storage_ref"),
-            info.get("original_filename"),
-            info.get("mime_type"),
-            info.get("byte_size"),
-            json.dumps(info.get("metadata") or {}),
-        )
-        artifact = json.loads(artifact_raw) if isinstance(artifact_raw, str) else artifact_raw
-        job_id = await conn.fetchval(
-            "SELECT enqueue_ingestion_job('artifact', $1::jsonb, NULL, $2)",
-            json.dumps({
-                "artifact_id": artifact["artifact_id"],
-                "filename": file.filename,
-                "title": (title or "").strip() or None,
-                "mode": mode_value,
-                "sensitivity": sensitivity_value,
-                "acquisition": "user",
-            }),
-            f"artifact:{info['sha256']}",
+        job_id = await _enqueue_artifact_ingestion(
+            conn,
+            artifact_id=artifact["artifact_id"],
+            sha256=info["sha256"],
+            filename=file.filename,
+            title=title,
+            mode=mode_value,
+            sensitivity=sensitivity_value,
         )
     return {
         "accepted": True,
-        "job_id": str(job_id),
+        "job_id": job_id,
         "artifact_id": artifact["artifact_id"],
         "sha256": info["sha256"],
         "byte_size": info["byte_size"],
         "filename": file.filename,
+        "mode": mode_value,
+    }
+
+
+@app.post("/api/attachments")
+async def prepare_chat_attachment(
+    file: UploadFile = File(...),
+    sensitivity: str | None = Form(None),
+):
+    """Prepare a file the user just attached to a chat message.
+
+    Two things happen here and nothing else: the original bytes are preserved
+    (deduped by hash, so re-attaching the same file costs nothing), and the
+    text is read *now*, within a budget. The text comes back to the composer,
+    which hands it to the turn — so attaching a PDF and asking about it in the
+    same breath simply works.
+
+    Ingestion into memory is deliberately NOT started here. The user has not
+    sent the message yet; a file they attach and then remove should leave no
+    trace in the agent's memory. POST /api/attachments/{id}/ingest starts that
+    when the message is actually sent.
+    """
+    from services.attachments import (
+        DEFAULT_READ_MAX_BYTES,
+        DEFAULT_READ_TIMEOUT_SECONDS,
+        DEFAULT_TEXT_CHARS,
+        attachment_kind,
+        read_attachment_text,
+    )
+
+    if _pool is None:
+        raise HTTPException(status_code=503, detail="database not ready")
+    sensitivity_value = _normalized_sensitivity(sensitivity)
+
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=422, detail="uploaded file is empty")
+
+    async with _pool.acquire() as conn:
+        info, artifact = await _preserve_upload_artifact(
+            conn,
+            data,
+            filename=file.filename,
+            mime_type=file.content_type,
+            uploaded_via="chat_attachment",
+        )
+        text_chars = int(
+            await conn.fetchval(
+                "SELECT COALESCE(get_config_int('ingest.attachment_text_chars'), $1::bigint)",
+                DEFAULT_TEXT_CHARS,
+            )
+        )
+        read_timeout = float(
+            await conn.fetchval(
+                "SELECT COALESCE(get_config_int('ingest.attachment_read_timeout_s'), $1::bigint)",
+                int(DEFAULT_READ_TIMEOUT_SECONDS),
+            )
+        )
+        read_max_bytes = int(
+            await conn.fetchval(
+                "SELECT COALESCE(get_config_int('ingest.attachment_read_max_bytes'), $1::bigint)",
+                DEFAULT_READ_MAX_BYTES,
+            )
+        )
+
+    reading = await read_attachment_text(
+        data,
+        file.filename,
+        mime_type=file.content_type,
+        max_chars=text_chars,
+        timeout_seconds=read_timeout,
+        max_bytes=read_max_bytes,
+    )
+    return {
+        "prepared": True,
+        "artifact_id": artifact["artifact_id"],
+        "sha256": info["sha256"],
+        "filename": file.filename,
+        "mime_type": info.get("mime_type") or file.content_type,
+        "byte_size": info["byte_size"],
+        "kind": attachment_kind(file.filename, file.content_type),
+        "sensitivity": sensitivity_value,
+        **reading.to_dict(),
+    }
+
+
+@app.post("/api/voice/transcribe")
+async def transcribe_pwa_voice(
+    file: UploadFile = File(...),
+    device_id: str | None = Form(None),
+):
+    """Transcribe a foreground PWA recording through the chosen STT policy."""
+
+    if _pool is None:
+        raise HTTPException(status_code=503, detail="database not ready")
+    async with _pool.acquire() as conn:
+        max_bytes = int(
+            await conn.fetchval(
+                "SELECT COALESCE(get_config_int('voice_notes.stt.max_bytes'), 26214400)"
+            )
+            or 26214400
+        )
+    data = await file.read(max(max_bytes, 1) + 1)
+
+    from services.voice_notes import transcribe_uploaded_voice
+
+    result = await transcribe_uploaded_voice(
+        _pool,
+        data,
+        filename=file.filename,
+        mime_type=file.content_type,
+        channel_id=(device_id or "")[:200] or None,
+        sender_id="pwa-user",
+    )
+    if not result.ok:
+        if result.outcome == "skipped_too_large":
+            status = 413
+        elif result.outcome == "failed_bad_attachment":
+            status = 415
+        elif result.outcome.startswith("skipped_"):
+            status = 409
+        elif result.outcome == "failed_missing_credentials":
+            status = 503
+        else:
+            status = 502
+        raise HTTPException(
+            status_code=status,
+            detail=result.error_detail or "voice transcription was unavailable",
+        )
+    return {
+        "transcript": result.transcript,
+        "provider": result.provider,
+        "model": result.model,
+        "outcome": result.outcome,
+        "duration_ms": result.duration_ms,
+    }
+
+
+@app.get("/api/voice/status")
+async def get_voice_status():
+    """Return derived readiness for foreground voice and talk mode."""
+
+    if _pool is None:
+        raise HTTPException(status_code=503, detail="database not ready")
+    from services.speech import voice_status
+
+    return await voice_status(_pool)
+
+
+@app.post("/api/voice/synthesize")
+async def synthesize_pwa_speech(req: SpeechSynthesisRequest):
+    """Render a bounded reply through the explicitly enabled local provider."""
+
+    if _pool is None:
+        raise HTTPException(status_code=503, detail="database not ready")
+    from services.speech import synthesize_text
+
+    result = await synthesize_text(_pool, req.text, source="pwa")
+    if not result.ok:
+        if result.outcome == "skipped_disabled":
+            status = 409
+        elif result.outcome == "skipped_too_long":
+            status = 413
+        elif result.outcome in {
+            "failed_endpoint",
+            "failed_unsupported_provider",
+        }:
+            status = 409
+        else:
+            status = 502
+        raise HTTPException(
+            status_code=status,
+            detail=result.error_detail or "speech synthesis was unavailable",
+        )
+    return Response(
+        content=result.audio,
+        media_type=result.mime_type,
+        headers={
+            "Cache-Control": "no-store",
+            "X-Hexis-Voice-Provider": result.provider,
+            "X-Hexis-Voice-Model": result.model,
+        },
+    )
+
+
+@app.get("/api/voice/audio/{output_id}")
+async def get_speech_output(output_id: str):
+    """Retrieve one unexpired tool-created speech output by opaque id."""
+
+    if _pool is None:
+        raise HTTPException(status_code=503, detail="database not ready")
+    try:
+        normalized = str(uuid.UUID(output_id))
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise HTTPException(status_code=404, detail="speech output not found") from exc
+    async with _pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT audio, mime_type
+            FROM voice_tts_outputs
+            WHERE id = $1::uuid AND expires_at > CURRENT_TIMESTAMP
+            """,
+            normalized,
+        )
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail="speech output expired or was not found; ask Hexis to speak it again",
+        )
+    return Response(
+        content=bytes(row["audio"]),
+        media_type=str(row["mime_type"] or "audio/wav"),
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.get("/api/pwa/push/config")
+async def pwa_push_config():
+    """Return the VAPID public key after an explicit client setup action."""
+
+    if _pool is None:
+        raise HTTPException(status_code=503, detail="database not ready")
+    from services.web_push import ensure_vapid_keypair
+
+    try:
+        _, public_key = ensure_vapid_keypair()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    async with _pool.acquire() as conn:
+        enabled = bool(
+            await conn.fetchval(
+                "SELECT COALESCE(get_config_bool('pwa.push.enabled'), TRUE)"
+            )
+        )
+        active = int(
+            await conn.fetchval(
+                "SELECT count(*) FROM web_push_subscriptions WHERE revoked_at IS NULL"
+            )
+            or 0
+        )
+    return {
+        "enabled": enabled,
+        "public_key": public_key,
+        "active_subscriptions": active,
+        "secure_context_required": True,
+        "message_previews_default": False,
+    }
+
+
+@app.post("/api/pwa/push/subscriptions")
+async def subscribe_pwa_push(req: WebPushSubscriptionRequest, request: Request):
+    """Persist one browser-granted PushSubscription."""
+
+    if _pool is None:
+        raise HTTPException(status_code=503, detail="database not ready")
+    if not req.endpoint.lower().startswith("https://"):
+        raise HTTPException(status_code=422, detail="push endpoint must use HTTPS")
+    from services.web_push import ensure_vapid_keypair, validate_push_endpoint
+
+    endpoint_error = await asyncio.to_thread(validate_push_endpoint, req.endpoint)
+    if endpoint_error:
+        raise HTTPException(status_code=422, detail=endpoint_error)
+
+    try:
+        ensure_vapid_keypair()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    metadata = {
+        "installed": req.installed,
+        "display_mode": req.display_mode,
+    }
+    async with _pool.acquire() as conn:
+        enabled = bool(
+            await conn.fetchval(
+                "SELECT COALESCE(get_config_bool('pwa.push.enabled'), TRUE)"
+            )
+        )
+        if not enabled:
+            raise HTTPException(
+                status_code=409,
+                detail="Web Push is disabled by pwa.push.enabled.",
+            )
+        result = await conn.fetchval(
+            """
+            SELECT upsert_web_push_subscription(
+                $1, $2, $3, $4, $5, $6::jsonb
+            )
+            """,
+            req.endpoint,
+            req.keys.p256dh,
+            req.keys.auth,
+            req.expirationTime,
+            request.headers.get("user-agent"),
+            json.dumps(metadata),
+        )
+    return result if isinstance(result, dict) else json.loads(result)
+
+
+@app.delete("/api/pwa/push/subscriptions")
+async def unsubscribe_pwa_push(req: WebPushRevokeRequest):
+    """Revoke one browser subscription after an explicit user choice."""
+
+    if _pool is None:
+        raise HTTPException(status_code=503, detail="database not ready")
+    async with _pool.acquire() as conn:
+        revoked = bool(
+            await conn.fetchval("SELECT revoke_web_push_subscription($1)", req.endpoint)
+        )
+    return {"revoked": revoked}
+
+
+@app.post("/api/pwa/presence")
+async def record_pwa_presence(req: PwaPresenceRequest):
+    """Project foreground PWA state into the existing presence ledger."""
+
+    if _pool is None:
+        raise HTTPException(status_code=503, detail="database not ready")
+    async with _pool.acquire() as conn:
+        enabled = bool(
+            await conn.fetchval(
+                "SELECT COALESCE(get_config_bool('pwa.presence.enabled'), TRUE)"
+            )
+        )
+        if not enabled:
+            return {"recorded": False, "reason": "pwa_presence_disabled"}
+        event = await conn.fetchval(
+            """
+            SELECT record_pwa_presence($1, $2, $3, $4)
+            """,
+            req.device_id,
+            req.presence,
+            req.display_mode,
+            req.visibility,
+        )
+    if isinstance(event, str):
+        event = json.loads(event)
+    return {"recorded": True, "presence": event}
+
+
+@app.post("/api/attachments/{artifact_id}/ingest")
+async def ingest_prepared_attachment(artifact_id: str, req: AttachmentIngestRequest):
+    """Start durable ingestion for an already-preserved attachment.
+
+    Called when the message carrying the attachment is sent, so the agent's
+    memory only ever gains files the user actually shared.
+    """
+    if _pool is None:
+        raise HTTPException(status_code=503, detail="database not ready")
+    try:
+        artifact_uuid = str(uuid.UUID(artifact_id))
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(status_code=422, detail="artifact_id must be a UUID")
+    mode_value = _normalized_ingest_mode(req.mode)
+    sensitivity_value = _normalized_sensitivity(req.sensitivity)
+
+    async with _pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT sha256, original_filename FROM source_artifacts "
+            "WHERE id = $1::uuid AND status = 'active'",
+            artifact_uuid,
+        )
+        if row is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"artifact {artifact_id} not found — re-attach the file",
+            )
+        job_id = await _enqueue_artifact_ingestion(
+            conn,
+            artifact_id=artifact_uuid,
+            sha256=row["sha256"],
+            filename=req.filename or row["original_filename"],
+            title=req.title,
+            mode=mode_value,
+            sensitivity=sensitivity_value,
+        )
+    return {
+        "accepted": True,
+        "job_id": job_id,
+        "artifact_id": artifact_uuid,
         "mode": mode_value,
     }
 
@@ -1772,7 +2815,10 @@ async def openai_models():
     except Exception as exc:
         logger.exception("OpenAI-compatible model discovery failed")
         return _openai_error(
-            str(exc), status_code=503, code="server_not_ready", error_type="server_error"
+            str(exc),
+            status_code=503,
+            code="server_not_ready",
+            error_type="server_error",
         )
     return JSONResponse({"object": "list", "data": [_openai_model_object(model)]})
 
@@ -1798,7 +2844,10 @@ async def openai_chat_completions(request: Request):
         model = await _active_openai_model()
     except Exception as exc:
         return _openai_error(
-            str(exc), status_code=503, code="server_not_ready", error_type="server_error"
+            str(exc),
+            status_code=503,
+            code="server_not_ready",
+            error_type="server_error",
         )
     if req.model != model["id"]:
         return _openai_error(
@@ -1811,9 +2860,7 @@ async def openai_chat_completions(request: Request):
     try:
         user_message, history, max_tokens = _prepare_openai_chat(req)
     except ValueError as exc:
-        return _openai_error(
-            str(exc), status_code=400, code="unsupported_parameter"
-        )
+        return _openai_error(str(exc), status_code=400, code="unsupported_parameter")
 
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
@@ -1899,9 +2946,11 @@ async def _collect_openai_chat_completion(
                 stopped = str(event.data.get("stopped_reason") or "completed")
                 if stopped == "timeout" or bool(event.data.get("timed_out")):
                     finish_reason = "length"
+                elif stopped == "error" and error is None:
+                    error = "Agent loop ended with an error."
     except Exception as exc:
         logger.exception("OpenAI-compatible chat completion failed")
-        error = str(exc)
+        error = describe_exception(exc)
 
     full_text = "".join(parts)
     return full_text, error, finish_reason
@@ -1924,9 +2973,7 @@ async def _stream_openai_chat_completion(
             "object": "chat.completion.chunk",
             "created": created,
             "model": model["id"],
-            "choices": [
-                {"index": 0, "delta": delta, "finish_reason": finish_reason}
-            ],
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
         }
 
     yield _openai_sse_data(_chunk({"role": "assistant", "content": ""}, None))
@@ -1953,9 +3000,11 @@ async def _stream_openai_chat_completion(
                 stopped = str(event.data.get("stopped_reason") or "completed")
                 if stopped == "timeout" or bool(event.data.get("timed_out")):
                     finish_reason = "length"
+                elif stopped == "error" and error is None:
+                    error = "Agent loop ended with an error."
     except Exception as exc:
         logger.exception("OpenAI-compatible chat stream failed")
-        error = str(exc)
+        error = describe_exception(exc)
 
     if error:
         yield _openai_sse_data(
@@ -1981,13 +3030,15 @@ async def _stream_chat(req: ChatRequest) -> AsyncIterator[str]:
     Event mapping:
         AgentEvent.PHASE_CHANGE  → phase_start/phase_end  {phase}
         AgentEvent.LOOP_START    → phase_start  {phase: "conscious_final"}
+        AgentEvent.REASONING_DELTA → reasoning  {}
         AgentEvent.TEXT_DELTA    → token        {phase: "conscious_final", text}
         AgentEvent.TOOL_START    → log          {id, kind: "tool_call", title, detail}
         AgentEvent.TOOL_RESULT   → log          {id, kind: "tool_result", title, detail}
         AgentEvent.LLM_REQUEST   → trace        {kind: "llm_request", ...}
         AgentEvent.LLM_RESPONSE  → trace        {kind: "llm_response", ...}
         AgentEvent.UI_ARTIFACT   → ui           {kind, ui, ...}
-        AgentEvent.LOOP_END      → done         {assistant, presentation}
+        AgentEvent.QUESTION      → question     {id, prompt, choices, ...}
+        AgentEvent.LOOP_END      → done/failed  {assistant, presentation/incomplete}
         AgentEvent.ERROR         → error        {message}
     """
     pool = _pool
@@ -2009,28 +3060,46 @@ async def _stream_chat(req: ChatRequest) -> AsyncIterator[str]:
     if session_id is None:
         session_id = str(uuid.uuid4())
 
+    full_text = ""
+    conscious_started = False
+    active_stream_phase = "conscious_final"
+    done_sent = False
+    stream_failed = False
+    failure_message = "Unknown error"
+    reasoning_last_sent = 0.0
+    visual_attachment_count = len(req.visual_attachments or [])
+    citation_sources = {}
+
+    def build_done_payload() -> dict[str, Any]:
+        payload: dict[str, Any] = {"assistant": full_text, "session_id": session_id}
+        if full_text:
+            payload["presentation"] = presentation_from_text(
+                full_text, citation_sources.values()
+            ).to_dict()
+        return payload
+
+    def build_failed_payload() -> dict[str, Any]:
+        return {
+            "assistant": full_text,
+            "session_id": session_id,
+            "message": failure_message,
+            "incomplete": True,
+        }
+
     try:
         addenda = await resolve_prompt_addenda(pool, req.prompt_addenda)
-        full_text = ""
-        conscious_started = False
-        active_stream_phase = "conscious_final"
-        done_sent = False
-        visual_attachment_count = len(req.visual_attachments or [])
 
         if visual_attachment_count:
             plural = "image" if visual_attachment_count == 1 else "images"
-            yield _sse_event("log", {
-                "id": str(uuid.uuid4()),
-                "kind": "visual_attachment",
-                "title": "Visual Attachment",
-                "detail": f"{visual_attachment_count} {plural} attached to this model request",
-            })
-
-        def build_done_payload() -> dict[str, Any]:
-            payload: dict[str, Any] = {"assistant": full_text, "session_id": session_id}
-            if full_text:
-                payload["presentation"] = presentation_from_text(full_text).to_dict()
-            return payload
+            yield _sse_event(
+                "log",
+                {
+                    "id": str(uuid.uuid4()),
+                    "kind": "visual_attachment",
+                    "title": "Visual Attachment",
+                    "detail": f"{visual_attachment_count} {plural} attached to this model request",
+                },
+            )
 
         async for event in stream_chat_events(
             user_message=user_message,
@@ -2049,6 +3118,10 @@ async def _stream_chat(req: ChatRequest) -> AsyncIterator[str]:
                 attachment.model_dump()
                 for attachment in (req.visual_attachments or [])[:8]
             ],
+            attachments=[
+                attachment.model_dump(exclude_none=True)
+                for attachment in (req.attachments or [])[:16]
+            ],
         ):
             if event.event == AgentEvent.PHASE_CHANGE:
                 phase = event.data.get("phase", "")
@@ -2063,14 +3136,17 @@ async def _stream_chat(req: ChatRequest) -> AsyncIterator[str]:
                     memories = event.data.get("memories")
                     if not isinstance(memories, list):
                         memories = []
-                    yield _sse_event("log", {
-                        "id": str(uuid.uuid4()),
-                        "kind": "memory_recall",
-                        "title": "Memory Recall",
-                        "detail": f"Retrieved {count} relevant memories",
-                        "count": count,
-                        "memories": memories,
-                    })
+                    yield _sse_event(
+                        "log",
+                        {
+                            "id": str(uuid.uuid4()),
+                            "kind": "memory_recall",
+                            "title": "Memory Recall",
+                            "detail": f"Retrieved {count} relevant memories",
+                            "count": count,
+                            "memories": memories,
+                        },
+                    )
                 elif phase == "subconscious":
                     if status == "start":
                         yield _sse_event("phase_start", {"phase": "subconscious"})
@@ -2078,44 +3154,74 @@ async def _stream_chat(req: ChatRequest) -> AsyncIterator[str]:
                         output = event.data.get("output")
                         # This turn's appraisal affect rides into memory
                         # formation (#81).
-                        yield _sse_event("phase_end", {
-                            "phase": "subconscious",
-                            "output": output,
-                        })
+                        yield _sse_event(
+                            "phase_end",
+                            {
+                                "phase": "subconscious",
+                                "output": output,
+                            },
+                        )
                 elif phase == "memory_write" and status == "end":
-                    yield _sse_event("log", {
-                        "id": str(uuid.uuid4()),
-                        "kind": "memory_write",
-                        "title": "Memory Formation",
-                        "detail": str(event.data.get("detail") or "Conversation stored as episodic memory"),
-                    })
+                    yield _sse_event(
+                        "log",
+                        {
+                            "id": str(uuid.uuid4()),
+                            "kind": "memory_write",
+                            "title": "Memory Formation",
+                            "detail": str(
+                                event.data.get("detail")
+                                or "Conversation stored as episodic memory"
+                            ),
+                        },
+                    )
 
             elif event.event == AgentEvent.LOOP_START:
                 if not conscious_started:
-                    active_stream_phase = str(event.data.get("phase") or "conscious_final")
+                    active_stream_phase = str(
+                        event.data.get("phase") or "conscious_final"
+                    )
                     yield _sse_event("phase_start", {"phase": active_stream_phase})
                     conscious_started = True
 
+            elif event.event == AgentEvent.REASONING_DELTA:
+                # Keep the dashboard alive during reasoning-heavy model output
+                # without exposing private reasoning text or flooding React
+                # with one event per token.
+                now = time.monotonic()
+                if reasoning_last_sent == 0.0 or now - reasoning_last_sent >= 1.0:
+                    yield _sse_event("reasoning", {})
+                    reasoning_last_sent = now
+
             elif event.event == AgentEvent.TEXT_DELTA:
                 if not conscious_started:
-                    active_stream_phase = str(event.data.get("phase") or "conscious_final")
+                    active_stream_phase = str(
+                        event.data.get("phase") or "conscious_final"
+                    )
                     yield _sse_event("phase_start", {"phase": active_stream_phase})
                     conscious_started = True
                 text = event.data.get("text", "")
                 if text:
                     full_text += text
-                    yield _sse_event("token", {
-                        "phase": str(event.data.get("phase") or active_stream_phase),
-                        "text": text,
-                    })
+                    yield _sse_event(
+                        "token",
+                        {
+                            "phase": str(
+                                event.data.get("phase") or active_stream_phase
+                            ),
+                            "text": text,
+                        },
+                    )
 
             elif event.event == AgentEvent.TOOL_START:
-                yield _sse_event("log", {
-                    "id": str(uuid.uuid4()),
-                    "kind": "tool_call",
-                    "title": event.data.get("tool_name", "tool"),
-                    "detail": json.dumps(event.data.get("arguments", {}))[:500],
-                })
+                yield _sse_event(
+                    "log",
+                    {
+                        "id": str(uuid.uuid4()),
+                        "kind": "tool_call",
+                        "title": event.data.get("tool_name", "tool"),
+                        "detail": json.dumps(event.data.get("arguments", {}))[:500],
+                    },
+                )
 
             elif event.event == AgentEvent.TOOL_RESULT:
                 tool_name = event.data.get("tool_name", "tool")
@@ -2123,6 +3229,8 @@ async def _stream_chat(req: ChatRequest) -> AsyncIterator[str]:
                 error = event.data.get("error")
                 display_output = event.data.get("display_output")
                 output = event.data.get("output")
+                for citation in citations_from_tool_output(output):
+                    citation_sources.setdefault(citation.citation_id, citation)
                 ui_payload = output.get("ui") if isinstance(output, dict) else None
                 detail = f"{'OK' if success else 'FAILED'}"
                 if error:
@@ -2143,32 +3251,54 @@ async def _stream_chat(req: ChatRequest) -> AsyncIterator[str]:
             elif event.event == AgentEvent.UI_ARTIFACT:
                 yield _sse_event("ui", event.data)
 
+            elif event.event == AgentEvent.QUESTION:
+                yield _sse_event("question", event.data)
+
             elif event.event == AgentEvent.CLAIM_FLAGGED:
-                yield _sse_event("log", {
-                    "id": str(uuid.uuid4()),
-                    "kind": "claim_flagged",
-                    "title": "Consistency check",
-                    "detail": json.dumps(event.data.get("findings", []))[:500],
-                })
+                yield _sse_event(
+                    "log",
+                    {
+                        "id": str(uuid.uuid4()),
+                        "kind": "claim_flagged",
+                        "title": "Consistency check",
+                        "detail": json.dumps(event.data.get("findings", []))[:500],
+                    },
+                )
 
             elif event.event == AgentEvent.LLM_REQUEST:
-                yield _sse_event("trace", {
-                    "id": str(uuid.uuid4()),
-                    "kind": "llm_request",
-                    **event.data,
-                })
+                reasoning_last_sent = 0.0
+                yield _sse_event(
+                    "trace",
+                    {
+                        "id": str(uuid.uuid4()),
+                        "kind": "llm_request",
+                        **event.data,
+                    },
+                )
 
             elif event.event == AgentEvent.LLM_RESPONSE:
-                yield _sse_event("trace", {
-                    "id": str(uuid.uuid4()),
-                    "kind": "llm_response",
-                    **event.data,
-                })
+                yield _sse_event(
+                    "trace",
+                    {
+                        "id": str(uuid.uuid4()),
+                        "kind": "llm_response",
+                        **event.data,
+                    },
+                )
 
             elif event.event == AgentEvent.ERROR:
-                yield _sse_event("error", {
-                    "message": event.data.get("error", "Unknown error"),
-                })
+                stream_failed = True
+                failure_message = str(
+                    event.data.get("error")
+                    or event.data.get("error_type")
+                    or "Unknown error"
+                )
+                yield _sse_event(
+                    "error",
+                    {
+                        "message": failure_message,
+                    },
+                )
 
             elif event.event == AgentEvent.LOOP_END and not done_sent:
                 # The assistant-visible turn is complete at LOOP_END. Memory
@@ -2177,7 +3307,10 @@ async def _stream_chat(req: ChatRequest) -> AsyncIterator[str]:
                 # while the response is already finished.
                 if conscious_started:
                     yield _sse_event("phase_end", {"phase": active_stream_phase})
-                yield _sse_event("done", build_done_payload())
+                if stream_failed or event.data.get("stopped_reason") == "error":
+                    yield _sse_event("failed", build_failed_payload())
+                else:
+                    yield _sse_event("done", build_done_payload())
                 done_sent = True
 
         # Signal phase end and completion for runtimes that do not surface a
@@ -2185,16 +3318,31 @@ async def _stream_chat(req: ChatRequest) -> AsyncIterator[str]:
         if conscious_started and not done_sent:
             yield _sse_event("phase_end", {"phase": active_stream_phase})
         if not done_sent:
-            yield _sse_event("done", build_done_payload())
+            if stream_failed:
+                yield _sse_event("failed", build_failed_payload())
+            else:
+                yield _sse_event("done", build_done_payload())
 
-    except Exception as e:
+    except Exception as exc:
         logger.exception("Chat stream error")
-        yield _sse_event("error", {"message": str(e)})
+        if done_sent:
+            yield _sse_event("error", {"message": describe_exception(exc)})
+            return
+        if not stream_failed:
+            failure_message = describe_exception(exc)
+            yield _sse_event("error", {"message": failure_message})
+        if conscious_started:
+            yield _sse_event("phase_end", {"phase": active_stream_phase})
+        yield _sse_event("failed", build_failed_payload())
 
 
 def _resolve_fallback_api_key(provider: str, role: str) -> str | None:
     # Prefer role-specific keys set by the UI init wizard.
-    role_env = "HEXIS_LLM_CONSCIOUS_API_KEY" if role == "conscious" else "HEXIS_LLM_SUBCONSCIOUS_API_KEY"
+    role_env = (
+        "HEXIS_LLM_CONSCIOUS_API_KEY"
+        if role == "conscious"
+        else "HEXIS_LLM_SUBCONSCIOUS_API_KEY"
+    )
     value = (os.getenv(role_env) or "").strip()
     if value:
         return value
@@ -2215,7 +3363,9 @@ def _resolve_fallback_api_key(provider: str, role: str) -> str | None:
     return value or None
 
 
-async def _fetch_consent_record(conn, *, provider: str | None, model: str | None, endpoint: str | None) -> dict[str, Any] | None:
+async def _fetch_consent_record(
+    conn, *, provider: str | None, model: str | None, endpoint: str | None
+) -> dict[str, Any] | None:
     if not provider and not model and not endpoint:
         return None
     row = await conn.fetchrow(
@@ -2239,7 +3389,11 @@ async def _fetch_consent_record(conn, *, provider: str | None, model: str | None
 
 async def _apply_existing_consent(conn, record: dict[str, Any]) -> dict[str, Any]:
     status_raw = await conn.fetchval("SELECT get_init_status() as status")
-    status = status_raw if isinstance(status_raw, dict) else (json.loads(status_raw) if isinstance(status_raw, str) else {})
+    status = (
+        status_raw
+        if isinstance(status_raw, dict)
+        else (json.loads(status_raw) if isinstance(status_raw, str) else {})
+    )
     if isinstance(status, dict) and status.get("stage") == "complete":
         return {"status": status}
 
@@ -2251,7 +3405,9 @@ async def _apply_existing_consent(conn, record: dict[str, Any]) -> dict[str, Any
         "endpoint": record.get("endpoint"),
         "memories": [],
     }
-    result_raw = await conn.fetchval("SELECT init_consent($1::jsonb) as result", json.dumps(payload))
+    result_raw = await conn.fetchval(
+        "SELECT init_consent($1::jsonb) as result", json.dumps(payload)
+    )
     _ = result_raw  # kept for parity/debugging; init status is what the UI cares about.
     next_status_raw = await conn.fetchval("SELECT get_init_status() as status")
     next_status = (
@@ -2301,10 +3457,13 @@ async def init_consent_override(req: InitConsentOverrideRequest):
         )
         status_raw = await conn.fetchval("SELECT get_init_status() as status")
         status = (
-            status_raw if isinstance(status_raw, dict)
+            status_raw
+            if isinstance(status_raw, dict)
             else (json.loads(status_raw) if isinstance(status_raw, str) else {})
         )
-    return JSONResponse({"decision": "consent", "override": True, "result": result, "status": status})
+    return JSONResponse(
+        {"decision": "consent", "override": True, "result": result, "status": status}
+    )
 
 
 @app.post("/api/init/consent/request")
@@ -2350,28 +3509,60 @@ async def init_consent_request(req: InitConsentRequest):
                 return JSONResponse({"error": str(exc)}, status_code=400)
 
             api_key = creds.access
-            existing = await _fetch_consent_record(conn, provider=provider, model=model, endpoint=endpoint)
+            existing = await _fetch_consent_record(
+                conn, provider=provider, model=model, endpoint=endpoint
+            )
             if existing and existing.get("decision") == "consent":
                 if role == "conscious":
                     applied = await _apply_existing_consent(conn, existing)
-                    return JSONResponse(jsonable_encoder({"consent_record": existing, "reused": True, "status": applied.get("status")}))
-                return JSONResponse(jsonable_encoder({"consent_record": existing, "reused": True, "status": None}))
+                    return JSONResponse(
+                        jsonable_encoder(
+                            {
+                                "consent_record": existing,
+                                "reused": True,
+                                "status": applied.get("status"),
+                            }
+                        )
+                    )
+                return JSONResponse(
+                    jsonable_encoder(
+                        {"consent_record": existing, "reused": True, "status": None}
+                    )
+                )
     else:
         # Resolve API key for non-OAuth providers
         if not api_key:
             api_key = _resolve_fallback_api_key(provider, role)
 
         # Fail early if we need a key (unless mocked).
-        if not use_mock_consent and provider in {"openai", "anthropic", "grok", "gemini"} and not api_key:
+        if (
+            not use_mock_consent
+            and provider in {"openai", "anthropic", "grok", "gemini"}
+            and not api_key
+        ):
             return JSONResponse({"error": "Missing API key"}, status_code=400)
 
         async with pool.acquire() as conn:
-            existing = await _fetch_consent_record(conn, provider=provider, model=model, endpoint=endpoint)
+            existing = await _fetch_consent_record(
+                conn, provider=provider, model=model, endpoint=endpoint
+            )
             if existing and existing.get("decision") == "consent":
                 if role == "conscious":
                     applied = await _apply_existing_consent(conn, existing)
-                    return JSONResponse(jsonable_encoder({"consent_record": existing, "reused": True, "status": applied.get("status")}))
-                return JSONResponse(jsonable_encoder({"consent_record": existing, "reused": True, "status": None}))
+                    return JSONResponse(
+                        jsonable_encoder(
+                            {
+                                "consent_record": existing,
+                                "reused": True,
+                                "status": applied.get("status"),
+                            }
+                        )
+                    )
+                return JSONResponse(
+                    jsonable_encoder(
+                        {"consent_record": existing, "reused": True, "status": None}
+                    )
+                )
 
     # No existing record; use the same request builder as the CLI consent flow.
     from core.init_api import build_consent_request
@@ -2412,8 +3603,14 @@ async def init_consent_request(req: InitConsentRequest):
     )
 
     if use_mock_consent:
-        decision = test_decision_raw if test_decision_raw in {"consent", "decline"} else "consent"
-        signature = (os.getenv("HEXIS_TEST_CONSENT_SIGNATURE") or "test-consent").strip()
+        decision = (
+            test_decision_raw
+            if test_decision_raw in {"consent", "decline"}
+            else "consent"
+        )
+        signature = (
+            os.getenv("HEXIS_TEST_CONSENT_SIGNATURE") or "test-consent"
+        ).strip()
         payload = {
             "decision": decision,
             "signature": signature if decision == "consent" else None,
@@ -2512,11 +3709,14 @@ async def init_consent_request(req: InitConsentRequest):
                 break
         if not args:
             from core.llm_json import extract_json_object
+
             args = extract_json_object(raw_content)
         raw_text = json.dumps(args) if args else raw_content
 
     decision = str(args.get("decision") or "").strip().lower()
-    signature = args.get("signature") if isinstance(args.get("signature"), str) else None
+    signature = (
+        args.get("signature") if isinstance(args.get("signature"), str) else None
+    )
     reason_value = args.get("reason", args.get("reasoning"))
     reason = reason_value.strip() if isinstance(reason_value, str) else ""
     memories = args.get("memories") if isinstance(args.get("memories"), list) else []
@@ -2525,23 +3725,29 @@ async def init_consent_request(req: InitConsentRequest):
     if decision not in {"consent", "decline"}:
         validation_error = "The model did not choose either consent or decline."
     elif not reason:
-        validation_error = "The model did not provide the required reason for its decision."
+        validation_error = (
+            "The model did not provide the required reason for its decision."
+        )
     elif decision == "consent" and not (signature or "").strip():
-        validation_error = "The model chose consent without providing the required signature."
+        validation_error = (
+            "The model chose consent without providing the required signature."
+        )
     if validation_error:
         return JSONResponse(
-            jsonable_encoder({
-                "error": f"{role.capitalize()} consent response was invalid: {validation_error}",
-                "provider": provider,
-                "model": model,
-                "role": role,
-                "attempt_id": attempt_id,
-                "exchange": {
-                    "request_messages": messages,
-                    "raw_content": raw_content,
-                    "raw_tool_calls": raw_tool_calls,
-                },
-            }),
+            jsonable_encoder(
+                {
+                    "error": f"{role.capitalize()} consent response was invalid: {validation_error}",
+                    "provider": provider,
+                    "model": model,
+                    "role": role,
+                    "attempt_id": attempt_id,
+                    "exchange": {
+                        "request_messages": messages,
+                        "raw_content": raw_content,
+                        "raw_tool_calls": raw_tool_calls,
+                    },
+                }
+            ),
             status_code=502,
         )
 
@@ -2565,9 +3771,14 @@ async def init_consent_request(req: InitConsentRequest):
 
     async with pool.acquire() as conn:
         if role == "conscious":
-            result_raw = await conn.fetchval("SELECT init_consent($1::jsonb) as result", json.dumps(payload))
+            result_raw = await conn.fetchval(
+                "SELECT init_consent($1::jsonb) as result", json.dumps(payload)
+            )
         else:
-            result_raw = await conn.fetchval("SELECT record_consent_response($1::jsonb) as result", json.dumps(payload))
+            result_raw = await conn.fetchval(
+                "SELECT record_consent_response($1::jsonb) as result",
+                json.dumps(payload),
+            )
 
         result = (
             result_raw
@@ -2580,22 +3791,26 @@ async def init_consent_request(req: InitConsentRequest):
             if isinstance(status_raw, dict)
             else (json.loads(status_raw) if isinstance(status_raw, str) else {})
         )
-        consent_record = await _fetch_consent_record(conn, provider=provider, model=model, endpoint=endpoint)
+        consent_record = await _fetch_consent_record(
+            conn, provider=provider, model=model, endpoint=endpoint
+        )
 
     return JSONResponse(
-        jsonable_encoder({
-            "decision": decision,
-            "contract": payload,
-            "result": result,
-            "consent_record": consent_record,
-            "status": status,
-            "attempt_id": attempt_id,
-            "exchange": {
-                "request_messages": messages,
-                "raw_content": raw_content,
-                "raw_tool_calls": raw_tool_calls,
-            },
-        })
+        jsonable_encoder(
+            {
+                "decision": decision,
+                "contract": payload,
+                "result": result,
+                "consent_record": consent_record,
+                "status": status,
+                "attempt_id": attempt_id,
+                "exchange": {
+                    "request_messages": messages,
+                    "raw_content": raw_content,
+                    "raw_tool_calls": raw_tool_calls,
+                },
+            }
+        )
     )
 
 
@@ -2603,16 +3818,21 @@ async def init_consent_request(req: InitConsentRequest):
 # CLI entry point
 # ---------------------------------------------------------------------------
 
+
 def main(argv: list[str] | None = None) -> None:
     from dotenv import load_dotenv
+
     load_dotenv()
 
     parser = argparse.ArgumentParser(description="Hexis API server")
-    parser.add_argument("--host", default="127.0.0.1", help="Bind address (default: 127.0.0.1)")
+    parser.add_argument(
+        "--host", default="127.0.0.1", help="Bind address (default: 127.0.0.1)"
+    )
     parser.add_argument("--port", type=int, default=43817, help="Port (default: 43817)")
     args = parser.parse_args(argv)
 
     import uvicorn
+
     uvicorn.run(
         "apps.hexis_api:app",
         host=args.host,

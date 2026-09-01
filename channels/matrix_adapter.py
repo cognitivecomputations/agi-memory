@@ -8,12 +8,18 @@ Inbound: sync_forever() callback.  Outbound: room_send() API calls.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 from typing import Any, Callable, Awaitable
 
-from .base import ChannelAdapter, ChannelCapabilities, ChannelMessage, parse_allowlist, resolve_channel_token
+from .base import (
+    ChannelAdapter,
+    ChannelCapabilities,
+    ChannelMessage,
+    parse_allowlist,
+    resolve_channel_token,
+    resolve_forward_all,
+)
 from .media import Attachment
 
 logger = logging.getLogger(__name__)
@@ -37,8 +43,14 @@ class MatrixAdapter(ChannelAdapter):
     Requires a Matrix account with an access token (not password login).
     """
 
-    def __init__(self, config: dict[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        config: dict[str, Any] | None = None,
+        *,
+        forward_all: bool | None = None,
+    ) -> None:
         self._config = config or {}
+        self._forward_all = resolve_forward_all(self._config, forward_all)
         self._on_message: Callable[[ChannelMessage], Awaitable[None]] | None = None
         self._connected = False
         self._client = None
@@ -90,7 +102,9 @@ class MatrixAdapter(ChannelAdapter):
                 "or configure channel.matrix.homeserver in the database."
             )
 
-        access_token = _resolve_token(self._config, "access_token", "MATRIX_ACCESS_TOKEN")
+        access_token = _resolve_token(
+            self._config, "access_token", "MATRIX_ACCESS_TOKEN"
+        )
         if not access_token:
             raise RuntimeError(
                 "Matrix access token not found. Set MATRIX_ACCESS_TOKEN env var "
@@ -120,7 +134,9 @@ class MatrixAdapter(ChannelAdapter):
         client.add_event_callback(_on_room_message, RoomMessageText)
 
         self._connected = True
-        logger.info("Matrix adapter started as %s on %s", self._user_id, self._homeserver)
+        logger.info(
+            "Matrix adapter started as %s on %s", self._user_id, self._homeserver
+        )
 
         try:
             # sync_forever blocks until cancelled
@@ -141,10 +157,12 @@ class MatrixAdapter(ChannelAdapter):
         if event.sender == self._user_id:
             return
 
-        # Check room allowlist
+        gate_hint: str | None = None
         if self._allowed_rooms is not None:
             if room.room_id not in self._allowed_rooms:
-                return
+                if not self._forward_all:
+                    return
+                gate_hint = "not_allowed_room"
 
         text = event.body or ""
         if not text:
@@ -154,7 +172,9 @@ class MatrixAdapter(ChannelAdapter):
         sender_name = room.user_name(event.sender) or event.sender
 
         # Check for thread (reply-to relation)
-        relates_to = getattr(event, "source", {}).get("content", {}).get("m.relates_to", {})
+        relates_to = (
+            getattr(event, "source", {}).get("content", {}).get("m.relates_to", {})
+        )
         thread_id = None
         reply_to_id = None
         if relates_to.get("rel_type") == "m.thread":
@@ -173,8 +193,13 @@ class MatrixAdapter(ChannelAdapter):
             reply_to_id=reply_to_id,
             thread_id=thread_id,
             metadata={
+                # Matrix has no DM flag on the event: a direct room is simply a
+                # room with two members. More than that is an audience.
+                "is_group": (room.member_count or 0) > 2,
                 "room_name": room.display_name,
                 "room_member_count": room.member_count,
+                "is_mention": False,
+                **({"gate_hint": gate_hint} if gate_hint else {}),
             },
         )
 
@@ -301,6 +326,7 @@ class MatrixAdapter(ChannelAdapter):
             else:
                 # Download first, then upload
                 from .media import download_attachment
+
                 downloaded = await download_attachment(attachment)
                 if not downloaded.local_path:
                     return None

@@ -5,7 +5,8 @@
 -- and — after a grace window — TRULY deleted, reclaiming representational mass
 -- against a capacity dial.
 --
--- Ships DARK: everything here is a no-op until config retention.enabled = true.
+-- Reversible consolidation ships on; retention.enabled remains the kill switch.
+-- Irreversible deletion is separately opt-in and off by default.
 -- Reuses phase-1 strength (calculate_strength) and the memory_edges helpers.
 SET search_path = public, ag_catalog, "$user";
 SET check_function_bodies = off;
@@ -179,14 +180,24 @@ BEGIN
             PERFORM create_memory_relationship(v_gist_id, v_orig, 'DERIVED_FROM', '{}'::jsonb);
         EXCEPTION WHEN OTHERS THEN NULL;  -- provenance edge is best-effort (source_ids in metadata is canonical)
         END;
+        PERFORM record_supersession(
+            v_orig,
+            v_gist_id,
+            'retention consolidation',
+            'retention',
+            'active',
+            CURRENT_TIMESTAMP,
+            NULL,
+            TRUE,
+            jsonb_build_object('source', 'consolidate_memory_group')
+        );
     END LOOP;
 
     UPDATE memories SET
         status = 'archived',
-        superseded_by = v_gist_id,
         metadata = jsonb_set(metadata, '{consolidation}',
                      COALESCE(metadata->'consolidation', '{}'::jsonb)
-                       || jsonb_build_object('superseded_by', v_gist_id, 'archived_at', clock_timestamp()::text))
+                       || jsonb_build_object('archived_at', clock_timestamp()::text))
     WHERE id = ANY(v_ids);
 
     INSERT INTO memory_summarization_queue (memory_id) VALUES (v_gist_id)
@@ -390,37 +401,34 @@ DECLARE
     v_mass FLOAT;
     v_target UUID;
     rec RECORD;
+    v_irreversible BOOLEAN := COALESCE(
+        get_config_bool('retention.irreversible_pruning_enabled'), FALSE
+    );
 BEGIN
     IF NOT COALESCE(get_config_bool('retention.enabled'), false) THEN
         RETURN jsonb_build_object('skipped', true);
     END IF;
 
-    -- (0) conscious review left undecided past its window -> default LET GO (consolidate)
-    FOR rec IN
-        SELECT id, memory_ids FROM memory_review_queue
-        WHERE status = 'pending' AND expires_at <= CURRENT_TIMESTAMP
-    LOOP
-        BEGIN
-            PERFORM consolidate_memory_group(rec.memory_ids);
-        EXCEPTION WHEN OTHERS THEN
-            RAISE WARNING 'review expiry consolidate failed: %', SQLERRM;
-        END;
-        UPDATE memory_review_queue SET status = 'expired', decided_at = CURRENT_TIMESTAMP WHERE id = rec.id;
-        v_expired := v_expired + 1;
-    END LOOP;
+    -- A timer never chooses forgetting. Expired review horizons remain pending
+    -- until the user or conscious agent makes an explicit decision.
+    SELECT count(*)::int INTO v_expired
+    FROM memory_review_queue
+    WHERE status = 'pending' AND expires_at <= CURRENT_TIMESTAMP;
 
     -- (a) archived originals past grace (the undo window) -> truly delete
-    FOR rec IN
-        SELECT id FROM memories
-        WHERE status = 'archived' AND superseded_by IS NOT NULL
-          AND age_in_days(COALESCE((metadata->'consolidation'->>'archived_at')::timestamptz, updated_at)) >= v_grace
-          AND NOT is_memory_protected(id)
-    LOOP
-        IF delete_memory_fully(rec.id) THEN v_pruned := v_pruned + 1; END IF;
-    END LOOP;
+    IF v_irreversible THEN
+        FOR rec IN
+            SELECT id FROM memories
+            WHERE status = 'archived' AND superseded_by IS NOT NULL
+              AND age_in_days(COALESCE((metadata->'consolidation'->>'archived_at')::timestamptz, updated_at)) >= v_grace
+              AND NOT is_memory_protected(id)
+        LOOP
+            IF delete_memory_fully(rec.id) THEN v_pruned := v_pruned + 1; END IF;
+        END LOOP;
+    END IF;
 
     -- (b) capacity pressure -> prune the weakest live episodic memories (last resort)
-    IF v_capacity > 0 THEN
+    IF v_irreversible AND v_capacity > 0 THEN
         LOOP
             SELECT COALESCE(sum(calculate_strength(importance, decay_rate, created_at, last_reinforced)), 0)
               INTO v_mass FROM memories WHERE status = 'active' AND type = 'episodic';
@@ -439,7 +447,8 @@ BEGIN
     -- retire on its own (user-provided sources only fade via approval).
     RETURN jsonb_build_object(
         'pruned', v_pruned,
-        'reviews_expired', v_expired,
+        'irreversible_pruning_enabled', v_irreversible,
+        'reviews_awaiting_decision', v_expired,
         'agent_sources', run_agent_source_retention()
     );
 END;
@@ -965,6 +974,9 @@ LANGUAGE sql STABLE
 AS $$
     SELECT jsonb_build_object(
         'enabled', COALESCE(get_config_bool('retention.enabled'), false),
+        'irreversible_pruning_enabled', COALESCE(
+            get_config_bool('retention.irreversible_pruning_enabled'), false
+        ),
         'episodic', jsonb_build_object(
             'active', (SELECT count(*) FROM memories WHERE status = 'active' AND type = 'episodic'),
             'mass', (SELECT round(COALESCE(sum(calculate_strength(importance, decay_rate, created_at, last_reinforced)), 0)::numeric, 2)

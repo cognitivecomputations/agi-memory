@@ -54,7 +54,7 @@ class ChatScreen(Screen):
         self._history: list[dict[str, Any]] = []
         self._verbose = False
         self._debug = False
-        self._show_reasoning = True
+        self._show_reasoning = False
         self._agent_name = "Hexis"
         self._mood = ""
         self._streaming = False
@@ -62,6 +62,7 @@ class ChatScreen(Screen):
         self._pending_user = ""
         self._queued: list[str] = []
         self._tool_count = 0
+        self._turn_failed = False
         self._flush_timer: Any = None
         self._greet = False
         self._chat_session_id = str(uuid.uuid4())
@@ -125,12 +126,12 @@ class ChatScreen(Screen):
                 energy = await conn.fetchval(
                     "SELECT current_energy FROM heartbeat_state WHERE id = 1"
                 )
-                max_energy = await conn.fetchval(
-                    "SELECT get_config_int('heartbeat.max_energy')"
+                energy_capacity = await conn.fetchval(
+                    "SELECT heartbeat_bank_capacity()"
                 )
             if energy is not None:
                 self.query_one(StatusBar).update_state(
-                    energy=int(energy), max_energy=int(max_energy or 20)
+                    energy=int(energy), max_energy=int(energy_capacity or 20)
                 )
         except Exception:
             pass  # energy meter is ambient; never block chat on it
@@ -219,9 +220,10 @@ class ChatScreen(Screen):
                 if payload.get("mood"):
                     tr.write_info(f"Mood: {payload.get('mood')}")
                 energy = payload.get("energy")
-                max_e = payload.get("max_energy")
+                max_e = payload.get("energy_capacity", payload.get("max_energy"))
+                reserve = payload.get("energy_reserve", payload.get("max_energy"))
                 if energy is not None:
-                    tr.write_info(f"Energy: {energy}/{max_e}")
+                    tr.write_info(f"Energy: {energy}/{max_e} (reserve {reserve})")
                 consent = payload.get("consent", {})
                 if isinstance(consent, dict) and consent.get("status"):
                     tr.write_info(f"Consent: {consent.get('status')}")
@@ -259,6 +261,7 @@ class ChatScreen(Screen):
         await tr.add_user(text)
         self._pending_user = text
         self._tool_count = 0
+        self._turn_failed = False
         self._streaming = True
         self._current_turn = await tr.add_assistant(self._agent_name)
         self._current_turn.show_reasoning(self._show_reasoning)
@@ -312,6 +315,11 @@ class ChatScreen(Screen):
                         saw_token = True
                         status.set_busy("")  # switch to rotating think-verbs
                     turn.append_delta(text)
+            elif ev == AgentEvent.REASONING_DELTA:
+                text = data.get("text", "")
+                if text and turn is not None:
+                    turn.append_reasoning_delta(text)
+                    status.set_busy("thinking")
             elif ev == AgentEvent.TOOL_START:
                 name = data.get("tool_name", "tool")
                 self._tool_count += 1
@@ -330,8 +338,16 @@ class ChatScreen(Screen):
                 tr.write_info("continuing…")
             elif ev == AgentEvent.ENERGY_EXHAUSTED:
                 tr.write_info("energy exhausted")
+            elif ev == AgentEvent.LOOP_END:
+                if data.get("stopped_reason") == "error":
+                    if not self._turn_failed:
+                        tr.write_error("Agent loop ended with an error.")
+                    self._turn_failed = True
             elif ev == AgentEvent.ERROR:
-                tr.write_error(data.get("error", "Unknown error"))
+                self._turn_failed = True
+                tr.write_error(
+                    data.get("error") or data.get("error_type") or "Unknown error"
+                )
 
     async def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
         if event.worker.name != "chat-stream":
@@ -353,11 +369,12 @@ class ChatScreen(Screen):
 
         tr = self.query_one(Transcript)
         if event.state == WorkerState.ERROR:
-            tr.write_error(str(event.worker.error))
+            from core.agent_loop import describe_exception
+            tr.write_error(describe_exception(event.worker.error))
         elif event.state == WorkerState.CANCELLED:
             tr.write_info("interrupted")
 
-        if event.state == WorkerState.SUCCESS and turn is not None:
+        if event.state == WorkerState.SUCCESS and turn is not None and not self._turn_failed:
             final_text = getattr(turn, "_visible", "") or ""
             self._history.append({"role": "user", "content": self._pending_user})
             self._history.append({"role": "assistant", "content": final_text})
@@ -469,7 +486,7 @@ class HexisChatApp(App):
         import asyncpg
         from core.agent_api import db_dsn_from_env, get_agent_profile_context
         from core.llm_config import load_llm_config
-        from core.tools import create_default_registry
+        from core.tools import create_full_registry
 
         dsn = None
         i = 0
@@ -502,7 +519,7 @@ class HexisChatApp(App):
                     configured = True  # never block chat on this probe
                 llm_config = await load_llm_config(conn, "llm.chat", fallback_key="llm")
             self.model_name = llm_config.get("model", "") if isinstance(llm_config, dict) else ""
-            self.registry = create_default_registry(self.pool)
+            self.registry = await create_full_registry(self.pool)
             agent_profile = await get_agent_profile_context(self.dsn)
             if isinstance(agent_profile, dict):
                 self.agent_name = agent_profile.get("name", "Hexis")

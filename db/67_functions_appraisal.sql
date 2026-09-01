@@ -128,6 +128,7 @@ BEGIN
                              THEN turn_ctx->'goals' ELSE '{}'::jsonb END, '{}'::jsonb),
         'relationships', NULLIF(get_relationships_context(8), '[]'::jsonb),
         'dopamine_state', NULLIF(get_dopamine_state(), '{}'::jsonb),
+        'emotion_families', COALESCE(get_config('emotion.families'), '{}'::jsonb),
         'limits', jsonb_build_object(
             'memory_limit', COALESCE(get_config_int('subconscious.appraisal_memory_limit'), 10),
             'memory_chars', COALESCE(get_config_int('subconscious.appraisal_memory_chars'), 1200),
@@ -167,6 +168,7 @@ DECLARE
     arousal FLOAT;
     intensity FLOAT;
     emotion TEXT;
+    emotion_family TEXT;
     response TEXT;
 BEGIN
     -- Memory references: confidence-filtered, clamped, allow-listed, and
@@ -223,6 +225,7 @@ BEGIN
                          THEN (emo_raw->>'confidence')::float ELSE 0.0 END;
         IF emo_conf >= min_conf THEN
             emotion := NULLIF(trim(COALESCE(emo_raw->>'primary_emotion', '')), '');
+            emotion_family := normalize_emotion_family(emo_raw->>'family');
             valence := CASE WHEN (emo_raw->>'valence') ~ '^-?[0-9.]+$'
                             THEN LEAST(1.0, GREATEST(-1.0, (emo_raw->>'valence')::float)) END;
             arousal := CASE WHEN (emo_raw->>'arousal') ~ '^-?[0-9.]+$'
@@ -237,7 +240,8 @@ BEGIN
                     'arousal', arousal,
                     'intensity', intensity,
                     'confidence', LEAST(1.0, emo_conf)
-                );
+                ) || CASE WHEN emotion_family IS NULL THEN '{}'::jsonb
+                          ELSE jsonb_build_object('family', emotion_family) END;
             END IF;
         END IF;
     END IF;

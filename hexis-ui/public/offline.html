@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#18211e" />
+    <title>Hexis is offline</title>
+    <style>
+      body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #f3f5f2; color: #18211e; font: 16px system-ui, sans-serif; }
+      main { width: min(32rem, calc(100% - 3rem)); padding: 2rem; border: 1px solid #d8ded9; border-radius: 1rem; background: white; }
+      h1 { margin-top: 0; font-size: 1.5rem; }
+      p { color: #5d6863; line-height: 1.6; }
+      button { border: 0; border-radius: .5rem; padding: .75rem 1rem; background: #18211e; color: white; font-weight: 700; cursor: pointer; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Hexis is out of reach</h1>
+      <p>The app shell is available, but conversations and memory stay on your Hexis host. Reconnect to that machine or its tailnet, then retry here.</p>
+      <button type="button" onclick="location.reload()">Retry connection</button>
+    </main>
+  </body>
+</html>

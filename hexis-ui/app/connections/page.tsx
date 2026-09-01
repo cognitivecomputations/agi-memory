@@ -15,7 +15,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Badge } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
 import { Card } from "../components/ui/card";
-import { TextInput } from "../components/ui/input";
+import { Label, TextInput } from "../components/ui/input";
 import { PageHeader } from "../components/ui/page-header";
 import { Spinner } from "../components/ui/spinner";
 import {
@@ -254,7 +254,9 @@ function ConnectorCard({
                           ? "revoke_gmail"
                           : connector.id === "twitter_x"
                             ? "revoke_twitter_x"
-                            : "revoke_connection";
+                            : ["notion", "spotify", "home_assistant", "weather", "trello"].includes(connector.id)
+                              ? "revoke_life"
+                              : "revoke_connection";
                       void onAction(
                         `${connector.id}:revoke:${connection.id}`,
                         revokeAction,
@@ -351,6 +353,14 @@ function ConnectorCard({
         />
       ) : null}
 
+      {["notion", "spotify", "home_assistant", "weather", "trello"].includes(connector.id) ? (
+        <LifeConnectorControls
+          summary={summary}
+          actionBusy={actionBusy}
+          onAction={onAction}
+        />
+      ) : null}
+
       {connector.id === "twitter_x" ? (
         <ArchiveImportControls
           summary={summary}
@@ -370,6 +380,193 @@ function ConnectorCard({
         </a>
       ) : null}
     </Card>
+  );
+}
+
+function LifeConnectorControls({
+  summary,
+  actionBusy,
+  onAction,
+}: {
+  summary: ConnectorSummary;
+  actionBusy: string | null;
+  onAction: IntegrationActionHandler;
+}) {
+  const { connector } = summary;
+  const setup = asRecord(connector.setup_manifest);
+  const defaults = stringArray(setup.default_capabilities);
+  const availableCapabilities = Object.entries(asRecord(connector.capability_manifest))
+    .filter(([, value]) => asString(asRecord(value).status) !== "planned")
+    .map(([name]) => name);
+  const rawFields = Array.isArray(setup.credential_fields) ? setup.credential_fields : [];
+  const fields = rawFields
+    .map(asRecord)
+    .filter((field) => Boolean(asString(field.name)));
+  const [values, setValues] = useState<Record<string, string>>({});
+  const [capabilities, setCapabilities] = useState<string[]>(defaults);
+  const [authorizationResponse, setAuthorizationResponse] = useState("");
+  const connected = summary.activeConnections.length > 0;
+  const pending = summary.activeAttempts.find((attempt) => attempt.authorization_url) || null;
+  const connectAction = connector.id === "spotify" ? "connect_spotify" : "connect_life";
+  const busyKey = `${connector.id}:connect`;
+  const completeBusyKey = `${connector.id}:complete`;
+
+  const requiredFieldNames = fields
+    .map((field) => asString(field.name))
+    .filter((name): name is string => Boolean(name));
+  const spotifyHasClientChoice =
+    connector.id !== "spotify" || Boolean(values.client_id?.trim() || values.client_id_env?.trim());
+  const configured =
+    connector.id === "spotify"
+      ? spotifyHasClientChoice
+      : requiredFieldNames.every((name) => Boolean(values[name]?.trim()));
+
+  const start = () => {
+    const payload: Record<string, unknown> = {
+      connector_id: connector.id,
+      capabilities,
+    };
+    for (const [name, value] of Object.entries(values)) {
+      if (value.trim()) payload[name] = value.trim();
+    }
+    void onAction(busyKey, connectAction, payload);
+  };
+
+  return (
+    <div className="space-y-3 rounded-md border border-[var(--outline)] bg-[var(--surface)] p-3">
+      <div>
+        <p className="text-xs font-semibold">{connector.display_name} setup</p>
+        <p className="mt-1 text-xs leading-5 text-[var(--ink-soft)]">
+          {asString(setup.user_next_step) || "Choose the least access needed, then verify the provider connection."}
+        </p>
+      </div>
+
+      {!connected ? (
+        <>
+          <fieldset className="space-y-2">
+            <legend className="text-xs font-semibold">Capabilities</legend>
+            <div className="grid gap-2 sm:grid-cols-2">
+              {availableCapabilities.map((capability) => {
+                const detail = asRecord(asRecord(connector.capability_manifest)[capability]);
+                const checked = capabilities.includes(capability);
+                return (
+                  <label key={capability} className="flex items-start gap-2 rounded-md border border-[var(--outline)] bg-white px-2.5 py-2 text-xs">
+                    <input
+                      type="checkbox"
+                      checked={checked}
+                      onChange={(event) =>
+                        setCapabilities((current) =>
+                          event.target.checked
+                            ? [...current.filter((item) => item !== capability), capability]
+                            : current.filter((item) => item !== capability)
+                        )
+                      }
+                      className="mt-0.5 h-4 w-4 accent-[var(--teal)]"
+                    />
+                    <span>
+                      <span className="block font-medium">{asString(detail.label) || humanize(capability)}</span>
+                      <span className="text-[var(--ink-soft)]">{humanize(asString(detail.scope_kind) || "access")}</span>
+                    </span>
+                  </label>
+                );
+              })}
+            </div>
+          </fieldset>
+
+          <div className="grid gap-2 sm:grid-cols-2">
+            {fields.map((field) => {
+              const name = asString(field.name) || "";
+              const isEnvironmentReference = name.endsWith("_env");
+              const inputId = `life-connector-${connector.id}-${name}`;
+              const descriptionId = isEnvironmentReference ? `${inputId}-description` : undefined;
+              return (
+                <div key={name} className="text-xs font-medium">
+                  <Label htmlFor={inputId} className="normal-case tracking-normal text-[var(--foreground)]">
+                    {asString(field.label) || humanize(name)}
+                  </Label>
+                  <TextInput
+                    id={inputId}
+                    value={values[name] || ""}
+                    onChange={(event) =>
+                      setValues((current) => ({ ...current, [name]: event.target.value }))
+                    }
+                    placeholder={asString(field.example) || (isEnvironmentReference ? "ENVIRONMENT_VARIABLE_NAME" : "")}
+                    className="mt-1"
+                    autoComplete="off"
+                    aria-describedby={descriptionId}
+                  />
+                  {isEnvironmentReference ? (
+                    <span id={descriptionId} className="mt-1 block font-normal text-[var(--ink-soft)]">
+                      Environment variable name only — never paste the secret value.
+                    </span>
+                  ) : null}
+                </div>
+              );
+            })}
+          </div>
+
+          {connector.id === "spotify" ? (
+            <p className="text-xs text-[var(--ink-soft)]">
+              Choose one client-ID field. Add the exact redirect URI returned after starting setup to your Spotify app.
+            </p>
+          ) : null}
+
+          <Button
+            type="button"
+            disabled={Boolean(actionBusy) || !configured || capabilities.length === 0}
+            onClick={start}
+          >
+            {actionBusy === busyKey
+              ? "Verifying..."
+              : connector.id === "spotify"
+                ? "Start Spotify sign-in"
+                : `Verify ${connector.display_name}`}
+          </Button>
+        </>
+      ) : (
+        <p className="text-xs text-[var(--ink-soft)]">
+          Connected provider actions are available in chat and MCP through the {humanize(connector.id)} skill.
+        </p>
+      )}
+
+      {pending?.authorization_url ? (
+        <div className="space-y-2 rounded-md border border-amber-200 bg-amber-50 p-3 text-xs">
+          <a
+            href={pending.authorization_url}
+            target="_blank"
+            rel="noreferrer"
+            className="inline-flex items-center gap-1 font-semibold text-[var(--teal)] underline"
+          >
+            Open Spotify sign-in <ExternalLink size={12} />
+          </a>
+          <p className="text-amber-900">
+            Hexis refreshes this page automatically after Spotify returns to the local callback.
+          </p>
+          <details>
+            <summary className="cursor-pointer font-semibold">Callback did not complete</summary>
+            <div className="mt-2 flex gap-2">
+              <TextInput
+                value={authorizationResponse}
+                onChange={(event) => setAuthorizationResponse(event.target.value)}
+                placeholder="Paste the full Spotify callback URL"
+              />
+              <Button
+                type="button"
+                disabled={Boolean(actionBusy) || !authorizationResponse.trim()}
+                onClick={() =>
+                  void onAction(completeBusyKey, "complete_spotify", {
+                    attempt_id: pending.attempt_id,
+                    authorization_response: authorizationResponse.trim(),
+                  })
+                }
+              >
+                {actionBusy === completeBusyKey ? "Completing..." : "Complete"}
+              </Button>
+            </div>
+          </details>
+        </div>
+      ) : null}
+    </div>
   );
 }
 
@@ -1390,7 +1587,7 @@ function connectorSetupNotice(ui: Record<string, unknown>): string {
     return `${connector} setup file saved. Start Google sign-in from the setup panel.`;
   }
   if (status === "pending_authorization") {
-    return `${connector} sign-in started. Open Google; Hexis will complete the connection when Google returns.`;
+    return `${connector} sign-in started. Open the provider authorization page; Hexis will complete the connection when it returns.`;
   }
   if (status === "connected") return `${connector} is connected.`;
   return `${connector} setup updated.`;

@@ -1,5 +1,4 @@
 import json
-import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -23,6 +22,21 @@ def test_normalize_provider_variants():
     assert llm.normalize_provider(None) == "openai"
     assert llm.normalize_provider("OpenAI") == "openai"
     assert llm.normalize_provider("openai_chat_completions_endpoint") == "openai-chat-completions-endpoint"
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_close_async_stream_falls_back_to_response():
+    class _Stream:
+        pass
+
+    response = MagicMock()
+    response.aclose = AsyncMock()
+    stream = _Stream()
+    stream.response = response
+
+    await llm._close_async_stream(stream)
+
+    response.aclose.assert_awaited_once_with()
 
 
 def test_normalize_provider_new_aliases():
@@ -77,6 +91,42 @@ def test_normalize_llm_config_falls_back_to_env(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "envkey")
     normalized = llm.normalize_llm_config({"provider": "openai", "model": "gpt-4o"})
     assert normalized["api_key"] == "envkey"
+
+
+def test_openai_compatible_does_not_consume_ambient_openai_key(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "ambient-openai-key")
+
+    normalized = llm.normalize_llm_config({
+        "provider": "openai_compatible",
+        "model": "local-model",
+        "endpoint": "http://localhost:11434/v1",
+    })
+
+    assert normalized["api_key"] is None
+
+
+def test_keyless_openai_compatible_uses_internal_sdk_key(monkeypatch):
+    captured: dict[str, object] = {}
+    client = object()
+
+    def fake_async_openai(**kwargs):
+        captured.update(kwargs)
+        return client
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr(llm.openai, "AsyncOpenAI", fake_async_openai)
+
+    result = llm._get_openai_client(
+        None,
+        "http://localhost:11434/v1",
+        "openai_compatible",
+    )
+
+    assert result is client
+    assert captured == {
+        "api_key": llm._LOCAL_OPENAI_COMPATIBLE_API_KEY,
+        "base_url": "http://localhost:11434/v1",
+    }
 
 
 def test_extract_system_prompt():
@@ -539,6 +589,31 @@ async def test_chat_completion_skips_responses_after_cached_false(monkeypatch):
 
 
 @pytest.mark.asyncio(loop_scope="session")
+async def test_compatible_completion_skips_responses_probe(monkeypatch):
+    monkeypatch.setattr(llm, "_HAS_RESPONSES_API", True)
+
+    mock_client = MagicMock()
+    mock_client.responses.create = AsyncMock(
+        side_effect=AssertionError("Responses API must not be used")
+    )
+    mock_client.chat.completions.create = AsyncMock(
+        return_value=_make_chat_completions_result("compatible response")
+    )
+    monkeypatch.setattr(llm.openai, "AsyncOpenAI", lambda **_kwargs: mock_client)
+
+    result = await llm.chat_completion(
+        provider="openai_compatible",
+        model="local-model",
+        endpoint="http://local.test/v1",
+        api_key="local-key",
+        messages=[{"role": "user", "content": "hi"}],
+    )
+
+    assert result["content"] == "compatible response"
+    mock_client.responses.create.assert_not_awaited()
+
+
+@pytest.mark.asyncio(loop_scope="session")
 async def test_chat_completion_real_error_propagates(monkeypatch):
     """Non-404 errors from Responses API propagate (not silently caught)."""
     monkeypatch.setattr(llm, "_HAS_RESPONSES_API", True)
@@ -596,6 +671,10 @@ async def test_stream_completion_uses_responses_api(monkeypatch):
     text_event.type = "response.output_text.delta"
     text_event.delta = "streamed"
 
+    reasoning_event = MagicMock()
+    reasoning_event.type = "response.reasoning_summary_text.delta"
+    reasoning_event.delta = "thinking"
+
     fc_item = MagicMock()
     fc_item.type = "function_call"
     fc_item.id = "item-1"
@@ -615,6 +694,7 @@ async def test_stream_completion_uses_responses_api(monkeypatch):
             pass
 
         async def __aiter__(self):
+            yield reasoning_event
             yield text_event
             yield done_event
 
@@ -623,6 +703,7 @@ async def test_stream_completion_uses_responses_api(monkeypatch):
     monkeypatch.setattr(llm.openai, "AsyncOpenAI", lambda **kw: mock_client)
 
     deltas = []
+    reasoning_deltas = []
     result = await llm.stream_chat_completion(
         provider="openai",
         model="gpt-4o",
@@ -630,12 +711,333 @@ async def test_stream_completion_uses_responses_api(monkeypatch):
         api_key="test",
         messages=[{"role": "user", "content": "hi"}],
         on_text_delta=lambda t: deltas.append(t),
+        on_reasoning_delta=lambda t: reasoning_deltas.append(t),
     )
     assert result["content"] == "streamed"
     assert deltas == ["streamed"]
+    assert reasoning_deltas == ["thinking"]
     assert len(result["tool_calls"]) == 1
     assert result["tool_calls"][0]["name"] == "recall"
     assert llm._endpoint_responses_support.get("default") is True
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_compatible_stream_uses_chat_and_separates_reasoning(monkeypatch):
+    """Generic compatible servers use their promised Chat Completions stream."""
+    monkeypatch.setattr(llm, "_HAS_RESPONSES_API", True)
+    requests: list[tuple[str, dict]] = []
+
+    async def fake_sse(_provider, _method, url, **kwargs):
+        requests.append((url, kwargs["json_body"]))
+        yield {"choices": [{"delta": {"reasoning": "thinking"}}]}
+        yield {
+            "choices": [{
+                "delta": {"content": "answer"},
+                "finish_reason": "stop",
+            }]
+        }
+
+    monkeypatch.setattr(llm, "iter_sse_json_events", fake_sse)
+    monkeypatch.setattr(
+        llm.openai,
+        "AsyncOpenAI",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("SDK streaming must not be used")
+        ),
+    )
+
+    text_deltas: list[str] = []
+    reasoning_deltas: list[str] = []
+    result = await llm.stream_chat_completion(
+        provider="openai_compatible",
+        model="local-model",
+        endpoint="http://local.test/v1",
+        api_key="local-key",
+        messages=[{"role": "user", "content": "hi"}],
+        on_text_delta=text_deltas.append,
+        on_reasoning_delta=reasoning_deltas.append,
+    )
+
+    assert result["content"] == "answer"
+    assert text_deltas == ["answer"]
+    assert reasoning_deltas == ["thinking"]
+    assert requests[0][0] == "http://local.test/v1/chat/completions"
+    assert requests[0][1]["stream"] is True
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_compatible_stream_propagates_midstream_error_after_partial_text(
+    monkeypatch,
+):
+    calls = 0
+    delivered: list[str] = []
+
+    async def fake_sse(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        yield {"choices": [{"delta": {"content": "partial"}}]}
+        raise ConnectionError("stream disconnected")
+
+    monkeypatch.setattr(llm, "iter_sse_json_events", fake_sse)
+
+    with pytest.raises(ConnectionError, match="stream disconnected"):
+        await llm.stream_chat_completion(
+            provider="openai_compatible",
+            model="local-model",
+            endpoint="http://local.test/v1",
+            api_key="local-key",
+            messages=[{"role": "user", "content": "hi"}],
+            on_text_delta=delivered.append,
+        )
+
+    assert calls == 1
+    assert delivered == ["partial"]
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_compatible_stream_accumulates_tool_call_deltas(monkeypatch):
+    async def fake_sse(*_args, **_kwargs):
+        yield {
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call-1",
+                        "function": {"name": "lookup", "arguments": '{"query":'},
+                    }]
+                },
+            }]
+        }
+        yield {
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "function": {"arguments": '"Libre WebUI"}'},
+                    }]
+                },
+                "finish_reason": "tool_calls",
+            }]
+        }
+
+    monkeypatch.setattr(llm, "iter_sse_json_events", fake_sse)
+
+    result = await llm.stream_chat_completion(
+        provider="openai_compatible",
+        model="local-model",
+        endpoint="http://local.test/v1",
+        api_key=None,
+        messages=[{"role": "user", "content": "look it up"}],
+        tools=[{
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }],
+    )
+
+    assert result["tool_calls"] == [{
+        "id": "call-1",
+        "name": "lookup",
+        "arguments": {"query": "Libre WebUI"},
+    }]
+
+
+@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.parametrize(
+    "invalid_index",
+    ["bad", -1, 1.5, True, "²", "9" * 5000],
+)
+async def test_compatible_stream_rejects_invalid_tool_call_index(
+    monkeypatch,
+    invalid_index,
+):
+    async def fake_sse(*_args, **_kwargs):
+        yield {
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "index": invalid_index,
+                        "id": "call-1",
+                        "function": {"name": "lookup", "arguments": "{}"},
+                    }]
+                },
+                "finish_reason": "tool_calls",
+            }]
+        }
+
+    monkeypatch.setattr(llm, "iter_sse_json_events", fake_sse)
+
+    with pytest.raises(RuntimeError, match="invalid index"):
+        await llm.stream_chat_completion(
+            provider="openai_compatible",
+            model="local-model",
+            endpoint="http://local.test/v1",
+            api_key=None,
+            messages=[{"role": "user", "content": "look it up"}],
+        )
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_compatible_stream_rejects_clean_truncated_text(monkeypatch):
+    async def fake_sse(*_args, **_kwargs):
+        yield {"choices": [{"delta": {"content": "partial"}}]}
+
+    monkeypatch.setattr(llm, "iter_sse_json_events", fake_sse)
+
+    with pytest.raises(RuntimeError, match="before a finish signal"):
+        await llm.stream_chat_completion(
+            provider="openai_compatible",
+            model="local-model",
+            endpoint="http://local.test/v1",
+            api_key=None,
+            messages=[{"role": "user", "content": "hi"}],
+        )
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_compatible_stream_rejects_truncated_tool_arguments(monkeypatch):
+    async def fake_sse(*_args, **_kwargs):
+        yield {
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call-1",
+                        "function": {"name": "lookup", "arguments": '{"query":'},
+                    }]
+                }
+            }]
+        }
+
+    monkeypatch.setattr(llm, "iter_sse_json_events", fake_sse)
+
+    with pytest.raises(RuntimeError, match="before a finish signal"):
+        await llm.stream_chat_completion(
+            provider="openai_compatible",
+            model="local-model",
+            endpoint="http://local.test/v1",
+            api_key=None,
+            messages=[{"role": "user", "content": "look it up"}],
+        )
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_compatible_stream_rejects_malformed_terminal_tool_arguments(monkeypatch):
+    async def fake_sse(*_args, **_kwargs):
+        yield {
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call-1",
+                        "function": {"name": "lookup", "arguments": '{"query":'},
+                    }]
+                },
+                "finish_reason": "tool_calls",
+            }]
+        }
+
+    monkeypatch.setattr(llm, "iter_sse_json_events", fake_sse)
+
+    with pytest.raises(RuntimeError, match="Malformed streamed arguments"):
+        await llm.stream_chat_completion(
+            provider="openai_compatible",
+            model="local-model",
+            endpoint="http://local.test/v1",
+            api_key=None,
+            messages=[{"role": "user", "content": "look it up"}],
+        )
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_responses_stream_does_not_replay_after_visible_delta(monkeypatch):
+    monkeypatch.setattr(llm, "_HAS_RESPONSES_API", True)
+    calls = 0
+    delivered: list[str] = []
+
+    text_event = MagicMock()
+    text_event.type = "response.output_text.delta"
+    text_event.delta = "partial"
+
+    class FailingStream:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def __aiter__(self):
+            yield text_event
+            raise ConnectionError("responses stream disconnected")
+
+    def fake_stream(**_kwargs):
+        nonlocal calls
+        calls += 1
+        return FailingStream()
+
+    mock_client = MagicMock()
+    mock_client.responses.stream = fake_stream
+    monkeypatch.setattr(llm.openai, "AsyncOpenAI", lambda **_kwargs: mock_client)
+
+    with pytest.raises(ConnectionError, match="responses stream disconnected"):
+        await llm.stream_chat_completion(
+            provider="openai",
+            model="gpt-4o",
+            endpoint=None,
+            api_key="test",
+            messages=[{"role": "user", "content": "hi"}],
+            on_text_delta=delivered.append,
+        )
+
+    assert calls == 1
+    assert delivered == ["partial"]
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_responses_stream_does_not_replay_after_reasoning_delivery(monkeypatch):
+    monkeypatch.setattr(llm, "_HAS_RESPONSES_API", True)
+    calls = 0
+    reasoning_deltas: list[str] = []
+
+    reasoning_event = MagicMock()
+    reasoning_event.type = "response.reasoning_summary_text.delta"
+    reasoning_event.delta = "private thought"
+
+    class FailingStream:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def __aiter__(self):
+            yield reasoning_event
+            raise ConnectionError("responses stream disconnected")
+
+    def fake_stream(**_kwargs):
+        nonlocal calls
+        calls += 1
+        return FailingStream()
+
+    mock_client = MagicMock()
+    mock_client.responses.stream = fake_stream
+    monkeypatch.setattr(llm.openai, "AsyncOpenAI", lambda **_kwargs: mock_client)
+
+    with patch("asyncio.sleep", new=AsyncMock()):
+        with pytest.raises(ConnectionError, match="responses stream disconnected"):
+            await llm.stream_chat_completion(
+                provider="openai",
+                model="gpt-4o",
+                endpoint=None,
+                api_key="test",
+                messages=[{"role": "user", "content": "hi"}],
+                on_reasoning_delta=reasoning_deltas.append,
+            )
+
+    assert calls == 1
+    assert reasoning_deltas == ["private thought"]
 
 
 @pytest.mark.asyncio(loop_scope="session")

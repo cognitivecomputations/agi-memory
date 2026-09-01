@@ -142,6 +142,58 @@ async def test_openai_client_streams_role_text_finish_and_done(http_client):
     assert chunks[-1].choices[0].finish_reason == "stop"
 
 
+async def test_openai_buffered_completion_rejects_error_stop_without_error_event(
+    http_client,
+):
+    model_id = await _active_model_id(http_client)
+
+    async def error_stream(*_args, **_kwargs):
+        yield AgentEventData(event=AgentEvent.TEXT_DELTA, data={"text": "partial"})
+        yield AgentEventData(
+            event=AgentEvent.LOOP_END,
+            data={"stopped_reason": "error", "timed_out": False},
+        )
+
+    with patch.object(web_module, "stream_chat_events", error_stream):
+        response = await http_client.post(
+            "/v1/chat/completions",
+            json={
+                "model": model_id,
+                "messages": [{"role": "user", "content": "Fail safely."}],
+            },
+        )
+
+    assert response.status_code == 502
+    assert response.json()["error"]["code"] == "upstream_agent_error"
+    assert response.json()["error"]["message"] == "Agent loop ended with an error."
+
+
+async def test_openai_stream_reports_error_stop_without_normal_finish(http_client):
+    model_id = await _active_model_id(http_client)
+
+    async def error_stream(*_args, **_kwargs):
+        yield AgentEventData(event=AgentEvent.TEXT_DELTA, data={"text": "partial"})
+        yield AgentEventData(
+            event=AgentEvent.LOOP_END,
+            data={"stopped_reason": "error", "timed_out": False},
+        )
+
+    with patch.object(web_module, "stream_chat_events", error_stream):
+        response = await http_client.post(
+            "/v1/chat/completions",
+            json={
+                "model": model_id,
+                "messages": [{"role": "user", "content": "Fail safely."}],
+                "stream": True,
+            },
+        )
+
+    assert response.status_code == 200
+    assert '"code":"upstream_agent_error"' in response.text
+    assert '"finish_reason":"stop"' not in response.text
+    assert response.text.rstrip().endswith("data: [DONE]")
+
+
 @pytest.mark.parametrize(
     ("body_update", "status", "code"),
     [

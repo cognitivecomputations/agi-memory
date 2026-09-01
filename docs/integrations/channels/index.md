@@ -41,7 +41,7 @@ Connect your Hexis agent to messaging platforms. Each channel runs as an adapter
 All channels follow the same pattern:
 
 1. **Configure credentials** -- `hexis channels setup <channel>`
-2. **Start the channel worker** -- included in `docker compose --profile active up -d`
+2. **Start the stack** -- `hexis up` includes the channel/web-inbox worker even when no external adapter is configured
 3. **Verify** -- `hexis channels status`
 
 See [Channels Setup guide](../../guides/channels-setup.md) for the general pattern and tips.

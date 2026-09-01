@@ -41,6 +41,7 @@ class GoalPriority(str, Enum):
     COMPLETED = "completed"
     ABANDONED = "abandoned"
 
+
 class GoalSource(str, Enum):
     CURIOSITY = "curiosity"
     USER_REQUEST = "user_request"
@@ -71,7 +72,9 @@ class Memory:
     similarity: float | None = None
     source: str | None = None  # retrieval source: 'vector', 'association', 'temporal'
     trust_level: float | None = None  # epistemic trust [0..1] (DB-computed)
-    source_attribution: dict[str, Any] | None = None  # primary provenance (DB-stored JSON)
+    source_attribution: dict[str, Any] | None = (
+        None  # primary provenance (DB-stored JSON)
+    )
     created_at: datetime | None = None
     emotional_valence: float | None = None
     tier: str | None = None
@@ -129,8 +132,14 @@ class HistorySearchResult:
 # view — every co-occurring memory linking through one episode/cluster node. The
 # substrate still stores those; the explore_subgraph tool can request any type.
 REASONING_EDGE_TYPES = [
-    "CAUSES", "SUPPORTS", "CONTRADICTS", "DERIVED_FROM",
-    "CONTESTED_BECAUSE", "INSTANCE_OF", "ASSOCIATED", "TEMPORAL_NEXT",
+    "CAUSES",
+    "SUPPORTS",
+    "CONTRADICTS",
+    "DERIVED_FROM",
+    "CONTESTED_BECAUSE",
+    "INSTANCE_OF",
+    "ASSOCIATED",
+    "TEMPORAL_NEXT",
 ]
 
 
@@ -178,7 +187,9 @@ class MemoryInput:
     context: dict[str, Any] | None = None
     concepts: list[str] | None = None
     source_attribution: dict[str, Any] | None = None
-    source_references: Any | None = None  # JSONB for semantic memories (dict or list[dict])
+    source_references: Any | None = (
+        None  # JSONB for semantic memories (dict or list[dict])
+    )
     trust_level: float | None = None
 
 
@@ -202,6 +213,7 @@ async def _init_connection(conn: asyncpg.Connection) -> None:
         await conn.execute("SET search_path = public, ag_catalog;")
     except Exception:
         pass
+
 
 def _to_jsonb_arg(val: Any) -> Any:
     if val is None:
@@ -308,12 +320,19 @@ class CognitiveMemory:
                 memory_limit = int(
                     await conn.fetchval(
                         "SELECT COALESCE(get_config_int('memory.hydrate_memory_limit'), 10)"
-                    ) or 10
+                    )
+                    or 10
                 )
 
         async def _fetch_memories():
             async with self._pool.acquire() as conn:
-                recalled = await self._recall_recmem(conn, query, memory_limit, session_id=session_id, exclude_sensitive=exclude_sensitive)
+                recalled = await self._recall_recmem(
+                    conn,
+                    query,
+                    memory_limit,
+                    session_id=session_id,
+                    exclude_sensitive=exclude_sensitive,
+                )
                 relevant_worldview = []
                 if include_worldview:
                     relevant_worldview = await self._recall_memories(
@@ -322,7 +341,9 @@ class CognitiveMemory:
                         max(10, memory_limit),
                         [MemoryType.WORLDVIEW],
                     )
-                return _deduplicate_memories([*relevant_worldview[:3], *recalled])[:memory_limit]
+                return _deduplicate_memories([*relevant_worldview[:3], *recalled])[
+                    :memory_limit
+                ]
 
         async def _fetch_partial():
             if not include_partial:
@@ -344,7 +365,9 @@ class CognitiveMemory:
 
         identity = ctx.get("identity", []) if include_identity else []
         worldview = ctx.get("worldview", []) if include_worldview else []
-        emotional_state = ctx.get("emotional_state") if include_emotional_state else None
+        emotional_state = (
+            ctx.get("emotional_state") if include_emotional_state else None
+        )
         goals = ctx.get("goals") if include_goals else None
         urgent_drives = ctx.get("urgent_drives", []) if include_drives else []
         user_model = ctx.get("user_model", [])
@@ -357,7 +380,11 @@ class CognitiveMemory:
             seed_ids = [m.id for m in memories]
             # Default to the semantic reasoning edges (curated); callers can pass
             # an explicit list (incl. structural types) to override.
-            rel_types = subgraph_rel_types if subgraph_rel_types is not None else REASONING_EDGE_TYPES
+            rel_types = (
+                subgraph_rel_types
+                if subgraph_rel_types is not None
+                else REASONING_EDGE_TYPES
+            )
             try:
                 async with self._pool.acquire() as conn:
                     sg_row = await conn.fetchrow(
@@ -366,10 +393,15 @@ class CognitiveMemory:
                             build_context_subgraph($1::uuid[], $2, $3::text[], $4) AS subgraph,
                             memory_context_paths($1::uuid[], $2) AS context_paths
                         """,
-                        seed_ids, subgraph_depth, rel_types, subgraph_budget,
+                        seed_ids,
+                        subgraph_depth,
+                        rel_types,
+                        subgraph_budget,
                     )
                 subgraph = _coerce_json(sg_row["subgraph"]) if sg_row else None
-                context_paths = _coerce_json(sg_row["context_paths"]) if sg_row else None
+                context_paths = (
+                    _coerce_json(sg_row["context_paths"]) if sg_row else None
+                )
             except Exception:
                 # advisory: never fail hydration on graph assembly
                 subgraph = None
@@ -381,9 +413,13 @@ class CognitiveMemory:
             identity=list(identity) if isinstance(identity, list) else [],
             worldview=list(worldview) if isinstance(worldview, list) else [],
             user_model=list(user_model) if isinstance(user_model, list) else [],
-            emotional_state=(dict(emotional_state) if isinstance(emotional_state, dict) else None),
+            emotional_state=(
+                dict(emotional_state) if isinstance(emotional_state, dict) else None
+            ),
             goals=dict(goals) if isinstance(goals, dict) else None,
-            urgent_drives=(list(urgent_drives) if isinstance(urgent_drives, list) else []),
+            urgent_drives=(
+                list(urgent_drives) if isinstance(urgent_drives, list) else []
+            ),
             subgraph=subgraph if isinstance(subgraph, dict) else None,
             context_paths=context_paths if isinstance(context_paths, dict) else None,
         )
@@ -430,8 +466,14 @@ class CognitiveMemory:
                 memory_types=memory_types,
                 min_importance=min_importance,
             )
-            partial = await self._find_partial_activations(conn, query) if include_partial else []
-            return RecallResult(memories=memories, partial_activations=partial, query=query)
+            partial = (
+                await self._find_partial_activations(conn, query)
+                if include_partial
+                else []
+            )
+            return RecallResult(
+                memories=memories, partial_activations=partial, query=query
+            )
 
     async def search_history(
         self,
@@ -450,15 +492,17 @@ class CognitiveMemory:
         """
 
         normalized_query = query.strip()
-        if not normalized_query.strip("* ") and created_after is None and created_before is None:
+        if (
+            not normalized_query.strip("* ")
+            and created_after is None
+            and created_before is None
+        ):
             raise ValueError(
                 "history search needs query keywords, or a created_after/"
                 "created_before window to browse chronologically"
             )
         normalized_sources = list(
-            dict.fromkeys(
-                sources if sources is not None else ["turn", "memory"]
-            )
+            dict.fromkeys(sources if sources is not None else ["turn", "memory"])
         )
         invalid_sources = sorted(set(normalized_sources) - {"turn", "memory"})
         if invalid_sources:
@@ -560,8 +604,16 @@ class CognitiveMemory:
                 type=MemoryType(row["type"]),
                 content=row["content"],
                 importance=float(row["importance"]),
-                trust_level=(float(row["trust_level"]) if row["trust_level"] is not None else None),
-                source_attribution=(_coerce_json(row["source_attribution"]) if row["source_attribution"] is not None else None),
+                trust_level=(
+                    float(row["trust_level"])
+                    if row["trust_level"] is not None
+                    else None
+                ),
+                source_attribution=(
+                    _coerce_json(row["source_attribution"])
+                    if row["source_attribution"] is not None
+                    else None
+                ),
                 created_at=row["created_at"],
                 emotional_valence=row["emotional_valence"],
             )
@@ -861,7 +913,9 @@ class CognitiveMemory:
     async def get_truth_profile(self, memory_id: UUID) -> dict[str, Any]:
         """Return DB-computed provenance/trust details for a memory."""
         async with self._pool.acquire() as conn:
-            row = await conn.fetchrow("SELECT get_memory_truth_profile($1::uuid) AS profile", memory_id)
+            row = await conn.fetchrow(
+                "SELECT get_memory_truth_profile($1::uuid) AS profile", memory_id
+            )
             if not row or row["profile"] is None:
                 return {}
             return dict(_coerce_json(row["profile"]))
@@ -884,16 +938,24 @@ class CognitiveMemory:
                     item["context"] = m.context
                     item["emotional_valence"] = m.emotional_valence
                 elif m.type == MemoryType.SEMANTIC:
-                    item["source_references"] = m.source_references if m.source_references is not None else m.context
+                    item["source_references"] = (
+                        m.source_references
+                        if m.source_references is not None
+                        else m.context
+                    )
                 elif m.type == MemoryType.PROCEDURAL:
-                    item["steps"] = m.context if m.context is not None else {"steps": []}
+                    item["steps"] = (
+                        m.context if m.context is not None else {"steps": []}
+                    )
                 elif m.type == MemoryType.STRATEGIC:
                     item["supporting_evidence"] = m.context
                 items.append(item)
 
             import json
 
-            created = await conn.fetchval("SELECT batch_create_memories($1::jsonb)", json.dumps(items))
+            created = await conn.fetchval(
+                "SELECT batch_create_memories($1::jsonb)", json.dumps(items)
+            )
             ids = list(created or [])
 
             # Link concepts in batch
@@ -931,7 +993,9 @@ class CognitiveMemory:
             expected_dim = int(await conn.fetchval("SELECT embedding_dimension()"))
             for embedding in embeddings:
                 if len(embedding) != expected_dim:
-                    raise ValueError(f"embedding dimension mismatch: expected {expected_dim}, got {len(embedding)}")
+                    raise ValueError(
+                        f"embedding dimension mismatch: expected {expected_dim}, got {len(embedding)}"
+                    )
 
             created = await conn.fetchval(
                 """
@@ -1002,26 +1066,40 @@ class CognitiveMemory:
                 ],
             )
 
-    async def find_causes(self, memory_id: UUID, *, depth: int = 3) -> list[dict[str, Any]]:
+    async def find_causes(
+        self, memory_id: UUID, *, depth: int = 3
+    ) -> list[dict[str, Any]]:
         async with self._pool.acquire() as conn:
-            rows = await conn.fetch("SELECT * FROM find_causal_chain($1::uuid, $2::int)", memory_id, depth)
+            rows = await conn.fetch(
+                "SELECT * FROM find_causal_chain($1::uuid, $2::int)", memory_id, depth
+            )
             return [dict(row) for row in rows]
 
-    async def find_contradictions(self, memory_id: UUID | None = None) -> list[dict[str, Any]]:
+    async def find_contradictions(
+        self, memory_id: UUID | None = None
+    ) -> list[dict[str, Any]]:
         async with self._pool.acquire() as conn:
-            rows = await conn.fetch("SELECT * FROM find_contradictions($1::uuid)", memory_id)
+            rows = await conn.fetch(
+                "SELECT * FROM find_contradictions($1::uuid)", memory_id
+            )
             return [dict(row) for row in rows]
 
-    async def find_supporting_evidence(self, worldview_id: UUID) -> list[dict[str, Any]]:
+    async def find_supporting_evidence(
+        self, worldview_id: UUID
+    ) -> list[dict[str, Any]]:
         async with self._pool.acquire() as conn:
-            rows = await conn.fetch("SELECT * FROM find_supporting_evidence($1::uuid)", worldview_id)
+            rows = await conn.fetch(
+                "SELECT * FROM find_supporting_evidence($1::uuid)", worldview_id
+            )
             return [dict(row) for row in rows]
 
     # =========================================================================
     # CONCEPTS
     # =========================================================================
 
-    async def link_concept(self, memory_id: UUID, concept: str, *, strength: float = 1.0) -> UUID:
+    async def link_concept(
+        self, memory_id: UUID, concept: str, *, strength: float = 1.0
+    ) -> UUID:
         async with self._pool.acquire() as conn:
             return await conn.fetchval(
                 "SELECT link_memory_to_concept($1::uuid, $2::text, $3::float)",
@@ -1059,9 +1137,13 @@ class CognitiveMemory:
                 ttl_seconds,
             )
 
-    async def search_working(self, query: str, *, limit: int = 5) -> list[dict[str, Any]]:
+    async def search_working(
+        self, query: str, *, limit: int = 5
+    ) -> list[dict[str, Any]]:
         async with self._pool.acquire() as conn:
-            rows = await conn.fetch("SELECT * FROM search_working_memory($1::text, $2::int)", query, limit)
+            rows = await conn.fetch(
+                "SELECT * FROM search_working_memory($1::text, $2::int)", query, limit
+            )
             return [dict(row) for row in rows]
 
     # =========================================================================
@@ -1075,12 +1157,16 @@ class CognitiveMemory:
 
     async def sense_memory_availability(self, query: str) -> dict[str, Any]:
         async with self._pool.acquire() as conn:
-            raw = await conn.fetchval("SELECT sense_memory_availability($1::text)", query)
+            raw = await conn.fetchval(
+                "SELECT sense_memory_availability($1::text)", query
+            )
             return _coerce_json(raw) if raw is not None else {}
 
     async def request_background_search(self, query: str) -> UUID | None:
         async with self._pool.acquire() as conn:
-            return await conn.fetchval("SELECT request_background_search($1::text)", query)
+            return await conn.fetchval(
+                "SELECT request_background_search($1::text)", query
+            )
 
     async def get_spontaneous_memories(self, *, limit: int = 3) -> list[Memory]:
         async with self._pool.acquire() as conn:
@@ -1115,21 +1201,23 @@ class CognitiveMemory:
         """Get identity aspects from graph (Phase 5: uses graph instead of identity_aspects table)."""
         async with self._pool.acquire() as conn:
             # Phase 5: Identity aspects are now graph edges from SelfNode
-            rows = await conn.fetch(
-                """
+            rows = await conn.fetch("""
                 SELECT * FROM get_identity_context()
-                """
-            )
+                """)
             result = rows[0][0] if rows and rows[0] else []
             return result if isinstance(result, list) else []
 
     async def get_worldview(self) -> list[dict[str, Any]]:
         """Get worldview beliefs from memories (Phase 5: uses worldview memories instead of worldview_primitives table)."""
         async with self._pool.acquire() as conn:
-            rows = await conn.fetch("SELECT * FROM get_worldview_snapshot($1::int, $2::float)", 5, 0.5)
+            rows = await conn.fetch(
+                "SELECT * FROM get_worldview_snapshot($1::int, $2::float)", 5, 0.5
+            )
             return [dict(row) for row in rows]
 
-    async def get_goals(self, *, priority: GoalPriority | None = None) -> list[dict[str, Any]]:
+    async def get_goals(
+        self, *, priority: GoalPriority | None = None
+    ) -> list[dict[str, Any]]:
         """Get goals by priority.
 
         Phase 6 (ReduceScopeCreep): Goals are now memories with type='goal'.
@@ -1147,6 +1235,7 @@ class CognitiveMemory:
         *,
         description: str | None = None,
         source: GoalSource | str = GoalSource.USER_REQUEST,
+        origin: GoalSource | str | None = None,
         priority: GoalPriority | str = GoalPriority.QUEUED,
         parent_id: UUID | None = None,
         due_at: datetime | None = None,
@@ -1160,15 +1249,33 @@ class CognitiveMemory:
                     $3::goal_source,
                     $4::goal_priority,
                     $5::uuid,
-                    $6::timestamptz
+                    $6::timestamptz,
+                    $7::goal_source
                 )
                 """,
                 title,
                 description,
                 (source.value if isinstance(source, GoalSource) else str(source)),
-                (priority.value if isinstance(priority, GoalPriority) else str(priority)),
+                (
+                    priority.value
+                    if isinstance(priority, GoalPriority)
+                    else str(priority)
+                ),
                 parent_id,
                 due_at,
+                (
+                    origin.value
+                    if isinstance(origin, GoalSource)
+                    else (
+                        str(origin)
+                        if origin is not None
+                        else (
+                            source.value
+                            if isinstance(source, GoalSource)
+                            else str(source)
+                        )
+                    )
+                ),
             )
 
     async def create_scheduled_task(
@@ -1305,7 +1412,9 @@ class CognitiveMemory:
             )
             return _coerce_json(raw)
 
-    async def get_ingestion_receipts(self, source_file: str, content_hashes: list[str]) -> dict[str, UUID]:
+    async def get_ingestion_receipts(
+        self, source_file: str, content_hashes: list[str]
+    ) -> dict[str, UUID]:
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
                 """
@@ -1432,8 +1541,16 @@ class CognitiveMemory:
                     importance=float(row["importance"]),
                     similarity=float(row["score"]),
                     source=row["source"],
-                    trust_level=(float(row["trust_level"]) if row["trust_level"] is not None else None),
-                    source_attribution=(_coerce_json(row["source_attribution"]) if row["source_attribution"] is not None else None),
+                    trust_level=(
+                        float(row["trust_level"])
+                        if row["trust_level"] is not None
+                        else None
+                    ),
+                    source_attribution=(
+                        _coerce_json(row["source_attribution"])
+                        if row["source_attribution"] is not None
+                        else None
+                    ),
                     created_at=row["created_at"],
                     emotional_valence=row["emotional_valence"],
                 )
@@ -1454,14 +1571,12 @@ class CognitiveMemory:
     ) -> list[Memory]:
         # Per-tier budgets are config-owned (#76): memory.recmem_sub/epi/sem_limit
         # seed the ceilings; the caller's overall limit still scales below them.
-        cfg = await conn.fetchrow(
-            """
+        cfg = await conn.fetchrow("""
             SELECT COALESCE(get_config_int('memory.recmem_sub_limit'), 10) AS sub,
                    COALESCE(get_config_int('memory.recmem_epi_limit'), 5) AS epi,
                    COALESCE(get_config_int('memory.recmem_sem_limit'), 10) AS sem,
                    COALESCE(get_config_int('memory.recmem_know_limit'), 5) AS know
-            """
-        )
+            """)
         rows = await conn.fetch(
             """
             SELECT *
@@ -1478,7 +1593,11 @@ class CognitiveMemory:
             query,
             int(sub_limit if sub_limit is not None else min(max(limit, 1), cfg["sub"])),
             int(epi_limit if epi_limit is not None else max(1, min(limit, cfg["epi"]))),
-            int(sem_limit if sem_limit is not None else max(1, min(limit * 2, cfg["sem"]))),
+            int(
+                sem_limit
+                if sem_limit is not None
+                else max(1, min(limit * 2, cfg["sem"]))
+            ),
             _uuid_text_or_none(session_id),
             exclude_sensitive,
             int(cfg["know"]),
@@ -1500,17 +1619,39 @@ class CognitiveMemory:
                     type=MemoryType(raw_type),
                     content=row["content"],
                     importance=0.3,
-                    similarity=(float(row["score"]) if row["score"] is not None else None),
+                    similarity=(
+                        float(row["score"]) if row["score"] is not None else None
+                    ),
                     source="recmem",
-                    trust_level=(float(row["trust_level"]) if row["trust_level"] is not None else None),
-                    source_attribution=(_coerce_json(row["source_attribution"]) if row["source_attribution"] is not None else None),
+                    trust_level=(
+                        float(row["trust_level"])
+                        if row["trust_level"] is not None
+                        else None
+                    ),
+                    source_attribution=(
+                        _coerce_json(row["source_attribution"])
+                        if row["source_attribution"] is not None
+                        else None
+                    ),
                     created_at=row["created_at"],
                     tier=row["tier"],
                     source_unit_ids=list(row["source_unit_ids"] or []),
-                    strength=(float(row["strength"]) if row["strength"] is not None else None),
-                    fidelity=(float(row["fidelity"]) if row["fidelity"] is not None else None),
-                    emotional_intensity=(float(row["emotional_intensity"]) if row["emotional_intensity"] is not None else None),
-                    confidence=(float(row["confidence"]) if row["confidence"] is not None else None),
+                    strength=(
+                        float(row["strength"]) if row["strength"] is not None else None
+                    ),
+                    fidelity=(
+                        float(row["fidelity"]) if row["fidelity"] is not None else None
+                    ),
+                    emotional_intensity=(
+                        float(row["emotional_intensity"])
+                        if row["emotional_intensity"] is not None
+                        else None
+                    ),
+                    confidence=(
+                        float(row["confidence"])
+                        if row["confidence"] is not None
+                        else None
+                    ),
                 )
             )
 
@@ -1520,22 +1661,34 @@ class CognitiveMemory:
         # clock -- the up-ladder). Only episodic/semantic tiers are `memories`
         # rows; subconscious item_ids are raw units. The chat/hydrate path did not
         # reinforce before this. Advisory -- never fail recall on it.
-        recalled_ids = [memory.id for memory in memories if memory.tier != "subconscious"]
+        recalled_ids = [
+            memory.id for memory in memories if memory.tier != "subconscious"
+        ]
         if recalled_ids:
             try:
                 await conn.execute("SELECT touch_memories($1::uuid[])", recalled_ids)
             except Exception as exc:
                 logger.warning("Failed to mark recalled memories as accessed: %s", exc)
-        raw_unit_ids = [memory.id for memory in memories if memory.tier == "subconscious"]
+        raw_unit_ids = [
+            memory.id for memory in memories if memory.tier == "subconscious"
+        ]
         if raw_unit_ids:
             try:
-                await conn.execute("SELECT touch_subconscious_units($1::uuid[])", raw_unit_ids)
+                await conn.execute(
+                    "SELECT touch_subconscious_units($1::uuid[])", raw_unit_ids
+                )
             except Exception as exc:
-                logger.warning("Failed to mark recalled RecMem units as accessed: %s", exc)
+                logger.warning(
+                    "Failed to mark recalled RecMem units as accessed: %s", exc
+                )
         return memories
 
-    async def _find_partial_activations(self, conn: asyncpg.Connection, query: str) -> list[PartialActivation]:
-        rows = await conn.fetch("SELECT * FROM find_partial_activations($1::text)", query)
+    async def _find_partial_activations(
+        self, conn: asyncpg.Connection, query: str
+    ) -> list[PartialActivation]:
+        rows = await conn.fetch(
+            "SELECT * FROM find_partial_activations($1::text)", query
+        )
         out: list[PartialActivation] = []
         for row in rows:
             out.append(
@@ -1543,14 +1696,20 @@ class CognitiveMemory:
                     cluster_id=row["cluster_id"],
                     cluster_name=row["cluster_name"],
                     keywords=list(row["keywords"] or []),
-                    emotional_signature=(_coerce_json(row["emotional_signature"]) if row["emotional_signature"] is not None else None),
+                    emotional_signature=(
+                        _coerce_json(row["emotional_signature"])
+                        if row["emotional_signature"] is not None
+                        else None
+                    ),
                     cluster_similarity=float(row["cluster_similarity"]),
                     best_memory_similarity=float(row["best_memory_similarity"]),
                 )
             )
         return out
 
-    async def explore_clusters(self, query: str, limit: int = 3, sample_size: int = 3) -> list[dict[str, Any]]:
+    async def explore_clusters(
+        self, query: str, limit: int = 3, sample_size: int = 3
+    ) -> list[dict[str, Any]]:
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT * FROM explore_clusters_with_samples($1::text, $2::int, $3::int)",
@@ -1570,12 +1729,14 @@ class CognitiveMemory:
                         "sample_memories": [],
                     }
                 if row["memory_id"] is not None:
-                    clusters_map[cid]["sample_memories"].append({
-                        "memory_id": row["memory_id"],
-                        "content": row["content"],
-                        "memory_type": row["memory_type"],
-                        "membership_strength": row["membership_strength"],
-                    })
+                    clusters_map[cid]["sample_memories"].append(
+                        {
+                            "memory_id": row["memory_id"],
+                            "content": row["content"],
+                            "memory_type": row["memory_type"],
+                            "membership_strength": row["membership_strength"],
+                        }
+                    )
         return list(clusters_map.values())
 
     def _row_to_memory(self, row: asyncpg.Record) -> Memory:
@@ -1584,14 +1745,24 @@ class CognitiveMemory:
             type=MemoryType(row["type"]),
             content=row["content"],
             importance=float(row["importance"]),
-            trust_level=(float(row["trust_level"]) if "trust_level" in row and row["trust_level"] is not None else None),
+            trust_level=(
+                float(row["trust_level"])
+                if "trust_level" in row and row["trust_level"] is not None
+                else None
+            ),
             source_attribution=(
-                _coerce_json(row["source_attribution"]) if "source_attribution" in row and row["source_attribution"] is not None else None
+                _coerce_json(row["source_attribution"])
+                if "source_attribution" in row and row["source_attribution"] is not None
+                else None
             ),
             created_at=row["created_at"] if "created_at" in row else None,
-            emotional_valence=(row["emotional_valence"] if "emotional_valence" in row else None),
+            emotional_valence=(
+                row["emotional_valence"] if "emotional_valence" in row else None
+            ),
             tier=row["tier"] if "tier" in row else None,
-            source_unit_ids=(list(row["source_unit_ids"] or []) if "source_unit_ids" in row else None),
+            source_unit_ids=(
+                list(row["source_unit_ids"] or []) if "source_unit_ids" in row else None
+            ),
             valid_until=row["valid_until"] if "valid_until" in row else None,
         )
 
@@ -1628,11 +1799,17 @@ class CognitiveMemorySync:
             self._async.search_history(query, **kwargs)
         )
 
-    def recall_recent(self, *, limit: int = 10, memory_type: MemoryType | None = None) -> list[Memory]:
-        return self._loop.run_until_complete(self._async.recall_recent(limit=limit, memory_type=memory_type))
+    def recall_recent(
+        self, *, limit: int = 10, memory_type: MemoryType | None = None
+    ) -> list[Memory]:
+        return self._loop.run_until_complete(
+            self._async.recall_recent(limit=limit, memory_type=memory_type)
+        )
 
     def list_recent_episodes(self, *, limit: int = 5) -> list[dict[str, Any]]:
-        return self._loop.run_until_complete(self._async.list_recent_episodes(limit=limit))
+        return self._loop.run_until_complete(
+            self._async.list_recent_episodes(limit=limit)
+        )
 
     def recall_episode(self, episode_id: UUID) -> list[Memory]:
         return self._loop.run_until_complete(self._async.recall_episode(episode_id))
@@ -1640,27 +1817,45 @@ class CognitiveMemorySync:
     def remember(self, content: str, **kwargs: Any) -> UUID:
         return self._loop.run_until_complete(self._async.remember(content, **kwargs))
 
-    def remember_turn_raw(self, user_text: str, assistant_text: str, **kwargs: Any) -> dict[str, Any]:
-        return self._loop.run_until_complete(self._async.remember_turn_raw(user_text, assistant_text, **kwargs))
+    def remember_turn_raw(
+        self, user_text: str, assistant_text: str, **kwargs: Any
+    ) -> dict[str, Any]:
+        return self._loop.run_until_complete(
+            self._async.remember_turn_raw(user_text, assistant_text, **kwargs)
+        )
 
-    def hydrate_chat_session(self, session_id: UUID | str, **kwargs: Any) -> list[dict[str, Any]]:
-        return self._loop.run_until_complete(self._async.hydrate_chat_session(session_id, **kwargs))
+    def hydrate_chat_session(
+        self, session_id: UUID | str, **kwargs: Any
+    ) -> list[dict[str, Any]]:
+        return self._loop.run_until_complete(
+            self._async.hydrate_chat_session(session_id, **kwargs)
+        )
 
-    def record_chat_session_turn(self, user_text: str, assistant_text: str, **kwargs: Any) -> dict[str, Any]:
+    def record_chat_session_turn(
+        self, user_text: str, assistant_text: str, **kwargs: Any
+    ) -> dict[str, Any]:
         return self._loop.run_until_complete(
             self._async.record_chat_session_turn(user_text, assistant_text, **kwargs)
         )
 
-    def clear_chat_session_context(self, session_id: UUID | str, **kwargs: Any) -> dict[str, Any]:
+    def clear_chat_session_context(
+        self, session_id: UUID | str, **kwargs: Any
+    ) -> dict[str, Any]:
         return self._loop.run_until_complete(
             self._async.clear_chat_session_context(session_id, **kwargs)
         )
 
     def hydrate_recmem(self, query: str, **kwargs: Any) -> list[Memory]:
-        return self._loop.run_until_complete(self._async.hydrate_recmem(query, **kwargs))
+        return self._loop.run_until_complete(
+            self._async.hydrate_recmem(query, **kwargs)
+        )
 
-    def link_to_source_unit(self, memory_id: UUID | str, unit_id: UUID | str, role: str = "direct_promotion") -> bool:
-        return self._loop.run_until_complete(self._async.link_to_source_unit(memory_id, unit_id, role))
+    def link_to_source_unit(
+        self, memory_id: UUID | str, unit_id: UUID | str, role: str = "direct_promotion"
+    ) -> bool:
+        return self._loop.run_until_complete(
+            self._async.link_to_source_unit(memory_id, unit_id, role)
+        )
 
     def redact_unit(self, unit_id: UUID | str, **kwargs: Any) -> dict[str, Any]:
         return self._loop.run_until_complete(self._async.redact_unit(unit_id, **kwargs))
@@ -1668,14 +1863,26 @@ class CognitiveMemorySync:
     def remember_batch(self, memories: Iterable[MemoryInput]) -> list[UUID]:
         return self._loop.run_until_complete(self._async.remember_batch(memories))
 
-    def remember_batch_raw(self, contents: list[str], embeddings: list[list[float]], **kwargs: Any) -> list[UUID]:
-        return self._loop.run_until_complete(self._async.remember_batch_raw(contents, embeddings, **kwargs))
+    def remember_batch_raw(
+        self, contents: list[str], embeddings: list[list[float]], **kwargs: Any
+    ) -> list[UUID]:
+        return self._loop.run_until_complete(
+            self._async.remember_batch_raw(contents, embeddings, **kwargs)
+        )
 
-    def connect_memories(self, from_id: UUID, to_id: UUID, relationship: RelationshipType, **kwargs: Any) -> None:
-        return self._loop.run_until_complete(self._async.connect_memories(from_id, to_id, relationship, **kwargs))
+    def connect_memories(
+        self, from_id: UUID, to_id: UUID, relationship: RelationshipType, **kwargs: Any
+    ) -> None:
+        return self._loop.run_until_complete(
+            self._async.connect_memories(from_id, to_id, relationship, **kwargs)
+        )
 
-    def link_concept(self, memory_id: UUID, concept: str, *, strength: float = 1.0) -> UUID:
-        return self._loop.run_until_complete(self._async.link_concept(memory_id, concept, strength=strength))
+    def link_concept(
+        self, memory_id: UUID, concept: str, *, strength: float = 1.0
+    ) -> UUID:
+        return self._loop.run_until_complete(
+            self._async.link_concept(memory_id, concept, strength=strength)
+        )
 
     def connect_batch(self, relationships: "Iterable[RelationshipInput]") -> None:
         return self._loop.run_until_complete(self._async.connect_batch(relationships))
@@ -1689,6 +1896,7 @@ class CognitiveMemorySync:
         *,
         description: str | None = None,
         source: GoalSource | str = GoalSource.USER_REQUEST,
+        origin: GoalSource | str | None = None,
         priority: GoalPriority | str = GoalPriority.QUEUED,
         parent_id: UUID | None = None,
         due_at: datetime | None = None,
@@ -1698,6 +1906,7 @@ class CognitiveMemorySync:
                 title,
                 description=description,
                 source=source,
+                origin=origin,
                 priority=priority,
                 parent_id=parent_id,
                 due_at=due_at,
@@ -1741,7 +1950,9 @@ class CognitiveMemorySync:
         limit: int = 50,
     ) -> list[dict[str, Any]]:
         return self._loop.run_until_complete(
-            self._async.list_scheduled_tasks(status=status, due_before=due_before, limit=limit)
+            self._async.list_scheduled_tasks(
+                status=status, due_before=due_before, limit=limit
+            )
         )
 
     def update_scheduled_task(
@@ -1799,11 +2010,17 @@ class CognitiveMemorySync:
             self._async.queue_user_message(message, intent=intent, context=context)
         )
 
-    def get_ingestion_receipts(self, source_file: str, content_hashes: list[str]) -> dict[str, UUID]:
-        return self._loop.run_until_complete(self._async.get_ingestion_receipts(source_file, content_hashes))
+    def get_ingestion_receipts(
+        self, source_file: str, content_hashes: list[str]
+    ) -> dict[str, UUID]:
+        return self._loop.run_until_complete(
+            self._async.get_ingestion_receipts(source_file, content_hashes)
+        )
 
     def record_ingestion_receipts(self, items: list[dict[str, Any]]) -> int:
-        return self._loop.run_until_complete(self._async.record_ingestion_receipts(items))
+        return self._loop.run_until_complete(
+            self._async.record_ingestion_receipts(items)
+        )
 
 
 def hydrated_context_to_render_json(context: HydratedContext) -> dict[str, Any]:
@@ -1870,7 +2087,11 @@ async def render_chat_memory_context_db(
         )
         user_model_text = str(user_model_raw or "").strip()
         if user_model_text:
-            text = f"{text.rstrip()}\n{user_model_text}" if text.strip() else user_model_text
+            text = (
+                f"{text.rstrip()}\n{user_model_text}"
+                if text.strip()
+                else user_model_text
+            )
     return text
 
 

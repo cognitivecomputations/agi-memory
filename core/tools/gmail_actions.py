@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from .base import (
+    OutboundSpec,
     ToolCategory,
     ToolContext,
     ToolErrorType,
@@ -34,13 +35,25 @@ class GmailSendHandler(ToolHandler):
             parameters={
                 "type": "object",
                 "properties": {
-                    "account_key": {"type": "string", "description": "Optional connected Gmail account/email."},
-                    "to": {"type": "string", "description": "Recipient email address or comma-separated addresses."},
+                    "account_key": {
+                        "type": "string",
+                        "description": "Optional connected Gmail account/email.",
+                    },
+                    "to": {
+                        "type": "string",
+                        "description": "Recipient email address or comma-separated addresses.",
+                    },
                     "subject": {"type": "string", "description": "Email subject."},
                     "body": {"type": "string", "description": "Plain-text email body."},
                     "cc": {"type": "string", "description": "Optional CC recipients."},
-                    "bcc": {"type": "string", "description": "Optional BCC recipients."},
-                    "reply_to": {"type": "string", "description": "Optional Reply-To address."},
+                    "bcc": {
+                        "type": "string",
+                        "description": "Optional BCC recipients.",
+                    },
+                    "reply_to": {
+                        "type": "string",
+                        "description": "Optional Reply-To address.",
+                    },
                 },
                 "required": ["to", "subject", "body"],
             },
@@ -49,10 +62,18 @@ class GmailSendHandler(ToolHandler):
             is_read_only=False,
             requires_approval=True,
             supports_parallel=False,
+            outbound=OutboundSpec(
+                recipient_arg="to",
+                additional_recipient_args=("cc", "bcc"),
+                body_arg="body",
+                channel="email",
+            ),
             allowed_contexts={ToolContext.CHAT, ToolContext.HEARTBEAT, ToolContext.MCP},
         )
 
-    async def execute(self, arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
+    async def execute(
+        self, arguments: dict[str, Any], context: ToolExecutionContext
+    ) -> ToolResult:
         from core.auth.google_gmail import GmailOAuthError
         from core.tools.email import _gmail_setup_required_result
         from services.gmail_actions import GmailActionError, send_gmail_message
@@ -86,15 +107,36 @@ class GmailReplyHandler(ToolHandler):
             parameters={
                 "type": "object",
                 "properties": {
-                    "account_key": {"type": "string", "description": "Optional connected Gmail account/email."},
-                    "thread_id": {"type": "string", "description": "Gmail thread ID to reply in."},
-                    "to": {"type": "string", "description": "Recipient email address or comma-separated addresses."},
-                    "subject": {"type": "string", "description": "Reply subject, usually Re: original subject."},
+                    "account_key": {
+                        "type": "string",
+                        "description": "Optional connected Gmail account/email.",
+                    },
+                    "thread_id": {
+                        "type": "string",
+                        "description": "Gmail thread ID to reply in.",
+                    },
+                    "to": {
+                        "type": "string",
+                        "description": "Recipient email address or comma-separated addresses.",
+                    },
+                    "subject": {
+                        "type": "string",
+                        "description": "Reply subject, usually Re: original subject.",
+                    },
                     "body": {"type": "string", "description": "Plain-text reply body."},
-                    "in_reply_to": {"type": "string", "description": "Optional Message-ID header being replied to."},
-                    "references": {"type": "string", "description": "Optional References header."},
+                    "in_reply_to": {
+                        "type": "string",
+                        "description": "Optional Message-ID header being replied to.",
+                    },
+                    "references": {
+                        "type": "string",
+                        "description": "Optional References header.",
+                    },
                     "cc": {"type": "string", "description": "Optional CC recipients."},
-                    "bcc": {"type": "string", "description": "Optional BCC recipients."},
+                    "bcc": {
+                        "type": "string",
+                        "description": "Optional BCC recipients.",
+                    },
                 },
                 "required": ["thread_id", "to", "subject", "body"],
             },
@@ -103,10 +145,19 @@ class GmailReplyHandler(ToolHandler):
             is_read_only=False,
             requires_approval=True,
             supports_parallel=False,
+            outbound=OutboundSpec(
+                recipient_arg="to",
+                additional_recipient_args=("cc", "bcc"),
+                body_arg="body",
+                channel="email",
+                thread_arg="thread_id",
+            ),
             allowed_contexts={ToolContext.CHAT, ToolContext.HEARTBEAT, ToolContext.MCP},
         )
 
-    async def execute(self, arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
+    async def execute(
+        self, arguments: dict[str, Any], context: ToolExecutionContext
+    ) -> ToolResult:
         from core.auth.google_gmail import GmailOAuthError
         from core.tools.email import _gmail_setup_required_result
         from services.gmail_actions import GmailActionError, reply_gmail_message
@@ -142,8 +193,14 @@ class GmailLabelHandler(ToolHandler):
             parameters={
                 "type": "object",
                 "properties": {
-                    "account_key": {"type": "string", "description": "Optional connected Gmail account/email."},
-                    "message_id": {"type": "string", "description": "Gmail message ID."},
+                    "account_key": {
+                        "type": "string",
+                        "description": "Optional connected Gmail account/email.",
+                    },
+                    "message_id": {
+                        "type": "string",
+                        "description": "Gmail message ID.",
+                    },
                     "add_label_ids": {
                         "type": "array",
                         "items": {"type": "string"},
@@ -165,7 +222,9 @@ class GmailLabelHandler(ToolHandler):
             allowed_contexts={ToolContext.CHAT, ToolContext.HEARTBEAT, ToolContext.MCP},
         )
 
-    async def execute(self, arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
+    async def execute(
+        self, arguments: dict[str, Any], context: ToolExecutionContext
+    ) -> ToolResult:
         from core.auth.google_gmail import GmailOAuthError
         from core.tools.email import _gmail_setup_required_result
         from services.gmail_actions import GmailActionError, modify_gmail_labels
@@ -196,8 +255,14 @@ class GmailSpamTriageHandler(ToolHandler):
             parameters={
                 "type": "object",
                 "properties": {
-                    "account_key": {"type": "string", "description": "Optional connected Gmail account/email."},
-                    "message_id": {"type": "string", "description": "Gmail message ID."},
+                    "account_key": {
+                        "type": "string",
+                        "description": "Optional connected Gmail account/email.",
+                    },
+                    "message_id": {
+                        "type": "string",
+                        "description": "Gmail message ID.",
+                    },
                     "action": {
                         "type": "string",
                         "enum": ["mark_spam", "mark_not_spam", "archive"],
@@ -214,7 +279,9 @@ class GmailSpamTriageHandler(ToolHandler):
             allowed_contexts={ToolContext.CHAT, ToolContext.HEARTBEAT, ToolContext.MCP},
         )
 
-    async def execute(self, arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
+    async def execute(
+        self, arguments: dict[str, Any], context: ToolExecutionContext
+    ) -> ToolResult:
         from core.auth.google_gmail import GmailOAuthError
         from core.tools.email import _gmail_setup_required_result
         from services.gmail_actions import GmailActionError, triage_gmail_spam
@@ -247,8 +314,14 @@ class GmailDeleteHandler(ToolHandler):
             parameters={
                 "type": "object",
                 "properties": {
-                    "account_key": {"type": "string", "description": "Optional connected Gmail account/email."},
-                    "message_id": {"type": "string", "description": "Gmail message ID."},
+                    "account_key": {
+                        "type": "string",
+                        "description": "Optional connected Gmail account/email.",
+                    },
+                    "message_id": {
+                        "type": "string",
+                        "description": "Gmail message ID.",
+                    },
                     "permanent": {
                         "type": "boolean",
                         "default": False,
@@ -265,7 +338,9 @@ class GmailDeleteHandler(ToolHandler):
             allowed_contexts={ToolContext.CHAT, ToolContext.HEARTBEAT, ToolContext.MCP},
         )
 
-    async def execute(self, arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
+    async def execute(
+        self, arguments: dict[str, Any], context: ToolExecutionContext
+    ) -> ToolResult:
         from core.auth.google_gmail import GmailOAuthError
         from core.tools.email import _gmail_setup_required_result
         from services.gmail_actions import GmailActionError, delete_gmail_message

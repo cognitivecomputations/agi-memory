@@ -30,6 +30,29 @@ pytest tests/cli -q        # CLI smoke tests
 
 Use `POSTGRES_HOST=127.0.0.1` to avoid SSL negotiation flakes when connecting to the local Docker Postgres.
 
+## Public Memory Benchmark
+
+The ordinary suite verifies benchmark validation, scoring, external-command
+isolation, stable reference baselines, and a rollback-only journey through the real
+Hexis memory functions:
+
+```bash
+pytest tests/evals/test_memory_benchmark.py -q
+python -m evals.memory_benchmark.run validate
+```
+
+A published Hexis score additionally needs the configured embedding service and
+five live contradiction-classifier calls:
+
+```bash
+python -m evals.memory_benchmark.run run --adapter hexis --live-contradictions
+```
+
+Do not add that live-provider run to CI. The public corpus is hash-pinned; change its
+version and expected hash deliberately when revising any case or gold label. See
+[Public Memory Benchmark](../guides/memory-benchmark.md) for the protocol and
+submission disclosure requirements.
+
 ## CI
 
 GitHub Actions runs the required `all-checks-pass` gate. The integration lane

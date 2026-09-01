@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/QuixiAI/Hexis/evals/memory_benchmark/case.schema.v1.json",
+  "title": "Hexis Public Memory Benchmark v1 case",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["case_id", "dimension", "topic", "description", "events", "query", "expected"],
+  "properties": {
+    "case_id": {"type": "string", "minLength": 1},
+    "dimension": {
+      "enum": [
+        "provenance_accuracy",
+        "contradiction_detection",
+        "six_month_recall",
+        "cross_session_continuity",
+        "stale_belief_resistance"
+      ]
+    },
+    "topic": {"type": "string", "minLength": 1},
+    "description": {"type": "string", "minLength": 1},
+    "events": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/event"}
+    },
+    "query": {"$ref": "#/$defs/query"},
+    "expected": {"$ref": "#/$defs/expected"}
+  },
+  "$defs": {
+    "stringArray": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["event_id", "session_id", "at", "kind", "content", "source"],
+      "properties": {
+        "event_id": {"type": "string", "minLength": 1},
+        "session_id": {"type": "string", "minLength": 1},
+        "at": {"type": "string", "format": "date-time"},
+        "kind": {"enum": ["remember", "correct"]},
+        "content": {"type": "string", "minLength": 1},
+        "source": {
+          "type": "object",
+          "required": ["kind"],
+          "properties": {
+            "kind": {"type": "string", "minLength": 1},
+            "ref": {"type": "string"},
+            "label": {"type": "string"},
+            "trust": {"type": "number", "minimum": 0, "maximum": 1}
+          },
+          "additionalProperties": true
+        },
+        "supersedes": {"$ref": "#/$defs/stringArray"}
+      }
+    },
+    "query": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["session_id", "at", "text"],
+      "properties": {
+        "session_id": {"type": "string", "minLength": 1},
+        "at": {"type": "string", "format": "date-time"},
+        "text": {"type": "string", "minLength": 1}
+      }
+    },
+    "expected": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["answers", "citations", "contradictions", "forbidden_answers"],
+      "properties": {
+        "answers": {"$ref": "#/$defs/stringArray", "minItems": 1},
+        "citations": {"$ref": "#/$defs/stringArray"},
+        "contradictions": {"$ref": "#/$defs/stringArray"},
+        "forbidden_answers": {"$ref": "#/$defs/stringArray"}
+      }
+    }
+  }
+}

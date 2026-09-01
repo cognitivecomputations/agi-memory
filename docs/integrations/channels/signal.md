@@ -24,7 +24,7 @@ Connect your Hexis agent to Signal.
 
 ```bash
 hexis channels setup signal
-docker compose --profile active --profile signal up -d
+docker compose --profile signal up -d
 hexis channels status
 ```
 
@@ -67,7 +67,7 @@ Signal requires its own Docker Compose profile because it runs an external sidec
 
 ```bash
 # Start with both active and signal profiles
-docker compose --profile active --profile signal up -d
+docker compose --profile signal up -d
 ```
 
 The `signal-cli-rest-api` container handles phone number registration and the Signal protocol. Hexis communicates with it via REST API.

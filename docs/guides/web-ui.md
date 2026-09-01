@@ -21,7 +21,7 @@ hexis open   # open http://localhost:3477 in your browser
 ## Features
 
 - **Init Wizard** -- 3-tier initialization flow (Express, Character, Custom) with character gallery
-- **Interactive Chat** -- Streaming conversation with tool use visibility; large pastes become ingested attachments, and dropped/picked files upload their original bytes for background ingestion (with a per-attachment private toggle)
+- **Interactive Chat** -- Streaming conversation with tool use visibility; attached files are read the moment they are attached, so the agent can answer about a PDF in the same message it arrives in (large pastes attach the same way, and each attachment has a private toggle)
 - **Agent Status** -- Memory counts, energy level, heartbeat status
 - **Memory Browser** -- Search and inspect distilled memories; memory detail links to the exact source documents and chunks behind it
 - **Documents** -- The source-document filing cabinet: search files or passages (with page/section/sheet locators), preview with paging and a PDF page picker, see extraction warnings, and load sources onto the desk

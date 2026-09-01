@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Hexis">
+  <rect width="512" height="512" rx="112" fill="#18211e"/>
+  <path d="M256 103 414 391H98L256 103Z" fill="#f3f5f2"/>
+  <path d="M256 184 344 345H168L256 184Z" fill="#176c63"/>
+  <circle cx="256" cy="294" r="35" fill="#d65d3b"/>
+</svg>

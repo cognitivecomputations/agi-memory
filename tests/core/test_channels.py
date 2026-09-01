@@ -15,8 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import datetime, timezone
-from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -199,6 +198,7 @@ class _MockAdapter:
     @property
     def capabilities(self):
         from channels.base import ChannelCapabilities
+
         return ChannelCapabilities(
             typing_indicator=True,
             max_message_length=2000,
@@ -220,12 +220,14 @@ class _MockAdapter:
         self._connected = False
 
     async def send(self, channel_id, text, *, reply_to=None, thread_id=None):
-        self._sent_messages.append({
-            "channel_id": channel_id,
-            "text": text,
-            "reply_to": reply_to,
-            "thread_id": thread_id,
-        })
+        self._sent_messages.append(
+            {
+                "channel_id": channel_id,
+                "text": text,
+                "reply_to": reply_to,
+                "thread_id": thread_id,
+            }
+        )
         return "sent-msg-1"
 
     async def send_typing(self, channel_id):
@@ -272,6 +274,58 @@ class TestChannelManager:
         manager = ChannelManager(pool=MagicMock())
         result = await manager.send("nonexistent", "ch-1", "Hello!")
         assert result is None
+
+    async def test_adapter_intake_stays_open_while_a_turn_waits(self):
+        from channels.base import ChannelMessage
+        from channels.manager import ChannelManager
+
+        manager = ChannelManager(pool=MagicMock())
+        adapter = _MockAdapter("test")
+        adapter_gate = asyncio.Event()
+        callback_ready = asyncio.Event()
+        received: list[ChannelMessage] = []
+        turn_gate = asyncio.Event()
+
+        async def start(on_message):
+            adapter._on_message = on_message
+            callback_ready.set()
+            await adapter_gate.wait()
+
+        async def handle(message):
+            received.append(message)
+            await turn_gate.wait()
+
+        adapter.start = start
+        manager.register(adapter)
+        manager._running = True
+        manager._record_runtime_status = AsyncMock()
+        manager._record_presence = AsyncMock()
+        manager._handle_message = handle
+        await manager._start_adapter("test", adapter)
+        await asyncio.wait_for(callback_ready.wait(), timeout=1)
+
+        first = ChannelMessage(
+            channel_type="test",
+            channel_id="room",
+            sender_id="user",
+            sender_name="User",
+            content="Start the task",
+            message_id="m1",
+        )
+        reply = ChannelMessage(
+            channel_type="test",
+            channel_id="room",
+            sender_id="user",
+            sender_name="User",
+            content="2",
+            message_id="m2",
+        )
+        await asyncio.wait_for(adapter._on_message(first), timeout=1)
+        await asyncio.wait_for(adapter._on_message(reply), timeout=1)
+        await asyncio.sleep(0)
+
+        assert [message.message_id for message in received] == ["m1", "m2"]
+        await manager.stop_all()
 
     def test_status(self):
         from channels.manager import ChannelManager
@@ -442,25 +496,34 @@ class TestChannelConversation:
     async def _cleanup(self, conn, sender_id: str):
         """Delete test data by sender_id."""
         session_ids = await conn.fetch(
-            "SELECT id FROM channel_sessions WHERE sender_id = $1", sender_id,
+            "SELECT id FROM channel_sessions WHERE sender_id = $1",
+            sender_id,
         )
         for row in session_ids:
-            await conn.execute("DELETE FROM channel_messages WHERE session_id = $1", row["id"])
-        await conn.execute("DELETE FROM channel_sessions WHERE sender_id = $1", sender_id)
+            await conn.execute(
+                "DELETE FROM channel_messages WHERE session_id = $1", row["id"]
+            )
+        await conn.execute(
+            "DELETE FROM channel_sessions WHERE sender_id = $1", sender_id
+        )
 
     @staticmethod
-    async def _prepare_turn(conn, sender_id: str, channel_id: str, message_id: str, content: str = "Hello") -> dict:
+    async def _prepare_turn(
+        conn, sender_id: str, channel_id: str, message_id: str, content: str = "Hello"
+    ) -> dict:
         """Run the DB-owned turn preparation (prepare_channel_turn, db/34)."""
         raw = await conn.fetchval(
             "SELECT prepare_channel_turn($1::jsonb)",
-            json.dumps({
-                "channel_type": "test",
-                "channel_id": channel_id,
-                "sender_id": sender_id,
-                "sender_name": "TestBot",
-                "content": content,
-                "message_id": message_id,
-            }),
+            json.dumps(
+                {
+                    "channel_type": "test",
+                    "channel_id": channel_id,
+                    "sender_id": sender_id,
+                    "sender_name": "TestBot",
+                    "content": content,
+                    "message_id": message_id,
+                }
+            ),
         )
         return json.loads(raw) if isinstance(raw, str) else raw
 
@@ -470,13 +533,17 @@ class TestChannelConversation:
 
         async with db_pool.acquire() as conn:
             try:
-                turn = await self._prepare_turn(conn, sender_id, "test-channel-1", "test-msg-1")
+                turn = await self._prepare_turn(
+                    conn, sender_id, "test-channel-1", "test-msg-1"
+                )
                 assert turn["allowed"] is True
                 assert turn["session_id"] is not None
                 assert turn["history"] == []
 
                 # Second call returns same session
-                turn2 = await self._prepare_turn(conn, sender_id, "test-channel-1", "test-msg-1b")
+                turn2 = await self._prepare_turn(
+                    conn, sender_id, "test-channel-1", "test-msg-1b"
+                )
                 assert turn2["session_id"] == turn["session_id"]
             finally:
                 await self._cleanup(conn, sender_id)
@@ -487,7 +554,9 @@ class TestChannelConversation:
 
         async with db_pool.acquire() as conn:
             try:
-                turn = await self._prepare_turn(conn, sender_id, "test-channel-2", "test-msg-2")
+                turn = await self._prepare_turn(
+                    conn, sender_id, "test-channel-2", "test-msg-2"
+                )
 
                 history = [
                     {"role": "user", "content": "Hello"},
@@ -495,11 +564,15 @@ class TestChannelConversation:
                 ]
                 await conn.fetchval(
                     "SELECT finalize_channel_turn($1::uuid, $2, $3, $4::jsonb)",
-                    turn["session_id"], "Hello", "Hi there!",
+                    turn["session_id"],
+                    "Hello",
+                    "Hi there!",
                     json.dumps({"history": history}),
                 )
 
-                turn2 = await self._prepare_turn(conn, sender_id, "test-channel-2", "test-msg-2b")
+                turn2 = await self._prepare_turn(
+                    conn, sender_id, "test-channel-2", "test-msg-2b"
+                )
                 retrieved = turn2["history"]
                 assert len(retrieved) == 2
                 assert retrieved[0]["role"] == "user"
@@ -513,11 +586,17 @@ class TestChannelConversation:
 
         async with db_pool.acquire() as conn:
             try:
-                turn = await self._prepare_turn(conn, sender_id, "test-channel-3", "test-msg-3")
+                turn = await self._prepare_turn(
+                    conn, sender_id, "test-channel-3", "test-msg-3"
+                )
                 await conn.fetchval(
                     "SELECT finalize_channel_turn($1::uuid, $2, $3, $4::jsonb)",
-                    turn["session_id"], "Hello", "Hi there!",
-                    json.dumps({"history": [], "platform_message_id": "test-msg-3-out"}),
+                    turn["session_id"],
+                    "Hello",
+                    "Hi there!",
+                    json.dumps(
+                        {"history": [], "platform_message_id": "test-msg-3-out"}
+                    ),
                 )
 
                 rows = await conn.fetch(
@@ -553,10 +632,140 @@ class TestChannelConversation:
             chunks = await process_channel_message(msg, db_pool)
             assert chunks == ["ok"]
             assert chat_turn_mock.await_args.kwargs["is_group"] is True
-            assert chat_turn_mock.await_args.kwargs["surface"] == "channel"
+            assert chat_turn_mock.await_args.kwargs["trusted_operator"] is False
+            assert chat_turn_mock.await_args.kwargs["surface"] == "test"
         finally:
             async with db_pool.acquire() as conn:
                 await self._cleanup(conn, sender_id)
+
+    async def test_verified_operator_context_reaches_chat_turn(
+        self, db_pool, monkeypatch
+    ):
+        import services.chat
+        from channels.base import ChannelMessage
+        from channels.conversation import process_channel_message
+
+        sender_id = f"{self._TEST_PREFIX}operator_{id(self)}"
+        chat_turn_mock = AsyncMock(return_value={"assistant": "ok", "history": []})
+        monkeypatch.setattr(services.chat, "chat_turn", chat_turn_mock)
+        msg = ChannelMessage(
+            channel_type="slack",
+            channel_id="private-owner",
+            sender_id=sender_id,
+            sender_name="Owner",
+            content="Always cite sources.",
+            message_id="operator-message-1",
+            metadata={"is_group": False},
+        )
+        try:
+            assert await process_channel_message(msg, db_pool, is_operator=True) == [
+                "ok"
+            ]
+            kwargs = chat_turn_mock.await_args.kwargs
+            assert kwargs["trusted_operator"] is True
+            assert kwargs["operator_context"]["raw_text"] == "Always cite sources."
+            assert (
+                kwargs["operator_context"]["metadata"]["message_id"]
+                == "operator-message-1"
+            )
+        finally:
+            async with db_pool.acquire() as conn:
+                await self._cleanup(conn, sender_id)
+
+
+async def test_streaming_channel_does_not_finalize_failed_partial_turn(monkeypatch):
+    import channels.conversation as conversation
+    import channels.streaming as streaming
+    import core.agent_api as agent_api
+    import core.gateway as gateway
+    import core.llm_config as llm_config
+    import services.chat as chat
+    from channels.base import ChannelCapabilities, ChannelMessage
+    from core.agent_loop import AgentEvent, AgentEventData
+
+    class _Acquire:
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class _Pool:
+        def acquire(self):
+            return _Acquire()
+
+    pushed: list[str] = []
+
+    class _Coalescer:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def push(self, text: str) -> None:
+            pushed.append(text)
+
+        async def flush(self) -> str:
+            return "platform-message-1"
+
+    class _Gateway:
+        def __init__(self, _pool):
+            pass
+
+        async def record(self, *_args, **_kwargs):
+            return None
+
+    async def fake_stream_chat_events(*_args, **_kwargs):
+        yield AgentEventData(event=AgentEvent.TEXT_DELTA, data={"text": "partial"})
+        raise ConnectionError("provider disconnected")
+
+    finalize = AsyncMock(
+        side_effect=AssertionError("failed partial turns must not be finalized")
+    )
+    hydrate = AsyncMock(
+        side_effect=AssertionError("failed partial turns must not enter history")
+    )
+    fallback = AsyncMock(
+        side_effect=AssertionError("failed streams must not start a second model turn")
+    )
+    monkeypatch.setattr(
+        conversation,
+        "_prepare_channel_turn_db",
+        AsyncMock(return_value={
+            "allowed": True,
+            "session_id": "11111111-1111-4111-8111-111111111111",
+            "history": [],
+        }),
+    )
+    monkeypatch.setattr(conversation, "_finalize_channel_turn_db", finalize)
+    monkeypatch.setattr(streaming, "StreamCoalescer", _Coalescer)
+    monkeypatch.setattr(agent_api, "db_dsn_from_env", lambda: "postgresql://unused")
+    monkeypatch.setattr(llm_config, "load_llm_config", AsyncMock(return_value={}))
+    monkeypatch.setattr(gateway, "Gateway", _Gateway)
+    monkeypatch.setattr(chat, "stream_chat_events", fake_stream_chat_events)
+    monkeypatch.setattr(chat, "_hydrate_chat_history", hydrate)
+    monkeypatch.setattr(conversation, "process_channel_message", fallback)
+
+    adapter = MagicMock()
+    adapter.capabilities = ChannelCapabilities(edit_message=True)
+    adapter.send = AsyncMock()
+    message = ChannelMessage(
+        channel_type="test",
+        channel_id="channel-1",
+        sender_id="sender-1",
+        sender_name="Test User",
+        content="Hello",
+        message_id="message-1",
+    )
+
+    result = await conversation.stream_channel_message(message, _Pool(), adapter)
+
+    assert result == "platform-message-1"
+    assert "".join(pushed) == (
+        "partial\n\n[Response failed before completion: provider disconnected]"
+    )
+    finalize.assert_not_awaited()
+    hydrate.assert_not_awaited()
+    fallback.assert_not_awaited()
+    adapter.send.assert_not_awaited()
 
 
 # ============================================================================

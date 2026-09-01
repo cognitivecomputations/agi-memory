@@ -164,3 +164,112 @@ BEGIN
     RETURN tool_error('Unsupported journal tool: ' || COALESCE(p_tool_name, '<null>'), 'invalid_params');
 END;
 $$;
+
+-- The journal is deliberate by design (see header) -- but "deliberate" has meant
+-- "never" in practice: write_journal has fired zero times live even on days the
+-- agent had plenty to say (issue #114). This is the one exception: called from
+-- subconscious maintenance, it steps in ONLY once, late in the local day, and
+-- ONLY when there was meaningful activity (real episodic memories) and nothing
+-- was journaled deliberately. It never fires twice for the same local date and
+-- never substitutes for a deliberate entry that already exists.
+CREATE OR REPLACE FUNCTION maybe_write_daily_journal_fallback()
+RETURNS JSONB
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_tz TEXT := COALESCE(
+        NULLIF(get_config_text('agent.timezone'), ''),
+        NULLIF(get_config_text('heartbeat.timezone'), ''),
+        'UTC'
+    );
+    v_local_ts TIMESTAMP;
+    v_local_date DATE;
+    v_local_hour INT;
+    v_state JSONB;
+    v_already_journaled BOOLEAN;
+    v_min_count INT;
+    v_count INT;
+    v_samples TEXT[];
+    v_content TEXT;
+    v_entry_id UUID;
+BEGIN
+    IF NOT COALESCE(get_config_bool('maintenance.daily_journal_fallback_enabled'), true) THEN
+        RETURN jsonb_build_object('skipped', true, 'reason', 'disabled');
+    END IF;
+
+    BEGIN
+        v_local_ts := CURRENT_TIMESTAMP AT TIME ZONE v_tz;
+    EXCEPTION WHEN OTHERS THEN
+        v_local_ts := CURRENT_TIMESTAMP AT TIME ZONE 'UTC';
+    END;
+    v_local_date := v_local_ts::date;
+    v_local_hour := EXTRACT(HOUR FROM v_local_ts)::int;
+
+    -- Give the agent the whole local day to journal deliberately before this
+    -- fallback ever considers stepping in.
+    IF v_local_hour < COALESCE(get_config_int('maintenance.daily_journal_fallback_hour'), 21) THEN
+        RETURN jsonb_build_object('skipped', true, 'reason', 'too_early', 'local_hour', v_local_hour);
+    END IF;
+
+    v_state := COALESCE(get_state('daily_journal_fallback'), '{}'::jsonb);
+    IF v_state->>'last_checked_date' = v_local_date::text THEN
+        RETURN jsonb_build_object('skipped', true, 'reason', 'already_checked_today');
+    END IF;
+
+    -- Record the attempt regardless of outcome -- a quiet day, or one already
+    -- journaled, should not be re-evaluated every maintenance tick until midnight.
+    PERFORM set_state('daily_journal_fallback', jsonb_build_object('last_checked_date', v_local_date::text));
+
+    SELECT EXISTS (
+        SELECT 1 FROM journal_entries
+        WHERE (written_at AT TIME ZONE v_tz)::date = v_local_date
+    ) INTO v_already_journaled;
+    IF v_already_journaled THEN
+        RETURN jsonb_build_object('skipped', true, 'reason', 'already_journaled', 'date', v_local_date);
+    END IF;
+
+    v_min_count := GREATEST(COALESCE(get_config_int('maintenance.daily_journal_fallback_min_episodes'), 3), 1);
+    SELECT count(*)::int INTO v_count
+    FROM memories
+    WHERE type = 'episodic'
+      AND status = 'active'
+      AND importance >= 0.5
+      AND (created_at AT TIME ZONE v_tz)::date = v_local_date;
+
+    IF v_count < v_min_count THEN
+        RETURN jsonb_build_object('skipped', true, 'reason', 'not_enough_activity',
+                                   'episodes', v_count, 'threshold', v_min_count);
+    END IF;
+
+    SELECT array_agg(top.snippet) INTO v_samples
+    FROM (
+        SELECT left(content, 140) AS snippet
+        FROM memories
+        WHERE type = 'episodic'
+          AND status = 'active'
+          AND importance >= 0.5
+          AND (created_at AT TIME ZONE v_tz)::date = v_local_date
+        ORDER BY importance DESC, created_at DESC
+        LIMIT 5
+    ) top;
+
+    v_content := 'A day worth remembering, though I never stopped to write it myself: '
+        || array_to_string(v_samples, ' ~ ');
+
+    v_entry_id := write_journal_entry(
+        p_content  := v_content,
+        p_title    := 'Auto-noted -- ' || to_char(v_local_date, 'FMMonth DD, YYYY'),
+        p_tags     := ARRAY['auto-generated'],
+        p_metadata := jsonb_build_object(
+            'source', 'subconscious_daily_fallback',
+            'episode_count', v_count,
+            'date', v_local_date::text
+        )
+    );
+
+    RETURN jsonb_build_object(
+        'journaled', true, 'entry_id', v_entry_id,
+        'episode_count', v_count, 'date', v_local_date
+    );
+END;
+$$;

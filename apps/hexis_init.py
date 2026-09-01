@@ -2,8 +2,8 @@
 
 Flow: [LLM Config] → [Choose Path] → [Express | Character | Custom] → [Consent] → [Done]
 
-Non-interactive mode: pass --api-key (and optionally --character, --provider, --model)
-to skip the wizard and configure everything from CLI flags.
+Non-interactive mode: pass provider/model flags with either --api-key or
+--api-key-env to skip the wizard and configure everything from CLI flags.
 """
 from __future__ import annotations
 
@@ -11,10 +11,12 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
 from getpass import getpass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 
@@ -40,6 +42,7 @@ from apps.cli_theme import console, err_console, heading, make_panel, make_table
 _PROVIDER_ENV_VARS: dict[str, str] = {
     "anthropic": "ANTHROPIC_API_KEY",
     "openai": "OPENAI_API_KEY",
+    "openai_compatible": "OPENAI_API_KEY",
     "openai-codex": "",
     "grok": "XAI_API_KEY",
     "gemini": "GEMINI_API_KEY",
@@ -84,6 +87,94 @@ def _normalize_provider_name(provider: str | None) -> str:
         "google_antigravity": "google-antigravity",
     }
     return _ALIASES.get(raw, raw)
+
+
+def _openai_compatible_endpoint_error(endpoint: str) -> str | None:
+    """Return actionable guidance when an endpoint cannot serve all runtimes."""
+    try:
+        parsed = urlsplit(endpoint)
+    except ValueError:
+        parsed = None
+    if parsed is None or parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return "Enter a complete http:// or https:// base URL, including /v1 when required."
+    if parsed.hostname.lower() in {"localhost", "127.0.0.1", "::1", "0.0.0.0"}:
+        return (
+            "localhost only reaches the current process, while Hexis workers run in Docker. "
+            "Use the server's LAN/Tailscale IP or DNS name so both this host and "
+            "Docker can reach it."
+        )
+    return None
+
+
+def _resolve_noninteractive_provider(args: argparse.Namespace) -> str:
+    """Resolve a provider only from values the user explicitly selected."""
+    provider = _normalize_provider_name(args.provider)
+    if provider:
+        return provider
+    if args.endpoint:
+        return "openai_compatible"
+    if args.api_key:
+        return detect_provider(args.api_key)
+    if args.api_key_env:
+        api_key = os.getenv(args.api_key_env)
+        if not api_key:
+            raise ValueError(
+                f"Environment variable {args.api_key_env} is not set. "
+                "Add it to .env, then re-run init."
+            )
+        return detect_provider(api_key)
+    return "openai-codex"
+
+
+def _resolve_noninteractive_endpoint(
+    args: argparse.Namespace,
+    provider: str,
+) -> tuple[str, str]:
+    """Return the endpoint and its visible source label."""
+    endpoint = (args.endpoint or "").strip()
+    source = "--endpoint" if endpoint else ""
+    if not endpoint and provider == "openai_compatible":
+        endpoint = os.getenv("OPENAI_BASE_URL", "").strip()
+        source = "OPENAI_BASE_URL" if endpoint else ""
+    if provider == "openai_compatible" and not endpoint:
+        raise ValueError(
+            "An OpenAI-compatible endpoint is required. Pass --endpoint URL "
+            "or set OPENAI_BASE_URL in .env."
+        )
+    return endpoint, source
+
+
+def _resolve_noninteractive_api_key_env(
+    args: argparse.Namespace,
+    provider: str,
+) -> str:
+    """Choose a credential env var without silently consuming ambient keys."""
+    if provider in _OAUTH_PROVIDERS:
+        return ""
+
+    api_key_env = (args.api_key_env or _PROVIDER_ENV_VARS.get(provider, "")).strip()
+    if args.api_key:
+        if not api_key_env:
+            raise ValueError(
+                f"No default API key variable is known for provider '{provider}'. "
+                "Use --api-key-env NAME instead."
+            )
+        return api_key_env
+
+    if not args.api_key_env:
+        suggestion = (
+            f" --api-key-env {api_key_env}" if api_key_env else " --api-key-env NAME"
+        )
+        raise ValueError(
+            f"API key configuration is required for provider '{provider}'. "
+            f"Set the key in .env and pass{suggestion}, or pass --api-key."
+        )
+    if not os.getenv(api_key_env):
+        raise ValueError(
+            f"Environment variable {api_key_env} is not set. "
+            "Add it to .env, then re-run init."
+        )
+    return api_key_env
 
 
 async def _ensure_oauth_login(
@@ -219,10 +310,68 @@ def _write_env_var(env_path: Path, key: str, value: str) -> None:
     env_path.write_text("\n".join(lines) + "\n")
 
 
+# Services the agent cannot live without, used only if compose cannot be asked.
+_FALLBACK_STACK_SERVICES = ("db", "heartbeat_worker", "maintenance_worker")
+
+
+def _default_stack_services(
+    compose_cmd: list[str], compose_file: Path, stack_root: Path, env_file: Path | None
+) -> list[str]:
+    """The services a bare `up -d` starts — compose's default profile.
+
+    Read from the compose file rather than hardcoded: the always-on set is
+    whatever is declared without a `profiles:` key, and that list grows.
+    """
+    from apps.hexis_cli import _run_compose_capture
+
+    rc, out = _run_compose_capture(
+        compose_cmd, compose_file, stack_root, ["config", "--services"], env_file
+    )
+    services: list[str] = []
+    if rc == 0:
+        for line in out.splitlines():
+            name = line.strip()
+            # compose merges warnings into this stream; service names are bare
+            # single tokens, so anything else is noise.
+            if name and " " not in name and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name):
+                services.append(name)
+    resolved = services or list(_FALLBACK_STACK_SERVICES)
+    try:
+        from apps.hexis_cli import _host_managed_compose_workers
+
+        host_managed = _host_managed_compose_workers()
+    except Exception:
+        host_managed = set()
+    return [name for name in resolved if name not in host_managed]
+
+
+def _dsn_is_local(dsn: str) -> bool:
+    """Does this DSN point at a database this machine hosts?
+
+    Starting the local stack for someone pointed at a Postgres they run
+    elsewhere would be a surprise, so the auto-start stays local-only.
+    """
+    from urllib.parse import urlparse
+
+    try:
+        host = (urlparse(dsn).hostname or "").lower()
+    except ValueError:
+        return False
+    return host in ("", "localhost", "127.0.0.1", "::1", "host.docker.internal", "db")
+
+
 def _ensure_stack_running(args: argparse.Namespace) -> Path:
-    """Start Docker stack if needed. Returns stack_root."""
+    """Start the Docker stack if any of it is missing. Returns stack_root.
+
+    "The database is up" is not the same as "the stack is up": the heartbeat
+    and maintenance workers are what make the agent autonomous, and an init
+    that returned early on a database-only stack left an agent that never woke
+    up on its own. Every service in the default profile has to be running.
+    """
     from apps.hexis_cli import (
+        _ensure_installed_host_services_running,
         _find_compose_file,
+        _host_managed_compose_workers,
         _stack_root_from_compose,
         ensure_compose,
         ensure_docker,
@@ -241,20 +390,50 @@ def _ensure_stack_running(args: argparse.Namespace) -> Path:
     compose_cmd = ensure_compose(docker_bin)
     env_file = resolve_env_file(stack_root)
 
-    # Check if db service is already running
-    rc, out = _run_compose_capture(compose_cmd, compose_file, stack_root, ["ps", "--services", "--filter", "status=running"], env_file)
-    if rc == 0 and "db" in out.split():
+    expected = _default_stack_services(compose_cmd, compose_file, stack_root, env_file)
+    host_managed_workers = _host_managed_compose_workers()
+    rc, out = _run_compose_capture(
+        compose_cmd, compose_file, stack_root,
+        ["ps", "--services", "--filter", "status=running"], env_file,
+    )
+    running = set(out.split()) if rc == 0 else set()
+    missing = [name for name in expected if name not in running]
+    if not missing:
+        if host_managed_workers:
+            workers_ok, workers_error = _ensure_installed_host_services_running()
+            if not workers_ok:
+                err_console.print(
+                    "[fail]Docker is ready, but the installed host workers did not "
+                    f"start: {workers_error}[/fail]\nRun `hexis service logs`, fix the "
+                    "reported cause, then run `hexis init` again."
+                )
+                raise SystemExit(1)
         console.print("[ok]\u2714[/ok] Docker stack already running")
         return stack_root
 
-    console.print("[muted]Starting Docker stack...[/muted]")
-    if not is_source:
-        # pip install path: pull images first
-        run_compose(compose_cmd, compose_file, stack_root, ["pull"], env_file)
-    rc = run_compose(compose_cmd, compose_file, stack_root, ["up", "-d"], env_file)
+    if running:
+        console.print(f"[muted]Starting {', '.join(missing)}...[/muted]")
+    else:
+        console.print("[muted]Starting Docker stack...[/muted]")
+        if not is_source:
+            # pip install path: pull images first
+            pull_args = ["pull", *expected] if host_managed_workers else ["pull"]
+            run_compose(compose_cmd, compose_file, stack_root, pull_args, env_file)
+    up_args = ["up", "-d", *expected] if host_managed_workers else ["up", "-d"]
+    rc = run_compose(compose_cmd, compose_file, stack_root, up_args, env_file)
     if rc != 0:
         err_console.print("[fail]Failed to start Docker stack.[/fail]")
         raise SystemExit(1)
+
+    if host_managed_workers:
+        workers_ok, workers_error = _ensure_installed_host_services_running()
+        if not workers_ok:
+            err_console.print(
+                "[fail]Docker started, but the installed host workers did not: "
+                f"{workers_error}[/fail]\nRun `hexis service logs`, fix the reported "
+                "cause, then run `hexis init` again."
+            )
+            raise SystemExit(1)
 
     console.print("[ok]\u2714[/ok] Docker stack started")
     return stack_root
@@ -338,13 +517,7 @@ def _ensure_embedding_model() -> None:
 async def _run_init_noninteractive(args: argparse.Namespace) -> int:
     """Non-interactive init: configure from CLI flags, start stack, apply config."""
     # 1. Detect provider
-    provider = _normalize_provider_name(args.provider)
-    if not provider:
-        if args.api_key:
-            provider = detect_provider(args.api_key)
-        else:
-            provider = "openai-codex"
-    provider = _normalize_provider_name(provider)
+    provider = _resolve_noninteractive_provider(args)
     persist_provider = provider
 
     # The Anthropic browser-OAuth (Claude Pro/Max) login was removed — the
@@ -354,10 +527,6 @@ async def _run_init_noninteractive(args: argparse.Namespace) -> int:
             "[fail]Anthropic OAuth login is no longer supported. Use "
             "`hexis auth anthropic setup-token` then `--provider anthropic`, "
             "or pass an Anthropic API key.[/fail]")
-        return 1
-
-    if provider not in _OAUTH_PROVIDERS and not args.api_key:
-        err_console.print(f"[fail]--api-key required for provider '{provider}'[/fail]")
         return 1
 
     # 2. Resolve model — derive from the live catalog (not a stale hard-code).
@@ -372,13 +541,23 @@ async def _run_init_noninteractive(args: argparse.Namespace) -> int:
         if not model:
             err_console.print(f"[fail]Could not determine a default model for '{provider}'. Pass --model.[/fail]")
             return 1
-    api_key_env = "" if provider in _no_key_needed else _PROVIDER_ENV_VARS.get(provider, "")
+    endpoint, endpoint_source = _resolve_noninteractive_endpoint(args, provider)
+    api_key_env = _resolve_noninteractive_api_key_env(args, provider)
 
-    console.print(make_panel(
-        f"[key]Provider:[/key] {persist_provider}\n"
-        f"[key]Model:[/key]    {model}",
-        title="Non-Interactive Init",
-    ))
+    config_summary = (
+        f"[key]Provider:[/key]  {persist_provider}\n"
+        f"[key]Model:[/key]     {model}"
+    )
+    if endpoint:
+        config_summary += (
+            f"\n[key]Endpoint:[/key]  {endpoint} "
+            f"[muted]({endpoint_source})[/muted]"
+        )
+    if api_key_env:
+        config_summary += (
+            f"\n[key]API key:[/key]   {api_key_env} environment variable"
+        )
+    console.print(make_panel(config_summary, title="Non-Interactive Init"))
 
     # 3. Write API key to .env + set os.environ
     if args.api_key and api_key_env:
@@ -415,7 +594,7 @@ async def _run_init_noninteractive(args: argparse.Namespace) -> int:
         heartbeat_config = {
             "provider": persist_provider,
             "model": model,
-            "endpoint": "",
+            "endpoint": endpoint,
             "api_key_env": api_key_env,
         }
         subconscious_config = heartbeat_config.copy()
@@ -610,37 +789,76 @@ async def _configure_llm(conn: Any, *, dsn: str, wait_seconds: int) -> dict[str,
     from apps.cli_prompts import autocomplete as _ac
     from apps.cli_prompts import select_value
 
-    _PROVIDER_MENU = [
+    _PROVIDER_MENU: list[tuple[str, object]] = [
         ("OpenAI Codex — ChatGPT Plus/Pro OAuth (no API key)", "openai-codex"),
         ("OpenAI — API key", "openai"),
         ("Anthropic — API key", "anthropic"),
         ("Grok (xAI) — API key", "grok"),
         ("Gemini — API key", "gemini"),
+        ("Chutes — OAuth", "chutes"),
         ("GitHub Copilot — OAuth", "github-copilot"),
         ("Qwen Portal — OAuth", "qwen-portal"),
         ("MiniMax Portal — OAuth", "minimax-portal"),
-        ("Other / custom (type it)", "__custom__"),
+        ("Google Gemini CLI — OAuth", "google-gemini-cli"),
+        ("Google Antigravity — OAuth", "google-antigravity"),
+        (
+            "Local / custom — OpenAI-compatible (Ollama, LM Studio, vLLM)",
+            "openai_compatible",
+        ),
     ]
+
     # Only honor LLM_PROVIDER if it's actually set — a brand-new user shouldn't
     # be pre-pointed at a paid API-key path (Bar #5, #6). With nothing set,
     # highlight the first (featured, zero-key) option instead.
     _env_provider = os.getenv("LLM_PROVIDER")
     env_default = _normalize_provider_name(_env_provider) if _env_provider else None
     provider = await select_value("Provider:", _PROVIDER_MENU, default_value=env_default)
-    if provider == "__custom__":
-        provider = _normalize_provider_name(
-            _prompt("Provider id", default=env_default or "", required=True))
+
+    # An OpenAI-compatible server is a concrete supported provider, not an
+    # arbitrary provider plug-in. Ask for its base URL before model discovery
+    # so the list comes from the server the user actually selected.
+    endpoint = ""
+    api_key_env = ""
+    if provider == "openai_compatible":
+        while True:
+            endpoint = _prompt(
+                "OpenAI-compatible endpoint (include /v1)",
+                default=os.getenv("OPENAI_BASE_URL", ""),
+                required=True,
+            )
+            endpoint_error = _openai_compatible_endpoint_error(endpoint)
+            if not endpoint_error:
+                break
+            err_console.print(f"[fail]{endpoint_error}[/fail]")
+        api_key_env = _prompt(
+            "API key env var name (blank if none; use HEXIS_LLM_CONSCIOUS_API_KEY for Docker)",
+            default=(
+                "HEXIS_LLM_CONSCIOUS_API_KEY"
+                if os.getenv("HEXIS_LLM_CONSCIOUS_API_KEY")
+                else ""
+            ),
+        )
 
     # Model — the list AND the default both come from the live catalog
     # (models.dev), the way hermes-agent and openclaw do it. No
     # stale hard-coded default; any free-typed name is still accepted.
     from apps.tui import model_catalog
     catalog: list[str] = []
+    catalog_error: str | None = None
     try:
         console.print("[muted]Fetching available models…[/muted]")
-        catalog = await model_catalog.fetch_models(provider)
-    except Exception:
+        catalog = await model_catalog.fetch_models(
+            provider,
+            endpoint=endpoint or None,
+            api_key=os.getenv(api_key_env) if api_key_env else None,
+        )
+    except Exception as exc:
+        catalog_error = str(exc)[:200]
         catalog = []
+    if provider == "openai_compatible" and not catalog:
+        if catalog_error:
+            err_console.print(f"[warn]Could not fetch endpoint models: {catalog_error}[/warn]")
+        console.print("[muted]Enter the endpoint's exact model id to continue.[/muted]")
     default_model = os.getenv("LLM_MODEL") or model_catalog.recommended_default(provider, catalog)
     if catalog:
         model = (await _ac("Model (type to filter, or enter your own)", catalog,
@@ -657,7 +875,7 @@ async def _configure_llm(conn: Any, *, dsn: str, wait_seconds: int) -> dict[str,
         api_key_env = ""
         console.print("[muted]OAuth provider — no endpoint or API key needed.[/muted]")
         use_separate_sub = False
-    else:
+    elif provider != "openai_compatible":
         endpoint = _prompt(
             "Endpoint (blank for provider default)",
             # Only OpenAI-shaped providers should inherit OPENAI_BASE_URL — don't
@@ -666,8 +884,11 @@ async def _configure_llm(conn: Any, *, dsn: str, wait_seconds: int) -> dict[str,
         )
         api_key_env = _prompt(
             "API key env var name (e.g. OPENAI_API_KEY)",
-            default=_PROVIDER_ENV_VARS.get(provider, "") or ("OPENAI_API_KEY" if provider in {"openai", "openai_compatible"} else ""),
+            default=_PROVIDER_ENV_VARS.get(provider, "")
+            or ("OPENAI_API_KEY" if provider == "openai" else ""),
         )
+        use_separate_sub = _prompt_yes_no("Use separate subconscious model?", default=False)
+    else:
         use_separate_sub = _prompt_yes_no("Use separate subconscious model?", default=False)
 
     if use_separate_sub:
@@ -1220,8 +1441,9 @@ async def _run_init(dsn: str, *, wait_seconds: int) -> int:
             f"[key]User:[/key]   {user_name}",
             title="What's set up",
         ))
-        console.print("[muted]Change anything later with `hexis init`. "
-                      "`hexis up` keeps the heartbeat and memory maintenance workers running.[/muted]")
+        console.print("[muted]Change anything later with `hexis init`. The heartbeat and "
+                      "memory maintenance workers run in the background — `hexis status` "
+                      "shows them, `hexis stop` pauses them.[/muted]")
         console.print("[muted]Hexis runs on your machine and sends no telemetry.[/muted]")
         return 0
 
@@ -1235,22 +1457,31 @@ def _post_init_handoff() -> int:
     Runs in the sync layer (the wizard's event loop has closed), so it starts a
     fresh loop just for the prompt.
     """
-    try:
-        choice = asyncio.run(_prompt_choice(
-            "What now?",
-            ["Open chat now", "Open the web dashboard", "Exit"],
-            default=1,
-        ))
-    except (KeyboardInterrupt, Exception):
-        console.print("[muted]Run `hexis chat` to say hello.[/muted]")
+    while True:
+        try:
+            choice = asyncio.run(_prompt_choice(
+                "What now?",
+                ["Open chat now", "Open the web dashboard", "Exit"],
+                default=1,
+            ))
+        except (KeyboardInterrupt, Exception):
+            console.print("[muted]Run `hexis chat` to say hello.[/muted]")
+            return 0
+        if choice == 1:
+            from apps import cli_chat
+            return cli_chat.main(["--greet"])
+        if choice == 2:
+            from apps.hexis_cli import main as cli_main
+            rc = cli_main(["ui"])
+            if rc == 0:
+                return 0
+            if rc == 130:
+                return 130
+            console.print(
+                "[warn]The dashboard did not start. Retry, open chat, or exit.[/warn]"
+            )
+            continue
         return 0
-    if choice == 1:
-        from apps import cli_chat
-        return cli_chat.main(["--greet"])
-    if choice == 2:
-        from apps.hexis_cli import main as cli_main
-        return cli_main(["ui"])
-    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1261,13 +1492,29 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dsn", default=None, help="Postgres DSN; defaults to POSTGRES_* env vars")
     p.add_argument("--wait-seconds", type=int, default=int(os.getenv("POSTGRES_WAIT_SECONDS", "30")))
 
-    # Non-interactive mode flags (any of --api-key, --provider, --character triggers it)
-    p.add_argument("--api-key", default=None,
-                    help="API key (auto-detects provider; triggers non-interactive mode)")
+    # Supplying any of these flags selects non-interactive mode in main().
+    credential_source = p.add_mutually_exclusive_group()
+    credential_source.add_argument(
+        "--api-key",
+        default=None,
+        help="API key (auto-detects provider; writes the key to .env)",
+    )
+    credential_source.add_argument(
+        "--api-key-env",
+        default=None,
+        metavar="NAME",
+        help="Read the API key from this environment variable (keeps secrets out of shell history)",
+    )
     p.add_argument("--provider", default=None,
                     help="LLM provider (auto-detected from --api-key if omitted)")
     p.add_argument("--model", default=None,
                     help="LLM model (defaults per provider)")
+    p.add_argument(
+        "--endpoint",
+        default=None,
+        metavar="URL",
+        help="LLM base URL (defaults to OPENAI_BASE_URL for openai_compatible)",
+    )
     p.add_argument("--character", default=None,
                     help="Character card name (e.g. 'hexis', 'jarvis'). Omit for express defaults")
     p.add_argument("--name", default=None,
@@ -1284,7 +1531,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
     # Non-interactive mode if any of these flags are present
-    if args.api_key or args.provider or args.character:
+    if args.api_key or args.api_key_env or args.endpoint or args.provider or args.character:
         try:
             return asyncio.run(_run_init_noninteractive(args))
         except KeyboardInterrupt:
@@ -1295,10 +1542,13 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
     # Interactive mode (original flow)
-    if args.dsn:
-        dsn = args.dsn
-    else:
-        dsn = agent_api.db_dsn_from_env()
+    dsn = args.dsn or agent_api.db_dsn_from_env()
+
+    # Same guarantee the flagged path gives: init leaves a stack that can run
+    # the agent — the database *and* the heartbeat/maintenance loops. Skipped
+    # for a database this machine does not host, or with --no-docker.
+    if not args.no_docker and not args.dsn and _dsn_is_local(dsn):
+        _ensure_stack_running(args)
 
     try:
         rc = asyncio.run(_run_init(dsn, wait_seconds=args.wait_seconds))

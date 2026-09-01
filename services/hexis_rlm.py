@@ -51,6 +51,16 @@ class FinalAnswerResolution:
     error: str | None = None
 
 
+class RlmLoopFailure(RuntimeError):
+    """The RLM loop got no usable LLM response at all (#111).
+
+    Raised instead of fabricating a well-formed-looking decision string, so
+    the caller's existing legacy-path fallback (services/external_calls.py)
+    actually runs, and the failure can be recorded as a real defect rather
+    than persisted as a heartbeat that "chose" to do nothing.
+    """
+
+
 def _workspace_metrics(workspace: RLMWorkspace) -> dict[str, Any]:
     """Return every retrieval/workspace counter the RLM can affect."""
     return {
@@ -322,6 +332,12 @@ def _run_loop(
 
     final_answer: str | None = None
     iteration_count = 0
+    # The real cause of an early exit (#111): distinct from genuinely
+    # exhausting max_iterations with real (if unresolved) responses, so the
+    # exhaustion log below reports what actually happened instead of always
+    # blaming the configured limit, and so a total failure can raise instead
+    # of silently fabricating a decision.
+    loop_error: str | None = None
 
     for i in range(max_iterations):
         iteration_count = i + 1
@@ -340,6 +356,7 @@ def _run_loop(
             response = future.result(timeout=120)
         except Exception as e:
             logger.error("LLM call failed at iteration %d: %s", i, e)
+            loop_error = str(e)
             break
 
         if not response:
@@ -393,10 +410,20 @@ def _run_loop(
 
     # If we ran out of iterations without a FINAL, use the last response
     if final_answer is None:
-        logger.warning(
-            "RLM loop exhausted %d iterations without FINAL, using last response",
-            max_iterations,
-        )
+        if loop_error:
+            # An LLM call itself failed (#111) -- this is not "used up all
+            # its iterations thinking," it's a real infrastructure failure
+            # after iteration_count response(s). Report the true cause.
+            logger.warning(
+                "RLM loop broke early after %d iteration(s) (%s); attempting one repair call",
+                iteration_count,
+                loop_error,
+            )
+        else:
+            logger.warning(
+                "RLM loop exhausted %d iterations without FINAL, using last response",
+                max_iterations,
+            )
         # Make one more call asking for a final answer
         message_history.append({
             "role": "user",
@@ -426,8 +453,15 @@ def _run_loop(
                     )
                 else:
                     final_answer = response
-        except Exception:
-            final_answer = '{"reasoning": "RLM loop timed out", "actions": [], "goal_changes": []}'
+        except Exception as repair_exc:
+            # Both the main loop AND the repair call failed to get any real
+            # LLM response -- a total failure, not a decision. Raising here
+            # (rather than fabricating a well-formed-looking decision, #111)
+            # lets the caller's existing legacy-path fallback actually run,
+            # and the real error surface instead of a fictitious "timed out."
+            reason = loop_error or str(repair_exc)
+            logger.error("RLM loop got no usable LLM response at all: %s", reason)
+            raise RlmLoopFailure(reason) from repair_exc
 
     return {
         "final_answer": final_answer,
@@ -681,6 +715,17 @@ async def run_chat_turn(
         logger.error("RLM chat timed out after %ds", timeout_seconds)
         result = {
             "final_answer": "I apologize, but I need more time to think about that. Could you try again?",
+            "iterations": 0,
+            "message_count": 0,
+        }
+    except RlmLoopFailure as exc:
+        # #111: a total LLM failure -- unlike the heartbeat path (which lets
+        # this propagate so the legacy-path fallback can actually run), a
+        # chat turn has no fallback provider to hand off to and must still
+        # answer the user, honestly, rather than crash the request.
+        logger.error("RLM chat got no usable LLM response at all: %s", exc)
+        result = {
+            "final_answer": "I'm having trouble reaching my model provider right now. Please try again in a moment.",
             "iterations": 0,
             "message_count": 0,
         }

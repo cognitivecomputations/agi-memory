@@ -96,6 +96,15 @@ class SkillSpec:
     category: SkillCategory = SkillCategory.OTHER  # J.1
     os_support: list[str] = field(default_factory=lambda: ["darwin", "linux"])  # J.1
     bound_tools: list[str] = field(default_factory=list)  # J.4: tool names to bind
+    # Words a person would actually use for this skill. Selection scores literal
+    # token overlap against the skill's *name*, so `gmail-actions` scored zero on
+    # "email" and `calendar` scored zero on "book time with Sarah". Aliases are
+    # scored exactly like name tokens — they are the user's vocabulary, not ours.
+    aliases: list[str] = field(default_factory=list)
+    # Exact, manifest-owned phrases that activate a capability even when the
+    # semantic score distribution is flat or misleading. Use sparingly for
+    # unambiguous user language (for example "screenshot"), not broad topics.
+    activation_phrases: list[str] = field(default_factory=list)
     contexts: list[SkillContext] = field(
         default_factory=lambda: [SkillContext.HEARTBEAT, SkillContext.CHAT]
     )
@@ -103,6 +112,9 @@ class SkillSpec:
     enabled: bool = True  # Can be disabled via config
     provenance: dict[str, Any] = field(default_factory=dict)
     mcp_binding: MCPBinding | None = None  # #41: MCP server this skill binds
+    # Optional consent-first automation proposal. Loading/installing the skill
+    # may register this block for review, but never schedules it directly.
+    blueprint: dict[str, Any] | None = None
 
     def requirements_met(
         self,
@@ -165,6 +177,7 @@ class SkillSpec:
 
         if not self.check_os_support():
             import sys
+
             reasons.append(f"OS {sys.platform} not in {self.os_support}")
 
         for tool in self.requires_tools:
@@ -204,7 +217,11 @@ class SkillSpec:
         import sys
 
         if not self.enabled:
-            return ("unavailable", ["skill disabled"], "Enable the skill in config to use it.")
+            return (
+                "unavailable",
+                ["skill disabled"],
+                "Enable the skill in config to use it.",
+            )
         if not self.check_os_support():
             return (
                 "unavailable",
@@ -213,7 +230,8 @@ class SkillSpec:
             )
 
         missing_tools = [
-            t for t in self.requires_tools
+            t
+            for t in self.requires_tools
             if not t.startswith("mcp_") and t not in available_tools
         ]
         if missing_tools:
@@ -235,11 +253,16 @@ class SkillSpec:
                     ),
                 )
 
-        env_wanted = list(dict.fromkeys([
-            *self.requires_env,
-            *(self.mcp_binding.env_requires if self.mcp_binding else []),
-        ]))
+        env_wanted = list(
+            dict.fromkeys(
+                [
+                    *self.requires_env,
+                    *(self.mcp_binding.env_requires if self.mcp_binding else []),
+                ]
+            )
+        )
         import os
+
         missing_env = [v for v in env_wanted if not os.environ.get(v)]
         if missing_env:
             return (
@@ -258,14 +281,16 @@ class SkillSpec:
             return (
                 "needs_setup",
                 [f"missing binary: {b}" for b in missing_bins],
-                f"Install with: {steps[0]}" if steps else f"Install {', '.join(missing_bins)} and retry.",
+                f"Install with: {steps[0]}"
+                if steps
+                else f"Install {', '.join(missing_bins)} and retry.",
             )
 
         return ("usable", missing, None)
 
     def to_prompt_block(self) -> str:
         """Format this skill's full instructions (returned by `use_skill`)."""
-        return f"<skill name=\"{self.name}\">\n{self.content}\n</skill>"
+        return f'<skill name="{self.name}">\n{self.content}\n</skill>'
 
     def to_index_line(self) -> str:
         """One-line entry for the compact skill index in the system prompt."""
@@ -273,7 +298,9 @@ class SkillSpec:
         return f"- {self.name}: {desc}" if desc else f"- {self.name}"
 
     @classmethod
-    def from_frontmatter(cls, metadata: dict[str, Any], content: str, source: str = "") -> "SkillSpec":
+    def from_frontmatter(
+        cls, metadata: dict[str, Any], content: str, source: str = ""
+    ) -> "SkillSpec":
         """Create a SkillSpec from parsed YAML frontmatter and markdown body."""
         # Parse contexts
         raw_contexts = metadata.get("contexts", ["heartbeat", "chat"])
@@ -304,7 +331,9 @@ class SkillSpec:
         raw_install = metadata.get("install", [])
         if not isinstance(raw_install, list):
             raw_install = []
-        install_methods = [InstallMethod.from_dict(m) for m in raw_install if isinstance(m, dict)]
+        install_methods = [
+            InstallMethod.from_dict(m) for m in raw_install if isinstance(m, dict)
+        ]
 
         # Parse os_support
         raw_os = metadata.get("os_support", ["darwin", "linux"])
@@ -321,7 +350,24 @@ class SkillSpec:
             raw_provenance = {}
 
         raw_mcp = metadata.get("mcp")
-        mcp_binding = MCPBinding.from_dict(raw_mcp) if isinstance(raw_mcp, dict) else None
+        mcp_binding = (
+            MCPBinding.from_dict(raw_mcp) if isinstance(raw_mcp, dict) else None
+        )
+
+        raw_blueprint = metadata.get("blueprint")
+        if isinstance(raw_blueprint, str):
+            # Inline JSON remains usable with the dependency-free fallback
+            # frontmatter parser; normal YAML blocks arrive as dictionaries.
+            try:
+                import json
+
+                parsed_blueprint = json.loads(raw_blueprint)
+                raw_blueprint = (
+                    parsed_blueprint if isinstance(parsed_blueprint, dict) else None
+                )
+            except (TypeError, ValueError):
+                raw_blueprint = None
+        blueprint = dict(raw_blueprint) if isinstance(raw_blueprint, dict) else None
 
         return cls(
             name=str(metadata.get("name", "")),
@@ -335,8 +381,19 @@ class SkillSpec:
             category=category,
             os_support=list(raw_os),
             bound_tools=list(raw_bound),
+            aliases=[
+                str(a).strip().lower()
+                for a in (metadata.get("aliases") or [])
+                if str(a).strip()
+            ],
+            activation_phrases=[
+                str(phrase).strip().lower()
+                for phrase in (metadata.get("activation_phrases") or [])
+                if str(phrase).strip()
+            ],
             contexts=contexts,
             source=source,
             provenance=dict(raw_provenance),
             mcp_binding=mcp_binding,
+            blueprint=blueprint,
         )

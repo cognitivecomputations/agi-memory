@@ -4,6 +4,7 @@ database with real data evolves to the new schema WITHOUT a wipe."""
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from uuid import uuid4
@@ -56,6 +57,194 @@ async def test_migrations_recorded_and_idempotent(db_pool):
         assert await conn.fetchval(
             "SELECT value IS NOT NULL FROM config WHERE key='agent.lineage_id'"
         )
+
+
+def test_latest_bundled_migration_version_reads_real_migrations_dir():
+    """#113: the value a worker stamps onto its own registration metadata is
+    exactly the highest-versioned file in this checkout's db/migrations/."""
+    from core.migrations import _list_migration_files, latest_bundled_migration_version
+
+    files = _list_migration_files(_DB_ROOT / "migrations")
+    assert files, "expected at least one real migration on disk"
+    assert latest_bundled_migration_version(_DB_ROOT / "migrations") == files[-1].stem
+
+
+def test_latest_bundled_migration_version_missing_dir_returns_none(tmp_path):
+    from core.migrations import latest_bundled_migration_version
+
+    assert latest_bundled_migration_version(tmp_path / "does_not_exist") is None
+
+
+def test_latest_bundled_migration_version_orders_lexicographically(tmp_path):
+    (tmp_path / "0002_second.sql").write_text("-- second", encoding="utf-8")
+    (tmp_path / "0010_tenth.sql").write_text("-- tenth", encoding="utf-8")
+    (tmp_path / "0001_first.sql").write_text("-- first", encoding="utf-8")
+    from core.migrations import latest_bundled_migration_version
+
+    assert latest_bundled_migration_version(tmp_path) == "0010_tenth"
+
+
+async def test_applied_migration_checksum_drift_fails_loudly(db_pool):
+    from core.migrations import (
+        MigrationChecksumError,
+        apply_pending_migrations,
+        migration_status,
+    )
+
+    async with db_pool.acquire() as conn:
+        transaction = conn.transaction()
+        await transaction.start()
+        try:
+            await conn.execute(
+                "UPDATE public.schema_migrations SET checksum = $1 WHERE version = $2",
+                "0" * 64,
+                "0001_hmx_enum_values",
+            )
+
+            status = await migration_status(conn)
+            assert len(status["drifted"]) == 1
+            drift = status["drifted"][0]
+            assert drift["version"] == "0001_hmx_enum_values"
+            assert drift["recorded_checksum"] == "0" * 64
+            assert drift["current_checksum"] != "0" * 64
+            with pytest.raises(
+                MigrationChecksumError,
+                match="Applied migrations are immutable",
+            ):
+                await apply_pending_migrations(conn)
+        finally:
+            await transaction.rollback()
+
+
+async def test_rlm_heartbeat_prompt_module_matches_current_file(db_pool):
+    """#115: the file (what load_rlm_heartbeat_prompt() actually reads) was
+    fixed in c08c8f5 to stop telling the model `reflect` is a tool_use
+    target, and the baseline seed picked that up for fresh installs, but no
+    migration ever refreshed the prompt_modules catalog row itself -- so an
+    already-migrated database kept serving the stale text to anything
+    reading the DB copy. Migration 0243 re-upserts it; this pins the fix."""
+    async with db_pool.acquire() as conn:
+        content = await conn.fetchval(
+            "SELECT content FROM prompt_modules WHERE key = 'rlm_heartbeat_system'"
+        )
+    assert content is not None
+    assert "recall, reflect, reach_out_user" not in content
+    file_content = (
+        _DB_ROOT.parent / "services" / "prompts" / "rlm_heartbeat_system.md"
+    ).read_text(encoding="utf-8")
+    assert content == file_content
+
+
+async def test_conversation_prompt_covers_claims_already_held(db_pool):
+    """#51: after reading a document, "nothing to retain" was concluded even
+    when the document's core claims already existed as seeded protected
+    origin memories -- because the failure mode was query shape (searching
+    for the reading event, not the claims). Pins the added guidance and that
+    the DB catalog copy matches the file exactly (migration 0247)."""
+    async with db_pool.acquire() as conn:
+        content = await conn.fetchval(
+            "SELECT content FROM prompt_modules WHERE key = 'conversation'"
+        )
+    assert content is not None
+    assert 'source_kind="origin_document"' in content
+    assert 'Before concluding "nothing to retain"' in content
+    file_content = (
+        _DB_ROOT.parent / "services" / "prompts" / "conversation.md"
+    ).read_text(encoding="utf-8")
+    assert content == file_content
+
+
+async def test_action_receipt_migration_upgrades_existing_memory_dispatch(db_pool):
+    """0199 must preserve the old dispatcher while installing remember v2."""
+    migration = (
+        _DB_ROOT / "migrations" / "0199_persist_action_receipts.sql"
+    ).read_text(encoding="utf-8")
+
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            # Recreate the function layout present before 0199.
+            await conn.execute("DROP FUNCTION execute_memory_tool(TEXT, JSONB)")
+            await conn.execute(
+                "ALTER FUNCTION _execute_memory_tool_dispatch(TEXT, JSONB) "
+                "RENAME TO execute_memory_tool"
+            )
+            legacy_prompt = """# Conversation System Prompt
+
+- Tool results, conversation history
+
+Your words about your own actions must match what actually happened this turn.
+
+- **Inspected** means you read content into this conversation only — nothing was retained.
+- **Ingested** means a durable ingestion tool (`slow_ingest`, `fast_ingest`, ...) succeeded and wrote provenanced memories.
+- **Remembered** means an explicit `remember` call succeeded.
+
+Never say you stored, saved, created, filed, scheduled, or sent something unless the matching tool call succeeded in this turn. Never cite file contents or line numbers you did not read with `inspect_source` this turn. Unsupported action claims are detected and corrected publicly — check before claiming.
+"""
+            await conn.execute(
+                "UPDATE prompt_modules SET content = $1 WHERE key = 'conversation'",
+                legacy_prompt,
+            )
+            await conn.execute(
+                "UPDATE prompt_modules SET content = 'legacy current-turn verifier' "
+                "WHERE key = 'action_claim_verify'"
+            )
+
+            await conn.execute(migration)
+
+            assert await conn.fetchval(
+                "SELECT to_regprocedure('public.execute_memory_tool(text,jsonb)') IS NOT NULL"
+            )
+            assert await conn.fetchval(
+                "SELECT to_regprocedure('public._execute_memory_tool_dispatch(text,jsonb)') IS NOT NULL"
+            )
+            session_id = str(uuid4())
+            memory_content = f"migration routing {uuid4().hex}"
+            existing_id = await conn.fetchval(
+                """
+                INSERT INTO memories (
+                    type, content, embedding, importance, trust_level, status, metadata
+                )
+                VALUES (
+                    'episodic', $1,
+                    array_fill(0.1, ARRAY[embedding_dimension()])::vector,
+                    0.5, 0.8, 'active',
+                    jsonb_build_object(
+                        'tool_write', jsonb_build_object('session_id', $2::text)
+                    )
+                )
+                RETURNING id
+                """,
+                memory_content,
+                session_id,
+            )
+            routed = await conn.fetchval(
+                "SELECT execute_memory_tool('remember', $1::jsonb)",
+                json.dumps(
+                    {
+                        "content": memory_content,
+                        "type": "episodic",
+                        "_execution_context": {"session_id": session_id},
+                    }
+                ),
+            )
+            routed = json.loads(routed) if isinstance(routed, str) else routed
+            assert routed["success"] is True, routed
+            assert routed["output"]["reused"] is True
+            assert routed["output"]["memory_id"] == str(existing_id)
+            conversation_prompt = await conn.fetchval(
+                "SELECT content FROM prompt_modules WHERE key = 'conversation'"
+            )
+            assert (
+                "durable prior-action receipts as the authority" in conversation_prompt
+            )
+            verifier_prompt = await conn.fetchval(
+                "SELECT content FROM prompt_modules WHERE key = 'action_claim_verify'"
+            )
+            assert "prior_action_receipts" in verifier_prompt
+        finally:
+            await tr.rollback()
 
 
 async def test_migrate_existing_database_preserves_data():

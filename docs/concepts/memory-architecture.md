@@ -81,6 +81,21 @@ is unavailable.
 
 **Memory formation is layered**: explicit writes (`remember`), document ingestion, and the **conscious-episode extraction** sweep — a maintenance job that reviews recent chat turns and heartbeat episodes and selectively promotes salient facts into durable memory (an importance floor gates the LLM pass; routine content yields nothing; near-duplicates corroborate existing beliefs instead of piling up).
 
+The opt-in weekly learning review makes those changes inspectable as a diff. A
+model may decide that enough changed and select records from a bounded candidate
+set, but the review renders the database's exact content and evidence. Approval
+keeps the change, correction creates a bitemporal replacement (semantic changes
+pass through the contradiction ledger), and forgetting closes active recall
+without erasing the historical account.
+
+**Forgetting is deliberate and inspectable.** Rest-cycle consolidation can
+compress ordinary episodic groups into lower-fidelity gists, but full source rows
+are archived recoverably by default. Borderline or load-bearing groups become an
+explicit user review: keep one with a finite chapter budget, journal the words
+that should survive, or let the group compress. No expiry timer chooses. Each
+completed summary records its actual source count and stored fidelity on the
+Forgetting page. Irreversible pruning is a separate, off-by-default operator opt-in.
+
 ### Retrieval Model
 
 Three performance tiers:
@@ -105,7 +120,7 @@ own recollection:
 
 | Layer | What it holds | Lifetime |
 |-------|---------------|----------|
-| **Long-term memory** | Distilled, confidence-bearing facts and events (`memories`) | Permanent (decay/retention-managed) |
+| **Long-term memory** | Distilled, confidence-bearing facts and events (`memories`) | Decay/retention-managed; archived originals remain recoverable unless hard pruning is explicitly enabled |
 | **Filing cabinet** | Exact preserved sources — files, emails, pages — with citable chunks (`source_documents`, `source_document_chunks`, original bytes in `source_artifacts`) | Durable; user data never auto-fades |
 | **RecMem desk** | Passages deliberately loaded for multi-step reasoning; searchable, scrollable, pinnable, GC'd when idle | Mid-term |
 | **Current context** | The live prompt window | One turn |
@@ -116,9 +131,45 @@ provenance to the exact source when wording matters, search the cabinet
 components), load onto the desk for sustained work, scroll rather than dump,
 and cite exact handles — document, chunk, page, path.
 
-### Worldview Integration
+### Provenance and Contradiction Review
 
-Beliefs (stored as worldview memories) filter and weight other memories. When new information contradicts existing beliefs, `CONTRADICTS` graph edges are created and the coherence drive is nudged upward to surface the tension. For semantic beliefs, contradiction also revises confidence through the audited belief-revision policy — except protected memories, where the contradiction is flagged for review but never applied.
+Recall and document tools return a stable citation envelope with the source,
+trust level, and exact page/section/sheet locator. The conversation renderer
+turns the model's `[^citation-id]` markers into expandable, linked footnotes;
+sources below the live `memory.low_trust_threshold` are visibly marked. Trust
+defaults come from `memory.source_trust_defaults`, so new source kinds can be
+calibrated without changing application code.
+
+New active semantic and worldview memories enter a durable, rate-limited
+contradiction queue. PostgreSQL selects a bounded same-topic candidate set; the
+model can only file pairs from that set and cannot decide which claim wins.
+Confident findings become `contradiction_cases`, appear in the daily review and
+the dashboard ledger, and remain inert until the operator chooses newer, older,
+or context-dependent tension. A winner decision records a
+`memory_supersessions` event and closes the loser's `valid_until`; it never
+deletes the old row. Accepting tension retains both memories and the
+`CONTRADICTS` relationship.
+
+Evidence attached directly to one semantic belief still uses the separately
+audited confidence-revision policy. Protected memories can be questioned but
+are never silently rewritten.
+
+### Point-in-Time State
+
+The memory store retains validity rather than overwriting history. A memory's
+`valid_from` / `valid_until` window and durable `memory_supersessions` events
+answer which claims held at an instant; reverted supersessions reopen the old
+claim after the recorded resolution. The first `belief_revision_audit` event
+after that instant supplies its prior confidence and trust, reconstructing the
+epistemic state that actually existed then.
+
+`temporal_memory_snapshot()` applies those rules during retrieval.
+`diff_memory_history()` compares two snapshots and joins the intervening event
+ledgers, so “what changed?” and “why?” are answered from recorded evidence.
+Chat activates these tools from temporal language, while the **Memory history**
+dashboard exposes snapshots and diffs directly. Invalidated rows without an
+explicit validity close are never treated as current, and private memories are
+excluded whenever the calling context requires the sensitivity wall.
 
 ## Key Design Decisions
 
@@ -133,6 +184,9 @@ Beliefs (stored as worldview memories) filter and weight other memories. When ne
 - Functions: `db/*_functions_memory.sql`
 - Neighborhoods: `db/*_functions_maintenance.sql`
 - Belief revision: `db/59_belief_revision.sql` (policy + `belief_revision_audit`)
+- Provenance envelopes: `db/46i_functions_memory_provenance.sql`, `channels/presentation.py`
+- Contradiction events: `db/46j_functions_contradictions.sql`, `services/contradictions.py`
+- Point-in-time history: `db/46k_functions_temporal_memory.sql`, `core/tools/memory.py`
 - Origin memories: `db/60_origin_memories.sql`
 - Conscious-episode extraction: `db/61_functions_conscious_extraction.sql`, `services/extraction.py`
 - Python client: `core/cognitive_memory_api.py`

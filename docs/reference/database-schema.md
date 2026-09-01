@@ -169,7 +169,28 @@ Views over the `state` table projecting runtime state.
 | Column | Type | Description |
 |--------|------|-------------|
 | `id` | INT | Always 1 |
+| `current_energy` | FLOAT | Energy currently stored in the heartbeat bank |
+| `last_heartbeat_at` | TIMESTAMPTZ | Most recent start/completion timestamp |
+| `next_heartbeat_at` | TIMESTAMPTZ | Database-selected adaptive due time |
+| `active_heartbeat_id` | UUID | Current claim, or null when idle |
 | `is_paused` | BOOLEAN | Whether the loop is paused |
+
+### heartbeat_economy_state / heartbeat_outcomes / heartbeat_outcome_signals
+
+Auditable heartbeat economy state. The singleton economy row anchors elapsed-time
+regeneration. Each heartbeat outcome records regeneration, spend, durable outcome
+counts, urgency, and the next cadence; signal rows point back to exact tool or
+verified-feedback evidence.
+
+### deliberation_sessions / deliberation_moves / deliberation_verdicts
+
+Durable advisory council history. A session records the question, stakes, source,
+selected personas, compact evidence context, and lifecycle status. Moves preserve
+each perspective, targeted adversarial challenge, and synthesis with exact evidence
+memory IDs. The one verdict per session retains agreements, disagreements, risks,
+missing evidence, dissent, observable invalidation conditions, and an optional
+episodic summary memory. These records explain advice; they do not authorize, gate,
+or execute actions.
 
 ### consent_log
 

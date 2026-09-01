@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, TYPE_CHECKING
+from typing import Any
 
 from .base import (
     ToolCategory,
@@ -20,9 +20,6 @@ from .base import (
     ToolResult,
     ToolSpec,
 )
-
-if TYPE_CHECKING:
-    import asyncpg
 
 logger = logging.getLogger(__name__)
 
@@ -115,19 +112,26 @@ class ManageGoalsHandler(ToolHandler):
         try:
             async with pool.acquire() as conn:
                 raw = await conn.fetchval(
-                    "SELECT execute_goals_tool($1::jsonb)",
+                    "SELECT execute_goals_tool($1::jsonb, $2::goal_source)",
                     json.dumps(arguments),
+                    context.trusted_goal_origin,
                 )
         except Exception as exc:
             logger.exception("Goals tool failed")
-            return ToolResult.error_result(f"Goals tool failed: {exc}", ToolErrorType.EXECUTION_FAILED)
+            return ToolResult.error_result(
+                f"Goals tool failed: {exc}", ToolErrorType.EXECUTION_FAILED
+            )
         payload = json.loads(raw) if isinstance(raw, str) else raw
         if isinstance(payload, dict) and "success" in payload:
             if payload.get("success"):
-                return ToolResult.success_result(payload.get("output"), payload.get("display_output"))
+                return ToolResult.success_result(
+                    payload.get("output"), payload.get("display_output")
+                )
             return ToolResult.error_result(
                 payload.get("error") or "Goals tool failed",
-                ToolErrorType(payload.get("error_type") or ToolErrorType.EXECUTION_FAILED.value),
+                ToolErrorType(
+                    payload.get("error_type") or ToolErrorType.EXECUTION_FAILED.value
+                ),
             )
         return ToolResult.error_result(
             "Goals tool returned an unexpected payload",

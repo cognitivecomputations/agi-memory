@@ -274,6 +274,7 @@ async def iter_sse_json_events(
     correlation_id: str | None = None,
     transport: httpx.AsyncBaseTransport | None = None,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    strict_json: bool = False,
 ) -> AsyncIterator[dict[str, Any]]:
     """Yield JSON objects from a server-sent-event stream.
 
@@ -353,14 +354,14 @@ async def iter_sse_json_events(
                             continue
                         if line.strip() != "":
                             continue
-                        obj = _parse_sse_json_payload(data_lines)
+                        obj = _parse_sse_json_payload(data_lines, strict=strict_json)
                         data_lines = []
                         if obj is None:
                             continue
                         emitted = True
                         yield obj
 
-                    obj = _parse_sse_json_payload(data_lines)
+                    obj = _parse_sse_json_payload(data_lines, strict=strict_json)
                     if obj is not None:
                         emitted = True
                         yield obj
@@ -600,7 +601,11 @@ async def _read_response_bytes_limited(
     return b"".join(chunks)
 
 
-def _parse_sse_json_payload(data_lines: list[str]) -> dict[str, Any] | None:
+def _parse_sse_json_payload(
+    data_lines: list[str],
+    *,
+    strict: bool = False,
+) -> dict[str, Any] | None:
     if not data_lines:
         return None
     data = "\n".join(data_lines).strip()
@@ -608,6 +613,8 @@ def _parse_sse_json_payload(data_lines: list[str]) -> dict[str, Any] | None:
         return None
     try:
         obj = _loads_json(data)
-    except ValueError:
+    except ValueError as exc:
+        if strict:
+            raise ValueError("Malformed SSE JSON payload.") from exc
         return None
     return obj if isinstance(obj, dict) else None

@@ -20,11 +20,16 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
+      - name: Committed dependency lock is current
+        run: >-
+          docker run --rm -v "$PWD:/app:ro" -w /app
+          ghcr.io/astral-sh/uv:0.12.7-python3.12-trixie-slim@sha256:9b269b249ad3de71611f3f4c8cabd38f7786205bbd79f727029a5cfdb072ffd4
+          uv lock --check
       - run: pip install -e . black isort mypy
       - name: black (advisory)
         continue-on-error: true
@@ -42,7 +47,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -112,12 +117,31 @@ jobs:
           docker logs hexisdb | tail -100 || true
           cat /tmp/fake_emb.log || true
 
+  # ------------------------------------------- locked dashboard install + build
+  ui:
+    runs-on: ubuntu-latest
+    env:
+      NEXT_TELEMETRY_DISABLED: "1"
+    defaults:
+      run:
+        working-directory: hexis-ui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: hexis-ui/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+
   # ------------------------------------------- prove an existing baked DB upgrades
   # cleanly (published image when accessible, local DB build as a fallback).
   migration-survivor:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -163,7 +187,7 @@ jobs:
   workflow-lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Lint GitHub Actions workflows
         run: |
           bash <(curl -sSf https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
@@ -177,7 +201,7 @@ jobs:
   # ------------------------------------------------ single required branch check
   all-checks-pass:
     if: always()
-    needs: [lint, test, migration-survivor, workflow-lint]
+    needs: [lint, test, ui, migration-survivor, workflow-lint]
     runs-on: ubuntu-latest
     steps:
       - name: Verify every required lane passed

@@ -118,6 +118,134 @@ async def test_connector_backfill_job_cursor_lifecycle(db_pool):
     assert status["jobs"][0]["status"] == "completed"
 
 
+async def test_enqueue_gmail_backfill_creates_ongoing_sync_responsibility(db_pool):
+    """#110: a Gmail backfill previously had no ongoing-sync mechanism --
+    the ambient responsibility evaluator was fully implemented but nothing
+    ever created a row for it to evaluate. Enqueuing a backfill now ensures
+    one exists, idempotently."""
+    marker = get_test_identifier("connector-ambient")
+
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            account = await _connected_gmail(conn, marker)
+            await conn.fetchval(
+                "SELECT enqueue_connector_backfill_job('gmail', $1, 'messages')",
+                account,
+            )
+
+            rows = await conn.fetch(
+                """
+                SELECT id, status, sources FROM ambient_responsibilities
+                WHERE sources @> jsonb_build_array(
+                    jsonb_build_object('connector_id', 'gmail', 'account_key', $1::text)
+                )
+                """,
+                account.lower(),
+            )
+            assert len(rows) == 1
+            assert rows[0]["status"] in ("active", "proposed", "blocked")
+
+            # A second backfill for the same account must not duplicate it.
+            await conn.fetchval(
+                "SELECT enqueue_connector_backfill_job('gmail', $1, 'messages')",
+                account,
+            )
+            rows_again = await conn.fetch(
+                """
+                SELECT id FROM ambient_responsibilities
+                WHERE sources @> jsonb_build_array(
+                    jsonb_build_object('connector_id', 'gmail', 'account_key', $1::text)
+                )
+                """,
+                account.lower(),
+            )
+            assert len(rows_again) == 1
+            assert rows_again[0]["id"] == rows[0]["id"]
+        finally:
+            await tr.rollback()
+
+
+async def test_completed_truncated_job_reenqueues_successor(db_pool):
+    """#110: a capped backfill that hit max_messages and still had a
+    page_token left previously completed and just sat there forever.
+    Completing with result.truncated=true must queue a successor so the
+    next maintenance tick continues from the advanced cursor."""
+    marker = get_test_identifier("connector-truncated")
+
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            account = await _connected_gmail(conn, marker)
+            job = _j(await conn.fetchval(
+                "SELECT enqueue_connector_backfill_job('gmail', $1, 'messages')",
+                account,
+            ))
+            await conn.fetchval("SELECT claim_connector_backfill_jobs_for('gmail', 5)")
+
+            completed = _j(await conn.fetchval(
+                """
+                SELECT complete_connector_backfill_job(
+                    $1::uuid,
+                    '{"items_seen": 100, "truncated": true, "next_page_token": "page-2"}'::jsonb,
+                    '{"page_token": "page-2"}'::jsonb,
+                    CURRENT_TIMESTAMP
+                )
+                """,
+                job["job_id"],
+            ))
+            assert completed["status"] == "completed"
+
+            status = _j(await conn.fetchval(
+                "SELECT get_connector_backfill_status('gmail', $1)", account
+            ))
+            statuses = {j["job_id"]: j["status"] for j in status["jobs"]}
+            assert statuses[job["job_id"]] == "completed"
+            successors = [
+                jid for jid, st in statuses.items()
+                if jid != job["job_id"] and st == "pending"
+            ]
+            assert len(successors) == 1, statuses
+            assert status["cursors"][0]["cursor_value"] == {"page_token": "page-2"}
+        finally:
+            await tr.rollback()
+
+
+async def test_completed_non_truncated_job_has_no_successor(db_pool):
+    marker = get_test_identifier("connector-finished")
+
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            account = await _connected_gmail(conn, marker)
+            job = _j(await conn.fetchval(
+                "SELECT enqueue_connector_backfill_job('gmail', $1, 'messages')",
+                account,
+            ))
+            await conn.fetchval("SELECT claim_connector_backfill_jobs_for('gmail', 5)")
+            await conn.fetchval(
+                """
+                SELECT complete_connector_backfill_job(
+                    $1::uuid,
+                    '{"items_seen": 3, "truncated": false}'::jsonb,
+                    '{"page_token": null}'::jsonb,
+                    CURRENT_TIMESTAMP
+                )
+                """,
+                job["job_id"],
+            )
+
+            status = _j(await conn.fetchval(
+                "SELECT get_connector_backfill_status('gmail', $1)", account
+            ))
+            assert len(status["jobs"]) == 1
+        finally:
+            await tr.rollback()
+
+
 async def test_connector_backfill_pause_resume_and_cancel(db_pool):
     marker = get_test_identifier("connector-pause")
 

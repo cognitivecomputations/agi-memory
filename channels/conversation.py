@@ -56,6 +56,22 @@ def _channel_message_payload(msg: ChannelMessage) -> dict[str, Any]:
     }
 
 
+def _operator_context(msg: ChannelMessage) -> dict[str, Any]:
+    return {
+        "channel_type": msg.channel_type,
+        "channel_id": msg.channel_id,
+        "sender_id": msg.sender_id,
+        "sender_name": msg.sender_name,
+        "raw_text": msg.content,
+        "metadata": {
+            "message_id": msg.message_id,
+            "platform_message_id": msg.message_id,
+            "thread_id": msg.thread_id,
+        },
+        "reason": "identity_verified_channel_turn",
+    }
+
+
 async def _prepare_channel_turn_db(
     conn: asyncpg.Connection,
     msg: ChannelMessage,
@@ -83,11 +99,13 @@ async def _finalize_channel_turn_db(
         session_id,
         user_text,
         assistant_text,
-        json.dumps({
-            "history": history,
-            "metadata": metadata or {},
-            "platform_message_id": platform_message_id,
-        }),
+        json.dumps(
+            {
+                "history": history,
+                "metadata": metadata or {},
+                "platform_message_id": platform_message_id,
+            }
+        ),
     )
     result = _coerce_json(raw)
     return result if isinstance(result, dict) else {}
@@ -104,6 +122,8 @@ async def process_channel_message(
     pool: asyncpg.Pool,
     *,
     max_message_length: int = 4000,
+    adapter: Any | None = None,
+    is_operator: bool = False,
 ) -> list[str]:
     """
     Process an inbound channel message through the conversation pipeline.
@@ -132,10 +152,16 @@ async def process_channel_message(
                 return [prepared.get("rejection") or "I can't respond right now."]
 
             session_id = str(prepared["session_id"])
-            history = prepared.get("history") if isinstance(prepared.get("history"), list) else []
+            history = (
+                prepared.get("history")
+                if isinstance(prepared.get("history"), list)
+                else []
+            )
 
             # Load LLM config from DB
-            llm_config = await load_llm_config(conn, "llm.chat", fallback_key="llm.heartbeat")
+            llm_config = await load_llm_config(
+                conn, "llm.chat", fallback_key="llm.heartbeat"
+            )
 
         # Record channel event for audit trail (record-and-dispatch)
         try:
@@ -157,15 +183,22 @@ async def process_channel_message(
         user_content = msg.content
         if msg.attachments:
             from .media import Attachment
+
             descs = []
             for att in msg.attachments:
                 if isinstance(att, Attachment):
                     descs.append(att.describe())
                 elif isinstance(att, dict):
-                    descs.append(str(att.get("filename") or att.get("url", "attachment")))
+                    descs.append(
+                        str(att.get("filename") or att.get("url", "attachment"))
+                    )
             if descs:
                 attachment_note = "[User attached: " + "; ".join(descs) + "]"
-                user_content = f"{attachment_note}\n\n{user_content}" if user_content else attachment_note
+                user_content = (
+                    f"{attachment_note}\n\n{user_content}"
+                    if user_content
+                    else attachment_note
+                )
 
         # Run the conversation turn
         from services.chat import chat_turn
@@ -173,6 +206,22 @@ async def process_channel_message(
         # The channel_sessions UUID from prepare_channel_turn (#71): the old
         # "channel:type:id:sender" string failed the UUID parse downstream, so
         # every unit landed with session_id NULL.
+        async def on_agent_event(event: Any) -> None:
+            if adapter is None:
+                return
+            from core.agent_loop import AgentEvent
+
+            if event.event != AgentEvent.QUESTION:
+                return
+            from .presentation import agent_question_presentation
+
+            await adapter.send_presentation(
+                msg.channel_id,
+                agent_question_presentation(dict(event.data)),
+                reply_to=msg.message_id,
+                thread_id=msg.thread_id,
+            )
+
         result = await chat_turn(
             user_message=user_content,
             history=history,
@@ -182,7 +231,10 @@ async def process_channel_message(
             pool=pool,
             user_label=msg.sender_name,
             is_group=msg.is_group,
-            surface="channel",
+            trusted_operator=is_operator,
+            operator_context=_operator_context(msg),
+            surface=msg.channel_type,
+            on_event=on_agent_event if adapter is not None else None,
         )
 
         assistant_text = result.get("assistant", "")
@@ -205,14 +257,22 @@ async def process_channel_message(
         return chunk_text(assistant_text, max_message_length)
 
     except Exception:
-        logger.exception("Error processing channel message from %s/%s", msg.channel_type, msg.sender_id)
-        return ["Sorry, I encountered an error processing your message. Please try again."]
+        logger.exception(
+            "Error processing channel message from %s/%s",
+            msg.channel_type,
+            msg.sender_id,
+        )
+        return [
+            "Sorry, I encountered an error processing your message. Please try again."
+        ]
 
 
 async def stream_channel_message(
     msg: ChannelMessage,
     pool: asyncpg.Pool,
     adapter: Any,
+    *,
+    is_operator: bool = False,
 ) -> str | None:
     """
     Process an inbound channel message with streaming edit-in-place delivery.
@@ -237,12 +297,22 @@ async def stream_channel_message(
         async with pool.acquire() as conn:
             prepared = await _prepare_channel_turn_db(conn, msg)
             if not prepared.get("allowed"):
-                await adapter.send(msg.channel_id, prepared.get("rejection") or "I can't respond right now.", reply_to=msg.message_id)
+                await adapter.send(
+                    msg.channel_id,
+                    prepared.get("rejection") or "I can't respond right now.",
+                    reply_to=msg.message_id,
+                )
                 return None
 
             session_id = str(prepared["session_id"])
-            history = prepared.get("history") if isinstance(prepared.get("history"), list) else []
-            llm_config = await load_llm_config(conn, "llm.chat", fallback_key="llm.heartbeat")
+            history = (
+                prepared.get("history")
+                if isinstance(prepared.get("history"), list)
+                else []
+            )
+            llm_config = await load_llm_config(
+                conn, "llm.chat", fallback_key="llm.heartbeat"
+            )
 
         # Record channel event for audit trail (record-and-dispatch)
         try:
@@ -252,7 +322,11 @@ async def stream_channel_message(
             await gateway.record(
                 EventSource.CHANNEL,
                 f"channel:{msg.channel_type}:{msg.channel_id}:{msg.sender_id}",
-                {"message": msg.content[:500], "sender": msg.sender_name, "streamed": True},
+                {
+                    "message": msg.content[:500],
+                    "sender": msg.sender_name,
+                    "streamed": True,
+                },
             )
         except Exception:
             logger.debug("Gateway record failed (non-fatal)", exc_info=True)
@@ -263,15 +337,22 @@ async def stream_channel_message(
         user_content = msg.content
         if msg.attachments:
             from .media import Attachment
+
             descs = []
             for att in msg.attachments:
                 if isinstance(att, Attachment):
                     descs.append(att.describe())
                 elif isinstance(att, dict):
-                    descs.append(str(att.get("filename") or att.get("url", "attachment")))
+                    descs.append(
+                        str(att.get("filename") or att.get("url", "attachment"))
+                    )
             if descs:
                 attachment_note = "[User attached: " + "; ".join(descs) + "]"
-                user_content = f"{attachment_note}\n\n{user_content}" if user_content else attachment_note
+                user_content = (
+                    f"{attachment_note}\n\n{user_content}"
+                    if user_content
+                    else attachment_note
+                )
 
         coalescer = StreamCoalescer(
             adapter,
@@ -281,6 +362,22 @@ async def stream_channel_message(
         )
 
         collected: list[str] = []
+        terminal_outcome = "unknown"
+
+        def record_terminal_outcome(outcome: str) -> None:
+            nonlocal terminal_outcome
+            terminal_outcome = outcome
+
+        async def present_question(payload: dict[str, Any]) -> None:
+            from .presentation import agent_question_presentation
+
+            await adapter.send_presentation(
+                msg.channel_id,
+                agent_question_presentation(payload),
+                reply_to=msg.message_id,
+                thread_id=msg.thread_id,
+            )
+
         async for token in stream_chat_turn(
             user_message=user_content,
             history=history,
@@ -290,13 +387,23 @@ async def stream_channel_message(
             pool=pool,
             user_label=msg.sender_name,
             is_group=msg.is_group,
-            surface="channel",
+            trusted_operator=is_operator,
+            operator_context=_operator_context(msg),
+            surface=msg.channel_type,
+            on_question=present_question,
+            on_terminal_outcome=record_terminal_outcome,
         ):
             collected.append(token)
             await coalescer.push(token)
 
         message_id = await coalescer.flush()
         assistant_text = "".join(collected)
+
+        # The incomplete notice is useful to the person, but failed/timeout
+        # output must never become durable conversation history. Raising here
+        # would trigger a second non-streaming model turn, so return normally.
+        if terminal_outcome != "completed":
+            return message_id
 
         # Update session and log
         fallback_history = [
@@ -320,10 +427,18 @@ async def stream_channel_message(
         return message_id
 
     except Exception:
-        logger.exception("Streaming failed for %s/%s, falling back to chunked", msg.channel_type, msg.sender_id)
+        logger.exception(
+            "Streaming failed for %s/%s, falling back to chunked",
+            msg.channel_type,
+            msg.sender_id,
+        )
         # Fall back to non-streaming
         chunks = await process_channel_message(
-            msg, pool, max_message_length=adapter.capabilities.max_message_length,
+            msg,
+            pool,
+            max_message_length=adapter.capabilities.max_message_length,
+            adapter=adapter,
+            is_operator=is_operator,
         )
         reply_to = msg.message_id
         for i, chunk in enumerate(chunks):

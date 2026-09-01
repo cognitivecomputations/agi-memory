@@ -4,6 +4,7 @@ import base64
 import json
 import logging
 import os
+import re
 from typing import Any, AsyncIterator
 
 import httpx
@@ -44,8 +45,16 @@ OPENAI_COMPATIBLE = {
 _CODEX_DEFAULT_BASE_URL = "https://chatgpt.com/backend-api"
 _CODEX_JWT_CLAIM_PATH = "https://api.openai.com/auth"
 
-# OpenAI client cache: (api_key, base_url, provider) -> client
-_openai_clients: dict[tuple[str, str, str], Any] = {}
+# OpenAI client cache: (api_key, base_url, provider, headers) -> client
+_openai_clients: dict[
+    tuple[str, str, str, tuple[tuple[str, Any], ...]],
+    Any,
+] = {}
+
+# The OpenAI SDK requires a non-empty credential even when a compatible local
+# server does not authenticate. This value is only an SDK adapter sentinel; it
+# is never persisted and is used only for the explicitly key-optional provider.
+_LOCAL_OPENAI_COMPATIBLE_API_KEY = "local-key"
 
 # LLM retry configuration
 _LLM_MAX_RETRIES = 4
@@ -118,18 +127,40 @@ async def _retry_on_transient(
     raise last_exc  # Should not reach here, but just in case
 
 
+async def _close_async_stream(stream: Any) -> None:
+    """Close an SDK stream without masking the provider error."""
+    import inspect
+
+    close = getattr(stream, "close", None) or getattr(stream, "aclose", None)
+    if not callable(close):
+        response = getattr(stream, "response", None)
+        close = getattr(response, "aclose", None)
+    if not callable(close):
+        return
+    try:
+        result = close()
+        if inspect.isawaitable(result):
+            await result
+    except Exception:
+        logger.debug("Failed to close provider stream", exc_info=True)
+
+
 def _get_openai_client(api_key: str | None, base_url: str | None, provider: str, default_headers: dict[str, Any] | None = None) -> Any:
     """Get or create a cached OpenAI client."""
     if openai is None:
         raise RuntimeError("openai package is required for OpenAI-compatible providers.")
 
+    effective_api_key = api_key
+    if provider == "openai_compatible" and not effective_api_key:
+        effective_api_key = _LOCAL_OPENAI_COMPATIBLE_API_KEY
+
     # Include headers in cache key to handle cases like github-copilot
     headers_key = tuple(sorted((default_headers or {}).items())) if default_headers else ()
-    cache_key = (api_key or "", base_url or "", provider, headers_key)
+    cache_key = (effective_api_key or "", base_url or "", provider, headers_key)
     if cache_key in _openai_clients:
         return _openai_clients[cache_key]
 
-    client_kwargs: dict[str, Any] = {"api_key": api_key, "base_url": base_url}
+    client_kwargs: dict[str, Any] = {"api_key": effective_api_key, "base_url": base_url}
     if default_headers:
         client_kwargs["default_headers"] = default_headers
 
@@ -307,24 +338,14 @@ async def _codex_responses_completion(
         "user-agent": f"hexis (python; {os.uname().sysname if hasattr(os, 'uname') else 'unknown'})",
     }
 
-    import asyncio as _asyncio
-    import ssl as _ssl
-
-    _MAX_RETRIES = 3
     timeout = httpx.Timeout(connect=30.0, read=120.0, write=30.0, pool=30.0)
-
-    for attempt in range(_MAX_RETRIES):
-        try:
-            return await _codex_responses_attempt(
-                url=url, headers=headers, payload=payload,
-                timeout=timeout, on_text_delta=on_text_delta,
-            )
-        except (_ssl.SSLError, httpx.RemoteProtocolError, httpx.ReadError) as exc:
-            if attempt < _MAX_RETRIES - 1:
-                wait = 2 ** attempt
-                await _asyncio.sleep(wait)
-                continue
-            raise RuntimeError(f"OpenAI Codex request failed after {_MAX_RETRIES} retries: {exc}") from exc
+    return await _codex_responses_attempt(
+        url=url,
+        headers=headers,
+        payload=payload,
+        timeout=timeout,
+        on_text_delta=on_text_delta,
+    )
 
 
 async def _codex_responses_attempt(
@@ -448,7 +469,16 @@ def _endpoint_cache_key(endpoint: str | None) -> str:
     return (endpoint or "default").rstrip("/")
 
 
-def _should_try_responses(endpoint: str | None) -> bool:
+def _should_try_responses(
+    endpoint: str | None,
+    *,
+    provider: str | None = None,
+) -> bool:
+    # A generic compatible endpoint promises Chat Completions, not the
+    # Responses event grammar. Some servers expose /responses nominally but
+    # emit tool/reasoning items the official SDK cannot parse safely.
+    if provider in {"openai_compatible", "openai-chat-completions-endpoint"}:
+        return False
     if not _HAS_RESPONSES_API:
         return False
     key = _endpoint_cache_key(endpoint)
@@ -573,6 +603,55 @@ def _extract_responses_result(response: Any) -> dict[str, Any]:
     return {"content": content, "tool_calls": tool_calls, "raw": response}
 
 
+_REASONING_PATTERNS = [
+    # DeepSeek/Qwen-style reasoning tags, if they surface inline in `content`.
+    re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE),
+    # Gemma 4 native reasoning channel — <|channel>thought ... <channel|>.
+    # A well-behaved Gemma 4 emits these special tokens; llama.cpp does not
+    # parse them, so they leak into `content`.
+    re.compile(r"<\|?channel\|?>\s*thought\b.*?<\|?channel\|?>", re.DOTALL | re.IGNORECASE),
+    # Markdown-fenced reasoning block — ```thought ... ``` — the form actually
+    # observed in production: an abliterated Gemma 4 merge degrades special-token
+    # adherence and approximates its thought channel as a plaintext fence.
+    re.compile(r"```(?:thought|thinking|reasoning)\b.*?```", re.DOTALL | re.IGNORECASE),
+]
+
+
+def strip_reasoning(content: str) -> str:
+    """
+    Remove leaked chain-of-thought from model output.
+
+    Some models — abliterated community merges in particular — emit their
+    reasoning trace as visible content instead of through a separate reasoning
+    channel: either ``<think>...</think>`` tags or a ```thought fenced block.
+    Hexis never wants that text in a user-facing reply.
+
+    Model-agnostic and a no-op when the content is already clean, so it is safe
+    to apply unconditionally regardless of which model/provider is configured.
+    """
+    if not content:
+        return content
+    lowered = content.lower()
+    if "```" not in content and "<think>" not in lowered and "channel" not in lowered:
+        return content
+    cleaned = content
+    for pat in _REASONING_PATTERNS:
+        cleaned = pat.sub("", cleaned)
+    cleaned = cleaned.strip()
+    if cleaned == content:
+        return content
+    if not cleaned:
+        logger.warning(
+            "strip_reasoning: model output was entirely reasoning trace, "
+            "nothing left after strip (%d chars removed)", len(content),
+        )
+        return ""
+    logger.info(
+        "strip_reasoning: removed %d chars of leaked reasoning", len(content) - len(cleaned),
+    )
+    return cleaned
+
+
 _PROVIDER_ALIASES: dict[str, str] = {
     "openai_chat_completions_endpoint": "openai-chat-completions-endpoint",
     "openai_codex": "openai-codex",
@@ -642,7 +721,6 @@ def normalize_llm_config(config: dict[str, Any] | None, *, default_model: str = 
             "anthropic": "ANTHROPIC_API_KEY",
             "grok": "XAI_API_KEY",
             "gemini": "GEMINI_API_KEY",
-            "openai_compatible": "OPENAI_API_KEY",
             "openai-chat-completions-endpoint": "OPENAI_API_KEY",
         }
         env_name = provider_env_map.get(provider)
@@ -662,14 +740,49 @@ def normalize_llm_config(config: dict[str, Any] | None, *, default_model: str = 
 
 
 def _extract_system_prompt(messages: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
+    parts, rest = _extract_system_parts(messages)
+    return "\n\n".join(parts), rest
+
+
+def _extract_system_parts(messages: list[dict[str, Any]]) -> tuple[list[str], list[dict[str, Any]]]:
+    """System messages kept as separate parts, in order.
+
+    Callers assemble the prompt so that everything stable comes first and
+    everything per-turn comes last (see services.agent.SystemPrompt). Providers
+    that can cache a prefix need that boundary preserved rather than flattened,
+    so the parts stay split until the last moment.
+    """
     system_parts: list[str] = []
     rest: list[dict[str, Any]] = []
     for msg in messages:
         if msg.get("role") == "system":
-            system_parts.append(_content_text(msg.get("content")))
+            text = _content_text(msg.get("content"))
+            if text.strip():
+                system_parts.append(text)
         else:
             rest.append(msg)
-    return "\n\n".join([p for p in system_parts if p.strip()]), rest
+    return system_parts, rest
+
+
+def _anthropic_system_blocks(parts: list[str]) -> list[dict[str, Any]] | None:
+    """Anthropic `system` as content blocks, with a cache breakpoint.
+
+    Everything except the final part is the stable prefix, so the breakpoint
+    goes on the last stable block: Anthropic caches up to and including the
+    marked block and re-reads only what follows. With a single part there is
+    nothing to cache against, so it is sent plain.
+    """
+    if not parts:
+        return None
+    if len(parts) == 1:
+        return [{"type": "text", "text": parts[0]}]
+    blocks: list[dict[str, Any]] = []
+    for index, part in enumerate(parts):
+        block: dict[str, Any] = {"type": "text", "text": part}
+        if index == len(parts) - 2:
+            block["cache_control"] = {"type": "ephemeral"}
+        blocks.append(block)
+    return blocks
 
 
 def _content_text(content: Any) -> str:
@@ -1072,6 +1185,7 @@ async def _responses_stream_completion(
     temperature: float,
     max_tokens: int,
     on_text_delta: Any | None = None,
+    on_reasoning_delta: Any | None = None,
 ) -> dict[str, Any]:
     """Streaming completion via the Responses API."""
     instructions, input_items = _messages_to_responses_input(messages)
@@ -1106,6 +1220,17 @@ async def _responses_stream_completion(
                     if asyncio.iscoroutine(result):
                         await result
 
+            elif event_type in {
+                "response.reasoning_summary_text.delta",
+                "response.reasoning_text.delta",
+            }:
+                text = getattr(event, "delta", "")
+                if text and on_reasoning_delta:
+                    import asyncio
+                    result = on_reasoning_delta(text)
+                    if asyncio.iscoroutine(result):
+                        await result
+
             elif event_type == "response.output_item.done":
                 item = getattr(event, "item", None)
                 if item and getattr(item, "type", None) == "function_call":
@@ -1127,6 +1252,157 @@ async def _responses_stream_completion(
             "id": tc["call_id"],
             "name": tc["name"],
             "arguments": tc["arguments"],
+        })
+
+    return {"content": "".join(content_parts), "tool_calls": tool_calls, "raw": None}
+
+
+def _chat_completions_url(endpoint: str | None) -> str:
+    base = (endpoint or "").strip().rstrip("/")
+    if not base:
+        raise ValueError("An endpoint is required for an OpenAI-compatible provider.")
+    if base.endswith("/chat/completions"):
+        return base
+    return f"{base}/chat/completions"
+
+
+async def _compatible_chat_stream_completion(
+    *,
+    provider: str,
+    model: str,
+    endpoint: str | None,
+    api_key: str | None,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None,
+    temperature: float,
+    max_tokens: int,
+    on_text_delta: Any | None,
+    on_reasoning_delta: Any | None,
+) -> dict[str, Any]:
+    """Stream the portable Chat Completions SSE contract without SDK parsing."""
+    import asyncio
+
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {**msg, "content": _content_to_openai_chat(msg.get("content"))}
+            for msg in messages
+        ],
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "stream": True,
+    }
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = "auto"
+
+    headers = {"Accept": "text/event-stream", "Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    content_parts: list[str] = []
+    tool_parts: dict[int, dict[str, Any]] = {}
+    terminal = False
+    timeout = httpx.Timeout(connect=30.0, read=120.0, write=30.0, pool=30.0)
+
+    async for event in iter_sse_json_events(
+        provider,
+        "POST",
+        _chat_completions_url(endpoint),
+        headers=headers,
+        json_body=payload,
+        timeout=timeout,
+        attempts=_LLM_MAX_RETRIES,
+        max_delay=_LLM_RETRY_MAX_WAIT,
+        retry_unsafe_methods=True,
+        strict_json=True,
+    ):
+        if isinstance(event.get("error"), dict):
+            error = event["error"]
+            detail = error.get("message") or error.get("type") or "Provider stream failed"
+            raise RuntimeError(str(detail))
+
+        choices = event.get("choices")
+        if not isinstance(choices, list) or not choices:
+            continue
+        choice = choices[0] if isinstance(choices[0], dict) else {}
+        if choice.get("finish_reason") is not None:
+            terminal = True
+        delta = choice.get("delta") if isinstance(choice, dict) else {}
+        if not isinstance(delta, dict):
+            continue
+
+        reasoning = delta.get("reasoning") or delta.get("reasoning_content")
+        if isinstance(reasoning, str) and reasoning and on_reasoning_delta:
+            result = on_reasoning_delta(reasoning)
+            if asyncio.iscoroutine(result):
+                await result
+
+        text = delta.get("content")
+        if isinstance(text, str) and text:
+            content_parts.append(text)
+            if on_text_delta:
+                result = on_text_delta(text)
+                if asyncio.iscoroutine(result):
+                    await result
+
+        tool_deltas = delta.get("tool_calls")
+        if not isinstance(tool_deltas, list):
+            continue
+        for tool_delta in tool_deltas:
+            if not isinstance(tool_delta, dict):
+                continue
+            raw_index = tool_delta.get("index")
+            if raw_index is None:
+                index = 0
+            elif isinstance(raw_index, bool):
+                raise RuntimeError("Streamed tool call has an invalid index.")
+            elif isinstance(raw_index, int) and raw_index >= 0:
+                index = raw_index
+            elif isinstance(raw_index, str):
+                index_text = raw_index.strip()
+                if not index_text.isascii() or not index_text.isdecimal():
+                    raise RuntimeError("Streamed tool call has an invalid index.")
+                try:
+                    index = int(index_text)
+                except (ValueError, OverflowError) as exc:
+                    raise RuntimeError(
+                        "Streamed tool call has an invalid index."
+                    ) from exc
+            else:
+                raise RuntimeError("Streamed tool call has an invalid index.")
+            current = tool_parts.setdefault(
+                index,
+                {"id": None, "name": None, "arguments_parts": []},
+            )
+            if tool_delta.get("id"):
+                current["id"] = tool_delta["id"]
+            function = tool_delta.get("function")
+            if isinstance(function, dict):
+                if function.get("name"):
+                    current["name"] = function["name"]
+                if function.get("arguments"):
+                    current["arguments_parts"].append(str(function["arguments"]))
+
+    if not terminal:
+        raise RuntimeError("OpenAI-compatible stream ended before a finish signal.")
+
+    tool_calls: list[dict[str, Any]] = []
+    for index in sorted(tool_parts):
+        item = tool_parts[index]
+        raw_arguments = "".join(item["arguments_parts"])
+        try:
+            arguments = json.loads(raw_arguments) if raw_arguments else {}
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"Malformed streamed arguments for tool {item['name'] or index}."
+            ) from exc
+        if not item["name"]:
+            raise RuntimeError(f"Streamed tool call {index} is missing a function name.")
+        tool_calls.append({
+            "id": item["id"],
+            "name": item["name"],
+            "arguments": arguments,
         })
 
     return {"content": "".join(content_parts), "tool_calls": tool_calls, "raw": None}
@@ -1155,6 +1431,9 @@ async def chat_completion(
             raise RuntimeError("Gemini API key is required. Set GEMINI_API_KEY or configure api_key_env.")
 
         client = genai.Client(api_key=api_key)
+        # Gemini 2.5+ implicitly caches repeated prefixes. SystemPrompt emits
+        # the stable half first and the volatile half second; keep that order
+        # intact when flattening the API's single system instruction.
         system_prompt, rest = _extract_system_prompt(messages)
         contents = _messages_to_gemini_contents(rest)
         gemini_tools = _gemini_tools(tools)
@@ -1201,7 +1480,7 @@ async def chat_completion(
         client = _get_openai_client(api_key, endpoint, provider, default_headers)
 
         # Try Responses API first, fall back to Chat Completions
-        if _should_try_responses(endpoint):
+        if _should_try_responses(endpoint, provider=provider):
             try:
                 result = await _retry_on_transient(lambda: _responses_completion(
                     client, model, messages, tools, temperature, max_tokens, response_format,
@@ -1232,7 +1511,7 @@ async def chat_completion(
         async def _do_chat_completion():
             response = await client.chat.completions.create(**payload)
             message = response.choices[0].message
-            content = message.content or ""
+            content = strip_reasoning(message.content or "")
             tool_calls = _openai_tool_calls(message.tool_calls or [])
             return {"content": content, "tool_calls": tool_calls, "raw": response}
 
@@ -1270,14 +1549,15 @@ async def chat_completion(
         if anthropic is None:
             raise RuntimeError("anthropic package is required for Anthropic provider.")
         client = anthropic.AsyncAnthropic(api_key=api_key)
-        system_prompt, rest = _extract_system_prompt(messages)
+        system_parts, rest = _extract_system_parts(messages)
+        system_blocks = _anthropic_system_blocks(system_parts)
         rest = _messages_to_anthropic_messages(rest)
         anthropic_tools = _anthropic_tools(tools)
 
         async def _do_anthropic_completion():
             response = await client.messages.create(
                 model=model,
-                system=system_prompt or None,
+                system=system_blocks,
                 messages=rest,
                 tools=anthropic_tools or None,
                 max_tokens=max_tokens,
@@ -1322,7 +1602,6 @@ async def chat_completion(
             messages=messages,
             tools=tools,
             is_antigravity=(provider == "google-antigravity"),
-            system_prompt=_extract_system_prompt(messages)[0] or None,
         )
 
     raise ValueError(f"Unsupported provider: {provider}")
@@ -1339,13 +1618,16 @@ async def stream_chat_completion(
     temperature: float = 0.7,
     max_tokens: int = 1200,
     on_text_delta: Any | None = None,
+    on_reasoning_delta: Any | None = None,
     auth_mode: str | None = None,
 ) -> dict[str, Any]:
     """
     Streaming chat completion that supports tools.
 
     Accumulates the full response while optionally calling ``on_text_delta(text)``
-    for each token. Returns the same shape as ``chat_completion()``:
+    for each answer token and ``on_reasoning_delta(text)`` for provider-native
+    reasoning. Reasoning never enters the returned content. Returns the same
+    shape as ``chat_completion()``:
     ``{content, tool_calls, raw}``.
 
     ``on_text_delta`` can be a sync or async callable accepting a single str
@@ -1353,6 +1635,31 @@ async def stream_chat_completion(
     """
     provider = normalize_provider(provider)
     endpoint = normalize_endpoint(provider, endpoint)
+    delivered = False
+
+    def _deliver_text(text: str) -> Any:
+        nonlocal delivered
+        if text:
+            delivered = True
+        if on_text_delta is not None:
+            return on_text_delta(text)
+        return None
+
+    def _deliver_reasoning(text: str) -> Any:
+        nonlocal delivered
+        if text:
+            delivered = True
+        if on_reasoning_delta is not None:
+            return on_reasoning_delta(text)
+        return None
+
+    text_delta_callback = _deliver_text if on_text_delta is not None else None
+    reasoning_delta_callback = (
+        _deliver_reasoning if on_reasoning_delta is not None else None
+    )
+
+    def _can_retry() -> bool:
+        return not delivered
 
     if provider == "gemini":
         if genai is None or gemini_types is None:
@@ -1361,6 +1668,8 @@ async def stream_chat_completion(
             raise RuntimeError("Gemini API key is required. Set GEMINI_API_KEY or configure api_key_env.")
 
         client = genai.Client(api_key=api_key)
+        # Preserve the stable-prefix/volatile-tail order for Gemini's implicit
+        # caching. The complete instruction still reaches the model.
         system_prompt, rest = _extract_system_prompt(messages)
         contents = _messages_to_gemini_contents(rest)
         gemini_tools = _gemini_tools(tools)
@@ -1385,12 +1694,14 @@ async def stream_chat_completion(
             # Track emitted text so we can compute deltas if the stream is cumulative.
             emitted: str = ""
             calls_by_id: dict[str, dict[str, Any]] = {}
+            last_chunk: Any | None = None
 
             async for chunk in client.aio.models.generate_content_stream(
                 model=model,
                 contents=contents,
                 config=config,
             ):
+                last_chunk = chunk
                 text = getattr(chunk, "text", "") or ""
                 if text:
                     if text.startswith(emitted):
@@ -1399,10 +1710,10 @@ async def stream_chat_completion(
                     else:
                         delta = text
                         emitted += text
-                    if delta and on_text_delta:
+                    if delta and text_delta_callback:
                         import asyncio
 
-                        result = on_text_delta(delta)
+                        result = text_delta_callback(delta)
                         if asyncio.iscoroutine(result):
                             await result
 
@@ -1415,11 +1726,30 @@ async def stream_chat_completion(
                     }
 
             tool_calls = [v for k, v in calls_by_id.items() if k]
-            return {"content": emitted, "tool_calls": tool_calls, "raw": None}
+            # Gemini reports cached_content_token_count on the final streamed
+            # chunk. Preserve it so record_llm_usage can prove cache hits.
+            return {"content": emitted, "tool_calls": tool_calls, "raw": last_chunk}
 
-        return await _retry_on_transient(_do_gemini_stream)
+        return await _retry_on_transient(
+            _do_gemini_stream,
+            should_retry=_can_retry,
+        )
 
     if provider in OPENAI_COMPATIBLE:
+        if provider in {"openai_compatible", "openai-chat-completions-endpoint"}:
+            return await _compatible_chat_stream_completion(
+                provider=provider,
+                model=model,
+                endpoint=endpoint,
+                api_key=api_key,
+                messages=messages,
+                tools=tools,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                on_text_delta=text_delta_callback,
+                on_reasoning_delta=reasoning_delta_callback,
+            )
+
         default_headers = None
         if provider == "github-copilot":
             from core.auth.github_copilot import COPILOT_REQUEST_HEADERS
@@ -1427,11 +1757,21 @@ async def stream_chat_completion(
         client = _get_openai_client(api_key, endpoint, provider, default_headers)
 
         # Try Responses API first, fall back to Chat Completions
-        if _should_try_responses(endpoint):
+        if _should_try_responses(endpoint, provider=provider):
             try:
-                result = await _retry_on_transient(lambda: _responses_stream_completion(
-                    client, model, messages, tools, temperature, max_tokens, on_text_delta,
-                ))
+                result = await _retry_on_transient(
+                    lambda: _responses_stream_completion(
+                        client,
+                        model,
+                        messages,
+                        tools,
+                        temperature,
+                        max_tokens,
+                        text_delta_callback,
+                        reasoning_delta_callback,
+                    ),
+                    should_retry=_can_retry,
+                )
                 _cache_responses_support(endpoint, True)
                 return result
             except Exception as exc:
@@ -1461,32 +1801,45 @@ async def stream_chat_completion(
             # Accumulate tool calls: index -> {id, name, arguments_parts}
             tc_accum: dict[int, dict[str, Any]] = {}
 
-            async for event in response:
-                delta = event.choices[0].delta
-                if delta and delta.content:
-                    content_parts.append(delta.content)
-                    if on_text_delta:
-                        import asyncio
-                        result = on_text_delta(delta.content)
-                        if asyncio.iscoroutine(result):
-                            await result
-                if delta and delta.tool_calls:
-                    for tc_delta in delta.tool_calls:
-                        idx = tc_delta.index
-                        if idx not in tc_accum:
-                            tc_accum[idx] = {
-                                "id": getattr(tc_delta, "id", None),
-                                "name": None,
-                                "arguments_parts": [],
-                            }
-                        if tc_delta.id:
-                            tc_accum[idx]["id"] = tc_delta.id
-                        fn = getattr(tc_delta, "function", None)
-                        if fn:
-                            if getattr(fn, "name", None):
-                                tc_accum[idx]["name"] = fn.name
-                            if getattr(fn, "arguments", None):
-                                tc_accum[idx]["arguments_parts"].append(fn.arguments)
+            try:
+                async for event in response:
+                    delta = event.choices[0].delta
+                    if delta and delta.content:
+                        content_parts.append(delta.content)
+                        if text_delta_callback:
+                            import asyncio
+                            result = text_delta_callback(delta.content)
+                            if asyncio.iscoroutine(result):
+                                await result
+                    if delta:
+                        reasoning = (
+                            getattr(delta, "reasoning", None)
+                            or getattr(delta, "reasoning_content", None)
+                        )
+                        if reasoning and reasoning_delta_callback:
+                            import asyncio
+                            result = reasoning_delta_callback(reasoning)
+                            if asyncio.iscoroutine(result):
+                                await result
+                    if delta and delta.tool_calls:
+                        for tc_delta in delta.tool_calls:
+                            idx = tc_delta.index
+                            if idx not in tc_accum:
+                                tc_accum[idx] = {
+                                    "id": getattr(tc_delta, "id", None),
+                                    "name": None,
+                                    "arguments_parts": [],
+                                }
+                            if tc_delta.id:
+                                tc_accum[idx]["id"] = tc_delta.id
+                            fn = getattr(tc_delta, "function", None)
+                            if fn:
+                                if getattr(fn, "name", None):
+                                    tc_accum[idx]["name"] = fn.name
+                                if getattr(fn, "arguments", None):
+                                    tc_accum[idx]["arguments_parts"].append(fn.arguments)
+            finally:
+                await _close_async_stream(response)
 
             # Build final tool calls
             tool_calls: list[dict[str, Any]] = []
@@ -1499,23 +1852,21 @@ async def stream_chat_completion(
                     logger.debug("Failed to parse tool arguments: %r", raw_args[:200])
                     args = {}
                 tool_calls.append({"id": tc["id"], "name": tc["name"], "arguments": args})
-            return {"content": "".join(content_parts), "tool_calls": tool_calls, "raw": None}
+            return {
+                "content": strip_reasoning("".join(content_parts)),
+                "tool_calls": tool_calls,
+                "raw": None,
+            }
 
-        return await _retry_on_transient(_do_stream_completion)
+        return await _retry_on_transient(
+            _do_stream_completion,
+            should_retry=_can_retry,
+        )
 
     if provider == "openai-codex":
         # A 429/5xx fails before any token reaches the caller and retries
         # freely; once tokens have streamed, retry is refused so the consumer
         # never sees the same text twice.
-        delivered = False
-
-        def _marking_delta(text: str):
-            nonlocal delivered
-            delivered = True
-            if on_text_delta is not None:
-                return on_text_delta(text)
-            return None
-
         return await _retry_on_transient(
             lambda: _codex_responses_completion(
                 model=model,
@@ -1525,9 +1876,9 @@ async def stream_chat_completion(
                 tools=tools,
                 temperature=temperature,
                 max_tokens=max_tokens,
-                on_text_delta=_marking_delta if on_text_delta is not None else None,
+                on_text_delta=text_delta_callback,
             ),
-            should_retry=lambda: not delivered,
+            should_retry=_can_retry,
         )
 
     if provider == "anthropic":
@@ -1535,17 +1886,20 @@ async def stream_chat_completion(
             from core.providers.anthropic_http import stream_anthropic_http_completion
             system_prompt, rest = _extract_system_prompt(messages)
             rest = _messages_to_anthropic_messages(rest)
-            return await _retry_on_transient(lambda: stream_anthropic_http_completion(
-                endpoint=endpoint or "https://api.anthropic.com",
-                api_key=api_key or "",
-                model=model,
-                messages=rest,
-                tools=tools,
-                auth_mode="setup-token",
-                max_tokens=max_tokens,
-                system_prompt=system_prompt or None,
-                on_text_delta=on_text_delta,
-            ))
+            return await _retry_on_transient(
+                lambda: stream_anthropic_http_completion(
+                    endpoint=endpoint or "https://api.anthropic.com",
+                    api_key=api_key or "",
+                    model=model,
+                    messages=rest,
+                    tools=tools,
+                    auth_mode="setup-token",
+                    max_tokens=max_tokens,
+                    system_prompt=system_prompt or None,
+                    on_text_delta=text_delta_callback,
+                ),
+                should_retry=_can_retry,
+            )
         if anthropic is None:
             raise RuntimeError("anthropic package is required for Anthropic provider.")
         client = anthropic.AsyncAnthropic(api_key=api_key)
@@ -1579,9 +1933,9 @@ async def stream_chat_completion(
                             delta = event.delta
                             if delta.type == "text_delta":
                                 text_parts.append(delta.text)
-                                if on_text_delta:
+                                if text_delta_callback:
                                     import asyncio
-                                    result = on_text_delta(delta.text)
+                                    result = text_delta_callback(delta.text)
                                     if asyncio.iscoroutine(result):
                                         await result
                             elif delta.type == "input_json_delta" and current_tool is not None:
@@ -1603,7 +1957,10 @@ async def stream_chat_completion(
 
                 return {"content": "".join(text_parts), "tool_calls": tool_calls, "raw": None}
 
-        return await _retry_on_transient(_do_anthropic_stream)
+        return await _retry_on_transient(
+            _do_anthropic_stream,
+            should_retry=_can_retry,
+        )
 
     if provider == "minimax-portal":
         from core.providers.anthropic_http import stream_anthropic_http_completion
@@ -1618,7 +1975,7 @@ async def stream_chat_completion(
             auth_mode="api-key",
             max_tokens=max_tokens,
             system_prompt=system_prompt or None,
-            on_text_delta=on_text_delta,
+            on_text_delta=text_delta_callback,
         )
 
     if provider in {"google-gemini-cli", "google-antigravity"}:
@@ -1626,7 +1983,6 @@ async def stream_chat_completion(
         _api_key_data = json.loads(api_key) if api_key else {}
         access_token = _api_key_data.get("token", api_key or "")
         project_id = _api_key_data.get("projectId", "")
-        system_prompt = _extract_system_prompt(messages)[0] or None
         return await stream_google_code_assist_completion(
             endpoint=endpoint or "https://cloudcode-pa.googleapis.com",
             access_token=access_token,
@@ -1636,7 +1992,7 @@ async def stream_chat_completion(
             tools=tools,
             is_antigravity=(provider == "google-antigravity"),
             system_prompt=system_prompt,
-            on_text_delta=on_text_delta,
+            on_text_delta=text_delta_callback,
         )
 
     raise ValueError(f"Unsupported provider: {provider}")
@@ -1666,10 +2022,13 @@ async def stream_text_completion(
                 max_tokens=max_tokens,
                 stream=True,
             )
-            async for event in response:
-                delta = event.choices[0].delta
-                if delta and delta.content:
-                    yield delta.content
+            try:
+                async for event in response:
+                    delta = event.choices[0].delta
+                    if delta and delta.content:
+                        yield delta.content
+            finally:
+                await _close_async_stream(response)
 
         # Note: We can't wrap a generator with retry logic the same way,
         # but we retry the initial request
@@ -1688,6 +2047,8 @@ async def stream_text_completion(
             raise RuntimeError("Gemini API key is required. Set GEMINI_API_KEY or configure api_key_env.")
 
         client = genai.Client(api_key=api_key)
+        # Preserve the stable-prefix/volatile-tail order for Gemini's implicit
+        # caching. The complete instruction still reaches the model.
         system_prompt, rest = _extract_system_prompt(messages)
         contents = _messages_to_gemini_contents(rest)
         config = gemini_types.GenerateContentConfig(
@@ -1809,7 +2170,6 @@ async def stream_text_completion(
         _api_key_data = json.loads(api_key) if api_key else {}
         access_token = _api_key_data.get("token", api_key or "")
         project_id = _api_key_data.get("projectId", "")
-        system_prompt = _extract_system_prompt(messages)[0] or None
         result = await stream_google_code_assist_completion(
             endpoint=endpoint or "https://cloudcode-pa.googleapis.com",
             access_token=access_token,
@@ -1818,7 +2178,6 @@ async def stream_text_completion(
             messages=messages,
             tools=None,
             is_antigravity=(provider == "google-antigravity"),
-            system_prompt=system_prompt,
         )
         if result["content"]:
             yield result["content"]

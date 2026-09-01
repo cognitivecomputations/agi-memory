@@ -20,7 +20,15 @@ class _Conn:
     async def fetchval(self, query, *args):
         if "get_appraisal_db_context" in query:
             return {
-                "emotional_state": {"primary_emotion": "warm", "valence": 0.4, "arousal": 0.3},
+                "emotional_state": {
+                    "primary_emotion": "warm",
+                    "valence": 0.4,
+                    "arousal": 0.3,
+                },
+                "emotion_families": {
+                    "connection": "social closeness",
+                    "threat": "danger or anticipated harm",
+                },
                 "relationships": [{"entity": "Eric", "strength": 0.9}],
                 "dopamine_state": {"tonic": 0.5, "effective": 0.5},
             }
@@ -32,13 +40,20 @@ class _Conn:
             doc = _json_mod.loads(args[0])
             allowed = set(args[1] or [])
             doc["salient_memories"] = [
-                m for m in doc.get("salient_memories", [])
+                m
+                for m in doc.get("salient_memories", [])
                 if not allowed or m.get("memory_id") in allowed
             ]
-            for key in ("ignored_memories", "memory_expansions", "instincts",
-                        "narrative_observations", "relationship_observations",
-                        "contradiction_observations", "emotional_observations",
-                        "consolidation_observations"):
+            for key in (
+                "ignored_memories",
+                "memory_expansions",
+                "instincts",
+                "narrative_observations",
+                "relationship_observations",
+                "contradiction_observations",
+                "emotional_observations",
+                "consolidation_observations",
+            ):
                 doc.setdefault(key, [])
             doc.setdefault("emotional_state", {})
             doc.setdefault("subconscious_response", "")
@@ -97,6 +112,7 @@ async def test_inline_appraisal_uses_structured_memory_context():
             ],
             "emotional_state": {
                 "primary_emotion": "warmth",
+                "family": "connection",
                 "valence": 0.5,
                 "arousal": 0.3,
                 "intensity": 0.5,
@@ -125,6 +141,8 @@ async def test_inline_appraisal_uses_structured_memory_context():
     assert memory_payload["emotional_valence"] == 0.7
     assert memory_payload["emotional_intensity"] == 0.6
     assert payload["relationships"][0]["entity"] == "Eric"
+    assert "connection" in payload["emotion_families"]
+    assert output.emotional_state["family"] == "connection"
     assert output.salient_memories[0]["memory_id"] == str(memory_id)
 
 
@@ -162,18 +180,28 @@ async def test_normalizer_rejects_low_confidence_and_hallucinated_memory_ids(db_
             {"query": "weak", "reason": "guess", "confidence": 0.4},
         ],
         "instincts": [
-            {"impulse": "approach", "intensity": 3, "reason": "evidence", "confidence": 0.8}
+            {
+                "impulse": "approach",
+                "intensity": 3,
+                "reason": "evidence",
+                "confidence": 0.8,
+            }
         ],
         "emotional_state": {
-            "primary_emotion": "warmth", "valence": 2, "arousal": -1,
-            "intensity": 0.5, "confidence": 0.8,
+            "primary_emotion": "warmth",
+            "family": "connection",
+            "valence": 2,
+            "arousal": -1,
+            "intensity": 0.5,
+            "confidence": 0.8,
         },
         "subconscious_response": "grounded synthesis",
     }
     async with db_pool.acquire() as conn:
         raw = await conn.fetchval(
             "SELECT normalize_inline_appraisal($1::jsonb, $2::text[])",
-            _json_mod.dumps(doc), [allowed],
+            _json_mod.dumps(doc),
+            [allowed],
         )
     out = _json_mod.loads(raw) if isinstance(raw, str) else raw
 
@@ -182,7 +210,32 @@ async def test_normalizer_rejects_low_confidence_and_hallucinated_memory_ids(db_
     assert out["instincts"][0]["intensity"] == 1.0
     assert out["emotional_state"]["valence"] == 1.0
     assert out["emotional_state"]["arousal"] == 0.0
+    assert out["emotional_state"]["family"] == "connection"
     assert out["subconscious_response"] == "grounded synthesis"
+
+
+@pytest.mark.asyncio(loop_scope="session")
+async def test_normalizer_rejects_unknown_emotion_family_without_dropping_label(
+    db_pool,
+):
+    doc = {
+        "emotional_state": {
+            "primary_emotion": "a precise but novel label",
+            "family": "made_up_family",
+            "valence": -0.4,
+            "arousal": 0.6,
+            "intensity": 0.7,
+            "confidence": 0.8,
+        }
+    }
+    async with db_pool.acquire() as conn:
+        raw = await conn.fetchval(
+            "SELECT normalize_inline_appraisal($1::jsonb, NULL)", json.dumps(doc)
+        )
+    out = json.loads(raw) if isinstance(raw, str) else raw
+
+    assert out["emotional_state"]["primary_emotion"] == "a precise but novel label"
+    assert "family" not in out["emotional_state"]
 
 
 def test_duplicate_memory_content_only_occupies_one_context_slot():
@@ -235,8 +288,14 @@ async def test_streaming_chat_runs_subconscious_once_before_multi_iteration_loop
     subconscious = AsyncMock(return_value=SubconsciousOutput())
     registry = create_default_registry(db_pool)
     with (
-        patch("services.agent.load_llm_config", new=AsyncMock(return_value={"provider": "fake", "model": "fake"})),
-        patch("core.cognitive_memory_api.CognitiveMemory.hydrate", new=AsyncMock(return_value=context)),
+        patch(
+            "services.agent.load_llm_config",
+            new=AsyncMock(return_value={"provider": "fake", "model": "fake"}),
+        ),
+        patch(
+            "core.cognitive_memory_api.CognitiveMemory.hydrate",
+            new=AsyncMock(return_value=context),
+        ),
         patch("services.agent.run_subconscious_appraisal", new=subconscious),
         patch.object(AgentLoop, "stream", new=fake_agent_stream),
     ):
@@ -289,9 +348,18 @@ async def test_streaming_chat_injects_continuity_into_appraisal_and_prompt(db_po
     subconscious = AsyncMock(return_value=SubconsciousOutput())
     registry = create_default_registry(db_pool)
     with (
-        patch("services.agent.load_llm_config", new=AsyncMock(return_value={"provider": "fake", "model": "fake"})),
-        patch("core.cognitive_memory_api.CognitiveMemory.hydrate", new=AsyncMock(return_value=context)),
-        patch("services.agent.render_chat_continuity_context_db", new=AsyncMock(return_value=continuity)),
+        patch(
+            "services.agent.load_llm_config",
+            new=AsyncMock(return_value={"provider": "fake", "model": "fake"}),
+        ),
+        patch(
+            "core.cognitive_memory_api.CognitiveMemory.hydrate",
+            new=AsyncMock(return_value=context),
+        ),
+        patch(
+            "services.agent.render_chat_continuity_context_db",
+            new=AsyncMock(return_value=continuity),
+        ),
         patch("services.agent.run_subconscious_appraisal", new=subconscious),
         patch.object(AgentLoop, "stream", new=fake_agent_stream),
     ):
@@ -349,9 +417,18 @@ async def test_nonstreaming_chat_injects_continuity_into_appraisal_and_prompt(db
     subconscious = AsyncMock(return_value=SubconsciousOutput())
     registry = create_default_registry(db_pool)
     with (
-        patch("services.agent.load_llm_config", new=AsyncMock(return_value={"provider": "fake", "model": "fake"})),
-        patch("core.cognitive_memory_api.CognitiveMemory.hydrate", new=AsyncMock(return_value=context)),
-        patch("services.agent.render_chat_continuity_context_db", new=AsyncMock(return_value=continuity)),
+        patch(
+            "services.agent.load_llm_config",
+            new=AsyncMock(return_value={"provider": "fake", "model": "fake"}),
+        ),
+        patch(
+            "core.cognitive_memory_api.CognitiveMemory.hydrate",
+            new=AsyncMock(return_value=context),
+        ),
+        patch(
+            "services.agent.render_chat_continuity_context_db",
+            new=AsyncMock(return_value=continuity),
+        ),
         patch("services.agent.run_subconscious_appraisal", new=subconscious),
         patch.object(AgentLoop, "run", new=fake_agent_run),
     ):
@@ -367,7 +444,10 @@ async def test_nonstreaming_chat_injects_continuity_into_appraisal_and_prompt(db
     assert result.text == "I remember the last exchange."
     assert subconscious.await_args.args[2] == continuity
     assert continuity in captured["user_message"]
-    assert "[USER MESSAGE]\nyou dont remember our previous conversation?" in captured["user_message"]
+    assert (
+        "[USER MESSAGE]\nyou dont remember our previous conversation?"
+        in captured["user_message"]
+    )
 
 
 @pytest.mark.asyncio(loop_scope="session")
@@ -382,13 +462,11 @@ async def test_get_appraisal_db_context_runs_against_real_schema(db_pool):
         tr = conn.transaction()
         await tr.start()
         try:
-            await conn.execute(
-                """
+            await conn.execute("""
                 INSERT INTO memories (type, content, embedding, importance, trust_level, status)
                 VALUES ('worldview', 'Appraisal context worldview pin',
                         array_fill(0.1, ARRAY[embedding_dimension()])::vector, 0.9, 0.9, 'active')
-                """
-            )
+                """)
             await conn.fetchval(
                 "SELECT create_goal('Appraisal context goal pin', NULL, 'curiosity', 'active', NULL, NULL)"
             )
@@ -401,6 +479,8 @@ async def test_get_appraisal_db_context_runs_against_real_schema(db_pool):
     # stability, so the pin memory need not surface — the goal must).
     assert isinstance(ctx.get("identity"), list)
     assert isinstance(ctx.get("worldview"), list)
+    assert "threat" in ctx.get("emotion_families", {})
+    assert "social_injury" in ctx.get("emotion_families", {})
     goals = ctx.get("goals") or {}
     assert any(
         g.get("title") == "Appraisal context goal pin" for g in goals.get("active", [])

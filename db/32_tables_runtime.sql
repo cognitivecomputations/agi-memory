@@ -63,6 +63,196 @@ CREATE TABLE IF NOT EXISTS tool_definitions (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Live truth for the tool surface in each worker process. Unlike the catalog,
+-- this records whether registration, configuration, and skill reachability agree.
+CREATE TABLE IF NOT EXISTS worker_capabilities (
+    worker_name TEXT NOT NULL,
+    worker_id UUID,
+    tool_name TEXT NOT NULL,
+    tool_context TEXT NOT NULL CHECK (tool_context IN ('heartbeat', 'chat', 'mcp')),
+    available BOOLEAN NOT NULL,
+    reason_code TEXT,
+    reason_if_missing TEXT,
+    registry_kind TEXT NOT NULL DEFAULT 'default',
+    last_checked_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (worker_name, tool_context, tool_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_worker_capabilities_checked
+    ON worker_capabilities (last_checked_at DESC);
+CREATE INDEX IF NOT EXISTS idx_worker_capabilities_gaps
+    ON worker_capabilities (worker_name, reason_code, last_checked_at DESC)
+    WHERE available = FALSE;
+
+CREATE TABLE IF NOT EXISTS tool_surface_decision_events (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id UUID,
+    surface TEXT NOT NULL DEFAULT 'chat',
+    tool_context TEXT NOT NULL,
+    decision_kind TEXT NOT NULL DEFAULT 'selection'
+        CHECK (decision_kind IN ('selection', 'skill_activation')),
+    input_text_hash TEXT NOT NULL,
+    selected_skills TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+    considered JSONB NOT NULL DEFAULT '[]'::jsonb,
+    allowed_tools TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+    reachable_tools TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+    unreachable_tools TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+    available_skill_count INT NOT NULL DEFAULT 0,
+    registry_kind TEXT NOT NULL DEFAULT 'default',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_tool_surface_decisions_created
+    ON tool_surface_decision_events (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_tool_surface_decisions_session
+    ON tool_surface_decision_events (session_id, created_at DESC)
+    WHERE session_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_tool_surface_decisions_gaps
+    ON tool_surface_decision_events (created_at DESC)
+    WHERE cardinality(unreachable_tools) > 0;
+
+-- The heartbeat economy is auditable state, not a timer-side calculation.
+-- One singleton anchors time-proportional regeneration; each beat and each
+-- useful outcome signal remains inspectable after scheduling decisions.
+CREATE TABLE IF NOT EXISTS heartbeat_economy_state (
+    id SMALLINT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    last_regenerated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+INSERT INTO heartbeat_economy_state (id, last_regenerated_at)
+SELECT 1, COALESCE(
+    (SELECT NULLIF(value->>'last_heartbeat_at', '')::timestamptz
+     FROM state WHERE key = 'heartbeat_state'),
+    CURRENT_TIMESTAMP
+)
+ON CONFLICT (id) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS heartbeat_outcomes (
+    heartbeat_id UUID PRIMARY KEY,
+    heartbeat_number INT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'running'
+        CHECK (status IN ('running', 'completed', 'error', 'cancelled')),
+    started_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    completed_at TIMESTAMPTZ,
+    stopped_reason TEXT,
+    energy_before FLOAT NOT NULL DEFAULT 0,
+    elapsed_regen_hours FLOAT NOT NULL DEFAULT 0,
+    surplus_decayed FLOAT NOT NULL DEFAULT 0,
+    energy_regenerated FLOAT NOT NULL DEFAULT 0,
+    regen_multiplier FLOAT NOT NULL DEFAULT 1,
+    energy_after_regen FLOAT NOT NULL DEFAULT 0,
+    energy_spent FLOAT NOT NULL DEFAULT 0,
+    durable_memories_created INT NOT NULL DEFAULT 0,
+    contradictions_resolved INT NOT NULL DEFAULT 0,
+    goals_advanced INT NOT NULL DEFAULT 0,
+    proactive_contact BOOLEAN NOT NULL DEFAULT FALSE,
+    user_feedback_score FLOAT NOT NULL DEFAULT 0,
+    outcome_score FLOAT NOT NULL DEFAULT 0,
+    outcome_tier TEXT NOT NULL DEFAULT 'none'
+        CHECK (outcome_tier IN ('none', 'useful', 'high_value')),
+    urgency_ratio FLOAT NOT NULL DEFAULT 0,
+    cadence_minutes FLOAT,
+    next_heartbeat_at TIMESTAMPTZ,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+CREATE INDEX IF NOT EXISTS idx_heartbeat_outcomes_completed
+    ON heartbeat_outcomes (completed_at DESC)
+    WHERE completed_at IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS heartbeat_outcome_signals (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    heartbeat_id UUID NOT NULL REFERENCES heartbeat_outcomes(heartbeat_id) ON DELETE CASCADE,
+    signal_kind TEXT NOT NULL CHECK (signal_kind IN (
+        'durable_memory', 'contradiction_resolved', 'goal_advanced',
+        'proactive_contact', 'user_feedback', 'tool_success', 'tool_failure'
+    )),
+    signal_key TEXT NOT NULL,
+    amount FLOAT NOT NULL DEFAULT 1,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (heartbeat_id, signal_key)
+);
+CREATE INDEX IF NOT EXISTS idx_heartbeat_outcome_signals_kind
+    ON heartbeat_outcome_signals (heartbeat_id, signal_kind, created_at);
+
+-- Durable, advisory internal deliberation. These records preserve the
+-- inspectable reasons, challenges, dissent, and invalidation conditions for a
+-- council run. They never authorize or gate an action.
+CREATE TABLE IF NOT EXISTS deliberation_sessions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    status TEXT NOT NULL DEFAULT 'running'
+        CHECK (status IN ('running', 'completed', 'failed')),
+    topic TEXT NOT NULL CHECK (btrim(topic) <> ''),
+    stakes TEXT NOT NULL DEFAULT 'material'
+        CHECK (stakes IN ('routine', 'material', 'high')),
+    source_context TEXT NOT NULL DEFAULT 'chat',
+    source_session_id TEXT,
+    heartbeat_id UUID,
+    call_id TEXT,
+    persona_keys JSONB NOT NULL DEFAULT '[]'::jsonb
+        CHECK (jsonb_typeof(persona_keys) = 'array'),
+    signal_count INT NOT NULL DEFAULT 0 CHECK (signal_count >= 0),
+    input_context JSONB NOT NULL DEFAULT '{}'::jsonb,
+    error TEXT,
+    started_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    completed_at TIMESTAMPTZ,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_deliberation_sessions_recent
+    ON deliberation_sessions (started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_deliberation_sessions_status
+    ON deliberation_sessions (status, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_deliberation_sessions_heartbeat
+    ON deliberation_sessions (heartbeat_id, started_at DESC)
+    WHERE heartbeat_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS deliberation_moves (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id UUID NOT NULL REFERENCES deliberation_sessions(id) ON DELETE CASCADE,
+    move_key TEXT NOT NULL,
+    round INT NOT NULL DEFAULT 1 CHECK (round >= 1),
+    ordinal INT NOT NULL DEFAULT 0 CHECK (ordinal >= 0),
+    role TEXT NOT NULL CHECK (role IN ('perspective', 'challenge', 'synthesis')),
+    persona_key TEXT,
+    content TEXT NOT NULL CHECK (btrim(content) <> ''),
+    target_move_id UUID REFERENCES deliberation_moves(id) ON DELETE SET NULL,
+    evidence_memory_ids UUID[] NOT NULL DEFAULT '{}',
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (session_id, move_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_deliberation_moves_session
+    ON deliberation_moves (session_id, round, ordinal, created_at);
+
+CREATE TABLE IF NOT EXISTS deliberation_verdicts (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id UUID NOT NULL UNIQUE
+        REFERENCES deliberation_sessions(id) ON DELETE CASCADE,
+    recommendation TEXT NOT NULL CHECK (btrim(recommendation) <> ''),
+    report TEXT NOT NULL CHECK (btrim(report) <> ''),
+    agreements JSONB NOT NULL DEFAULT '[]'::jsonb
+        CHECK (jsonb_typeof(agreements) = 'array'),
+    disagreements JSONB NOT NULL DEFAULT '[]'::jsonb
+        CHECK (jsonb_typeof(disagreements) = 'array'),
+    risks JSONB NOT NULL DEFAULT '[]'::jsonb
+        CHECK (jsonb_typeof(risks) = 'array'),
+    missing_evidence JSONB NOT NULL DEFAULT '[]'::jsonb
+        CHECK (jsonb_typeof(missing_evidence) = 'array'),
+    dissent JSONB NOT NULL DEFAULT '[]'::jsonb
+        CHECK (jsonb_typeof(dissent) = 'array'),
+    invalidation_conditions JSONB NOT NULL DEFAULT '[]'::jsonb
+        CHECK (jsonb_typeof(invalidation_conditions) = 'array'),
+    evidence_memory_ids UUID[] NOT NULL DEFAULT '{}',
+    summary_memory_id UUID,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_deliberation_verdicts_recent
+    ON deliberation_verdicts (created_at DESC);
+
 CREATE TABLE IF NOT EXISTS agent_turns (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     mode TEXT NOT NULL,
@@ -83,6 +273,11 @@ CREATE TABLE IF NOT EXISTS agent_turns (
 
 CREATE INDEX IF NOT EXISTS idx_agent_turns_status_created
     ON agent_turns (status, created_at DESC);
+-- `hexis transcript --session <id>` (#54) looks up by either grouping.
+CREATE INDEX IF NOT EXISTS idx_agent_turns_session
+    ON agent_turns (session_id, created_at) WHERE session_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_agent_turns_heartbeat
+    ON agent_turns (heartbeat_id, created_at) WHERE heartbeat_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS agent_turn_events (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -667,3 +862,259 @@ CREATE INDEX IF NOT EXISTS idx_connector_action_audit_policy
     ON connector_action_audit (policy_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_connector_action_audit_connector
     ON connector_action_audit (connector_id, account_key, action_kind, created_at DESC);
+
+-- Exact, one-shot approvals for protected tool calls. Arguments themselves are
+-- never stored: only their canonical JSON hash and a redacted human preview.
+CREATE TABLE IF NOT EXISTS operator_tool_approval_requests (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tool_name TEXT NOT NULL,
+    arguments_hash TEXT NOT NULL,
+    arguments_preview JSONB NOT NULL DEFAULT '{}'::jsonb,
+    tool_context TEXT NOT NULL CHECK (tool_context IN ('chat', 'heartbeat', 'mcp')),
+    session_id TEXT,
+    heartbeat_id TEXT,
+    surface TEXT NOT NULL DEFAULT 'chat',
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN (
+        'unrouted', 'pending', 'slack_delivered', 'escalating', 'escalated',
+        'approved', 'denied', 'consumed', 'expired'
+    )),
+    slack_user_id TEXT,
+    slack_channel_id TEXT,
+    slack_message_ts TEXT,
+    slack_delivered_at TIMESTAMPTZ,
+    escalate_after TIMESTAMPTZ,
+    escalation_attempts INTEGER NOT NULL DEFAULT 0,
+    imessage_recipient TEXT,
+    imessage_message_id TEXT,
+    escalated_at TIMESTAMPTZ,
+    decision_channel TEXT,
+    decision_actor TEXT,
+    decision_at TIMESTAMPTZ,
+    consumed_at TIMESTAMPTZ,
+    expires_at TIMESTAMPTZ NOT NULL,
+    outbox_message_id UUID,
+    delivery_error TEXT,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_operator_tool_approvals_pending
+    ON operator_tool_approval_requests (expires_at, created_at)
+    WHERE status IN ('unrouted', 'pending', 'slack_delivered', 'escalating', 'escalated');
+CREATE INDEX IF NOT EXISTS idx_operator_tool_approvals_escalation_due
+    ON operator_tool_approval_requests (escalate_after)
+    WHERE status IN ('pending', 'slack_delivered');
+CREATE INDEX IF NOT EXISTS idx_operator_tool_approvals_session
+    ON operator_tool_approval_requests (session_id, created_at DESC)
+    WHERE session_id IS NOT NULL;
+
+-- Consent-first automation proposals. A proposal is inert until the user
+-- accepts it; dedup_key is deliberately permanent so "Not for me" latches.
+CREATE TABLE IF NOT EXISTS automation_suggestions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    source TEXT NOT NULL
+        CHECK (source IN ('catalog', 'blueprint', 'usage', 'connector')),
+    dedup_key TEXT NOT NULL UNIQUE,
+    title TEXT NOT NULL,
+    rationale TEXT NOT NULL,
+    task_spec JSONB NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'accepted', 'dismissed')),
+    scheduled_task_id UUID REFERENCES scheduled_tasks(id) ON DELETE SET NULL,
+    outbox_message_id UUID,
+    decision_channel TEXT,
+    decision_actor TEXT,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    decided_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_automation_suggestions_status_created
+    ON automation_suggestions (status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_automation_suggestions_task
+    ON automation_suggestions (scheduled_task_id)
+    WHERE scheduled_task_id IS NOT NULL;
+
+-- Curated proposals are data, not branches in application code. Preconditions
+-- are evaluated against the live connector registry before a suggestion is
+-- filed; catalog rows never create schedules themselves.
+CREATE TABLE IF NOT EXISTS automation_suggestion_catalog (
+    dedup_key TEXT PRIMARY KEY,
+    source TEXT NOT NULL DEFAULT 'catalog'
+        CHECK (source IN ('catalog', 'connector')),
+    title TEXT NOT NULL,
+    rationale TEXT NOT NULL,
+    task_spec JSONB NOT NULL,
+    precondition TEXT NOT NULL DEFAULT 'none'
+        CHECK (precondition IN ('none', 'gmail_connected', 'calendar_connected')),
+    sort_order INTEGER NOT NULL DEFAULT 100,
+    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_automation_suggestion_catalog_enabled
+    ON automation_suggestion_catalog (enabled, sort_order, dedup_key);
+
+-- A clarification is durable because the turn that asks it may outlive its
+-- transport connection. Interactive surfaces wait on the same row that
+-- heartbeat/outbox answers resume on a later beat.
+CREATE TABLE IF NOT EXISTS agent_questions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id UUID,
+    heartbeat_id UUID,
+    surface TEXT NOT NULL,
+    prompt TEXT NOT NULL,
+    choices JSONB NOT NULL DEFAULT '[]'::jsonb,
+    allow_free_text BOOLEAN NOT NULL DEFAULT TRUE,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'answered', 'timed_out', 'superseded')),
+    answer TEXT,
+    answer_choice_index INTEGER,
+    answer_channel TEXT,
+    answer_actor TEXT,
+    asked_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    expires_at TIMESTAMPTZ,
+    answered_at TIMESTAMPTZ,
+    resumed_at TIMESTAMPTZ,
+    outbox_message_id UUID,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_questions_pending_session
+    ON agent_questions (session_id, asked_at DESC)
+    WHERE status = 'pending' AND session_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_agent_questions_answered_resume
+    ON agent_questions (answered_at, asked_at)
+    WHERE status = 'answered' AND resumed_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_agent_questions_heartbeat
+    ON agent_questions (heartbeat_id, asked_at DESC)
+    WHERE heartbeat_id IS NOT NULL;
+
+-- Metadata-only, append-only record of inbound voice transcription attempts.
+-- Transcript content deliberately remains in the conversation path, not here.
+CREATE TABLE IF NOT EXISTS voice_note_stt_events (
+    id BIGSERIAL PRIMARY KEY,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    channel_type TEXT NOT NULL,
+    channel_id TEXT,
+    sender_id TEXT,
+    message_id TEXT,
+    attachment_id TEXT,
+    mime_type TEXT,
+    filename TEXT,
+    provider TEXT NOT NULL,
+    model TEXT,
+    outcome TEXT NOT NULL CHECK (
+        outcome = 'transcribed'
+        OR outcome LIKE 'skipped\_%' ESCAPE '\'
+        OR outcome LIKE 'failed\_%' ESCAPE '\'
+    ),
+    transcript_chars INTEGER CHECK (transcript_chars IS NULL OR transcript_chars >= 0),
+    error_detail TEXT,
+    duration_ms INTEGER CHECK (duration_ms IS NULL OR duration_ms >= 0),
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+
+CREATE INDEX IF NOT EXISTS idx_voice_note_stt_events_created
+    ON voice_note_stt_events (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_voice_note_stt_events_channel
+    ON voice_note_stt_events (channel_type, created_at DESC);
+
+-- Browser Web Push endpoints are explicit per-device grants. Revocation is
+-- soft so a browser can re-enable the same endpoint without duplicating it.
+CREATE TABLE IF NOT EXISTS web_push_subscriptions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    endpoint TEXT NOT NULL UNIQUE,
+    p256dh TEXT NOT NULL,
+    auth TEXT NOT NULL,
+    expiration_time BIGINT,
+    user_agent TEXT,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    failure_count INTEGER NOT NULL DEFAULT 0 CHECK (failure_count >= 0),
+    last_error TEXT,
+    last_delivered_at TIMESTAMPTZ,
+    revoked_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_web_push_subscriptions_active
+    ON web_push_subscriptions (updated_at DESC)
+    WHERE revoked_at IS NULL;
+
+-- Headless companion nodes connect outward to the API. Their Ed25519 public
+-- key is the durable identity; approval is explicit and revocation is kept as
+-- evidence rather than deleting the device.
+CREATE TABLE IF NOT EXISTS hexis_nodes (
+    node_id TEXT PRIMARY KEY,
+    public_key TEXT NOT NULL,
+    name TEXT NOT NULL,
+    capabilities JSONB NOT NULL DEFAULT '[]'::jsonb,
+    status TEXT NOT NULL DEFAULT 'offline'
+        CHECK (status IN ('offline', 'online', 'revoked')),
+    approved_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    approved_by TEXT NOT NULL DEFAULT 'operator',
+    revoked_at TIMESTAMPTZ,
+    last_seen_at TIMESTAMPTZ,
+    connection_id UUID,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS node_pairing_requests (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    code TEXT NOT NULL UNIQUE,
+    node_id TEXT NOT NULL,
+    public_key TEXT NOT NULL,
+    name TEXT NOT NULL,
+    capabilities JSONB NOT NULL DEFAULT '[]'::jsonb,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'approved', 'denied', 'expired')),
+    requested_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    expires_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP + INTERVAL '1 day',
+    decided_at TIMESTAMPTZ,
+    decided_by TEXT,
+    decision_note TEXT,
+    outbox_message_id UUID,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_node_pairing_one_pending
+    ON node_pairing_requests (node_id) WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS idx_node_pairing_status
+    ON node_pairing_requests (status, requested_at DESC);
+
+CREATE TABLE IF NOT EXISTS node_invocations (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    node_id TEXT NOT NULL REFERENCES hexis_nodes(node_id),
+    action TEXT NOT NULL CHECK (action IN (
+        'system.run', 'screen.capture',
+        'apple.reminders.list', 'apple.reminders.create',
+        'apple.notes.search', 'apple.notes.create',
+        'apple.calendar.list', 'apple.calendar.create',
+        'apple.shortcuts.list', 'apple.shortcuts.run',
+        'onepassword.items', 'onepassword.copy'
+    )),
+    arguments JSONB NOT NULL DEFAULT '{}'::jsonb,
+    requested_by TEXT NOT NULL DEFAULT 'agent',
+    status TEXT NOT NULL DEFAULT 'queued'
+        CHECK (status IN ('queued', 'dispatched', 'succeeded', 'failed', 'expired', 'cancelled')),
+    result JSONB,
+    error TEXT,
+    result_signature TEXT,
+    requested_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    dispatched_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ,
+    expires_at TIMESTAMPTZ NOT NULL,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+CREATE INDEX IF NOT EXISTS idx_node_invocations_queued
+    ON node_invocations (node_id, requested_at)
+    WHERE status = 'queued';
+CREATE INDEX IF NOT EXISTS idx_node_invocations_recent
+    ON node_invocations (requested_at DESC);

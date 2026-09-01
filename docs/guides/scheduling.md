@@ -57,12 +57,36 @@ hexis schedule delete <task_id> --force   # hard delete
 
 | Action | Payload | Description |
 |--------|---------|-------------|
-| `queue_user_message` | `{"message": "..."}` | Sends a message to the agent as if from the user |
+| `queue_user_message` | `{"message": "..."}` | Delivers the fixed message to the user through the configured outbox route |
 | `create_goal` | `{"title": "...", "priority": "active"}` | Creates a new goal |
+
+A scheduled `queue_user_message` is a reminder, not an agent invocation. It
+does not dynamically run a skill, inspect Gmail, or generate a briefing. The
+message should tell the user exactly what to open or ask Hexis to do next.
 
 ## Agent-Side Scheduling
 
 The agent can also manage schedules via the `manage_schedule` tool during chat or heartbeats. This allows the agent to create, modify, and delete its own scheduled tasks.
+
+## Automation Suggestions
+
+Hexis can meet you halfway by proposing useful recurring reminders. A
+suggestion is inert: it appears in the web inbox with **Accept** and **Not for
+me**, and may also arrive over your most recently active private channel with a
+numbered response and eight-character code.
+
+- **Accept** creates exactly the stored `manage_schedule` task, using your
+  current `agent.timezone` when the proposal does not specify one.
+- **Not for me** is final for that suggestion's deduplication key, so a worker
+  restart or later catalog scan cannot nag you again.
+- If more than one suggestion is pending on a channel, include the code:
+  `1 A1B2C3D4` accepts and `2 A1B2C3D4` dismisses.
+- Suggestions can come from the starter catalog, a newly connected account,
+  an installed skill's `blueprint:` block, or the separately opted-in
+  recurring-usage review. None of those sources can schedule work directly.
+
+The starter catalog offers morning briefing, evening wind-down, and weekly
+review prompts. Connecting Gmail makes the important-mail check eligible.
 
 ## Active Hours
 

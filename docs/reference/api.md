@@ -128,6 +128,38 @@ Accept external webhook events (e.g., from channels or external services).
 
 SSE stream of gateway events. Listens on PostgreSQL `pg_notify` for real-time updates.
 
+### Voice
+
+| Endpoint | Description |
+|----------|-------------|
+| `POST /api/voice/transcribe` | Transcribe one bounded foreground upload through the selected STT policy |
+| `GET /api/voice/status` | Return live STT, TTS, Talk-mode, and local-provider readiness |
+| `POST /api/voice/synthesize` | Synthesize bounded text through the enabled local provider and return uncached audio |
+| `GET /api/voice/audio/{output_id}` | Retrieve one unexpired tool-created output by opaque UUID |
+
+Synthesis is off by default. The server refuses remote or credential-bearing TTS
+URLs. Generated audio responses use `Cache-Control: no-store`; metadata audits do
+not contain the input text or audio. See [Voice and Talk Mode](../operations/voice.md).
+
+### GET /api/integrations/status
+
+Returns DB-owned connector manifests, saved connection references, recent setup
+attempts, channel runtime, and backfill status. An optional `connector_id` query
+parameter filters the result.
+
+### POST /api/integrations/action
+
+Runs the narrow set of connector setup, verification, completion, revocation, and
+backfill controls used by the Connections page. It is not a generic tool-execution
+endpoint. Provider-state writes such as creating a Notion page or changing Home
+Assistant state are not exposed here; they remain normal approval-gated tools.
+
+### GET /api/integrations/spotify/callback
+
+Completes a pending Spotify Authorization Code + PKCE flow and returns a small HTML
+success or recovery page. Register the exact URI shown by the setup flow; local HTTP
+callbacks use a loopback IP rather than `localhost`.
+
 ### POST /api/init/consent/request
 
 Trigger the consent flow for a model.

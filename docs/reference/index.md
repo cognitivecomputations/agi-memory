@@ -24,6 +24,7 @@ Authoritative reference documentation for CLI commands, tools, database function
 | [Config Keys](config-keys.md) | All config table keys with types and defaults |
 | [API](api.md) | FastAPI HTTP endpoints |
 | [Plugin System](plugin-system.md) | Plugin ABC, manifest, hook events |
+| [HMX Mind Exchange](hmx.md) | Public schema and interoperability contract for portable minds |
 
 ## I want to...
 
@@ -36,3 +37,4 @@ Authoritative reference documentation for CLI commands, tools, database function
 | Call a database function | [Database API](database-api.md) |
 | Check a config key | [Config Keys](config-keys.md) |
 | Use the HTTP API | [API](api.md) |
+| Implement a mind-file importer | [HMX Mind Exchange](hmx.md) |

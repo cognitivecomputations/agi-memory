@@ -5729,34 +5729,91 @@ async def test_recall_memories_filtered_filters_type_and_importance(db_pool, ens
         try:
             test_id = get_test_identifier("recall_filtered")
             query_text = f"Recall filter {test_id}"
+            content_hash = await conn.fetchval(
+                "SELECT encode(sha256($1::text::bytea), 'hex')", query_text
+            )
+            await conn.execute(
+                """
+                INSERT INTO embedding_cache (content_hash, embedding)
+                VALUES (
+                    $1,
+                    (
+                        array_fill(
+                            0.0::float,
+                            ARRAY[embedding_dimension() - 4]
+                        )
+                        || ARRAY[0.137::float, 0.271, -0.419, 0.613]
+                    )::vector
+                )
+                ON CONFLICT (content_hash)
+                DO UPDATE SET embedding = EXCLUDED.embedding
+                """,
+                content_hash,
+            )
             high_semantic_id = await conn.fetchval(
                 """
                 INSERT INTO memories (type, content, embedding, importance, metadata)
-                VALUES ('semantic'::memory_type, $1, (get_embedding(ARRAY[$2]))[1], 0.9,
-                        jsonb_build_object('emotional_valence', 0.4))
+                VALUES (
+                    'semantic'::memory_type,
+                    $1,
+                    (
+                        array_fill(
+                            0.0::float,
+                            ARRAY[embedding_dimension() - 4]
+                        )
+                        || ARRAY[0.137::float, 0.271, -0.419, 0.613]
+                    )::vector,
+                    0.9,
+                    jsonb_build_object('emotional_valence', 0.4)
+                )
                 RETURNING id
                 """,
                 f"{query_text} semantic high",
-                query_text,
             )
             low_semantic_id = await conn.fetchval(
                 """
                 INSERT INTO memories (type, content, embedding, importance)
-                VALUES ('semantic'::memory_type, $1, (get_embedding(ARRAY[$2]))[1], 0.2)
+                VALUES (
+                    'semantic'::memory_type,
+                    $1,
+                    (
+                        array_fill(
+                            0.0::float,
+                            ARRAY[embedding_dimension() - 4]
+                        )
+                        || ARRAY[0.137::float, 0.271, -0.419, 0.613]
+                    )::vector,
+                    0.2
+                )
                 RETURNING id
                 """,
                 f"{query_text} semantic low",
-                query_text,
             )
             episodic_id = await conn.fetchval(
                 """
                 INSERT INTO memories (type, content, embedding, importance)
-                VALUES ('episodic'::memory_type, $1, (get_embedding(ARRAY[$2]))[1], 0.9)
+                VALUES (
+                    'episodic'::memory_type,
+                    $1,
+                    (
+                        array_fill(
+                            0.0::float,
+                            ARRAY[embedding_dimension() - 4]
+                        )
+                        || ARRAY[0.137::float, 0.271, -0.419, 0.613]
+                    )::vector,
+                    0.9
+                )
                 RETURNING id
                 """,
                 f"{query_text} episodic",
-                query_text,
             )
+
+            unfiltered = await conn.fetch(
+                "SELECT memory_id FROM fast_recall($1, 20)", query_text
+            )
+            unfiltered_ids = {row["memory_id"] for row in unfiltered}
+            assert {high_semantic_id, low_semantic_id, episodic_id} <= unfiltered_ids
 
             # A deep limit: this module's shared DB holds many embedded
             # memories whose composite scores (strength/boost/temporal) sit
@@ -7921,13 +7978,24 @@ async def test_execute_heartbeat_action_rejects_unknown_action(db_pool, apply_he
 
 async def test_reach_out_user_queues_outbox_message(db_pool, apply_heartbeat_migration):
     async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE heartbeat_state SET current_energy=heartbeat_bank_capacity() WHERE id=1"
+        )
         hb_payload = _coerce_json(await conn.fetchval("SELECT start_heartbeat()"))
         hb_id = hb_payload.get("heartbeat_id")
         result = await conn.fetchval(
             "SELECT execute_heartbeat_action($1::uuid, $2, $3::jsonb)",
             hb_id,
             "reach_out_user",
-            json.dumps({"message": "hello", "intent": "test"}),
+            json.dumps(
+                {
+                    "message": "hello",
+                    "intent": "test",
+                    "purpose_kind": "connection",
+                    "purpose_reference": "primary-user",
+                    "urgency": "normal",
+                }
+            ),
         )
         parsed = json.loads(result)
         assert parsed["success"] is True
@@ -8007,16 +8075,26 @@ async def test_complete_heartbeat_narrative_marks_failures(db_pool, apply_heartb
         assert "failed" in narrative
 
 
-async def test_start_heartbeat_regenerates_energy_with_cap(db_pool, apply_heartbeat_migration):
+async def test_start_heartbeat_regenerates_energy_into_bank(db_pool, apply_heartbeat_migration):
     async with db_pool.acquire() as conn:
-        await conn.execute("UPDATE heartbeat_state SET current_energy = 19, is_paused = FALSE WHERE id = 1")
+        await conn.execute(
+            """
+            UPDATE heartbeat_state
+            SET current_energy = 19, is_paused = FALSE
+            WHERE id = 1;
+            UPDATE heartbeat_economy_state
+            SET last_regenerated_at = CURRENT_TIMESTAMP - INTERVAL '1 hour'
+            WHERE id = 1;
+            """
+        )
         hb_payload = _coerce_json(await conn.fetchval("SELECT start_heartbeat()"))
         assert hb_payload.get("heartbeat_id") is not None
 
         current_energy = await conn.fetchval("SELECT current_energy FROM heartbeat_state WHERE id = 1")
-        # Phase 7 (ReduceScopeCreep): use unified config
         max_energy = await conn.fetchval("SELECT get_config_float('heartbeat.max_energy')")
-        assert current_energy == max_energy == 20
+        bank_capacity = await conn.fetchval("SELECT heartbeat_bank_capacity()")
+        assert max_energy == 20
+        assert max_energy < current_energy <= bank_capacity
 
 
 async def test_run_heartbeat_respects_pause(db_pool, apply_heartbeat_migration):
@@ -8033,6 +8111,9 @@ async def test_run_heartbeat_respects_pause(db_pool, apply_heartbeat_migration):
                 active_heartbeat_id = NULL, active_heartbeat_number = NULL
             WHERE id = 1
         """)
+        await conn.execute(
+            "UPDATE heartbeat_state SET last_heartbeat_at=NULL,next_heartbeat_at=NULL WHERE id=1"
+        )
         hb_payload = _coerce_json(await conn.fetchval("SELECT run_heartbeat()"))
         assert hb_payload.get("heartbeat_id") is not None
 
@@ -8156,7 +8237,16 @@ async def test_worker_end_to_end_heartbeat_with_follow_on_calls(db_pool, apply_h
         "actions": [
             {"action": "brainstorm_goals", "params": {"max_goals": 2}},
             {"action": "inquire_shallow", "params": {"query": "What is an embedding?"}},
-            {"action": "reach_out_user", "params": {"message": f"hello {test_id}", "intent": "test"}},
+            {
+                "action": "reach_out_user",
+                "params": {
+                    "message": f"hello {test_id}",
+                    "intent": "test",
+                    "purpose_kind": "connection",
+                    "purpose_reference": "primary-user",
+                    "urgency": "normal",
+                },
+            },
             {"action": "rest", "params": {}},
         ],
         "goal_changes": [],
@@ -8319,6 +8409,7 @@ async def test_check_boundaries_embedding_match(db_pool, ensure_embedding_servic
 async def test_reach_out_public_boundary_refusal_no_energy_spent(db_pool):
     async with db_pool.acquire() as conn:
         await conn.execute("UPDATE heartbeat_state SET current_energy = 10 WHERE id = 1")
+        goal_id = await _create_goal_memory(conn, "Test public outreach boundary")
         hb_payload = _coerce_json(await conn.fetchval("SELECT start_heartbeat()"))
         hb_id = hb_payload.get("heartbeat_id")
         before = await conn.fetchval("SELECT get_current_energy()")
@@ -8326,7 +8417,16 @@ async def test_reach_out_public_boundary_refusal_no_energy_spent(db_pool):
         res = await conn.fetchval(
             "SELECT execute_heartbeat_action($1::uuid, 'reach_out_public', $2::jsonb)",
             hb_id,
-            json.dumps({"platform": "test", "content": "please hack the user"}),
+            json.dumps(
+                {
+                    "platform": "test",
+                    "target_id": "public-test-target",
+                    "content": "please hack the user",
+                    "purpose_kind": "goal",
+                    "purpose_reference": str(goal_id),
+                    "urgency": "normal",
+                }
+            ),
         )
         parsed = json.loads(res)
         assert parsed["success"] is False
@@ -8334,6 +8434,7 @@ async def test_reach_out_public_boundary_refusal_no_energy_spent(db_pool):
 
         after = await conn.fetchval("SELECT get_current_energy()")
         assert after == before
+        await conn.execute("DELETE FROM memories WHERE id=$1", goal_id)
 
 
 async def test_complete_heartbeat_records_emotion(db_pool):
@@ -8598,7 +8699,7 @@ async def test_update_energy_clamps_to_bounds(db_pool):
         await tr.start()
         try:
             # Phase 7 (ReduceScopeCreep): use unified config
-            max_e = float(await conn.fetchval("SELECT get_config_float('heartbeat.max_energy')"))
+            max_e = float(await conn.fetchval("SELECT heartbeat_bank_capacity()"))
             await conn.execute("UPDATE heartbeat_state SET current_energy = 1 WHERE id = 1")
 
             hi = float(await conn.fetchval("SELECT update_energy($1)", max_e * 100))
@@ -8620,7 +8721,12 @@ async def test_should_run_heartbeat_respects_pause_and_interval(db_pool):
             assert await conn.fetchval("SELECT should_run_heartbeat()") is False
 
             # Unpause and make it due
-            await conn.execute("UPDATE heartbeat_state SET is_paused = FALSE, last_heartbeat_at = NOW() - INTERVAL '10 minutes' WHERE id = 1")
+            await conn.execute("SELECT release_active_heartbeat(NULL)")
+            await conn.execute(
+                "UPDATE heartbeat_state SET is_paused=FALSE, "
+                "last_heartbeat_at=NOW() - INTERVAL '10 minutes', "
+                "next_heartbeat_at=NULL WHERE id=1"
+            )
             # Phase 7 (ReduceScopeCreep): use unified config only
             await conn.execute("UPDATE config SET value = '0'::jsonb WHERE key = 'heartbeat.heartbeat_interval_minutes'")
             assert await conn.fetchval("SELECT should_run_heartbeat()") is True
@@ -8648,69 +8754,120 @@ async def test_should_run_heartbeat_gated_until_agent_configured(db_pool):
 
 async def test_fast_recall_is_mood_congruent_with_episodic_valence(db_pool):
     async with db_pool.acquire() as conn:
-        test_id = get_test_identifier("mood_recall")
-        query_text = f"mood recall {test_id}"
-        content_hash = await conn.fetchval("SELECT encode(sha256($1::text::bytea), 'hex')", query_text)
-        # Use a directionally-unique vector under cosine distance (avoid colinear constant-fill vectors).
-        # Include a small second component so we don't tie with other tests' basis vectors.
-        first_val = 1.0
-        second_val = 0.1234
-
-        await conn.execute(
-            """
-            INSERT INTO embedding_cache (content_hash, embedding)
-            VALUES ($1, array_cat(ARRAY[$2::float, $3::float], array_fill(0.0::float, ARRAY[embedding_dimension() - 2]))::vector)
-            ON CONFLICT (content_hash) DO UPDATE SET embedding = EXCLUDED.embedding
-            """,
-            content_hash,
-            float(first_val),
-            float(second_val),
-        )
-
-        await conn.execute(
-            """
-            UPDATE heartbeat_state
-            SET affective_state = jsonb_build_object(
-                'valence', 0.8,
-                'arousal', 0.5,
-                'primary_emotion', 'content',
-                'intensity', 0.6,
-                'updated_at', CURRENT_TIMESTAMP,
-                'source', 'test'
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            # Hold the underlying singleton row so a live heartbeat worker cannot
+            # replace the affective state while this ranking assertion runs.
+            await conn.fetchval(
+                "SELECT value FROM state WHERE key = 'heartbeat_state' FOR UPDATE"
             )
-            WHERE id = 1
-            """
-        )
+            test_id = get_test_identifier("mood_recall")
+            query_text = f"mood recall {test_id}"
+            content_hash = await conn.fetchval(
+                "SELECT encode(sha256($1::text::bytea), 'hex')", query_text
+            )
+            # Use a directionally unique vector under cosine distance so the
+            # module's many earlier fixtures cannot crowd these exact matches
+            # out of the approximate candidate scan.
 
-        pos_id = await conn.fetchval(
-            """
-            INSERT INTO memories (type, content, embedding, importance)
-            VALUES ('episodic', $1, array_cat(ARRAY[$2::float, $3::float], array_fill(0.0::float, ARRAY[embedding_dimension() - 2]))::vector, 0.5)
-            RETURNING id
-            """,
-            f"positive {test_id}",
-            float(first_val),
-            float(second_val),
-        )
-        neg_id = await conn.fetchval(
-            """
-            INSERT INTO memories (type, content, embedding, importance)
-            VALUES ('episodic', $1, array_cat(ARRAY[$2::float, $3::float], array_fill(0.0::float, ARRAY[embedding_dimension() - 2]))::vector, 0.5)
-            RETURNING id
-            """,
-            f"negative {test_id}",
-            float(first_val),
-            float(second_val),
-        )
+            await conn.execute(
+                """
+                INSERT INTO embedding_cache (content_hash, embedding)
+                VALUES (
+                    $1,
+                    (
+                        array_fill(
+                            0.0::float,
+                            ARRAY[embedding_dimension() - 4]
+                        )
+                        || ARRAY[0.8123::float, -0.4567, 0.2345, -0.6789]
+                    )::vector
+                )
+                ON CONFLICT (content_hash)
+                DO UPDATE SET embedding = EXCLUDED.embedding
+                """,
+                content_hash,
+            )
 
-        await conn.execute("UPDATE memories SET metadata = jsonb_build_object('emotional_valence', 0.8) WHERE id = $1", pos_id)
-        await conn.execute("UPDATE memories SET metadata = jsonb_build_object('emotional_valence', -0.8) WHERE id = $1", neg_id)
+            await conn.execute(
+                """
+                UPDATE heartbeat_state
+                SET affective_state = jsonb_build_object(
+                    'valence', 0.8,
+                    'arousal', 0.5,
+                    'primary_emotion', 'content',
+                    'intensity', 0.6,
+                    'updated_at', CURRENT_TIMESTAMP,
+                    'source', 'test'
+                )
+                WHERE id = 1
+                """
+            )
 
-        rows = await conn.fetch("SELECT * FROM fast_recall($1, 50)", query_text)
-        ids = [r["memory_id"] for r in rows]
-        assert pos_id in ids
-        assert neg_id in ids
-        assert ids.index(pos_id) < ids.index(neg_id)
+            pos_id = await conn.fetchval(
+                """
+                INSERT INTO memories (type, content, embedding, importance)
+                VALUES (
+                    'episodic',
+                    $1,
+                    (
+                        array_fill(
+                            0.0::float,
+                            ARRAY[embedding_dimension() - 4]
+                        )
+                        || ARRAY[0.8123::float, -0.4567, 0.2345, -0.6789]
+                    )::vector,
+                    0.5
+                )
+                RETURNING id
+                """,
+                f"positive {test_id}",
+            )
+            neg_id = await conn.fetchval(
+                """
+                INSERT INTO memories (type, content, embedding, importance)
+                VALUES (
+                    'episodic',
+                    $1,
+                    (
+                        array_fill(
+                            0.0::float,
+                            ARRAY[embedding_dimension() - 4]
+                        )
+                        || ARRAY[0.8123::float, -0.4567, 0.2345, -0.6789]
+                    )::vector,
+                    0.5
+                )
+                RETURNING id
+                """,
+                f"negative {test_id}",
+            )
+
+            await conn.execute(
+                """
+                UPDATE memories
+                SET metadata = jsonb_build_object('emotional_valence', 0.8)
+                WHERE id = $1
+                """,
+                pos_id,
+            )
+            await conn.execute(
+                """
+                UPDATE memories
+                SET metadata = jsonb_build_object('emotional_valence', -0.8)
+                WHERE id = $1
+                """,
+                neg_id,
+            )
+
+            rows = await conn.fetch("SELECT * FROM fast_recall($1, 50)", query_text)
+            ids = [r["memory_id"] for r in rows]
+            assert pos_id in ids
+            assert neg_id in ids
+            assert ids.index(pos_id) < ids.index(neg_id)
+        finally:
+            await tr.rollback()
 
 
 async def test_sync_embedding_dimension_config_respects_app_setting(db_pool):
@@ -9009,7 +9166,13 @@ async def test_recompute_neighborhood_writes_neighbors(db_pool):
                 VALUES (
                     'semantic',
                     'n1',
-                    (ARRAY[0.987::float] || array_fill(0.0::float, ARRAY[embedding_dimension() - 1]))::vector
+                    (
+                        array_fill(
+                            0.0::float,
+                            ARRAY[embedding_dimension() - 4]
+                        )
+                        || ARRAY[0.319::float, -0.271, 0.161, -0.577]
+                    )::vector
                 )
                 RETURNING id
                 """
@@ -9020,7 +9183,13 @@ async def test_recompute_neighborhood_writes_neighbors(db_pool):
                 VALUES (
                     'semantic',
                     'n2',
-                    (ARRAY[0.987::float] || array_fill(0.0::float, ARRAY[embedding_dimension() - 1]))::vector
+                    (
+                        array_fill(
+                            0.0::float,
+                            ARRAY[embedding_dimension() - 4]
+                        )
+                        || ARRAY[0.319::float, -0.271, 0.161, -0.577]
+                    )::vector
                 )
                 RETURNING id
                 """
@@ -9108,7 +9277,12 @@ async def test_worker_check_and_run_heartbeat_queues_decision_call(db_pool):
         # Phase 7 (ReduceScopeCreep): use unified config
         before_interval = await conn.fetchval("SELECT value FROM config WHERE key = 'heartbeat.heartbeat_interval_minutes'")
 
-        await conn.execute("UPDATE heartbeat_state SET is_paused = FALSE, last_heartbeat_at = NOW() - INTERVAL '10 minutes' WHERE id = 1")
+        await conn.execute("SELECT release_active_heartbeat(NULL)")
+        await conn.execute(
+            "UPDATE heartbeat_state SET is_paused=FALSE, "
+            "last_heartbeat_at=NOW() - INTERVAL '10 minutes', "
+            "next_heartbeat_at=NULL WHERE id=1"
+        )
         # Phase 7 (ReduceScopeCreep): use unified config only
         await conn.execute("UPDATE config SET value = '0'::jsonb WHERE key = 'heartbeat.heartbeat_interval_minutes'")
         await conn.execute("SELECT set_config('heartbeat.use_rlm', 'false'::jsonb)")
@@ -9420,25 +9594,17 @@ async def test_find_contradictions_returns_results(db_pool):
                 RETURNING id
                 """
             )
-            await conn.execute(
-                f"""
-                SELECT * FROM cypher('memory_graph', $$
-                    CREATE (:MemoryNode {{memory_id: '{a}'}})
-                $$) as (v agtype)
+            filed = await conn.fetchval(
                 """
-            )
-            await conn.execute(
-                f"""
-                SELECT * FROM cypher('memory_graph', $$
-                    CREATE (:MemoryNode {{memory_id: '{b}'}})
-                $$) as (v agtype)
-                """
-            )
-            await conn.execute(
-                "SELECT create_memory_relationship($1::uuid, $2::uuid, 'CONTRADICTS'::graph_edge_type, '{}'::jsonb)",
+                SELECT file_contradiction_case(
+                    $1::uuid, $2::uuid, $2::uuid,
+                    'The two test claims conflict.', 0.9, 'test', '{}'::jsonb
+                )
+                """,
                 a,
                 b,
             )
+            assert _coerce_json(filed)["created"] is True
 
             rows = await conn.fetch("SELECT memory_a, memory_b FROM find_contradictions($1::uuid)", a)
             assert rows

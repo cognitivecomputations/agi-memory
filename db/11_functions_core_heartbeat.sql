@@ -7,9 +7,9 @@ RETURNS JSONB AS $$
 DECLARE
     heartbeat_id UUID;
     state_record RECORD;
-    base_regen FLOAT;
-    max_energy FLOAT;
     new_energy FLOAT;
+    regeneration JSONB;
+    economy JSONB;
     context JSONB;
     decision_max_tokens INT;
     hb_number INT;
@@ -26,27 +26,36 @@ BEGIN
     PERFORM ensure_self_node();
     PERFORM ensure_current_life_chapter();
     SELECT * INTO state_record FROM heartbeat_state WHERE id = 1;
-    base_regen := get_config_float('heartbeat.base_regeneration');
-    max_energy := get_config_float('heartbeat.max_energy');
-    new_energy := LEAST(state_record.current_energy + base_regen, max_energy);
     hb_number := state_record.heartbeat_count + 1;
     heartbeat_id := gen_random_uuid();
     PERFORM update_drives();
+    regeneration := regenerate_heartbeat_energy(CURRENT_TIMESTAMP);
+    new_energy := COALESCE(
+        NULLIF(regeneration->>'after_energy', '')::float,
+        state_record.current_energy
+    );
     UPDATE heartbeat_state SET
         current_energy = new_energy,
         heartbeat_count = hb_number,
         last_heartbeat_at = CURRENT_TIMESTAMP,
+        next_heartbeat_at = NULL,
         active_heartbeat_id = heartbeat_id,
         active_heartbeat_number = hb_number,
         active_actions = '[]'::jsonb,
         active_reasoning = NULL,
         updated_at = CURRENT_TIMESTAMP
     WHERE id = 1;
+    economy := begin_heartbeat_outcome(heartbeat_id, hb_number, regeneration);
     IF COALESCE(get_config_bool('heartbeat.use_rlm'), FALSE) THEN
         context := gather_turn_snapshot();
     ELSE
         context := gather_turn_context();
     END IF;
+    context := context || jsonb_build_object(
+        'belief_updates_recent',
+        recent_belief_updates_json(20, state_record.last_heartbeat_at),
+        'heartbeat_economy', economy
+    );
     decision_max_tokens := get_config_int('heartbeat.max_decision_tokens');
     external_calls := jsonb_build_array(
         build_external_call(

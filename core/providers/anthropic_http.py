@@ -101,13 +101,43 @@ def _convert_tools(
     return result
 
 
-def _build_system_prompt(system_prompt: str | None, auth_mode: str) -> str | None:
+def _build_system_prompt(
+    system_prompt: str | list[str] | None, auth_mode: str
+) -> str | list[dict[str, Any]] | None:
+    """Assemble `system`, with a cache breakpoint when the parts are split.
+
+    A list means the caller separated the stable prefix from this turn's
+    volatile tail (see services.agent.SystemPrompt). Anthropic caches up to and
+    including the block marked with `cache_control`, so the marker goes on the
+    last stable part. A bare string has no boundary to exploit and is passed
+    through unchanged.
+    """
+    split = isinstance(system_prompt, list)
+    parts: list[str] = (
+        [p for p in system_prompt if p and p.strip()]
+        if split
+        else ([system_prompt] if system_prompt else [])
+    )
+
     if auth_mode == "setup-token":
-        parts = [_CLAUDE_CODE_IDENTITY]
-        if system_prompt:
-            parts.append(system_prompt)
+        # The identity preamble is the most stable text there is; it leads.
+        parts = [_CLAUDE_CODE_IDENTITY, *parts]
+
+    if not parts:
+        return None
+    # Only reshape the wire format when the caller actually split the prompt.
+    # A bare string has no cacheable boundary to exploit, and this is a
+    # validated auth path — Anthropic checks the identity preamble on the OAuth
+    # flow, so it keeps the exact shape it has always had.
+    if not split or len(parts) == 1:
         return "\n\n".join(parts)
-    return system_prompt
+    blocks: list[dict[str, Any]] = []
+    for index, part in enumerate(parts):
+        block: dict[str, Any] = {"type": "text", "text": part}
+        if index == len(parts) - 2:
+            block["cache_control"] = {"type": "ephemeral"}
+        blocks.append(block)
+    return blocks
 
 
 def _build_request_body(
@@ -117,7 +147,7 @@ def _build_request_body(
     *,
     auth_mode: str,
     max_tokens: int,
-    system_prompt: str | None,
+    system_prompt: str | list[str] | None,
     stream: bool = False,
 ) -> dict[str, Any]:
     body: dict[str, Any] = {
@@ -170,7 +200,7 @@ async def anthropic_http_completion(
     *,
     auth_mode: str = "api-key",
     max_tokens: int = 16384,
-    system_prompt: str | None = None,
+    system_prompt: str | list[str] | None = None,
 ) -> dict[str, Any]:
     """Non-streaming Anthropic Messages completion via HTTP."""
     url = f"{endpoint.rstrip('/')}/v1/messages"
@@ -201,7 +231,7 @@ async def stream_anthropic_http_completion(
     *,
     auth_mode: str = "api-key",
     max_tokens: int = 16384,
-    system_prompt: str | None = None,
+    system_prompt: str | list[str] | None = None,
     on_text_delta: Any | None = None,
 ) -> dict[str, Any]:
     """Streaming Anthropic Messages completion via HTTP SSE.

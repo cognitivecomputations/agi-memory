@@ -26,7 +26,11 @@ hexis skills list                    # list installed skills
 hexis skills info daily-briefing     # show skill details
 ```
 
-## Built-in Skills (17)
+## Included Skills
+
+The runtime catalog is the source of truth; use `hexis skills list` to see every
+bundled, user, plugin, and configured MCP skill available in this installation.
+Hexis includes these workflows among others:
 
 | Skill | Category | Description |
 |-------|----------|-------------|
@@ -47,6 +51,25 @@ hexis skills info daily-briefing     # show skill details
 | `github-issues` | productivity | GitHub issues via a skill-bound MCP server |
 | `image-gen` | creative | Image generation with prompt refinement |
 | `humanizer` | communication | Detect and rewrite AI-patterned text |
+| `travel-prep` | productivity | Build a sourced itinerary, checklist, and travel brief without transacting |
+| `inbox-triage` | communication | Propose safe inbox actions and apply only the user's chosen batch |
+| `meeting-follow-up` | productivity | Extract decisions and draft controlled post-meeting actions |
+| `weekly-review` | productivity | Reconcile goals, tasks, commitments, and the week ahead |
+| `expense-capture` | productivity | Save structured, source-linked local expense records |
+| `personal-notes` | knowledge | Work with mounted Obsidian vaults and Bear Markdown exports |
+| `council` | knowledge | Run durable multi-perspective deliberation for consequential choices, preserving challenges, dissent, and review conditions |
+| `notion` | productivity | Search, read, query, and approval-gated page creation in a connected Notion workspace |
+| `spotify` | creative | Search Spotify, inspect playback, and control it with explicit approval |
+| `home-assistant` | productivity | Read entity states and call exact services with explicit approval |
+| `weather` | research | Get current conditions and up to sixteen forecast days from Open-Meteo |
+| `trello` | productivity | Read boards/cards and create or update cards with explicit approval |
+
+The `council` skill is advisory. `run_council` records bounded perspective,
+challenge, and synthesis passes in Postgres; `list_deliberations` finds prior
+runs and `inspect_deliberation` reopens the evidence, dissent, missing evidence,
+and conditions that should trigger review. A failed or degraded pass remains
+inspectable and is labeled as such. It never authorizes, blocks, or executes an
+action.
 
 ## Managing Skills
 
@@ -91,7 +114,28 @@ Markdown instructions the agent follows when executing this skill.
 | `requires.env` / `requires.bins` | No | Environment variables / binaries the skill needs (drive the `needs_setup` status) |
 | `bound_tools` | No | Tools this skill exposes to the model while active; supports globs like `mcp_github_*` |
 | `mcp` | No | MCP server binding — see below |
+| `blueprint` | No | One inert automation suggestion registered when the installed skill is discovered; it never schedules automatically |
 | `provenance` | No | Ownership metadata reserved for managed agent-authored skills |
+
+### Suggesting a routine from a skill
+
+An installed skill may carry one consent-first automation blueprint. The flat
+form works with Hexis's dependency-free frontmatter parser:
+
+```yaml
+blueprint:
+  dedup_key: blueprint:my-skill-weekly-prompt
+  title: Weekly project check
+  rationale: A Friday prompt makes it easier to close the week's open loops.
+  schedule: weekly:friday:16:00
+  action_kind: queue_user_message
+  message: Weekly project check — open Hexis and review the project's open loops.
+  delivery_mode: outbox
+```
+
+`title`, `rationale`, and a valid schedule are required. The maintenance worker
+registers the block as a pending suggestion. Installation never accepts it or
+creates a scheduled task.
 
 ### Binding an MCP server
 

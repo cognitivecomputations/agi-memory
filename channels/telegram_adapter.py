@@ -10,9 +10,18 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import tempfile
+from pathlib import Path
 from typing import Any, Callable, Awaitable
 
-from .base import ChannelAdapter, ChannelCapabilities, ChannelMessage, parse_allowlist, resolve_channel_token
+from .base import (
+    ChannelAdapter,
+    ChannelCapabilities,
+    ChannelMessage,
+    parse_allowlist,
+    resolve_channel_token,
+    resolve_forward_all,
+)
 from .media import Attachment
 from .presentation import MarkdownDialect
 
@@ -38,13 +47,21 @@ class TelegramAdapter(ChannelAdapter):
         - Group messages in allowed chats
     """
 
-    def __init__(self, config: dict[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        config: dict[str, Any] | None = None,
+        *,
+        forward_all: bool | None = None,
+    ) -> None:
         self._config = config or {}
+        self._forward_all = resolve_forward_all(self._config, forward_all)
         self._application = None
         self._on_message: Callable[[ChannelMessage], Awaitable[None]] | None = None
         self._connected = False
         self._bot_username: str | None = None
-        self._allowed_chat_ids = self._parse_allowlist(self._config.get("allowed_chat_ids"))
+        self._allowed_chat_ids = self._parse_allowlist(
+            self._config.get("allowed_chat_ids")
+        )
 
     @staticmethod
     def _parse_allowlist(value: Any) -> set[str] | None:
@@ -104,8 +121,15 @@ class TelegramAdapter(ChannelAdapter):
         async def handle_message(update: Update, context) -> None:
             await self._handle_telegram_message(update)
 
+        inbound = (
+            filters.TEXT
+            | filters.PHOTO
+            | filters.Document.ALL
+            | filters.VOICE
+            | filters.AUDIO
+        )
         application.add_handler(
-            MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
+            MessageHandler(inbound & ~filters.COMMAND, handle_message)
         )
 
         # Get bot info
@@ -156,22 +180,28 @@ class TelegramAdapter(ChannelAdapter):
         if not user:
             return
 
-        # Accept text, photos, or documents
+        # Accept text plus media that can be discussed or transcribed.
         has_text = bool(message.text or message.caption)
-        has_media = bool(message.photo or message.document)
+        has_media = bool(
+            message.photo or message.document or message.voice or message.audio
+        )
         if not has_text and not has_media:
             return
 
         is_private = chat.type == "private"
         raw_text = message.text or message.caption or ""
+        is_mention = bool(self._bot_username and f"@{self._bot_username}" in raw_text)
+        gate_hint: str | None = None
 
         if not is_private:
             # Check chat allowlist
             if self._allowed_chat_ids is not None:
                 if str(chat.id) not in self._allowed_chat_ids:
                     # Still respond if mentioned
-                    if self._bot_username and f"@{self._bot_username}" not in raw_text:
-                        return
+                    if not is_mention:
+                        if not self._forward_all:
+                            return
+                        gate_hint = "not_allowed_chat"
 
         # Strip bot mention from content
         content = raw_text
@@ -186,22 +216,48 @@ class TelegramAdapter(ChannelAdapter):
         if message.photo:
             # Telegram provides multiple sizes; pick the largest
             photo = message.photo[-1]
-            attachments.append(Attachment(
-                url="",  # Telegram requires bot.get_file() to get the URL
-                filename=f"photo_{photo.file_unique_id}.jpg",
-                mime_type="image/jpeg",
-                size=photo.file_size,
-                platform_id=photo.file_id,
-            ))
+            attachments.append(
+                Attachment(
+                    url="",  # Telegram requires bot.get_file() to get the URL
+                    filename=f"photo_{photo.file_unique_id}.jpg",
+                    mime_type="image/jpeg",
+                    size=photo.file_size,
+                    platform_id=photo.file_id,
+                )
+            )
         if message.document:
             doc = message.document
-            attachments.append(Attachment(
-                url="",
-                filename=doc.file_name or f"doc_{doc.file_unique_id}",
-                mime_type=doc.mime_type,
-                size=doc.file_size,
-                platform_id=doc.file_id,
-            ))
+            attachments.append(
+                Attachment(
+                    url="",
+                    filename=doc.file_name or f"doc_{doc.file_unique_id}",
+                    mime_type=doc.mime_type,
+                    size=doc.file_size,
+                    platform_id=doc.file_id,
+                )
+            )
+        if message.voice:
+            voice = message.voice
+            attachments.append(
+                Attachment(
+                    url="",
+                    filename=f"voice_{voice.file_unique_id}.ogg",
+                    mime_type=voice.mime_type or "audio/ogg",
+                    size=voice.file_size,
+                    platform_id=voice.file_id,
+                )
+            )
+        if message.audio:
+            audio = message.audio
+            attachments.append(
+                Attachment(
+                    url="",
+                    filename=audio.file_name or f"audio_{audio.file_unique_id}.mp3",
+                    mime_type=audio.mime_type or "audio/mpeg",
+                    size=audio.file_size,
+                    platform_id=audio.file_id,
+                )
+            )
 
         sender_name = user.full_name or user.username or str(user.id)
 
@@ -217,15 +273,22 @@ class TelegramAdapter(ChannelAdapter):
             sender_name=sender_name,
             content=content or "",
             message_id=str(message.message_id),
-            reply_to_id=str(message.reply_to_message.message_id) if message.reply_to_message else None,
+            reply_to_id=(
+                str(message.reply_to_message.message_id)
+                if message.reply_to_message
+                else None
+            ),
             thread_id=topic_id,
             attachments=attachments,
             metadata={
                 "chat_type": chat.type,
                 "is_private": is_private,
+                "is_group": not is_private,
+                "is_mention": is_mention,
                 "username": user.username,
                 "topic_id": topic_id,
                 "is_topic_message": getattr(message, "is_topic_message", False),
+                **({"gate_hint": gate_hint} if gate_hint else {}),
             },
         )
 
@@ -244,6 +307,39 @@ class TelegramAdapter(ChannelAdapter):
             except Exception:
                 logger.debug("Telegram stop warning", exc_info=True)
             self._application = None
+
+    async def download_attachment(
+        self, attachment: Attachment, *, max_size: int
+    ) -> Attachment:
+        if attachment.local_path or not attachment.platform_id or not self._application:
+            return attachment
+        if attachment.size is not None and attachment.size > max_size:
+            return attachment
+        telegram_file = await self._application.bot.get_file(attachment.platform_id)
+        filename = Path(attachment.filename or "voice-note").name
+        suffix = Path(filename).suffix[:16]
+        fd, path = tempfile.mkstemp(prefix="hexis-telegram-", suffix=suffix)
+        os.close(fd)
+        try:
+            await telegram_file.download_to_drive(custom_path=path)
+            size = os.path.getsize(path)
+            if size > max_size:
+                os.unlink(path)
+                return attachment
+            return Attachment(
+                url=attachment.url,
+                filename=filename,
+                mime_type=attachment.mime_type,
+                size=size,
+                platform_id=attachment.platform_id,
+                local_path=path,
+            )
+        except Exception:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            raise
 
     async def send(
         self,
@@ -294,7 +390,10 @@ class TelegramAdapter(ChannelAdapter):
             logger.debug("Silent exception in TelegramAdapter", exc_info=True)
 
     async def edit_message(
-        self, channel_id: str, message_id: str, text: str,
+        self,
+        channel_id: str,
+        message_id: str,
+        text: str,
     ) -> bool:
         if not self._application or not self._application.bot:
             return False

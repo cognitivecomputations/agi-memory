@@ -927,7 +927,10 @@ BEGIN
         || 'Day of week: ' || COALESCE(env->>'day_of_week', '?')
         || ', Hour: ' || COALESCE(env->>'hour_of_day', '?') || E'\n\n'
         || '## Environment' || E'\n'
-        || '- Time since last user interaction: ' || COALESCE(env->>'time_since_user_hours', 'Never') || ' hours' || E'\n'
+        || '- Time since last user interaction: ' || CASE
+               WHEN env->>'time_since_user_hours' IS NULL THEN 'Never'
+               ELSE round((env->>'time_since_user_hours')::numeric, 1)::text || ' hours'
+           END || E'\n'
         || '- Pending events: ' || COALESCE(env->>'pending_events', '0') || E'\n'
         || '- Journal: ' || CASE
                WHEN env->>'journal_last_entry_days' IS NULL THEN 'no entries yet'
