@@ -1075,3 +1075,34 @@ async def test_stream_completion_fallback_on_404(monkeypatch):
     )
     assert result["content"] == "fallback"
     assert llm._endpoint_responses_support.get("default") is False
+
+
+def test_strip_leading_divider_removes_opening_rule():
+    assert llm.strip_leading_divider("---\nHere is the reply.") == "Here is the reply."
+    assert llm.strip_leading_divider("***\nHere is the reply.") == "Here is the reply."
+    assert llm.strip_leading_divider("___\nHere is the reply.") == "Here is the reply."
+    assert llm.strip_leading_divider("- - -\nHere is the reply.") == "Here is the reply."
+
+
+def test_strip_leading_divider_removes_stacked_rules_and_whitespace():
+    assert llm.strip_leading_divider("\n---\n\n---\n\nReply.") == "Reply."
+
+
+def test_strip_leading_divider_keeps_internal_rules():
+    content = "First section.\n\n---\n\nSecond section."
+    assert llm.strip_leading_divider(content) == content
+
+
+def test_strip_leading_divider_is_a_no_op_on_clean_content():
+    for content in ("", "Plain reply.", "# Heading\n\nBody.", "-- not a rule"):
+        assert llm.strip_leading_divider(content) == content
+
+
+def test_strip_leading_divider_returns_empty_when_output_was_only_a_rule():
+    assert llm.strip_leading_divider("---") == ""
+    assert llm.strip_leading_divider("\n---\n") == ""
+
+
+def test_strip_leading_divider_does_not_eat_a_list_item():
+    content = "- first item\n- second item"
+    assert llm.strip_leading_divider(content) == content
