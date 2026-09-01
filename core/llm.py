@@ -652,6 +652,51 @@ def strip_reasoning(content: str) -> str:
     return cleaned
 
 
+# Markdown horizontal-rule line - 3+ of -, *, or _ alone on a line. Some
+# community merges open a reply with one as a spurious section divider
+# (observed: an abliterated Gemma 4 merge emitting a lone "---" before the
+# actual reply, or as the entire reply). Never load-bearing at the start of a
+# user-facing message.
+_LEADING_DIVIDER = re.compile(r"^\s*(?:[-*_]\s*){3,}(?:\n|$)")
+
+
+def strip_leading_divider(content: str) -> str:
+    """
+    Drop a spurious markdown horizontal rule from the start of model output.
+
+    Community merges sometimes open a reply with a lone ``---`` (or ``***`` /
+    ``___``) divider line - markdown-structure leakage, never intended as
+    content. Strips any such leading divider lines plus the whitespace around
+    them.
+
+    Only touches the *start* of the content, so an intentional internal rule
+    survives. Model-agnostic and a no-op when the content does not start with
+    a divider, so it is safe to apply unconditionally.
+    """
+    if not content:
+        return content
+    cleaned = content
+    while True:
+        m = _LEADING_DIVIDER.match(cleaned)
+        if not m:
+            break
+        cleaned = cleaned[m.end():]
+    cleaned = cleaned.lstrip()
+    if cleaned == content:
+        return content
+    if not cleaned:
+        logger.warning(
+            "strip_leading_divider: model output was entirely divider lines, "
+            "nothing left after strip (%d chars removed)", len(content),
+        )
+        return ""
+    logger.info(
+        "strip_leading_divider: removed %d chars of leading divider",
+        len(content) - len(cleaned),
+    )
+    return cleaned
+
+
 _PROVIDER_ALIASES: dict[str, str] = {
     "openai_chat_completions_endpoint": "openai-chat-completions-endpoint",
     "openai_codex": "openai-codex",
@@ -1511,7 +1556,7 @@ async def chat_completion(
         async def _do_chat_completion():
             response = await client.chat.completions.create(**payload)
             message = response.choices[0].message
-            content = strip_reasoning(message.content or "")
+            content = strip_leading_divider(strip_reasoning(message.content or ""))
             tool_calls = _openai_tool_calls(message.tool_calls or [])
             return {"content": content, "tool_calls": tool_calls, "raw": response}
 
@@ -1853,7 +1898,7 @@ async def stream_chat_completion(
                     args = {}
                 tool_calls.append({"id": tc["id"], "name": tc["name"], "arguments": args})
             return {
-                "content": strip_reasoning("".join(content_parts)),
+                "content": strip_leading_divider(strip_reasoning("".join(content_parts))),
                 "tool_calls": tool_calls,
                 "raw": None,
             }
