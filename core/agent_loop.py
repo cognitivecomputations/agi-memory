@@ -16,11 +16,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, AsyncIterator, Awaitable, Callable, TYPE_CHECKING
+from urllib.parse import urlsplit
 
 from core.llm import chat_completion, stream_chat_completion
 from core.tools.base import ToolContext, ToolExecutionContext
@@ -32,6 +35,60 @@ if TYPE_CHECKING:
     from core.tools.registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
+
+_EXCEPTION_URL_RE = re.compile(
+    r"\b[A-Za-z][A-Za-z0-9+.-]*://[^\s\"'<>]+"
+)
+_EXCEPTION_QUOTED_DATA_URI_RE = re.compile(
+    r"(?P<quote>['\"])(?P<uri>data:(?:\\.|(?!(?P=quote)).)*)(?P=quote)",
+    re.IGNORECASE | re.DOTALL,
+)
+_EXCEPTION_DATA_URI_RE = re.compile(
+    r"\bdata:[^,\s\"'<>]+(?:;[^,\s\"'<>]+)*,"
+    r"[A-Za-z0-9+/=_%-]+(?:\r?\n[ \t]*[A-Za-z0-9+/=_%-]+)*",
+    re.IGNORECASE,
+)
+_EXCEPTION_CONTROL_RE = re.compile(
+    r"[\x00-\x08\x0b-\x1f\x7f-\x9f]"
+)
+_EXCEPTION_BEARER_RE = re.compile(
+    r"\bBearer\s+[A-Za-z0-9._~+/=-]+", re.IGNORECASE
+)
+_EXCEPTION_BASIC_RE = re.compile(
+    r"\bBasic\s+[A-Za-z0-9+/=]+", re.IGNORECASE
+)
+_EXCEPTION_HEADER_RE = re.compile(
+    r"\b(Authorization|Cookie|Set-Cookie)(\s*:\s*)[^\r\n]+", re.IGNORECASE
+)
+_EXCEPTION_SENSITIVE_KEY = (
+    r"[A-Za-z0-9_.-]*(?:api[_-]?key|access[_-]?key|access[_-]?token|"
+    r"refresh[_-]?token|token|password|passwd|secret|client[_-]?secret|"
+    r"private[_-]?key|signature|authorization|(?:set[_-]?)?cookie|credentials?|"
+    r"(?:auth|oauth|authorization)[_-]?code)"
+)
+_EXCEPTION_JSON_SECRET_RE = re.compile(
+    rf"(?P<prefix>['\"]?{_EXCEPTION_SENSITIVE_KEY}['\"]?\s*[:=]\s*)"
+    r"(?P<quote>['\"])(?P<value>(?:\\.|(?!(?P=quote)).)*)(?P=quote)",
+    re.IGNORECASE | re.DOTALL,
+)
+_EXCEPTION_SECRET_PAIR_RE = re.compile(
+    rf"\b({_EXCEPTION_SENSITIVE_KEY})(\s*[:=]\s*)"
+    r"(?!['\"]?\[redacted(?:-[a-z-]+)?\])['\"]?[^\s,;'\"]+",
+    re.IGNORECASE,
+)
+_EXCEPTION_KNOWN_KEY_RE = re.compile(
+    r"\b(?:sk-[A-Za-z0-9_-]{8,}|gsk_[A-Za-z0-9_-]{8,}|"
+    r"gh[oprsu]_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]{8,}|"
+    r"hf_[A-Za-z0-9_-]{8,}|AIza[A-Za-z0-9_-]{12,}|"
+    r"xai-[A-Za-z0-9_-]{8,})\b"
+)
+_EXCEPTION_JWT_RE = re.compile(
+    r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b"
+)
+_EXCEPTION_PRIVATE_KEY_RE = re.compile(
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
+    re.DOTALL,
+)
 
 
 def _trace_safe_content(content: Any) -> Any:
@@ -90,6 +147,67 @@ def _model_safe_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]
     ]
 
 
+def describe_exception(exc: BaseException) -> str:
+    """Return a non-empty, user-safe exception description."""
+    message = str(exc).strip()
+    if not message:
+        return type(exc).__name__
+    # Normalize control-character obfuscation before matching secrets. Run
+    # the same filter again at the end as defense in depth for replacements.
+    message = _EXCEPTION_CONTROL_RE.sub("", message)
+
+    def _redact_url(match: re.Match[str]) -> str:
+        raw = match.group(0)
+        trailing = raw[len(raw.rstrip(".,;!?)]}")) :]
+        clean = raw[: len(raw) - len(trailing)] if trailing else raw
+        try:
+            parsed = urlsplit(clean)
+            host = parsed.hostname
+            if not host:
+                raise ValueError("missing URL hostname")
+            rendered_host = f"[{host}]" if ":" in host else host
+            if parsed.port is not None:
+                rendered_host = f"{rendered_host}:{parsed.port}"
+            return f"{parsed.scheme}://{rendered_host}/[redacted]{trailing}"
+        except (TypeError, ValueError):
+            scheme = clean.partition("://")[0]
+            return f"{scheme}://[redacted]{trailing}"
+
+    message = _EXCEPTION_PRIVATE_KEY_RE.sub("[redacted-private-key]", message)
+    message = _EXCEPTION_QUOTED_DATA_URI_RE.sub(
+        lambda match: f"{match.group('quote')}data:[redacted]{match.group('quote')}",
+        message,
+    )
+    message = _EXCEPTION_DATA_URI_RE.sub("data:[redacted]", message)
+    message = _EXCEPTION_JSON_SECRET_RE.sub(
+        lambda match: f"{match.group('prefix')}{match.group('quote')}"
+        f"[redacted]{match.group('quote')}",
+        message,
+    )
+    message = _EXCEPTION_URL_RE.sub(_redact_url, message)
+    message = _EXCEPTION_HEADER_RE.sub(
+        lambda match: f"{match.group(1)}{match.group(2)}[redacted]",
+        message,
+    )
+    message = _EXCEPTION_BEARER_RE.sub("Bearer [redacted]", message)
+    message = _EXCEPTION_BASIC_RE.sub("Basic [redacted]", message)
+    message = _EXCEPTION_SECRET_PAIR_RE.sub(
+        lambda match: f"{match.group(1)}{match.group(2)}[redacted]",
+        message,
+    )
+    message = _EXCEPTION_KNOWN_KEY_RE.sub("[redacted-key]", message)
+    message = _EXCEPTION_JWT_RE.sub("[redacted-token]", message)
+    message = _EXCEPTION_CONTROL_RE.sub("", message)
+    home = os.path.expanduser("~")
+    if home and home != "/":
+        message = message.replace(home, "~")
+    limit = 1000
+    suffix = "… [truncated]"
+    if len(message) > limit:
+        message = message[: limit - len(suffix)].rstrip() + suffix
+    return message or type(exc).__name__
+
+
 # ---------------------------------------------------------------------------
 # Events
 # ---------------------------------------------------------------------------
@@ -100,6 +218,7 @@ class AgentEvent(str, Enum):
 
     LOOP_START = "loop_start"
     TEXT_DELTA = "text_delta"
+    REASONING_DELTA = "reasoning_delta"
     TOOL_START = "tool_start"
     TOOL_RESULT = "tool_result"
     APPROVAL_REQUEST = "approval_request"
@@ -460,13 +579,16 @@ class AgentLoop:
         if self._streaming:
 
             async def _on_text_delta(token: str) -> None:
-                await self._emit(
-                    AgentEvent.TEXT_DELTA,
-                    {
-                        "text": token,
-                        "iteration": self._iteration_count,
-                    },
-                )
+                await self._emit(AgentEvent.TEXT_DELTA, {
+                    "text": token,
+                    "iteration": self._iteration_count,
+                }, persist=False)
+
+            async def _on_reasoning_delta(token: str) -> None:
+                await self._emit(AgentEvent.REASONING_DELTA, {
+                    "text": token,
+                    "iteration": self._iteration_count,
+                }, persist=False)
 
             result = await stream_chat_completion(
                 provider=llm["provider"],
@@ -478,6 +600,7 @@ class AgentLoop:
                 temperature=cfg.temperature,
                 max_tokens=cfg.max_tokens,
                 on_text_delta=_on_text_delta,
+                on_reasoning_delta=_on_reasoning_delta,
                 auth_mode=llm.get("auth_mode"),
             )
         else:
@@ -562,13 +685,19 @@ class AgentLoop:
             try:
                 response = await self._llm_call(messages, tools)
             except Exception as e:
-                logger.error(
-                    "LLM call failed at iteration %d: %s", self._iteration_count, e
+                error = describe_exception(e)
+                logger.exception(
+                    "LLM call failed at iteration %d: %s",
+                    self._iteration_count,
+                    error,
                 )
-                await self._emit(
-                    AgentEvent.ERROR,
-                    {"error": str(e), "iteration": self._iteration_count},
-                )
+                await self._emit(AgentEvent.ERROR, {
+                    "error": error,
+                    "error_type": type(e).__name__,
+                    "provider": cfg.llm_config.get("provider"),
+                    "model": cfg.llm_config.get("model"),
+                    "iteration": self._iteration_count,
+                })
                 return self._make_result(await self._get_messages(), "error")
 
             text = response.get("content", "") or ""
@@ -941,8 +1070,15 @@ class AgentLoop:
         try:
             response = await self._llm_call(messages, tools=None)
         except Exception as e:
-            logger.error("Plan phase LLM call failed: %s", e)
-            await self._emit(AgentEvent.ERROR, {"error": str(e), "phase": "plan"})
+            error = describe_exception(e)
+            logger.exception("Plan phase LLM call failed: %s", error)
+            await self._emit(AgentEvent.ERROR, {
+                "error": error,
+                "error_type": type(e).__name__,
+                "provider": self.config.llm_config.get("provider"),
+                "model": self.config.llm_config.get("model"),
+                "phase": "plan",
+            })
             return self._make_result(await self._get_messages(), "error")
 
         plan_text = response.get("content", "") or ""
@@ -1387,17 +1523,15 @@ class AgentLoop:
                 await conn.fetchval(
                     "SELECT finish_agent_turn($1::uuid, $2::jsonb)",
                     self._turn_id,
-                    json.dumps(
-                        {
-                            "status": "completed",
-                            "stopped_reason": result.stopped_reason,
-                            "text": result.text,
-                            "visible_text": result.visible_text,
-                            "iterations": result.iterations,
-                            "energy_spent": result.energy_spent,
-                            "timed_out": result.timed_out,
-                        }
-                    ),
+                    json.dumps({
+                        "status": "failed" if result.stopped_reason == "error" else "completed",
+                        "stopped_reason": result.stopped_reason,
+                        "text": result.text,
+                        "visible_text": result.visible_text,
+                        "iterations": result.iterations,
+                        "energy_spent": result.energy_spent,
+                        "timed_out": result.timed_out,
+                    }),
                 )
         except Exception:
             logger.warning(
@@ -1405,13 +1539,17 @@ class AgentLoop:
             )
 
     async def _emit(
-        self, event: AgentEvent, data: dict[str, Any] | None = None
+        self,
+        event: AgentEvent,
+        data: dict[str, Any] | None = None,
+        *,
+        persist: bool = True,
     ) -> None:
         """Emit an event via the configured callback."""
         event_data = dict(data or {})
         if self._turn_id:
             event_data.setdefault("turn_id", self._turn_id)
-        if self._turn_id:
+        if persist and self._turn_id:
             try:
                 async with self.config.pool.acquire() as conn:
                     await conn.fetchval(

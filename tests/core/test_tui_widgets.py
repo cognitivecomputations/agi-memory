@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import os
 
+import pytest
+
 from apps.tui import activity, model_catalog, textkit
-from apps.tui.chat_widgets import COMMANDS, StreamingBlock, ToolTree
+from apps.tui.chat_widgets import AssistantTurn, COMMANDS, StreamingBlock, ToolTree
 from apps.tui.init_widgets import (
     BigFiveSliders,
     CharacterPreview,
@@ -31,6 +33,29 @@ def test_widgets_accept_id_kwarg():
     assert ModelMenu(id="model-menu").id == "model-menu"
     assert StreamingBlock() is not None
     assert ToolTree() is not None
+
+
+@pytest.mark.asyncio
+async def test_assistant_turn_keeps_structured_reasoning_out_of_visible_text():
+    class _ReasoningBlock:
+        text = ""
+
+        def set_text(self, text: str) -> None:
+            self.text = text
+
+    turn = AssistantTurn("Hexis")
+    reasoning_block = _ReasoningBlock()
+    turn._reasoning_block = reasoning_block  # type: ignore[assignment]
+    turn.append_reasoning_delta("private thought")
+    turn.append_delta("visible answer")
+    await turn.flush()
+
+    assert turn._structured_reasoning == "private thought"
+    assert turn._raw == "visible answer"
+    assert turn._visible == "visible answer"
+    assert turn._reasoning == "private thought"
+    assert reasoning_block.text == "private thought"
+    assert "private thought" not in turn._visible
 
 
 # ── Model catalog (models.dev parsing) ────────────────────────────────────────

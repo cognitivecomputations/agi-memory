@@ -23,6 +23,7 @@ from core.agent_loop import (
     AgentLoopConfig,
     AgentLoopResult,
     _to_openai_tool_call,
+    describe_exception,
 )
 from core.tools.base import (
     OutboundSpec,
@@ -1012,11 +1013,14 @@ class TestStreaming:
 
     @patch("core.agent_loop.stream_chat_completion")
     async def test_stream_text_delta_content(self, mock_stream_llm):
-        """TEXT_DELTA events contain the text content."""
+        """TEXT_DELTA events contain the text content, without per-token DB writes."""
 
         # Simulate stream_chat_completion calling on_text_delta per-token
         async def _fake_stream(**kwargs):
             cb = kwargs.get("on_text_delta")
+            reasoning_cb = kwargs.get("on_reasoning_delta")
+            if reasoning_cb:
+                await reasoning_cb("considering")
             if cb:
                 await cb("Hello ")
                 await cb("stream!")
@@ -1027,14 +1031,30 @@ class TestStreaming:
         agent = AgentLoop(config)
 
         text_events = []
+        reasoning_events = []
         async for event in agent.stream("Hi"):
             if event.event == AgentEvent.TEXT_DELTA:
                 text_events.append(event)
+            elif event.event == AgentEvent.REASONING_DELTA:
+                reasoning_events.append(event)
 
         # Two token-level deltas
         assert len(text_events) == 2
         assert text_events[0].data["text"] == "Hello "
         assert text_events[1].data["text"] == "stream!"
+        assert [event.data["text"] for event in reasoning_events] == ["considering"]
+
+        async with _DB_POOL.acquire() as conn:
+            transient_count = await conn.fetchval(
+                """
+                SELECT count(*)
+                FROM agent_turn_events
+                WHERE turn_id = $1::uuid
+                  AND event_type IN ('text_delta', 'reasoning_delta')
+                """,
+                agent._turn_id,
+            )
+        assert transient_count == 0
 
     @patch("core.agent_loop.stream_chat_completion")
     async def test_stream_with_tools(self, mock_stream_llm):
@@ -1068,6 +1088,27 @@ class TestStreaming:
 
         assert AgentEvent.TOOL_START in event_types
         assert AgentEvent.TOOL_RESULT in event_types
+        assert call_count == 2
+        assert registry.execute.await_count == 1
+
+    @patch("core.agent_loop.stream_chat_completion")
+    async def test_failed_stream_never_executes_partial_tool_call(self, mock_stream_llm):
+        registry = _mock_registry()
+
+        async def _fake_stream(**kwargs):
+            callback = kwargs.get("on_text_delta")
+            if callback:
+                await callback("partial")
+            raise ConnectionError("stream disconnected during tool arguments")
+
+        mock_stream_llm.side_effect = _fake_stream
+        agent = AgentLoop(_make_config(registry=registry))
+
+        events = [event async for event in agent.stream("Find it")]
+
+        assert any(event.event == AgentEvent.ERROR for event in events)
+        assert not any(event.event == AgentEvent.TOOL_START for event in events)
+        assert registry.execute.await_count == 0
 
 
 # ============================================================================
@@ -1076,6 +1117,169 @@ class TestStreaming:
 
 
 class TestErrorHandling:
+    async def test_exception_description_redacts_credentials_and_sensitive_urls(self):
+        secret_key = "sk-supersecret123456"
+        secret_token = "eyJheader12345.eyJpayload12345.signature12345"
+        error = RuntimeError(
+            "POST https://alice:password@example.test/v1/private"
+            f"?api_key={secret_key} Authorization: Bearer {secret_token}\n"
+            'password=another-secret {"client_secret":"json-secret"}'
+        )
+
+        description = describe_exception(error)
+
+        assert secret_key not in description
+        assert secret_token not in description
+        assert "alice" not in description
+        assert "password" not in description.splitlines()[0]
+        assert "another-secret" not in description
+        assert "json-secret" not in description
+        assert "https://example.test/[redacted]" in description
+        assert "Authorization: [redacted]" in description
+        assert "password=[redacted]" in description
+        assert '"client_secret":"[redacted]"' in description
+
+    async def test_exception_description_bounds_provider_response_bodies(self):
+        description = describe_exception(RuntimeError("provider body: " + "x" * 2000))
+
+        assert len(description) <= 1000
+        assert description.endswith("… [truncated]")
+
+    async def test_exception_description_blocks_common_bypass_formats(self):
+        secrets = {
+            "basic": "dXNlcjpwYXNz",
+            "cookie": "session=abc123",
+            "database": "dbpassword",
+            "rabbitmq": "rabbitsecret",
+            "signature": "signed-query-secret",
+            "openai": "opaque-openai-secret",
+            "env_password": "opaque-rabbit-secret",
+            "private_key": "multiline-private-secret",
+            "image": "iVBORw0KGgoAAAANSUhEUgAAABYPASSPixels",
+        }
+        error = RuntimeError(
+            "headers={'Authorization': 'Basic " + secrets["basic"]
+            + "', 'Cookie': '" + secrets["cookie"] + "'}\n"
+            "postgresql://alice:" + secrets["database"] + "@db.example/hexis\n"
+            "amqp://hexis:" + secrets["rabbitmq"] + "@mq.example/%2F\n"
+            "https://signed.example?X-Amz-Signature=" + secrets["signature"] + "\n"
+            "OPENAI_API_KEY=" + secrets["openai"] + "\n"
+            "RABBITMQ_PASSWORD=" + secrets["env_password"] + "\n"
+            "private_key='-----BEGIN PRIVATE KEY-----\n"
+            + secrets["private_key"]
+            + "\n-----END PRIVATE KEY-----'\n"
+            "image_url='data:image/png;base64,"
+            + secrets["image"]
+            + "'\nterminal=\x1b[31mred\x9b32mgreen\roverwrite"
+        )
+
+        description = describe_exception(error)
+
+        for secret in secrets.values():
+            assert secret not in description
+        assert "postgresql://db.example/[redacted]" in description
+        assert "amqp://mq.example/[redacted]" in description
+        assert "https://signed.example/[redacted]" in description
+        assert "OPENAI_API_KEY=[redacted]" in description
+        assert "RABBITMQ_PASSWORD=[redacted]" in description
+        assert "private_key='[redacted]'" in description
+        assert "data:[redacted]" in description
+        assert "\x1b" not in description
+        assert "\x9b" not in description
+        assert "\r" not in description
+
+    async def test_exception_description_uses_type_for_blank_messages(self):
+        assert describe_exception(AssertionError()) == "AssertionError"
+
+    async def test_exception_description_normalizes_controls_before_redaction(self):
+        secrets = (
+            "opaque-env-secret",
+            "opaque-bearer-secret",
+            "opaque-url-secret",
+            "opaque-image-secret",
+        )
+        error = RuntimeError(
+            "OPENAI_API\x1b_KEY=" + secrets[0] + "\n"
+            "Authorization: Bearer\x9b " + secrets[1] + "\n"
+            "ht\x1btps://user:" + secrets[2] + "@example.test/v1\n"
+            "image=da\x9bta:image/png;base64," + secrets[3]
+        )
+
+        description = describe_exception(error)
+
+        for secret in secrets:
+            assert secret not in description
+        assert "OPENAI_API_KEY=[redacted]" in description
+        assert "Authorization: [redacted]" in description
+        assert "https://example.test/[redacted]" in description
+        assert "data:[redacted]" in description
+
+    async def test_exception_description_handles_escaped_quotes_and_wrapped_data(self):
+        secrets = (
+            "single-quote-secret",
+            "double-quote-secret",
+            "cookie-quote-secret",
+            "LINEONESECRET",
+            "LINETWOSECRET",
+            "UNQUOTEDLINEONE",
+            "UNQUOTEDLINETWO",
+        )
+        error = RuntimeError(
+            "password='pa\\'ss-" + secrets[0] + "'\n"
+            'client_secret="abc\\"' + secrets[1] + '"\n'
+            "headers={'Cookie': 'session=abc\\'" + secrets[2] + "'}\n"
+            "image_url='data:image/png;base64,"
+            + secrets[3]
+            + "\n"
+            + secrets[4]
+            + "'\nimage=data:image/png;base64,"
+            + secrets[5]
+            + "\n"
+            + secrets[6]
+            + " status=failed"
+        )
+
+        description = describe_exception(error)
+
+        for secret in secrets:
+            assert secret not in description
+        assert "password='[redacted]'" in description
+        assert 'client_secret="[redacted]"' in description
+        assert "'Cookie': '[redacted]'" in description
+        assert "data:[redacted]" in description
+
+    @patch("core.agent_loop.stream_chat_completion")
+    async def test_stream_error_persists_only_sanitized_detail(self, mock_stream_llm):
+        secret = "sk-supersecret123456"
+        private_image = "iVBORw0KGgoAAAANSUhEUgAAASECRETPixels"
+        mock_stream_llm.side_effect = RuntimeError(
+            f"provider failed at https://example.test/v1?api_key={secret} "
+            f"image_url=data:image/png;base64,{private_image}"
+        )
+        agent = AgentLoop(_make_config())
+
+        events = [event async for event in agent.stream("Fail safely")]
+        error_event = next(event for event in events if event.event == AgentEvent.ERROR)
+
+        assert secret not in error_event.data["error"]
+        assert private_image not in error_event.data["error"]
+        assert "https://example.test/[redacted]" in error_event.data["error"]
+        async with _DB_POOL.acquire() as conn:
+            persisted_error = await conn.fetchval(
+                """
+                SELECT payload ->> 'error'
+                FROM agent_turn_events
+                WHERE turn_id = $1::uuid
+                  AND event_type = 'error'
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                agent._turn_id,
+            )
+        assert secret not in persisted_error
+        assert private_image not in persisted_error
+        assert persisted_error == error_event.data["error"]
+
     @patch("core.agent_loop.chat_completion")
     async def test_llm_error_returns_error_result(self, mock_llm):
         """LLM call failure returns error stopped_reason."""
@@ -1087,6 +1291,25 @@ class TestErrorHandling:
         assert result.stopped_reason == "error"
         assert result.iterations == 1
         assert result.timed_out is False
+
+    @patch("core.agent_loop.stream_chat_completion")
+    async def test_stream_error_has_detail_and_marks_turn_failed(self, mock_stream_llm):
+        mock_stream_llm.side_effect = AssertionError()
+        config = _make_config()
+        agent = AgentLoop(config)
+
+        events = [event async for event in agent.stream("Fail please")]
+        errors = [event for event in events if event.event == AgentEvent.ERROR]
+
+        assert len(errors) == 1
+        assert errors[0].data["error"] == "AssertionError"
+        assert errors[0].data["error_type"] == "AssertionError"
+        async with _DB_POOL.acquire() as conn:
+            status = await conn.fetchval(
+                "SELECT status FROM agent_turns WHERE id = $1::uuid",
+                agent._turn_id,
+            )
+        assert status == "failed"
 
     @patch("core.agent_loop.chat_completion")
     async def test_tool_error_visible_to_llm(self, mock_llm):

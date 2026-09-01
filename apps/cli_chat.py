@@ -21,6 +21,7 @@ import uuid
 from typing import Any
 
 from dotenv import load_dotenv
+from rich.markup import escape
 
 from apps.cli_theme import console, err_console
 
@@ -492,7 +493,17 @@ async def _run_chat(dsn: str, *, verbose: bool = False, debug: bool = False,
                 raw_buf = ""   # full raw model output
                 shown = ""     # what we've actually printed (scaffolding-stripped)
                 turn_timed_out = False
+                turn_error: str | None = None
+                reasoning_active = False
+                reasoning_chunks = 0
                 tool_calls_log: list[dict[str, Any]] = []
+
+                def _end_reasoning_activity() -> None:
+                    nonlocal reasoning_active
+                    if reasoning_active:
+                        sys.stdout.write("\n")
+                        sys.stdout.flush()
+                        reasoning_active = False
 
                 # Debug: show conversation history being sent
                 if debug and history:
@@ -533,6 +544,7 @@ async def _run_chat(dsn: str, *, verbose: bool = False, debug: bool = False,
                     elif event.event == AgentEvent.TEXT_DELTA:
                         text = event.data.get("text", "")
                         if text:
+                            _end_reasoning_activity()
                             raw_buf += text
                             # Strip leaked <think>/tool-call scaffolding from what the
                             # user SEES, not just from what we persist. Streaming-safe:
@@ -547,7 +559,21 @@ async def _run_chat(dsn: str, *, verbose: bool = False, debug: bool = False,
                             else:
                                 shown = visible
 
+                    elif event.event == AgentEvent.REASONING_DELTA:
+                        # The provider is actively thinking even though no
+                        # user-visible answer token exists yet. Show truthful
+                        # progress without leaking reasoning into the reply,
+                        # history, or memory.
+                        reasoning_chunks += 1
+                        if not reasoning_active:
+                            console.print("\n  [muted]thinking[/muted]", end="")
+                            reasoning_active = True
+                        elif reasoning_chunks % 24 == 0:
+                            sys.stdout.write("·")
+                            sys.stdout.flush()
+
                     elif event.event == AgentEvent.TOOL_START:
+                        _end_reasoning_activity()
                         tool_name = event.data.get("tool_name", "tool")
                         arguments = event.data.get("arguments", {})
                         tool_calls_log.append({"tool": tool_name, "args": arguments})
@@ -572,7 +598,10 @@ async def _run_chat(dsn: str, *, verbose: bool = False, debug: bool = False,
                                     console.print(f"    [dim]{_fmt_json(display, 500)}[/dim]")
                         else:
                             error_msg = event.data.get("error", "")
-                            console.print(f" [fail]failed[/fail][dim]{dur_str}[/dim] [muted]{error_msg[:120]}[/muted]")
+                            console.print(
+                                f" [fail]failed[/fail][dim]{dur_str}[/dim] "
+                                f"[muted]{escape(error_msg[:120])}[/muted]"
+                            )
                             if ui and _connector_setup_requires_action(ui):
                                 _print_connector_setup_ui(ui)
 
@@ -593,6 +622,9 @@ async def _run_chat(dsn: str, *, verbose: bool = False, debug: bool = False,
 
                     elif event.event == AgentEvent.LOOP_END:
                         turn_timed_out = bool(event.data.get("timed_out", False))
+                        reason = str(event.data.get("stopped_reason") or "")
+                        if reason == "error" and not turn_error:
+                            turn_error = "Agent loop ended with an error."
                         if debug:
                             reason = event.data.get("stopped_reason", "?")
                             iters = event.data.get("iterations", 0)
@@ -603,10 +635,19 @@ async def _run_chat(dsn: str, *, verbose: bool = False, debug: bool = False,
                             )
 
                     elif event.event == AgentEvent.ERROR:
-                        error_msg = event.data.get("error", "Unknown error")
-                        console.print(f"\n[fail]Error: {error_msg}[/fail]")
+                        _end_reasoning_activity()
+                        error_msg = str(
+                            event.data.get("error")
+                            or event.data.get("error_type")
+                            or "Unknown error"
+                        )
+                        turn_error = error_msg
+                        console.print(
+                            f"\n[fail]Error: {escape(error_msg)}[/fail]"
+                        )
 
                 # End the streaming line
+                _end_reasoning_activity()
                 sys.stdout.write("\n")
 
                 # Debug: post-turn summary
@@ -621,6 +662,16 @@ async def _run_chat(dsn: str, *, verbose: bool = False, debug: bool = False,
 
                 if turn_timed_out:
                     console.print("[warn](response timed out — the reply above may be incomplete)[/warn]")
+
+                if turn_error:
+                    console.print(
+                        "[warn](response incomplete — your conversation was not updated)[/warn]"
+                    )
+                    console.print(
+                        "[muted]Try again, or run `hexis doctor --llm` if it "
+                        "keeps happening.[/muted]\n"
+                    )
+                    continue
 
                 # Empty response — say so, don't poison history with a blank turn.
                 if not clean_text:

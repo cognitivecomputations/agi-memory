@@ -107,6 +107,8 @@ class AssistantTurn(Vertical):
         self._raw = ""
         self._visible = ""
         self._reasoning = ""
+        self._structured_reasoning = ""
+        self._show_reasoning = False
         self._activity = ToolActivity()
         self._stream: StreamingBlock | None = None
         self._reasoning_block: ReasoningBlock | None = None
@@ -124,11 +126,15 @@ class AssistantTurn(Vertical):
     def append_delta(self, raw: str) -> None:
         self._raw += raw
 
+    def append_reasoning_delta(self, raw: str) -> None:
+        self._structured_reasoning += raw
+
     async def flush(self) -> None:
         """Recompute visible/reasoning from the raw buffer and repaint."""
         if self._done:
             return
-        visible, reasoning = textkit.strip_scaffolding(self._raw)
+        visible, inline_reasoning = textkit.strip_scaffolding(self._raw)
+        reasoning = self._structured_reasoning + inline_reasoning
         self._visible = visible
         self._caret_on = not self._caret_on
         if self._stream is not None:
@@ -141,6 +147,7 @@ class AssistantTurn(Vertical):
     async def _ensure_reasoning(self) -> None:
         if self._reasoning_block is None:
             self._reasoning_block = ReasoningBlock()
+            self._reasoning_block.collapsed = not self._show_reasoning
             await self.mount(self._reasoning_block)
 
     # tools -------------------------------------------------------------------
@@ -163,7 +170,8 @@ class AssistantTurn(Vertical):
     # finalize ----------------------------------------------------------------
     async def finalize(self) -> None:
         self._done = True
-        visible, reasoning = textkit.strip_scaffolding(self._raw)
+        visible, inline_reasoning = textkit.strip_scaffolding(self._raw)
+        reasoning = self._structured_reasoning + inline_reasoning
         self._visible = visible
         if reasoning:
             await self._ensure_reasoning()
@@ -178,6 +186,7 @@ class AssistantTurn(Vertical):
             self._stream = None
 
     def show_reasoning(self, show: bool) -> None:
+        self._show_reasoning = show
         if self._reasoning_block is not None:
             self._reasoning_block.collapsed = not show
 

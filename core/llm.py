@@ -127,6 +127,24 @@ async def _retry_on_transient(
     raise last_exc  # Should not reach here, but just in case
 
 
+async def _close_async_stream(stream: Any) -> None:
+    """Close an SDK stream without masking the provider error."""
+    import inspect
+
+    close = getattr(stream, "close", None) or getattr(stream, "aclose", None)
+    if not callable(close):
+        response = getattr(stream, "response", None)
+        close = getattr(response, "aclose", None)
+    if not callable(close):
+        return
+    try:
+        result = close()
+        if inspect.isawaitable(result):
+            await result
+    except Exception:
+        logger.debug("Failed to close provider stream", exc_info=True)
+
+
 def _get_openai_client(api_key: str | None, base_url: str | None, provider: str, default_headers: dict[str, Any] | None = None) -> Any:
     """Get or create a cached OpenAI client."""
     if openai is None:
@@ -320,24 +338,14 @@ async def _codex_responses_completion(
         "user-agent": f"hexis (python; {os.uname().sysname if hasattr(os, 'uname') else 'unknown'})",
     }
 
-    import asyncio as _asyncio
-    import ssl as _ssl
-
-    _MAX_RETRIES = 3
     timeout = httpx.Timeout(connect=30.0, read=120.0, write=30.0, pool=30.0)
-
-    for attempt in range(_MAX_RETRIES):
-        try:
-            return await _codex_responses_attempt(
-                url=url, headers=headers, payload=payload,
-                timeout=timeout, on_text_delta=on_text_delta,
-            )
-        except (_ssl.SSLError, httpx.RemoteProtocolError, httpx.ReadError) as exc:
-            if attempt < _MAX_RETRIES - 1:
-                wait = 2 ** attempt
-                await _asyncio.sleep(wait)
-                continue
-            raise RuntimeError(f"OpenAI Codex request failed after {_MAX_RETRIES} retries: {exc}") from exc
+    return await _codex_responses_attempt(
+        url=url,
+        headers=headers,
+        payload=payload,
+        timeout=timeout,
+        on_text_delta=on_text_delta,
+    )
 
 
 async def _codex_responses_attempt(
@@ -461,7 +469,16 @@ def _endpoint_cache_key(endpoint: str | None) -> str:
     return (endpoint or "default").rstrip("/")
 
 
-def _should_try_responses(endpoint: str | None) -> bool:
+def _should_try_responses(
+    endpoint: str | None,
+    *,
+    provider: str | None = None,
+) -> bool:
+    # A generic compatible endpoint promises Chat Completions, not the
+    # Responses event grammar. Some servers expose /responses nominally but
+    # emit tool/reasoning items the official SDK cannot parse safely.
+    if provider in {"openai_compatible", "openai-chat-completions-endpoint"}:
+        return False
     if not _HAS_RESPONSES_API:
         return False
     key = _endpoint_cache_key(endpoint)
@@ -1168,6 +1185,7 @@ async def _responses_stream_completion(
     temperature: float,
     max_tokens: int,
     on_text_delta: Any | None = None,
+    on_reasoning_delta: Any | None = None,
 ) -> dict[str, Any]:
     """Streaming completion via the Responses API."""
     instructions, input_items = _messages_to_responses_input(messages)
@@ -1202,6 +1220,17 @@ async def _responses_stream_completion(
                     if asyncio.iscoroutine(result):
                         await result
 
+            elif event_type in {
+                "response.reasoning_summary_text.delta",
+                "response.reasoning_text.delta",
+            }:
+                text = getattr(event, "delta", "")
+                if text and on_reasoning_delta:
+                    import asyncio
+                    result = on_reasoning_delta(text)
+                    if asyncio.iscoroutine(result):
+                        await result
+
             elif event_type == "response.output_item.done":
                 item = getattr(event, "item", None)
                 if item and getattr(item, "type", None) == "function_call":
@@ -1223,6 +1252,157 @@ async def _responses_stream_completion(
             "id": tc["call_id"],
             "name": tc["name"],
             "arguments": tc["arguments"],
+        })
+
+    return {"content": "".join(content_parts), "tool_calls": tool_calls, "raw": None}
+
+
+def _chat_completions_url(endpoint: str | None) -> str:
+    base = (endpoint or "").strip().rstrip("/")
+    if not base:
+        raise ValueError("An endpoint is required for an OpenAI-compatible provider.")
+    if base.endswith("/chat/completions"):
+        return base
+    return f"{base}/chat/completions"
+
+
+async def _compatible_chat_stream_completion(
+    *,
+    provider: str,
+    model: str,
+    endpoint: str | None,
+    api_key: str | None,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None,
+    temperature: float,
+    max_tokens: int,
+    on_text_delta: Any | None,
+    on_reasoning_delta: Any | None,
+) -> dict[str, Any]:
+    """Stream the portable Chat Completions SSE contract without SDK parsing."""
+    import asyncio
+
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {**msg, "content": _content_to_openai_chat(msg.get("content"))}
+            for msg in messages
+        ],
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "stream": True,
+    }
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = "auto"
+
+    headers = {"Accept": "text/event-stream", "Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    content_parts: list[str] = []
+    tool_parts: dict[int, dict[str, Any]] = {}
+    terminal = False
+    timeout = httpx.Timeout(connect=30.0, read=120.0, write=30.0, pool=30.0)
+
+    async for event in iter_sse_json_events(
+        provider,
+        "POST",
+        _chat_completions_url(endpoint),
+        headers=headers,
+        json_body=payload,
+        timeout=timeout,
+        attempts=_LLM_MAX_RETRIES,
+        max_delay=_LLM_RETRY_MAX_WAIT,
+        retry_unsafe_methods=True,
+        strict_json=True,
+    ):
+        if isinstance(event.get("error"), dict):
+            error = event["error"]
+            detail = error.get("message") or error.get("type") or "Provider stream failed"
+            raise RuntimeError(str(detail))
+
+        choices = event.get("choices")
+        if not isinstance(choices, list) or not choices:
+            continue
+        choice = choices[0] if isinstance(choices[0], dict) else {}
+        if choice.get("finish_reason") is not None:
+            terminal = True
+        delta = choice.get("delta") if isinstance(choice, dict) else {}
+        if not isinstance(delta, dict):
+            continue
+
+        reasoning = delta.get("reasoning") or delta.get("reasoning_content")
+        if isinstance(reasoning, str) and reasoning and on_reasoning_delta:
+            result = on_reasoning_delta(reasoning)
+            if asyncio.iscoroutine(result):
+                await result
+
+        text = delta.get("content")
+        if isinstance(text, str) and text:
+            content_parts.append(text)
+            if on_text_delta:
+                result = on_text_delta(text)
+                if asyncio.iscoroutine(result):
+                    await result
+
+        tool_deltas = delta.get("tool_calls")
+        if not isinstance(tool_deltas, list):
+            continue
+        for tool_delta in tool_deltas:
+            if not isinstance(tool_delta, dict):
+                continue
+            raw_index = tool_delta.get("index")
+            if raw_index is None:
+                index = 0
+            elif isinstance(raw_index, bool):
+                raise RuntimeError("Streamed tool call has an invalid index.")
+            elif isinstance(raw_index, int) and raw_index >= 0:
+                index = raw_index
+            elif isinstance(raw_index, str):
+                index_text = raw_index.strip()
+                if not index_text.isascii() or not index_text.isdecimal():
+                    raise RuntimeError("Streamed tool call has an invalid index.")
+                try:
+                    index = int(index_text)
+                except (ValueError, OverflowError) as exc:
+                    raise RuntimeError(
+                        "Streamed tool call has an invalid index."
+                    ) from exc
+            else:
+                raise RuntimeError("Streamed tool call has an invalid index.")
+            current = tool_parts.setdefault(
+                index,
+                {"id": None, "name": None, "arguments_parts": []},
+            )
+            if tool_delta.get("id"):
+                current["id"] = tool_delta["id"]
+            function = tool_delta.get("function")
+            if isinstance(function, dict):
+                if function.get("name"):
+                    current["name"] = function["name"]
+                if function.get("arguments"):
+                    current["arguments_parts"].append(str(function["arguments"]))
+
+    if not terminal:
+        raise RuntimeError("OpenAI-compatible stream ended before a finish signal.")
+
+    tool_calls: list[dict[str, Any]] = []
+    for index in sorted(tool_parts):
+        item = tool_parts[index]
+        raw_arguments = "".join(item["arguments_parts"])
+        try:
+            arguments = json.loads(raw_arguments) if raw_arguments else {}
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"Malformed streamed arguments for tool {item['name'] or index}."
+            ) from exc
+        if not item["name"]:
+            raise RuntimeError(f"Streamed tool call {index} is missing a function name.")
+        tool_calls.append({
+            "id": item["id"],
+            "name": item["name"],
+            "arguments": arguments,
         })
 
     return {"content": "".join(content_parts), "tool_calls": tool_calls, "raw": None}
@@ -1300,7 +1480,7 @@ async def chat_completion(
         client = _get_openai_client(api_key, endpoint, provider, default_headers)
 
         # Try Responses API first, fall back to Chat Completions
-        if _should_try_responses(endpoint):
+        if _should_try_responses(endpoint, provider=provider):
             try:
                 result = await _retry_on_transient(lambda: _responses_completion(
                     client, model, messages, tools, temperature, max_tokens, response_format,
@@ -1438,13 +1618,16 @@ async def stream_chat_completion(
     temperature: float = 0.7,
     max_tokens: int = 1200,
     on_text_delta: Any | None = None,
+    on_reasoning_delta: Any | None = None,
     auth_mode: str | None = None,
 ) -> dict[str, Any]:
     """
     Streaming chat completion that supports tools.
 
     Accumulates the full response while optionally calling ``on_text_delta(text)``
-    for each token. Returns the same shape as ``chat_completion()``:
+    for each answer token and ``on_reasoning_delta(text)`` for provider-native
+    reasoning. Reasoning never enters the returned content. Returns the same
+    shape as ``chat_completion()``:
     ``{content, tool_calls, raw}``.
 
     ``on_text_delta`` can be a sync or async callable accepting a single str
@@ -1452,6 +1635,31 @@ async def stream_chat_completion(
     """
     provider = normalize_provider(provider)
     endpoint = normalize_endpoint(provider, endpoint)
+    delivered = False
+
+    def _deliver_text(text: str) -> Any:
+        nonlocal delivered
+        if text:
+            delivered = True
+        if on_text_delta is not None:
+            return on_text_delta(text)
+        return None
+
+    def _deliver_reasoning(text: str) -> Any:
+        nonlocal delivered
+        if text:
+            delivered = True
+        if on_reasoning_delta is not None:
+            return on_reasoning_delta(text)
+        return None
+
+    text_delta_callback = _deliver_text if on_text_delta is not None else None
+    reasoning_delta_callback = (
+        _deliver_reasoning if on_reasoning_delta is not None else None
+    )
+
+    def _can_retry() -> bool:
+        return not delivered
 
     if provider == "gemini":
         if genai is None or gemini_types is None:
@@ -1502,10 +1710,10 @@ async def stream_chat_completion(
                     else:
                         delta = text
                         emitted += text
-                    if delta and on_text_delta:
+                    if delta and text_delta_callback:
                         import asyncio
 
-                        result = on_text_delta(delta)
+                        result = text_delta_callback(delta)
                         if asyncio.iscoroutine(result):
                             await result
 
@@ -1522,9 +1730,26 @@ async def stream_chat_completion(
             # chunk. Preserve it so record_llm_usage can prove cache hits.
             return {"content": emitted, "tool_calls": tool_calls, "raw": last_chunk}
 
-        return await _retry_on_transient(_do_gemini_stream)
+        return await _retry_on_transient(
+            _do_gemini_stream,
+            should_retry=_can_retry,
+        )
 
     if provider in OPENAI_COMPATIBLE:
+        if provider in {"openai_compatible", "openai-chat-completions-endpoint"}:
+            return await _compatible_chat_stream_completion(
+                provider=provider,
+                model=model,
+                endpoint=endpoint,
+                api_key=api_key,
+                messages=messages,
+                tools=tools,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                on_text_delta=text_delta_callback,
+                on_reasoning_delta=reasoning_delta_callback,
+            )
+
         default_headers = None
         if provider == "github-copilot":
             from core.auth.github_copilot import COPILOT_REQUEST_HEADERS
@@ -1532,11 +1757,21 @@ async def stream_chat_completion(
         client = _get_openai_client(api_key, endpoint, provider, default_headers)
 
         # Try Responses API first, fall back to Chat Completions
-        if _should_try_responses(endpoint):
+        if _should_try_responses(endpoint, provider=provider):
             try:
-                result = await _retry_on_transient(lambda: _responses_stream_completion(
-                    client, model, messages, tools, temperature, max_tokens, on_text_delta,
-                ))
+                result = await _retry_on_transient(
+                    lambda: _responses_stream_completion(
+                        client,
+                        model,
+                        messages,
+                        tools,
+                        temperature,
+                        max_tokens,
+                        text_delta_callback,
+                        reasoning_delta_callback,
+                    ),
+                    should_retry=_can_retry,
+                )
                 _cache_responses_support(endpoint, True)
                 return result
             except Exception as exc:
@@ -1566,32 +1801,45 @@ async def stream_chat_completion(
             # Accumulate tool calls: index -> {id, name, arguments_parts}
             tc_accum: dict[int, dict[str, Any]] = {}
 
-            async for event in response:
-                delta = event.choices[0].delta
-                if delta and delta.content:
-                    content_parts.append(delta.content)
-                    if on_text_delta:
-                        import asyncio
-                        result = on_text_delta(delta.content)
-                        if asyncio.iscoroutine(result):
-                            await result
-                if delta and delta.tool_calls:
-                    for tc_delta in delta.tool_calls:
-                        idx = tc_delta.index
-                        if idx not in tc_accum:
-                            tc_accum[idx] = {
-                                "id": getattr(tc_delta, "id", None),
-                                "name": None,
-                                "arguments_parts": [],
-                            }
-                        if tc_delta.id:
-                            tc_accum[idx]["id"] = tc_delta.id
-                        fn = getattr(tc_delta, "function", None)
-                        if fn:
-                            if getattr(fn, "name", None):
-                                tc_accum[idx]["name"] = fn.name
-                            if getattr(fn, "arguments", None):
-                                tc_accum[idx]["arguments_parts"].append(fn.arguments)
+            try:
+                async for event in response:
+                    delta = event.choices[0].delta
+                    if delta and delta.content:
+                        content_parts.append(delta.content)
+                        if text_delta_callback:
+                            import asyncio
+                            result = text_delta_callback(delta.content)
+                            if asyncio.iscoroutine(result):
+                                await result
+                    if delta:
+                        reasoning = (
+                            getattr(delta, "reasoning", None)
+                            or getattr(delta, "reasoning_content", None)
+                        )
+                        if reasoning and reasoning_delta_callback:
+                            import asyncio
+                            result = reasoning_delta_callback(reasoning)
+                            if asyncio.iscoroutine(result):
+                                await result
+                    if delta and delta.tool_calls:
+                        for tc_delta in delta.tool_calls:
+                            idx = tc_delta.index
+                            if idx not in tc_accum:
+                                tc_accum[idx] = {
+                                    "id": getattr(tc_delta, "id", None),
+                                    "name": None,
+                                    "arguments_parts": [],
+                                }
+                            if tc_delta.id:
+                                tc_accum[idx]["id"] = tc_delta.id
+                            fn = getattr(tc_delta, "function", None)
+                            if fn:
+                                if getattr(fn, "name", None):
+                                    tc_accum[idx]["name"] = fn.name
+                                if getattr(fn, "arguments", None):
+                                    tc_accum[idx]["arguments_parts"].append(fn.arguments)
+            finally:
+                await _close_async_stream(response)
 
             # Build final tool calls
             tool_calls: list[dict[str, Any]] = []
@@ -1610,21 +1858,15 @@ async def stream_chat_completion(
                 "raw": None,
             }
 
-        return await _retry_on_transient(_do_stream_completion)
+        return await _retry_on_transient(
+            _do_stream_completion,
+            should_retry=_can_retry,
+        )
 
     if provider == "openai-codex":
         # A 429/5xx fails before any token reaches the caller and retries
         # freely; once tokens have streamed, retry is refused so the consumer
         # never sees the same text twice.
-        delivered = False
-
-        def _marking_delta(text: str):
-            nonlocal delivered
-            delivered = True
-            if on_text_delta is not None:
-                return on_text_delta(text)
-            return None
-
         return await _retry_on_transient(
             lambda: _codex_responses_completion(
                 model=model,
@@ -1634,9 +1876,9 @@ async def stream_chat_completion(
                 tools=tools,
                 temperature=temperature,
                 max_tokens=max_tokens,
-                on_text_delta=_marking_delta if on_text_delta is not None else None,
+                on_text_delta=text_delta_callback,
             ),
-            should_retry=lambda: not delivered,
+            should_retry=_can_retry,
         )
 
     if provider == "anthropic":
@@ -1644,17 +1886,20 @@ async def stream_chat_completion(
             from core.providers.anthropic_http import stream_anthropic_http_completion
             system_prompt, rest = _extract_system_prompt(messages)
             rest = _messages_to_anthropic_messages(rest)
-            return await _retry_on_transient(lambda: stream_anthropic_http_completion(
-                endpoint=endpoint or "https://api.anthropic.com",
-                api_key=api_key or "",
-                model=model,
-                messages=rest,
-                tools=tools,
-                auth_mode="setup-token",
-                max_tokens=max_tokens,
-                system_prompt=system_prompt or None,
-                on_text_delta=on_text_delta,
-            ))
+            return await _retry_on_transient(
+                lambda: stream_anthropic_http_completion(
+                    endpoint=endpoint or "https://api.anthropic.com",
+                    api_key=api_key or "",
+                    model=model,
+                    messages=rest,
+                    tools=tools,
+                    auth_mode="setup-token",
+                    max_tokens=max_tokens,
+                    system_prompt=system_prompt or None,
+                    on_text_delta=text_delta_callback,
+                ),
+                should_retry=_can_retry,
+            )
         if anthropic is None:
             raise RuntimeError("anthropic package is required for Anthropic provider.")
         client = anthropic.AsyncAnthropic(api_key=api_key)
@@ -1688,9 +1933,9 @@ async def stream_chat_completion(
                             delta = event.delta
                             if delta.type == "text_delta":
                                 text_parts.append(delta.text)
-                                if on_text_delta:
+                                if text_delta_callback:
                                     import asyncio
-                                    result = on_text_delta(delta.text)
+                                    result = text_delta_callback(delta.text)
                                     if asyncio.iscoroutine(result):
                                         await result
                             elif delta.type == "input_json_delta" and current_tool is not None:
@@ -1712,7 +1957,10 @@ async def stream_chat_completion(
 
                 return {"content": "".join(text_parts), "tool_calls": tool_calls, "raw": None}
 
-        return await _retry_on_transient(_do_anthropic_stream)
+        return await _retry_on_transient(
+            _do_anthropic_stream,
+            should_retry=_can_retry,
+        )
 
     if provider == "minimax-portal":
         from core.providers.anthropic_http import stream_anthropic_http_completion
@@ -1727,7 +1975,7 @@ async def stream_chat_completion(
             auth_mode="api-key",
             max_tokens=max_tokens,
             system_prompt=system_prompt or None,
-            on_text_delta=on_text_delta,
+            on_text_delta=text_delta_callback,
         )
 
     if provider in {"google-gemini-cli", "google-antigravity"}:
@@ -1743,7 +1991,8 @@ async def stream_chat_completion(
             messages=messages,
             tools=tools,
             is_antigravity=(provider == "google-antigravity"),
-            on_text_delta=on_text_delta,
+            system_prompt=system_prompt,
+            on_text_delta=text_delta_callback,
         )
 
     raise ValueError(f"Unsupported provider: {provider}")
@@ -1773,10 +2022,13 @@ async def stream_text_completion(
                 max_tokens=max_tokens,
                 stream=True,
             )
-            async for event in response:
-                delta = event.choices[0].delta
-                if delta and delta.content:
-                    yield delta.content
+            try:
+                async for event in response:
+                    delta = event.choices[0].delta
+                    if delta and delta.content:
+                        yield delta.content
+            finally:
+                await _close_async_stream(response)
 
         # Note: We can't wrap a generator with retry logic the same way,
         # but we retry the initial request

@@ -362,6 +362,11 @@ async def stream_channel_message(
         )
 
         collected: list[str] = []
+        terminal_outcome = "unknown"
+
+        def record_terminal_outcome(outcome: str) -> None:
+            nonlocal terminal_outcome
+            terminal_outcome = outcome
 
         async def present_question(payload: dict[str, Any]) -> None:
             from .presentation import agent_question_presentation
@@ -386,12 +391,19 @@ async def stream_channel_message(
             operator_context=_operator_context(msg),
             surface=msg.channel_type,
             on_question=present_question,
+            on_terminal_outcome=record_terminal_outcome,
         ):
             collected.append(token)
             await coalescer.push(token)
 
         message_id = await coalescer.flush()
         assistant_text = "".join(collected)
+
+        # The incomplete notice is useful to the person, but failed/timeout
+        # output must never become durable conversation history. Raising here
+        # would trigger a second non-streaming model turn, so return normally.
+        if terminal_outcome != "completed":
+            return message_id
 
         # Update session and log
         fallback_history = [
