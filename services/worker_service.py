@@ -62,6 +62,11 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
+# python-telegram-bot issues its API calls through httpx, and the bot token
+# is part of the request URL. httpx logs a line per request at INFO, so
+# leaving it enabled writes the token to the logs in plaintext.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger("heartbeat_worker")
 
 POLL_INTERVAL = float(os.getenv("WORKER_POLL_INTERVAL", 1.0))
