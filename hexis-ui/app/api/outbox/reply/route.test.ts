@@ -60,4 +60,35 @@ describe("/api/outbox/reply", () => {
     expect(body.error).toContain("Inbox reply upstream unreachable");
     expect(body.error).toContain("ECONNREFUSED");
   });
+
+  it("preserves an upstream queue failure for the dashboard", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        Response.json(
+          {
+            detail:
+              "Reply was not queued because Hexis's inbox is unavailable: queue unavailable",
+          },
+          { status: 503 }
+        )
+      )
+    );
+
+    const response = await POST(
+      new Request("http://localhost/api/outbox/reply", {
+        method: "POST",
+        body: JSON.stringify({
+          message_id: crypto.randomUUID(),
+          reply: "Hello",
+        }),
+      })
+    );
+
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({
+      detail:
+        "Reply was not queued because Hexis's inbox is unavailable: queue unavailable",
+    });
+  });
 });

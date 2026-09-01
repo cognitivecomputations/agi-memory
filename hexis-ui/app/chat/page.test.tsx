@@ -707,6 +707,78 @@ describe("ChatPage outbox replies", () => {
     expect(screen.getByRole("heading", { name: "Inbox" })).toBeInTheDocument();
   });
 
+  it("preserves a reply draft and retries after the inbox is unavailable", async () => {
+    let replyAttempts = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.endsWith("/api/status")) {
+          return Response.json({
+            configured: true,
+            agent_name: "Samantha",
+            mood: "Ready",
+            valence: 0,
+          });
+        }
+        if (url.endsWith("/api/outbox/reply")) {
+          replyAttempts += 1;
+          if (replyAttempts === 1) {
+            return Response.json(
+              {
+                detail:
+                  "Reply was not queued because Hexis's inbox is unavailable.",
+              },
+              { status: 503 }
+            );
+          }
+          return Response.json({ queued: true, marked_read: 1 });
+        }
+        if (url.endsWith("/api/outbox")) {
+          return Response.json({
+            unread: 1,
+            messages: [
+              {
+                id: "11111111-1111-4111-8111-111111111111",
+                kind: "user",
+                intent: "check_in",
+                message: "Should I prepare the report?",
+                delivered_at: "2026-07-28T12:00:00Z",
+                read_at: null,
+              },
+            ],
+            pending_requests: [],
+          });
+        }
+        return Response.json({});
+      }) as unknown as typeof fetch
+    );
+
+    render(<ChatPage />);
+
+    fireEvent.click(await screen.findByRole("button", { name: /Show inbox/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Reply" }));
+    const replyEditor = await screen.findByLabelText("Reply to Samantha");
+    fireEvent.change(replyEditor, { target: { value: "Yes, please do." } });
+    fireEvent.click(screen.getByRole("button", { name: "Send reply" }));
+
+    expect(
+      await screen.findByText(
+        "Reply was not queued because Hexis's inbox is unavailable. Check Hexis's RabbitMQ connection, then retry."
+      )
+    ).toBeInTheDocument();
+    expect(screen.getByLabelText("Reply to Samantha")).toHaveValue(
+      "Yes, please do."
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Send reply" }));
+
+    expect(
+      await screen.findByText("Reply queued for Samantha's next heartbeat.")
+    ).toBeInTheDocument();
+    expect(replyAttempts).toBe(2);
+  });
+
   it("shows an inert automation suggestion and activates it only after Accept", async () => {
     const decisions: Record<string, unknown>[] = [];
     let pending = true;

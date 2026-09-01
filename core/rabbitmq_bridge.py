@@ -12,37 +12,80 @@ import requests
 logger = logging.getLogger(__name__)
 
 
-RABBITMQ_MANAGEMENT_URL = os.getenv(
-    "RABBITMQ_MANAGEMENT_URL",
-    f"http://localhost:{os.getenv('RABBITMQ_MANAGEMENT_PORT', '45673')}",
-).rstrip("/")
-RABBITMQ_USER = os.getenv("RABBITMQ_USER") or os.getenv(
-    "RABBITMQ_DEFAULT_USER", "hexis"
-)
-RABBITMQ_PASSWORD = os.getenv("RABBITMQ_PASSWORD") or os.getenv(
-    "RABBITMQ_DEFAULT_PASS", "hexis_password"
-)
-RABBITMQ_VHOST = os.getenv("RABBITMQ_VHOST", "/")
-RABBITMQ_OUTBOX_QUEUE = os.getenv("RABBITMQ_OUTBOX_QUEUE", "hexis.outbox")
-RABBITMQ_INBOX_QUEUE = os.getenv("RABBITMQ_INBOX_QUEUE", "hexis.inbox")
-RABBITMQ_POLL_INBOX_EVERY = float(os.getenv("RABBITMQ_POLL_INBOX_EVERY", 1.0))
+# Public defaults retained for callers that import these settings directly.
+# RabbitMQBridge resolves live environment overrides at construction time.
+RABBITMQ_MANAGEMENT_URL = "http://127.0.0.1:45673"
+RABBITMQ_USER = "hexis"
+RABBITMQ_PASSWORD = "hexis_password"
+RABBITMQ_VHOST = "/"
+RABBITMQ_OUTBOX_QUEUE = "hexis.outbox"
+RABBITMQ_INBOX_QUEUE = "hexis.inbox"
+RABBITMQ_POLL_INBOX_EVERY = 1.0
+
+
+def _runtime_value(name: str, alias: str | None = None, default: str = "") -> str:
+    """Read RabbitMQ settings when a bridge is created, after dotenv loads."""
+    value = (os.getenv(name) or "").strip()
+    if not value and alias:
+        value = (os.getenv(alias) or "").strip()
+    return value or default
+
+
+def _runtime_management_url() -> str:
+    port = _runtime_value("RABBITMQ_MANAGEMENT_PORT")
+    if port:
+        return f"http://127.0.0.1:{port}"
+    return RABBITMQ_MANAGEMENT_URL.rstrip("/")
 
 
 class RabbitMQBridge:
     def __init__(self, pool):
         self.pool = pool
+        explicit_management_url = _runtime_value("RABBITMQ_MANAGEMENT_URL")
+        if explicit_management_url:
+            self.management_url = explicit_management_url.rstrip("/")
+            self.user = _runtime_value(
+                "RABBITMQ_USER", "RABBITMQ_DEFAULT_USER", RABBITMQ_USER
+            )
+            self.password = _runtime_value(
+                "RABBITMQ_PASSWORD", "RABBITMQ_DEFAULT_PASS", RABBITMQ_PASSWORD
+            )
+        else:
+            self.management_url = _runtime_management_url()
+            # The local broker is created from RABBITMQ_DEFAULT_* by Compose.
+            # Prefer those aliases so the host API authenticates as that same
+            # account even if a separate RABBITMQ_USER value is also present.
+            self.user = _runtime_value(
+                "RABBITMQ_DEFAULT_USER", "RABBITMQ_USER", RABBITMQ_USER
+            )
+            self.password = _runtime_value(
+                "RABBITMQ_DEFAULT_PASS", "RABBITMQ_PASSWORD", RABBITMQ_PASSWORD
+            )
+        self.vhost = _runtime_value("RABBITMQ_VHOST", default=RABBITMQ_VHOST)
+        self.outbox_queue = _runtime_value(
+            "RABBITMQ_OUTBOX_QUEUE", default=RABBITMQ_OUTBOX_QUEUE
+        )
+        self.inbox_queue = _runtime_value(
+            "RABBITMQ_INBOX_QUEUE", default=RABBITMQ_INBOX_QUEUE
+        )
+        self.poll_inbox_every = float(
+            _runtime_value(
+                "RABBITMQ_POLL_INBOX_EVERY",
+                default=str(RABBITMQ_POLL_INBOX_EVERY),
+            )
+        )
         self._last_inbox_poll = 0.0
 
     def _vhost_path(self) -> str:
-        if RABBITMQ_VHOST == "/":
+        if self.vhost == "/":
             return "%2F"
-        return requests.utils.quote(RABBITMQ_VHOST, safe="")
+        return requests.utils.quote(self.vhost, safe="")
 
     async def _request(
         self, method: str, path: str, payload: dict | None = None
     ) -> requests.Response:
-        url = f"{RABBITMQ_MANAGEMENT_URL}{path}"
-        auth = (RABBITMQ_USER, RABBITMQ_PASSWORD)
+        url = f"{self.management_url}{path}"
+        auth = (self.user, self.password)
 
         def _do() -> requests.Response:
             return requests.request(method, url, auth=auth, json=payload, timeout=5)
@@ -56,7 +99,7 @@ class RabbitMQBridge:
                 raise RuntimeError(f"rabbitmq overview HTTP {resp.status_code}")
 
             vhost = self._vhost_path()
-            for q in (RABBITMQ_OUTBOX_QUEUE, RABBITMQ_INBOX_QUEUE):
+            for q in (self.outbox_queue, self.inbox_queue):
                 r = await self._request(
                     "PUT",
                     f"/api/queues/{vhost}/{requests.utils.quote(q, safe='')}",
@@ -88,7 +131,7 @@ class RabbitMQBridge:
                     f"/api/exchanges/{vhost}/amq.default/publish",
                     payload={
                         "properties": {"content_type": "application/json"},
-                        "routing_key": RABBITMQ_OUTBOX_QUEUE,
+                        "routing_key": self.outbox_queue,
                         "payload": json.dumps(body, default=str),
                         "payload_encoding": "string",
                     },
@@ -123,7 +166,7 @@ class RabbitMQBridge:
                     "delivery_mode": 2,
                     **({"message_id": str(message_id)} if message_id else {}),
                 },
-                "routing_key": RABBITMQ_INBOX_QUEUE,
+                "routing_key": self.inbox_queue,
                 "payload": json.dumps(body, default=str),
                 "payload_encoding": "string",
             },
@@ -139,9 +182,7 @@ class RabbitMQBridge:
                 f"inbox publish returned invalid JSON: {resp.text[:200]}"
             ) from exc
         if not routed:
-            raise RuntimeError(
-                f"inbox message was not routed to {RABBITMQ_INBOX_QUEUE!r}"
-            )
+            raise RuntimeError(f"inbox message was not routed to {self.inbox_queue!r}")
         return True
 
     async def poll_inbox_messages(self, max_messages: int = 10) -> int:
@@ -149,7 +190,7 @@ class RabbitMQBridge:
             return 0
 
         now = time.monotonic()
-        if now - self._last_inbox_poll < RABBITMQ_POLL_INBOX_EVERY:
+        if now - self._last_inbox_poll < self.poll_inbox_every:
             return 0
         self._last_inbox_poll = now
 
@@ -157,7 +198,7 @@ class RabbitMQBridge:
         try:
             resp = await self._request(
                 "POST",
-                f"/api/queues/{vhost}/{requests.utils.quote(RABBITMQ_INBOX_QUEUE, safe='')}/get",
+                f"/api/queues/{vhost}/{requests.utils.quote(self.inbox_queue, safe='')}/get",
                 payload={
                     "count": max_messages,
                     "ackmode": "ack_requeue_false",

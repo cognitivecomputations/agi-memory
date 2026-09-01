@@ -7,6 +7,9 @@ import sys
 
 
 def test_selected_worker_env_loads_before_rabbitmq_constants(tmp_path):
+    """A RabbitMQBridge resolves the selected worker env regardless of import
+    order: settings are read live at construction time (core/rabbitmq_bridge.py's
+    ``_runtime_value``), not baked into module-level constants at import time."""
     env_file = tmp_path / ".env.worker"
     env_file.write_text(
         "RABBITMQ_MANAGEMENT_PORT=49999\n"
@@ -33,8 +36,8 @@ def test_selected_worker_env_loads_before_rabbitmq_constants(tmp_path):
             (
                 "import json; import services.worker_environment; "
                 "import core.rabbitmq_bridge as bridge; "
-                "print(json.dumps([bridge.RABBITMQ_MANAGEMENT_URL, "
-                "bridge.RABBITMQ_USER, bridge.RABBITMQ_PASSWORD]))"
+                "b = bridge.RabbitMQBridge(None); "
+                "print(json.dumps([b.management_url, b.user, b.password]))"
             ),
         ],
         env=env,
@@ -44,7 +47,7 @@ def test_selected_worker_env_loads_before_rabbitmq_constants(tmp_path):
     )
 
     assert json.loads(result.stdout) == [
-        "http://localhost:49999",
+        "http://127.0.0.1:49999",
         "host-user",
         "host-password",
     ]
